@@ -503,17 +503,19 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 
     # Assign each resource to the closest worker (avoid stampede)
     _resource_assignments.clear()
+    # Only assign to workers without cargo (cargo workers are heading home)
+    idle_workers = [(str(w.id), tuple(w.position)) for w in turn.workers if not w.cargo]
     all_resources = list(turn.resource_cells) + [p for p in _resource_memory if p not in depleted]
-    worker_list = [(str(w.id), tuple(w.position)) for w in turn.workers]
     assigned_workers: set[str] = set()
-    for res in sorted(all_resources, key=lambda p: min(_manhattan(p, w[1]) for w in worker_list) if worker_list else 0):
-        if not worker_list:
+    # Sort resources by distance to nearest idle worker, assign each to closest
+    available = list(idle_workers)  # copy, will remove assigned workers
+    for res in sorted(all_resources, key=lambda p: min(_manhattan(p, w[1]) for w in available) if available else 0):
+        if not available:
             break
-        closest = min(worker_list, key=lambda w: _manhattan(res, w[1]))
+        closest = min(available, key=lambda w: _manhattan(res, w[1]))
         wid = closest[0]
-        if wid not in assigned_workers:
-            _resource_assignments[wid] = res
-            assigned_workers.add(wid)
+        _resource_assignments[wid] = res
+        available.remove(closest)  # remove assigned worker from pool
     for event in turn.events:
         if (
             event.event_type == "HARVEST_FAILED"
