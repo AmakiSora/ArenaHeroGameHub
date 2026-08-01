@@ -172,7 +172,8 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
     out = []
     a = out.append
     a(f'<svg class="game-map" id="gameMap" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
-      f'data-width="{W}" data-height="{H}" '
+      f'data-width="{W}" data-height="{H}" data-xmin="{xmin}" data-xmax="{xmax}" '
+      f'data-ymin="{ymin}" data-ymax="{ymax}" data-cell="{cell}" data-pad="{pad}" '
       f'data-focus-x="{(core_cx if core_cx is not None else W/2):.1f}" '
       f'data-focus-y="{(core_cy if core_cy is not None else H/2):.1f}" '
       f'role="img" aria-label="known-map" style="width:{W}px;height:{H}px">')
@@ -386,160 +387,248 @@ body{margin:0;min-height:100vh;color:var(--text);
 JS = r"""
 <script>
 (function(){
-  const KEY='arenaMapView.v1';
-  const stage=document.getElementById('mapStage');
-  const svg=document.getElementById('gameMap');
-  if(!stage||!svg){return;}
+  const KEY = 'arenaMapView.v2';
+  let stage = document.getElementById('mapStage');
+  let svg = document.getElementById('gameMap');
+  let view = null;
+  let drag = false, lx = 0, ly = 0;
+  let lastTick = null;
+  let refreshing = false;
 
-  // Prevent native image/svg drag ghosts
-  svg.addEventListener('dragstart', function(e){ e.preventDefault(); });
-  stage.addEventListener('dragstart', function(e){ e.preventDefault(); });
+  function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
 
-  const baseW=Number(svg.dataset.width||svg.getAttribute('width')||800);
-  const baseH=Number(svg.dataset.height||svg.getAttribute('height')||600);
-  const focusX=Number(svg.dataset.focusX||(baseW/2));
-  const focusY=Number(svg.dataset.focusY||(baseH/2));
-
-  let view=null;
-  try{ view=JSON.parse(localStorage.getItem(KEY)||'null'); }catch(e){ view=null; }
-
-  function clamp(v,lo,hi){ return Math.max(lo, Math.min(hi, v)); }
-
-  function defaultView(){
-    const r=stage.getBoundingClientRect();
-    // fit whole map with a little padding, but not too tiny
-    const fit = Math.min(r.width/baseW, r.height/baseH) * 0.92;
-    const s = clamp(fit, 0.15, 2.5);
+  function readSvgMeta(el){
+    if(!el) return null;
     return {
-      scale: s,
-      x: r.width/2 - focusX * s,
-      y: r.height/2 - focusY * s
+      width: Number(el.dataset.width || el.getAttribute('width') || 800),
+      height: Number(el.dataset.height || el.getAttribute('height') || 600),
+      xmin: Number(el.dataset.xmin || 0),
+      xmax: Number(el.dataset.xmax || 0),
+      ymin: Number(el.dataset.ymin || 0),
+      ymax: Number(el.dataset.ymax || 0),
+      cell: Number(el.dataset.cell || 16),
+      pad: Number(el.dataset.pad || 24),
+      focusX: Number(el.dataset.focusX || 0),
+      focusY: Number(el.dataset.focusY || 0)
     };
   }
 
-  // If map size changed a lot (new walls discovered), reset if old view is nonsense
-  const mapSig = baseW + 'x' + baseH;
-  if(!view || typeof view.scale !== 'number' || view.mapSig !== mapSig){
-    view = defaultView();
-    view.mapSig = mapSig;
+  function worldToSvg(meta, wx, wy){
+    const px = meta.pad + (wx - meta.xmin) * meta.cell + meta.cell / 2;
+    const py = meta.pad + (meta.ymax - wy) * meta.cell + meta.cell / 2;
+    return [px, py];
   }
 
-  const zlbl=document.getElementById('zoomLabel');
+  function svgToWorld(meta, px, py){
+    const wx = meta.xmin + (px - meta.pad) / meta.cell - 0.5;
+    const wy = meta.ymax - (py - meta.pad) / meta.cell + 0.5;
+    return [wx, wy];
+  }
+
+  function loadView(){
+    try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch(e){ return null; }
+  }
+  function saveView(){
+    try {
+      localStorage.setItem(KEY, JSON.stringify({
+        scale: view.scale, worldX: view.worldX, worldY: view.worldY
+      }));
+    } catch(e){}
+  }
+
+  function defaultViewFromSvg(el){
+    const meta = readSvgMeta(el);
+    const r = stage.getBoundingClientRect();
+    const fit = Math.min(r.width / meta.width, r.height / meta.height) * 0.92;
+    const scale = clamp(fit, 0.15, 2.5);
+    let wx, wy;
+    if (meta.focusX || meta.focusY) {
+      const w = svgToWorld(meta, meta.focusX, meta.focusY);
+      wx = w[0]; wy = w[1];
+    } else {
+      wx = (meta.xmin + meta.xmax) / 2;
+      wy = (meta.ymin + meta.ymax) / 2;
+    }
+    return { scale: scale, worldX: wx, worldY: wy };
+  }
+
+  function ensureView(){
+    view = loadView();
+    if(!view || typeof view.scale !== 'number' || typeof view.worldX !== 'number'){
+      view = defaultViewFromSvg(svg);
+      saveView();
+    }
+  }
+
   function apply(){
+    if(!svg || !stage || !view) return;
+    const meta = readSvgMeta(svg);
+    const r = stage.getBoundingClientRect();
+    const sp = worldToSvg(meta, view.worldX, view.worldY);
+    const x = r.width / 2 - sp[0] * view.scale;
+    const y = r.height / 2 - sp[1] * view.scale;
     svg.style.transformOrigin = '0 0';
-    svg.style.transform = 'translate(' + view.x + 'px, ' + view.y + 'px) scale(' + view.scale + ')';
+    svg.style.transform = 'translate(' + x + 'px, ' + y + 'px) scale(' + view.scale + ')';
+    const zlbl = document.getElementById('zoomLabel');
     if(zlbl) zlbl.textContent = Math.round(view.scale * 100) + '%';
-    view.mapSig = mapSig;
-    try{ localStorage.setItem(KEY, JSON.stringify(view)); }catch(e){}
+    view._x = x; view._y = y;
+    saveView();
+  }
+
+  function pixelToWorldUnder(clientX, clientY){
+    const meta = readSvgMeta(svg);
+    const r = stage.getBoundingClientRect();
+    const px = (clientX - r.left - view._x) / view.scale;
+    const py = (clientY - r.top - view._y) / view.scale;
+    return svgToWorld(meta, px, py);
   }
 
   function zoomAt(clientX, clientY, nextScale){
-    const r=stage.getBoundingClientRect();
-    const px = clientX - r.left;
-    const py = clientY - r.top;
-    const worldX = (px - view.x) / view.scale;
-    const worldY = (py - view.y) / view.scale;
+    const before = pixelToWorldUnder(clientX, clientY);
     view.scale = clamp(nextScale, 0.1, 6);
-    view.x = px - worldX * view.scale;
-    view.y = py - worldY * view.scale;
+    apply();
+    const after = pixelToWorldUnder(clientX, clientY);
+    view.worldX += before[0] - after[0];
+    view.worldY += before[1] - after[1];
     apply();
   }
 
-  let drag=false, moved=false, lx=0, ly=0;
-  stage.addEventListener('pointerdown', function(e){
-    if(e.button !== 0) return;
-    drag=true; moved=false; lx=e.clientX; ly=e.clientY;
-    stage.setPointerCapture(e.pointerId);
-    svg.classList.add('dragging');
-  });
-  stage.addEventListener('pointermove', function(e){
-    if(!drag) return;
-    const dx=e.clientX-lx, dy=e.clientY-ly;
-    if(Math.abs(dx)+Math.abs(dy) > 2) moved=true;
-    view.x += dx; view.y += dy;
-    lx=e.clientX; ly=e.clientY;
-    apply();
-  });
-  function endDrag(e){
-    if(!drag) return;
-    drag=false;
-    svg.classList.remove('dragging');
-    try{ stage.releasePointerCapture(e.pointerId); }catch(err){}
+  function bindStage(){
+    stage = document.getElementById('mapStage');
+    svg = document.getElementById('gameMap');
+    if(!stage || !svg) return;
+    svg.addEventListener('dragstart', function(e){ e.preventDefault(); });
+
+    stage.onpointerdown = function(e){
+      if(e.button !== 0) return;
+      drag = true; lx = e.clientX; ly = e.clientY;
+      try { stage.setPointerCapture(e.pointerId); } catch(err){}
+      svg.classList.add('dragging');
+    };
+    stage.onpointermove = function(e){
+      if(!drag) return;
+      const dx = e.clientX - lx, dy = e.clientY - ly;
+      lx = e.clientX; ly = e.clientY;
+      const meta = readSvgMeta(svg);
+      view.worldX -= dx / (view.scale * meta.cell);
+      view.worldY += dy / (view.scale * meta.cell);
+      apply();
+    };
+    function endDrag(e){
+      if(!drag) return;
+      drag = false;
+      if(svg) svg.classList.remove('dragging');
+      try { stage.releasePointerCapture(e.pointerId); } catch(err){}
+    }
+    stage.onpointerup = endDrag;
+    stage.onpointercancel = endDrag;
+
+    const zi = document.getElementById('zoomInBtn');
+    const zo = document.getElementById('zoomOutBtn');
+    const rst = document.getElementById('resetViewBtn');
+    const fc = document.getElementById('focusCoreBtn');
+    if(zi) zi.onclick = function(){
+      const r=stage.getBoundingClientRect();
+      zoomAt(r.left+r.width/2, r.top+r.height/2, view.scale*1.2);
+    };
+    if(zo) zo.onclick = function(){
+      const r=stage.getBoundingClientRect();
+      zoomAt(r.left+r.width/2, r.top+r.height/2, view.scale/1.2);
+    };
+    if(rst) rst.onclick = function(){ view = defaultViewFromSvg(svg); apply(); };
+    if(fc) fc.onclick = function(){
+      const meta = readSvgMeta(svg);
+      const w = svgToWorld(meta, meta.focusX, meta.focusY);
+      view.worldX = w[0]; view.worldY = w[1];
+      apply();
+    };
   }
-  stage.addEventListener('pointerup', endDrag);
-  stage.addEventListener('pointercancel', endDrag);
-  stage.addEventListener('pointerleave', function(e){ if(drag) endDrag(e); });
 
-  stage.addEventListener('wheel', function(e){
-    e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.12 : (1/1.12);
-    zoomAt(e.clientX, e.clientY, view.scale * factor);
-  }, {passive:false});
+  function setHtml(sel, html){
+    const el = document.querySelector(sel);
+    if(el) el.innerHTML = html;
+  }
+  function setText(sel, text){
+    const el = document.querySelector(sel);
+    if(el) el.textContent = text;
+  }
+  function setClass(sel, cls){
+    const el = document.querySelector(sel);
+    if(el) el.className = cls;
+  }
 
-  // Touch pinch zoom (simple 2-finger)
-  let pinch=null;
-  stage.addEventListener('touchstart', function(e){
-    if(e.touches.length===2){
-      const a=e.touches[0], b=e.touches[1];
-      const dist=Math.hypot(a.clientX-b.clientX, a.clientY-b.clientY);
-      pinch={dist:dist, scale:view.scale, cx:(a.clientX+b.clientX)/2, cy:(a.clientY+b.clientY)/2};
+  async function softRefresh(){
+    if(document.hidden || drag || refreshing) return;
+    refreshing = true;
+    try{
+      const res = await fetch('/api/state?ts=' + Date.now(), {cache:'no-store'});
+      if(!res.ok) return;
+      const data = await res.json();
+      if(!data || data.tick == null) return;
+      if(lastTick !== null && data.tick === lastTick) return;
+      lastTick = data.tick;
+
+      if(data.brand) setHtml('#brandLine', data.brand);
+      if(data.statusHtml) setHtml('#statusPill', data.statusHtml);
+      if(data.statusClass) setClass('#statusPill', 'status-pill ' + data.statusClass);
+      if(data.heroHtml) setHtml('#heroSection', data.heroHtml);
+      if(data.metricsHtml) setHtml('#metricsSection', data.metricsHtml);
+      if(data.issuesHtml !== undefined) setHtml('#issuesSection', data.issuesHtml);
+      if(data.workersHtml) setHtml('#workersGrid', data.workersHtml);
+      if(data.vgHtml) setHtml('#vgGrid', data.vgHtml);
+      if(data.rgHtml) setHtml('#rgGrid', data.rgHtml);
+      if(data.resHtml) setHtml('#resSection', data.resHtml);
+      if(data.eventsHtml) setHtml('#eventsSection', data.eventsHtml);
+      if(data.mapTitle) setHtml('#mapTitleCount', data.mapTitle);
+      if(data.footerHtml) setHtml('#footerSection', data.footerHtml);
+      if(data.workersCount !== undefined) setText('#workersCount', data.workersCount + ' 个');
+      if(data.vgCount !== undefined) setText('#vgCount', String(data.vgCount));
+      if(data.rgCount !== undefined) setText('#rgCount', String(data.rgCount));
+      if(data.resCount !== undefined) setText('#resCount', data.resCount + ' 可见');
+      if(data.eventsCount !== undefined) setText('#eventsCount', String(data.eventsCount));
+
+      if(data.mapSvg){
+        const stageEl = document.getElementById('mapStage');
+        if(stageEl){
+          stageEl.innerHTML = data.mapSvg;
+          svg = document.getElementById('gameMap');
+          if(svg){
+            svg.addEventListener('dragstart', function(e){ e.preventDefault(); });
+            apply();
+          }
+        }
+      }
+    } catch(e) {
+    } finally {
+      refreshing = false;
     }
-  }, {passive:true});
-  stage.addEventListener('touchmove', function(e){
-    if(e.touches.length===2 && pinch){
-      e.preventDefault();
-      const a=e.touches[0], b=e.touches[1];
-      const dist=Math.hypot(a.clientX-b.clientX, a.clientY-b.clientY);
-      const cx=(a.clientX+b.clientX)/2, cy=(a.clientY+b.clientY)/2;
-      zoomAt(cx, cy, pinch.scale * (dist / pinch.dist));
-    }
-  }, {passive:false});
-  stage.addEventListener('touchend', function(){ pinch=null; }, {passive:true});
+  }
 
-  const zi=document.getElementById('zoomInBtn');
-  const zo=document.getElementById('zoomOutBtn');
-  const rst=document.getElementById('resetViewBtn');
-  const fc=document.getElementById('focusCoreBtn');
-  if(zi) zi.onclick=function(){ const r=stage.getBoundingClientRect(); zoomAt(r.left+r.width/2, r.top+r.height/2, view.scale*1.2); };
-  if(zo) zo.onclick=function(){ const r=stage.getBoundingClientRect(); zoomAt(r.left+r.width/2, r.top+r.height/2, view.scale/1.2); };
-  if(rst) rst.onclick=function(){ view=defaultView(); view.mapSig=mapSig; apply(); };
-  if(fc) fc.onclick=function(){
-    const r=stage.getBoundingClientRect();
-    view.x = r.width/2 - focusX*view.scale;
-    view.y = r.height/2 - focusY*view.scale;
-    apply();
-  };
-
-  window.addEventListener('resize', function(){ apply(); });
+  ensureView();
+  bindStage();
   apply();
-
-  // Auto refresh keeps camera. Skip while dragging.
-  setInterval(function(){
-    if(document.hidden || drag) return;
-    try{ localStorage.setItem(KEY, JSON.stringify(view)); }catch(e){}
-    location.reload();
-  }, 2000);
+  window.addEventListener('resize', function(){ apply(); });
+  if(stage){
+    stage.addEventListener('wheel', function(e){
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : (1/1.12);
+      zoomAt(e.clientX, e.clientY, view.scale * factor);
+    }, {passive:false});
+  }
+  setInterval(softRefresh, 2000);
 })();
 </script>
 """
 
 
-def unit_card(kind: str, uid: str, pos, extra: str, badge_text: str, badge_cls: str):
-    return (f'<div class="unit {kind}">'
-            f'<div class="unit-top"><div class="unit-id">{short_id(uid)}</div>'
-            f'<span class="badge {badge_cls}">{badge_text}</span></div>'
-            f'<div class="unit-meta"><span>{fmt_pos(pos)}</span><span>{extra}</span></div></div>')
-
-
-def generate_html() -> str:
+def build_parts():
+    """Build all dashboard fragments + map for page and /api/state."""
     rec, mtime = read_latest()
     history = read_history(40)
     issues = check_stuck(history)
     age = time.time() - mtime if mtime else 0
     if not rec:
-        return ('<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>战术仪表盘</title>'
-                '<style>' + CSS + '</style></head><body><div class="wrap"><div class="card"><h1>暂无数据</h1>'
-                '<p class="muted">等待 tactic_log.jsonl 写入…</p></div></div></body></html>')
+        return None
 
     workers = rec.get("workers", [])
     vgs = rec.get("vanguards", [])
@@ -559,54 +648,174 @@ def generate_html() -> str:
 
     stats = defaultdict(int)
     for w in workers:
-        stats[action_kind(actions.get(short_id(w.get("id", "")), ""), w.get("cargo", 0))] += 1
+        wid = short_id(w.get("id", ""))
+        act = actions.get(wid) or actions.get(w.get("id", ""), "")
+        stats[action_kind(act, w.get("cargo", 0))] += 1
 
     def wcard(w):
         wid = w.get("id", "")
-        act = actions.get(short_id(wid), "")
+        sid = short_id(wid)
+        act = actions.get(sid) or actions.get(wid, "")
         cargo = w.get("cargo", 0)
         kind = action_kind(act, cargo)
         badge = action_label(act, cargo)
-        extra = f'<span class="pill">矿 {cargo}</span>' if cargo else f'<span class="pill">HP {w.get("hp","?")}</span>'
-        meta = f'<div class="unit-meta"><span>{fmt_pos(w.get("pos"))}</span>{extra}</div>'
-        act_div = f'<div class="unit-action">{act}</div>'
-        return (f'<div class="unit {kind}"><div class="unit-top">'
-                f'<div class="unit-id">{short_id(wid)}</div>'
-                f'<span class="badge {kind}">{badge}</span></div>{meta}{act_div}</div>')
+        extra = (
+            f'<span class="pill">矿 {cargo}</span>'
+            if cargo else f'<span class="pill">HP {w.get("hp","?")}</span>'
+        )
+        return (
+            f'<div class="unit {kind}"><div class="unit-top">'
+            f'<div class="unit-id">{sid}</div>'
+            f'<span class="badge {kind}">{badge}</span></div>'
+            f'<div class="unit-meta"><span>{fmt_pos(w.get("pos"))}</span>{extra}</div>'
+            f'<div class="unit-action">{act}</div></div>'
+        )
+
+    def ucard(u, color_cls, label):
+        uid = u.get("id", "")
+        sid = short_id(uid)
+        act = actions.get(sid) or actions.get(uid, "")
+        return (
+            f'<div class="unit {color_cls}"><div class="unit-top">'
+            f'<div class="unit-id">{sid}</div>'
+            f'<span class="badge {color_cls}">{label}</span></div>'
+            f'<div class="unit-meta"><span>{fmt_pos(u.get("pos"))}</span>'
+            f'<span class="pill">HP {u.get("hp","?")}</span></div>'
+            f'<div class="unit-action">{act}</div></div>'
+        )
 
     w_html = "".join(wcard(w) for w in workers) or '<div class="empty">暂无工人</div>'
+    vg_html = "".join(ucard(v, "combat", "作战") for v in vgs) or '<div class="empty">暂无先锋</div>'
+    rg_html = "".join(ucard(r, "combat", "作战") for r in rgs) or '<div class="empty">暂无游侠</div>'
 
-    def ucard(u, kind, color_cls, icon, label):
-        uid = u.get("id", "")
-        act = actions.get(short_id(uid), "")
-        return (f'<div class="unit {color_cls}"><div class="unit-top">'
-                f'<div class="unit-id">{short_id(uid)}</div>'
-                f'<span class="badge {color_cls}">{label}</span></div>'
-                f'<div class="unit-meta"><span>{fmt_pos(u.get("pos"))}</span>'
-                f'<span class="pill">HP {u.get("hp","?")}</span></div>'
-                f'<div class="unit-action">{act}</div></div>')
-
-    vg_html = "".join(ucard(v, "vg", "combat", "V", "作战") for v in vgs) or '<div class="empty">暂无先锋</div>'
-    rg_html = "".join(ucard(r, "rg", "combat", "R", "作战") for r in rgs) or '<div class="empty">暂无游侠</div>'
-
-    issues_html = ""
     if issues:
-        items = "".join(f'<div class="issue {i["level"]}"><strong>{i["title"]}</strong><span>{i["detail"]}</span></div>' for i in issues)
-        issues_html = f'<section class="panel" style="margin-bottom:14px"><div class="panel-title">异常告警</div><div class="issues">{items}</div></section>'
-
-    chips = "".join(f'<span class="chip">{fmt_pos(p)}</span>' for p in rcells[:12]) if rcells else '<div class="muted">当前无可见矿点</div>'
-    mem_chips = "".join(f'<span class="chip mem">{fmt_pos(p)}</span>' for p in mm.get("resources", [])[:12])
-    res_html = chips + (f'<div class="muted" style="margin-top:8px">记忆矿点 {mm.get("resource_count",0)}</div><div class="chip-row">{mem_chips}</div>' if mm.get("resources") else '')
-
-    ev_rows = ""
-    if events:
-        for e in events:
-            ev_rows += f"<tr><td>{e.get('type','')}</td><td>{e.get('reason') or '—'}</td><td>{short_id(e.get('actor')) if e.get('actor') else '—'}</td><td>{fmt_pos(e.get('pos'))}</td></tr>"
-        ev_html = f'<table class="events"><thead><tr><th>事件</th><th>原因</th><th>单位</th><th>位置</th></tr></thead><tbody>{ev_rows}</tbody></table>'
+        items = "".join(
+            f'<div class="issue {i["level"]}"><strong>{i["title"]}</strong>'
+            f'<span>{i["detail"]}</span></div>'
+            for i in issues
+        )
+        issues_html = (
+            '<section class="panel" style="margin-bottom:14px">'
+            f'<div class="panel-title">异常告警</div><div class="issues">{items}</div></section>'
+        )
     else:
-        ev_html = '<div class="muted">本帧无特殊事件</div>'
+        issues_html = ""
 
-    html = f"""<!DOCTYPE html>
+    chips = (
+        "".join(f'<span class="chip">{fmt_pos(p)}</span>' for p in rcells[:12])
+        if rcells else '<div class="muted">当前无可见矿点</div>'
+    )
+    mem_chips = "".join(
+        f'<span class="chip mem">{fmt_pos(p)}</span>' for p in mm.get("resources", [])[:12]
+    )
+    res_html = chips
+    if mm.get("resources"):
+        res_html += (
+            f'<div class="muted" style="margin-top:8px">记忆矿点 {mm.get("resource_count",0)}</div>'
+            f'<div class="chip-row">{mem_chips}</div>'
+        )
+
+    if events:
+        rows = ""
+        for e in events:
+            rows += (
+                f"<tr><td>{e.get('type','')}</td><td>{e.get('reason') or '—'}</td>"
+                f"<td>{short_id(e.get('actor')) if e.get('actor') else '—'}</td>"
+                f"<td>{fmt_pos(e.get('pos'))}</td></tr>"
+            )
+        events_html = (
+            '<table class="events"><thead><tr><th>事件</th><th>原因</th>'
+            '<th>单位</th><th>位置</th></tr></thead>'
+            f'<tbody>{rows}</tbody></table>'
+        )
+    else:
+        events_html = '<div class="muted">本帧无特殊事件</div>'
+
+    brand = (
+        f"Tick {rec.get('tick')} · 延迟 {rec.get('latency_ms',0):.0f} ms · "
+        f"核心 {fmt_pos(rec.get('core_pos'))}"
+    )
+    status_html = (
+        f'<span class="dot"></span><span>{status_text}</span>'
+        f'<span style="color:var(--muted)">日志 {age:.0f}s 前</span>'
+    )
+    hero_html = (
+        f'<div class="card"><div class="kicker">核心状态</div>'
+        f'<div class="big">{fmt_pos(rec.get("core_pos"))}</div>'
+        f'<div class="sub">动作 {rec.get("core_action") or "—"} · 状态 {rec.get("core_state") or "—"} · '
+        f'HP {rec.get("core_hp","?")} / Shield {rec.get("core_shield","?")}</div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">'
+        f'<span class="pill">人口 {rec.get("population",0)}</span>'
+        f'<span class="pill">人口层 {rec.get("population_tier",0)}</span>'
+        f'<span class="pill">保养 {rec.get("upkeep_next_tick",0)}</span>'
+        f'<span class="pill">信标 {fmt_pos(rec.get("beacon_pos"))}</span></div></div>'
+        f'<div class="card"><div class="kicker">资源</div>'
+        f'<div class="big">{resources}<span style="font-size:18px;color:var(--muted)"> / {cap}</span></div>'
+        f'<div class="bar"><span style="width:{pct}%"></span></div>'
+        f'<div class="sub">进度 {pct}% · 可见矿点 {len(rcells)}</div></div>'
+        f'<div class="card"><div class="kicker">战场</div>'
+        f'<div class="big">{enemies}</div>'
+        f'<div class="sub">可见敌人 · 工人 {len(workers)} · 先锋 {len(vgs)} · 游侠 {len(rgs)}</div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">'
+        f'<span class="pill">回矿 {stats["cargo"]+stats["deposit"]}</span>'
+        f'<span class="pill">探索 {stats["explore"]}</span>'
+        f'<span class="pill">等待 {stats["wait"]}</span>'
+        f'<span class="pill">挖矿 {stats["harvest"]}</span></div></div>'
+    )
+    metrics_html = (
+        f'<div class="metric"><div class="label">墙记忆</div>'
+        f'<div class="value">{mm.get("obstacle_count",0)}</div></div>'
+        f'<div class="metric"><div class="label">可见障碍</div>'
+        f'<div class="value">{rec.get("obstacle_cells_visible",0)}</div></div>'
+        f'<div class="metric"><div class="label">记忆矿点</div>'
+        f'<div class="value">{mm.get("resource_count",0)}</div></div>'
+        f'<div class="metric"><div class="label">异常告警</div>'
+        f'<div class="value">{len(issues)}</div></div>'
+    )
+    map_title = (
+        f"墙 {mm.get('obstacle_count',0)} · 记忆矿 {mm.get('resource_count',0)} · "
+        f"可见矿 {len(rcells)}"
+    )
+    footer_html = (
+        f'<div>软刷新 · 不重置视角 · 不抢焦点</div>'
+        f'<div>更新于 {time.strftime("%H:%M:%S")} · Tick {rec.get("tick")}</div>'
+    )
+
+    return {
+        "tick": rec.get("tick"),
+        "brand": brand,
+        "statusHtml": status_html,
+        "statusClass": status_cls,
+        "heroHtml": hero_html,
+        "metricsHtml": metrics_html,
+        "issuesHtml": issues_html,
+        "workersHtml": w_html,
+        "vgHtml": vg_html,
+        "rgHtml": rg_html,
+        "resHtml": res_html,
+        "eventsHtml": events_html,
+        "mapSvg": svg,
+        "mapTitle": map_title,
+        "footerHtml": footer_html,
+        "workersCount": len(workers),
+        "vgCount": len(vgs),
+        "rgCount": len(rgs),
+        "resCount": len(rcells),
+        "eventsCount": len(events),
+    }
+
+
+def generate_html() -> str:
+    parts = build_parts()
+    if not parts:
+        return (
+            '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">'
+            '<title>战术仪表盘</title><style>' + CSS + '</style></head><body>'
+            '<div class="wrap"><div class="card"><h1>暂无数据</h1>'
+            '<p class="muted">等待 tactic_log.jsonl 写入…</p></div></div></body></html>'
+        )
+
+    return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><title>Arena Hero 战术仪表盘</title>
@@ -617,59 +826,26 @@ def generate_html() -> str:
   <div class="topbar">
     <div class="brand">
       <h1>Arena Hero 战术仪表盘</h1>
-      <p>Tick {rec.get('tick')} · 延迟 {rec.get('latency_ms',0):.0f} ms · 核心 {fmt_pos(rec.get('core_pos'))}</p>
+      <p id="brandLine">{parts['brand']}</p>
     </div>
-    <div class="status-pill {status_cls}"><span class="dot"></span><span>{status_text}</span><span style="color:var(--muted)">日志 {age:.0f}s 前</span></div>
+    <div class="status-pill {parts['statusClass']}" id="statusPill">{parts['statusHtml']}</div>
   </div>
 
-  <div class="hero">
-    <div class="card"><div class="kicker">核心状态</div>
-     <div class="big">{fmt_pos(rec.get('core_pos'))}</div>
-     <div class="sub">动作 {rec.get('core_action') or '—'} · 状态 {rec.get('core_state') or '—'} · HP {rec.get('core_hp','?')} / Shield {rec.get('core_shield','?')}</div>
-     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">
-      <span class="pill">人口 {rec.get('population',0)}</span>
-      <span class="pill">人口层 {rec.get('population_tier',0)}</span>
-      <span class="pill">保养 {rec.get('upkeep_next_tick',0)}</span>
-      <span class="pill">信标 {fmt_pos(rec.get('beacon_pos'))}</span>
-     </div>
-    </div>
-    <div class="card"><div class="kicker">资源</div>
-     <div class="big">{resources}<span style="font-size:18px;color:var(--muted)"> / {cap}</span></div>
-     <div class="bar"><span style="width:{pct}%"></span></div>
-     <div class="sub">进度 {pct}% · 可见矿点 {len(rcells)}</div>
-    </div>
-    <div class="card"><div class="kicker">战场</div>
-     <div class="big">{enemies}</div>
-     <div class="sub">可见敌人 · 工人 {len(workers)} · 先锋 {len(vgs)} · 游侠 {len(rgs)}</div>
-     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">
-      <span class="pill">回矿 {stats['cargo']+stats['deposit']}</span>
-      <span class="pill">探索 {stats['explore']}</span>
-      <span class="pill">等待 {stats['wait']}</span>
-      <span class="pill">挖矿 {stats['harvest']}</span>
-     </div>
-    </div>
-  </div>
-
-  <div class="metrics">
-   <div class="metric"><div class="label">墙记忆</div><div class="value">{mm.get('obstacle_count',0)}</div></div>
-   <div class="metric"><div class="label">可见障碍</div><div class="value">{rec.get('obstacle_cells_visible',0)}</div></div>
-   <div class="metric"><div class="label">记忆矿点</div><div class="value">{mm.get('resource_count',0)}</div></div>
-   <div class="metric"><div class="label">异常告警</div><div class="value">{len(issues)}</div></div>
-  </div>
-
-  {issues_html}
+  <div class="hero" id="heroSection">{parts['heroHtml']}</div>
+  <div class="metrics" id="metricsSection">{parts['metricsHtml']}</div>
+  <div id="issuesSection">{parts['issuesHtml']}</div>
 
   <section class="panel map-panel" style="margin-bottom:14px">
-   <div class="panel-title"><span>已知地图</span><span class="count">墙 {mm.get('obstacle_count',0)} · 记忆矿 {mm.get('resource_count',0)} · 可见矿 {len(rcells)}</span></div>
+   <div class="panel-title"><span>已知地图</span><span class="count" id="mapTitleCount">{parts['mapTitle']}</span></div>
    <div class="map-toolbar">
     <button type="button" id="zoomOutBtn">-</button>
     <button type="button" id="zoomInBtn">+</button>
     <button type="button" id="resetViewBtn">重置视角</button>
     <button type="button" id="focusCoreBtn">定位核心</button>
     <span id="zoomLabel">100%</span>
-    <span class="hint">拖动平移 · 滚轮缩放 · 视角自动记忆</span>
+    <span class="hint">拖动平移 · 滚轮缩放 · 软刷新不重置</span>
    </div>
-   <div class="map-stage" id="mapStage">{svg}</div>
+   <div class="map-stage" id="mapStage">{parts['mapSvg']}</div>
    <div class="map-legend">
     <span><i class="dot core"></i>核心</span>
     <span><i class="dot cargo"></i>带矿工人</span>
@@ -683,35 +859,46 @@ def generate_html() -> str:
   </section>
 
   <div class="layout">
-    <section class="panel"><div class="panel-title"><span>工人</span><span class="count">{len(workers)} 个</span></div>
-     <div class="unit-grid">{w_html}</div>
+    <section class="panel"><div class="panel-title"><span>工人</span><span class="count" id="workersCount">{parts['workersCount']} 个</span></div>
+     <div class="unit-grid" id="workersGrid">{parts['workersHtml']}</div>
     </section>
     <div class="side-stack">
-     <section class="panel"><div class="panel-title"><span>先锋</span><span class="count">{len(vgs)}</span></div><div class="unit-grid" style="grid-template-columns:1fr">{vg_html}</div></section>
-     <section class="panel"><div class="panel-title"><span>游侠</span><span class="count">{len(rgs)}</span></div><div class="unit-grid" style="grid-template-columns:1fr">{rg_html}</div></section>
-     <section class="panel"><div class="panel-title"><span>矿点</span><span class="count">{len(rcells)} 可见</span></div>{res_html}</section>
-     <section class="panel"><div class="panel-title"><span>本帧事件</span><span class="count">{len(events)}</span></div>{ev_html}</section>
+     <section class="panel"><div class="panel-title"><span>先锋</span><span class="count" id="vgCount">{parts['vgCount']}</span></div><div class="unit-grid" id="vgGrid" style="grid-template-columns:1fr">{parts['vgHtml']}</div></section>
+     <section class="panel"><div class="panel-title"><span>游侠</span><span class="count" id="rgCount">{parts['rgCount']}</span></div><div class="unit-grid" id="rgGrid" style="grid-template-columns:1fr">{parts['rgHtml']}</div></section>
+     <section class="panel"><div class="panel-title"><span>矿点</span><span class="count" id="resCount">{parts['resCount']} 可见</span></div><div id="resSection">{parts['resHtml']}</div></section>
+     <section class="panel"><div class="panel-title"><span>本帧事件</span><span class="count" id="eventsCount">{parts['eventsCount']}</span></div><div id="eventsSection">{parts['eventsHtml']}</div></section>
     </div>
   </div>
 
-  <div class="footer"><div>每 2 秒刷新 · 拖动地图可平移</div><div>更新于 {time.strftime('%H:%M:%S')}</div></div>
+  <div class="footer" id="footerSection">{parts['footerHtml']}</div>
 </div>
 {JS}
 </body></html>"""
-    return html
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _send(self, code: int, body: bytes, content_type: str):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if urlparse(self.path).path == "/":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(generate_html().encode("utf-8"))
-        else:
-            self.send_response(404)
-            self.end_headers()
+        path = urlparse(self.path).path
+        if path == "/":
+            self._send(200, generate_html().encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == "/api/state":
+            parts = build_parts()
+            if not parts:
+                body = json.dumps({"tick": None, "error": "no data"}, ensure_ascii=False).encode("utf-8")
+            else:
+                body = json.dumps(parts, ensure_ascii=False).encode("utf-8")
+            self._send(200, body, "application/json; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def log_message(self, fmt, *args):
         pass
@@ -720,7 +907,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     srv = HTTPServer((HOST, PORT), Handler)
     print(f"[dashboard] http://localhost:{PORT}")
-    print("[dashboard] Ctrl+C 停止")
+    print("[dashboard] soft refresh /api/state · Ctrl+C 停止")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
