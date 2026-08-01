@@ -237,11 +237,15 @@ def _plan_worker(
         if remembered:
             goal = min(remembered, key=lambda p: _manhattan(pos, p))
 
-    # Move toward goal (try all 4 dirs if blocked)
+    # Move toward goal (try all 4 dirs, sorted by proximity to goal)
     if goal is not None and goal != pos:
         direction = _step_towards(pos, goal)
         dirs_try = [direction] if direction else []
-        for d in dirs_try + [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]:
+        # Add remaining directions sorted by how much they reduce distance to goal
+        remaining = [d for d in [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
+                     if d not in dirs_try]
+        remaining.sort(key=lambda d: _manhattan((pos[0]+d.delta[0], pos[1]+d.delta[1]), goal))
+        for d in dirs_try + remaining:
             if d is None:
                 continue
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
