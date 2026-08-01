@@ -22,6 +22,7 @@ __pycache__/
 .env
 
 # Temp scripts
+_*.py
 fix_*.py
 _dash*.py
 _patch*.py
