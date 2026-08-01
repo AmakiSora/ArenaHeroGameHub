@@ -358,14 +358,17 @@ def _plan_vanguard(
                 vanguard.move(direction)
                 return ("MOVE", f"{direction.name} -> enemy at {nearest.position}")
 
-    # No enemies: scout unexplored area (up-priority, different from workers' right-up)
+    # No enemies: scout with UUID rotation + backtrack avoidance
+    prev = _worker_last_pos.get(str(vanguard.id))
     idx = hash(str(vanguard.id)) % 4
     base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
     rotated = base[idx:] + base[:idx]
+    rotated.sort(key=lambda d: 1 if prev and (pos[0]+d.delta[0], pos[1]+d.delta[1]) == prev else 0)
     for d in rotated:
         nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
         if (nx, ny) not in obstacle_cells:
             vanguard.move(d)
+            _worker_last_pos[str(vanguard.id)] = pos
             return ("MOVE", f"{d.name} scout")
 
     vanguard.wait()
