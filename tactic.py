@@ -255,21 +255,25 @@ def _plan_worker(
         # All blocked, fall through to explore
         goal = None
 
-    # No goal at all: fan out in unique direction based on worker ID
+    # No goal at all: fan out with backtracking avoidance
     if goal is None and not worker.cargo:
-        # Use UUID hash to pick a unique exploration direction
-        idx = hash(str(worker.id)) % 4
-        dirs = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
-        preferred = dirs[idx]
-        nx, ny = pos[0] + preferred.delta[0], pos[1] + preferred.delta[1]
-        if (nx, ny) not in obstacle_cells:
-            worker.move(preferred)
-            return ("MOVE", f"{preferred.name} explore")
-        # Fallback: try other directions
-        for d in dirs:
+        uid = str(worker.id)
+        prev = _worker_last_pos.get(uid)
+        idx = hash(uid) % 4
+        base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
+        rotated = base[idx:] + base[:idx]
+        # Sort: deprioritize direction that goes back to previous position
+        def _sort_key(d):
+            nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+            if prev and (nx, ny) == prev:
+                return 1  # backtracking = bad
+            return 0
+        rotated.sort(key=_sort_key)
+        for d in rotated:
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
             if (nx, ny) not in obstacle_cells:
                 worker.move(d)
+                _worker_last_pos[uid] = pos
                 return ("MOVE", f"{d.name} explore")
 
     if goal is not None and goal != pos:
@@ -310,7 +314,10 @@ def _plan_vanguard(
                 return ("MOVE", f"{direction.name} -> enemy at {nearest.position}")
 
     # No enemies: scout unexplored area (up-priority, different from workers' right-up)
-    for d in (Direction.UP, Direction.RIGHT, Direction.LEFT, Direction.DOWN):
+    idx = hash(str(vanguard.id)) % 4
+    base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
+    rotated = base[idx:] + base[:idx]
+    for d in rotated:
         nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
         if (nx, ny) not in obstacle_cells:
             vanguard.move(d)
@@ -358,13 +365,9 @@ def _plan_ranger(
 
     # 3. No enemies: scout in unique direction (based on UUID hash)
     idx = hash(str(ranger.id)) % 4
-    dirs = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
-    preferred = dirs[idx]
-    nx, ny = pos[0] + preferred.delta[0], pos[1] + preferred.delta[1]
-    if (nx, ny) not in obstacle_cells:
-        ranger.move(preferred)
-        return ("MOVE", f"{preferred.name} scout")
-    for d in dirs:
+    base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
+    rotated = base[idx:] + base[:idx]
+    for d in rotated:
         nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
         if (nx, ny) not in obstacle_cells:
             ranger.move(d)
@@ -378,6 +381,8 @@ def _plan_ranger(
 
 # ── shared resource memory (persists across ticks) ────────────────────────
 _resource_memory: set[tuple[int, int]] = set()
+# Track each worker's previous position to avoid backtracking
+_worker_last_pos: dict[str, tuple[int, int]] = {}
 
 
 def _update_resource_memory(turn) -> None:
