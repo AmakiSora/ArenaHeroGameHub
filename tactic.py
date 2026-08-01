@@ -259,14 +259,16 @@ def _plan_worker(
     if worker.cargo:
         goal = core.position
     elif resource_cells:
-        candidates = [c for c in resource_cells if c not in depleted]
-        if candidates:
-            goal = min(candidates, key=lambda p: _manhattan(pos, p))
-    # Fallback: use remembered resource coordinates
+        # Only go to assigned resource, not the nearest one
+        assigned = _resource_assignments.get(str(worker.id))
+        if assigned and assigned in resource_cells:
+            goal = assigned
+        # If no assignment, skip visible resources (they're assigned to other workers)
+    # Fallback: use remembered resource coordinates (only if assigned)
     if goal is None and not worker.cargo:
-        remembered = [p for p in _resource_memory if p not in depleted]
-        if remembered:
-            goal = min(remembered, key=lambda p: _manhattan(pos, p))
+        assigned = _resource_assignments.get(str(worker.id))
+        if assigned and assigned in _resource_memory:
+            goal = assigned
 
     # Move toward goal (BFS multi-step pathfinding, avoids dead ends)
     if goal is not None and goal != pos:
@@ -408,6 +410,8 @@ def _plan_ranger(
 _resource_memory: set[tuple[int, int]] = set()
 # Track each worker's previous position to avoid backtracking
 _worker_last_pos: dict[str, tuple[int, int]] = {}
+# Resource assignment: each resource assigned to closest worker only
+_resource_assignments: dict[str, tuple[int, int]] = {}
 
 
 def _update_resource_memory(turn) -> None:
@@ -468,6 +472,21 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 
     beacon_on_ground_here = beacon.status == "GROUND" and beacon.position == core_pos
     beacon_carried_by_core = beacon.status == "CARRIED" and beacon.carrier_id == core.id
+
+    # Assign each resource to the closest worker (avoid stampede)
+    _resource_assignments.clear()
+    all_resources = list(turn.resource_cells) + [p for p in _resource_memory if p not in depleted]
+    worker_list = [(str(w.id), tuple(w.position)) for w in turn.workers]
+    # For each resource, find the closest worker that hasn't been assigned elsewhere
+    assigned_workers: set[str] = set()
+    for res in sorted(all_resources, key=lambda p: min(_manhattan(p, w[1]) for w in worker_list) if worker_list else 0):
+        if not worker_list:
+            break
+        closest = min(worker_list, key=lambda w: _manhattan(res, w[1]))
+        wid = closest[0]
+        if wid not in assigned_workers:
+            _resource_assignments[wid] = res
+            assigned_workers.add(wid)
 
     # Build depleted set from previous Tick events
     depleted: set[tuple[int, int]] = set()
