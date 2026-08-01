@@ -64,24 +64,119 @@ def read_history(ticks: int = 40):
     return out
 
 
+
 def load_map_memory():
+    empty = {
+        "obstacles": [],
+        "resources": [],
+        "manual_resources": [],
+        "obstacle_count": 0,
+        "resource_count": 0,
+        "manual_count": 0,
+    }
     if not os.path.exists(MAP_FILE):
-        return {"obstacles": [], "resources": [], "obstacle_count": 0, "resource_count": 0}
+        return empty
     try:
         with open(MAP_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
+        resources = [tuple(p) for p in d.get("resources", []) if len(p) == 2]
+        manual = [tuple(p) for p in d.get("manual_resources", []) if len(p) == 2]
+        all_res = sorted(set(resources) | set(manual))
         return {
             "obstacles": [tuple(p) for p in d.get("obstacles", []) if len(p) == 2],
-            "resources": [tuple(p) for p in d.get("resources", []) if len(p) == 2],
+            "resources": all_res,
+            "manual_resources": manual,
             "obstacle_count": d.get("obstacle_count", len(d.get("obstacles", []))),
-            "resource_count": d.get("resource_count", len(d.get("resources", []))),
+            "resource_count": len(all_res),
+            "manual_count": len(manual),
             "updated_tick": d.get("updated_tick"),
         }
     except Exception:
-        return {"obstacles": [], "resources": [], "obstacle_count": 0, "resource_count": 0}
+        return empty
 
 
-# ---------- helpers -------------------------------------------------------
+def save_manual_resource(x: int, y: int) -> dict:
+    """Add a manually entered resource into map_memory.json."""
+    data: dict = {
+        "obstacles": [],
+        "resources": [],
+        "manual_resources": [],
+        "obstacle_count": 0,
+        "resource_count": 0,
+        "manual_count": 0,
+    }
+    if os.path.exists(MAP_FILE):
+        try:
+            with open(MAP_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data.update(loaded)
+        except Exception:
+            pass
+
+    pos = (int(x), int(y))
+    resources = {tuple(p) for p in data.get("resources", []) if len(p) == 2}
+    manual = {tuple(p) for p in data.get("manual_resources", []) if len(p) == 2}
+    resources.add(pos)
+    manual.add(pos)
+
+    payload = {
+        "updated_tick": data.get("updated_tick"),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "obstacles": data.get("obstacles", []),
+        "resources": [list(p) for p in sorted(resources)],
+        "manual_resources": [list(p) for p in sorted(manual)],
+        "obstacle_count": data.get("obstacle_count", len(data.get("obstacles", []))),
+        "resource_count": len(resources),
+        "manual_count": len(manual),
+        "source": "dashboard-manual",
+    }
+    tmp = MAP_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp, MAP_FILE)
+    return {
+        "ok": True,
+        "pos": [pos[0], pos[1]],
+        "resource_count": len(resources),
+        "manual_count": len(manual),
+    }
+
+
+def remove_manual_resource(x: int, y: int) -> dict:
+    pos = (int(x), int(y))
+    if not os.path.exists(MAP_FILE):
+        return {"ok": False, "error": "no map file"}
+    with open(MAP_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    resources = {tuple(p) for p in data.get("resources", []) if len(p) == 2}
+    manual = {tuple(p) for p in data.get("manual_resources", []) if len(p) == 2}
+    resources.discard(pos)
+    manual.discard(pos)
+    payload = {
+        "updated_tick": data.get("updated_tick"),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "obstacles": data.get("obstacles", []),
+        "resources": [list(p) for p in sorted(resources)],
+        "manual_resources": [list(p) for p in sorted(manual)],
+        "obstacle_count": data.get("obstacle_count", len(data.get("obstacles", []))),
+        "resource_count": len(resources),
+        "manual_count": len(manual),
+        "source": "dashboard-manual",
+    }
+    tmp = MAP_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp, MAP_FILE)
+    return {
+        "ok": True,
+        "pos": [pos[0], pos[1]],
+        "resource_count": len(resources),
+        "manual_count": len(manual),
+    }
+
+
+
 
 def short_id(uid: str) -> str:
     return (uid or "?")[:8]
@@ -412,7 +507,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .kv span{color:var(--muted)}
 .stat-chips{display:flex;flex-wrap:wrap;gap:6px}
 .mini-bar{height:6px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:8px}
-.mini-bar>span{display:block;height:100%;background:linear-gradient(90deg,#57d6a3,#6ea8ff)}
+.mini-bar>span{display:block;height:100%;background:linear-gradient(90deg,#57d6a3,#6ea8ff)}.ore-form{display:grid;gap:8px;margin-top:4px}.ore-form .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.ore-form label{display:grid;gap:4px;font-size:12px;color:var(--muted)}.ore-form input{width:100%;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.25);color:#eef3ff;font-family:Consolas,monospace;font-size:13px;outline:none}.ore-form input:focus{border-color:rgba(110,168,255,.45);box-shadow:0 0 0 2px rgba(110,168,255,.12)}.ore-form .actions{display:flex;gap:8px;flex-wrap:wrap}.ore-form button{appearance:none;border:1px solid rgba(255,255,255,.10);background:rgba(110,168,255,.16);color:#eef3ff;border-radius:999px;padding:7px 12px;font-size:12px;cursor:pointer}.ore-form button.secondary{background:rgba(255,255,255,.05)}.ore-form button:hover{border-color:rgba(110,168,255,.35)}.ore-form .msg{min-height:16px;font-size:12px;color:var(--muted)}.ore-form .msg.ok{color:#8ef0c4}.ore-form .msg.err{color:#ff9b9b}.manual-tag{color:#ffd98a;font-size:11px}
 .hero{display:none}
 .metrics{display:none}
 .layout{display:none}
@@ -614,7 +709,7 @@ JS = r"""
       lastTick = data.tick;
 
       if(data.brand) setHtml('#brandLine', data.brand);
-      if(data.leftHtml) setHtml('#leftColumn', data.leftHtml);
+      if(data.leftHtml){ setHtml('#leftColumn', data.leftHtml); bindOreForm(); }
       if(data.statusHtml) setHtml('#statusPill', data.statusHtml);
       if(data.statusClass) setClass('#statusPill', 'status-pill ' + data.statusClass);
       if(data.heroHtml) setHtml('#heroSection', data.heroHtml);
@@ -650,6 +745,53 @@ JS = r"""
     }
   }
 
+  
+  function bindOreForm(){
+    const form = document.getElementById('oreForm');
+    if(!form) return;
+    // always rebind after left column rerender
+    const msg = document.getElementById('oreMsg');
+    const xEl = document.getElementById('oreX');
+    const yEl = document.getElementById('oreY');
+    async function postOre(path){
+      const x = Number(xEl && xEl.value);
+      const y = Number(yEl && yEl.value);
+      if(!Number.isFinite(x) || !Number.isFinite(y)){
+        if(msg){ msg.className='msg err'; msg.textContent='请输入有效整数坐标'; }
+        return;
+      }
+      if(msg){ msg.className='msg'; msg.textContent='提交中…'; }
+      try{
+        const res = await fetch(path, {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({x:Math.trunc(x), y:Math.trunc(y)})
+        });
+        const data = await res.json();
+        if(!res.ok || !data.ok){
+          if(msg){ msg.className='msg err'; msg.textContent=(data && data.error) || '失败'; }
+          return;
+        }
+        if(msg){
+          msg.className='msg ok';
+          msg.textContent = (path.indexOf('remove')>=0 ? '已删除 ' : '已加入 ') +
+            '(' + data.pos[0] + ', ' + data.pos[1] + ') · 记忆 ' + data.resource_count;
+        }
+        lastTick = null;
+        softRefresh();
+      }catch(e){
+        if(msg){ msg.className='msg err'; msg.textContent='网络错误'; }
+      }
+    }
+    form.onsubmit = function(e){
+      e.preventDefault();
+      postOre('/api/resource/add');
+    };
+    const delBtn = document.getElementById('oreDelBtn');
+    if(delBtn) delBtn.onclick = function(){ postOre('/api/resource/remove'); };
+  }
+
+  bindOreForm();
   ensureView();
   bindStage();
   apply();
@@ -859,10 +1001,12 @@ def build_parts():
         f'<span class="pill">挖矿 {stats["harvest"]}</span></div>'
     )
     mem_list = list(mm.get("resources", []) or [])
+    manual_set = {tuple(p) for p in (mm.get("manual_resources") or [])}
     if mem_list:
-        left_ores = "".join(
-            f'<div class="kv"><span>矿</span><b>{fmt_pos(p)}</b></div>' for p in mem_list[:18]
-        )
+        def _ore_row(p):
+            tag = ' <span class="manual-tag">手动</span>' if tuple(p) in manual_set else ""
+            return f'<div class="kv"><span>矿{tag}</span><b>{fmt_pos(p)}</b></div>'
+        left_ores = "".join(_ore_row(p) for p in mem_list[:18])
         if len(mem_list) > 18:
             left_ores += f'<div class="muted">…还有 {len(mem_list)-18} 个</div>'
     else:
@@ -880,8 +1024,24 @@ def build_parts():
         )
     else:
         left_issues = '<div class="muted">暂无异常</div>'
+
+    ore_form = (
+        '<section class="panel">'
+        '<div class="panel-title"><span>录入矿点</span><span class="count">手动</span></div>'
+        '<form class="ore-form" id="oreForm">'
+        '<div class="row">'
+        '<label>X<input id="oreX" name="x" type="number" step="1" placeholder="-30" required></label>'
+        '<label>Y<input id="oreY" name="y" type="number" step="1" placeholder="65" required></label>'
+        '</div>'
+        '<div class="actions">'
+        '<button type="submit" id="oreAddBtn">加入记忆</button>'
+        '<button type="button" class="secondary" id="oreDelBtn">删除该点</button>'
+        '</div>'
+        '<div class="msg" id="oreMsg">输入坐标后点加入</div>'
+        '</form></section>'
+    )
     left_html = (
-        f'<section class="panel"><div class="panel-title"><span>核心</span><span class="count">状态</span></div>{left_core}</section>'
+        f'{ore_form}<section class="panel"><div class="panel-title"><span>核心</span><span class="count">状态</span></div>{left_core}</section>'
         f'<section class="panel"><div class="panel-title"><span>资源</span><span class="count">{pct}%</span></div>{left_res}</section>'
         f'<section class="panel"><div class="panel-title"><span>战场</span><span class="count">摘要</span></div>{left_fight}</section>'
         f'<section class="panel"><div class="panel-title"><span>异常</span><span class="count">{len(issues)}</span></div><div class="compact-list">{left_issues}</div></section>'
@@ -999,6 +1159,7 @@ def generate_html() -> str:
 </body></html>"""
 
 
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, body: bytes, content_type: str):
         self.send_response(code)
@@ -1007,6 +1168,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -1023,8 +1193,32 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
+    def do_POST(self):
+        path = urlparse(self.path).path
+        data = self._read_json()
+        try:
+            x = int(data.get("x"))
+            y = int(data.get("y"))
+        except Exception:
+            body = json.dumps({"ok": False, "error": "x/y 必须是整数"}, ensure_ascii=False).encode("utf-8")
+            self._send(400, body, "application/json; charset=utf-8")
+            return
+
+        if path == "/api/resource/add":
+            result = save_manual_resource(x, y)
+            self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if path == "/api/resource/remove":
+            result = remove_manual_resource(x, y)
+            code = 200 if result.get("ok") else 400
+            self._send(code, json.dumps(result, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        self._send(404, b"not found", "text/plain; charset=utf-8")
+
     def log_message(self, fmt, *args):
         pass
+
+
 
 
 def main():

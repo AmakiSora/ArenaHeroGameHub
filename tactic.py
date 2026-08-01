@@ -466,30 +466,53 @@ def _load_map_memory() -> None:
     try:
         data = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
         _obstacle_memory = {tuple(p) for p in data.get("obstacles", []) if len(p) == 2}
-        _resource_memory = {tuple(p) for p in data.get("resources", []) if len(p) == 2}
+        resources = {tuple(p) for p in data.get("resources", []) if len(p) == 2}
+        # manual resources are sticky and must survive auto-cleanup
+        manual = {tuple(p) for p in data.get("manual_resources", []) if len(p) == 2}
+        _resource_memory = resources | manual
         print(
             f"[map] loaded obstacles={len(_obstacle_memory)} resources={len(_resource_memory)} "
-            f"from {MAP_MEMORY_PATH}",
+            f"manual={len(manual)} from {MAP_MEMORY_PATH}",
             flush=True,
         )
     except Exception as e:
         print(f"[map] load failed: {e}", flush=True)
 
 
+
 def _save_map_memory(tick: int | None = None, force: bool = False) -> None:
-    """Persist permanent map memory. Obstacles never shrink."""
+    """Persist permanent map memory. Obstacles never shrink.
+
+    Manual resources entered from the dashboard are preserved across saves.
+    """
     global _map_dirty, _last_map_save_tick
     if not force and not _map_dirty:
         return
     if not force and tick is not None and _last_map_save_tick >= 0 and tick - _last_map_save_tick < 10:
         return
+
+    manual: set[tuple[int, int]] = set()
+    if MAP_MEMORY_PATH.exists():
+        try:
+            prev = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
+            manual = {tuple(p) for p in prev.get("manual_resources", []) if len(p) == 2}
+        except Exception:
+            manual = set()
+
+    # keep all known resources, plus sticky manual ones
+    resources = set(_resource_memory) | manual
+    _resource_memory.clear()
+    _resource_memory.update(resources)
+
     payload = {
         "updated_tick": tick,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "obstacles": sorted([list(p) for p in _obstacle_memory]),
-        "resources": sorted([list(p) for p in _resource_memory]),
+        "resources": sorted([list(p) for p in resources]),
+        "manual_resources": sorted([list(p) for p in manual]),
         "obstacle_count": len(_obstacle_memory),
-        "resource_count": len(_resource_memory),
+        "resource_count": len(resources),
+        "manual_count": len(manual),
     }
     tmp = MAP_MEMORY_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -497,6 +520,7 @@ def _save_map_memory(tick: int | None = None, force: bool = False) -> None:
     _map_dirty = False
     if tick is not None:
         _last_map_save_tick = tick
+
 
 
 def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
@@ -511,36 +535,42 @@ def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
 
 
 def _update_resource_memory(turn) -> None:
-    """Remember visible resources, remove harvested/depleted ones."""
+    """Remember visible resources permanently until depletion is confirmed.
+
+    Manual resources are never auto-removed here; only RESOURCE_DEPLETED clears
+    a remembered point. HARVEST_SUCCEEDED alone does not prove the node is gone.
+    """
     global _resource_memory, _map_dirty
     before = set(_resource_memory)
-    # Add newly visible resources
+
     for p in turn.resource_cells:
         _resource_memory.add(tuple(p) if not isinstance(p, tuple) else p)
-    # Remove resources confirmed harvested (from events)
+
     for event in turn.events:
-        if event.event_type == "HARVEST_SUCCEEDED" and event.position:
-            _resource_memory.discard(event.position)
-        if event.event_type == "HARVEST_FAILED" and event.reason_code == "RESOURCE_DEPLETED" and event.position:
-            _resource_memory.discard(event.position)
-    # Remove remembered resources: a friendly unit can see the cell but no resource there
-    dead = set()
-    for pos in _resource_memory:
-        if pos in turn.resource_cells:
-            continue
-        # Check if Core or any Worker/Vanguard/Ranger can see this cell
-        for obj in turn.state.objects:
-            if not getattr(obj, "controlled", False):
-                continue
-            obj_pos = getattr(obj, "position", None)
-            if obj_pos is None:
-                continue
-            if _manhattan(tuple(obj_pos), pos) <= 5:
-                dead.add(pos)
-                break
-    _resource_memory -= dead
+        if (
+            event.event_type == "HARVEST_FAILED"
+            and event.reason_code == "RESOURCE_DEPLETED"
+            and event.position
+        ):
+            pos = tuple(event.position)
+            _resource_memory.discard(pos)
+            # also drop from sticky manual list on disk
+            if MAP_MEMORY_PATH.exists():
+                try:
+                    data = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
+                    manual = [p for p in data.get("manual_resources", []) if tuple(p) != pos]
+                    if len(manual) != len(data.get("manual_resources", [])):
+                        data["manual_resources"] = manual
+                        data["manual_count"] = len(manual)
+                        MAP_MEMORY_PATH.write_text(
+                            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+                        )
+                except Exception:
+                    pass
+
     if _resource_memory != before:
         _map_dirty = True
+
 
 
 # Context holder for the current turn's resource_space (set by choose_actions)
