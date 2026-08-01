@@ -533,31 +533,6 @@ def play(api_key: str, log_path: str = "tactic_log.jsonl") -> None:
                     )
                 except Exception as e:
                     print(f"tick={turn.tick} submit_error={e}", flush=True)
-
-                # Build a simplified action map for the log
-                plan_actions: dict[str, str] = {}
-                for uid, detail in unit_actions.items():
-                    plan_actions[uid] = detail
-
-                logger.record_tick(
-                    turn,
-                    core_action=core_action,
-                    unit_actions=plan_actions,
-                    accepted=accepted.accepted,
-                    latency_ms=latency,
-                )
-
-                print(
-                    f"tick={accepted.tick} "
-                    f"core={core_action} "
-                    f"res={turn.resources}/{turn.resource_capacity} "
-                    f"pop={turn.state.population} "
-                    f"workers={len(turn.workers)} "
-                    f"enemies={len(turn.visible_enemies)} "
-                    f"resources_visible={len(turn.resource_cells)} "
-                    f"latency={latency:.0f}ms",
-                    flush=True,
-                )
     except KeyboardInterrupt:
         print("\n[tactic] stopped by user", flush=True)
     finally:
