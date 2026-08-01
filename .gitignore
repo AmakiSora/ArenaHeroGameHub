@@ -1,10 +1,15 @@
 # Logs
 tactic_play.log
 tactic_log.jsonl
+dashboard.log
 direct_play.log
 direct_debug.json
 diagnose_*.txt
 log_check*.txt
+
+# Runtime map memory (auto-generated)
+map_memory.json
+map_memory.tmp
 
 # Python cache
 __pycache__/

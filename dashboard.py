@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
 LOG_FILE = "tactic_log.jsonl"
+MAP_FILE = "map_memory.json"
 HOST = "0.0.0.0"
 PORT = 4399
 
@@ -54,6 +55,80 @@ def format_pos(pos) -> str:
     if not pos:
         return "—"
     return f"({pos[0]}, {pos[1]})"
+
+
+def load_map_memory():
+    if not os.path.exists(MAP_FILE):
+        return {"obstacles": [], "resources": [], "obstacle_count": 0, "resource_count": 0}
+    try:
+        with open(MAP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {
+            "obstacles": [tuple(p) for p in data.get("obstacles", []) if len(p) == 2],
+            "resources": [tuple(p) for p in data.get("resources", []) if len(p) == 2],
+            "obstacle_count": data.get("obstacle_count", len(data.get("obstacles", []))),
+            "resource_count": data.get("resource_count", len(data.get("resources", []))),
+            "updated_tick": data.get("updated_tick"),
+        }
+    except Exception:
+        return {"obstacles": [], "resources": [], "obstacle_count": 0, "resource_count": 0}
+
+
+def render_ascii_map(rec, map_mem, radius: int = 18) -> str:
+    """Render a local known-map around the core using permanent obstacle memory."""
+    core = rec.get("core_pos")
+    if not core:
+        return "暂无核心位置"
+    cx, cy = core[0], core[1]
+    xmin, xmax = cx - radius, cx + radius
+    ymin, ymax = cy - radius, cy + radius
+    width = xmax - xmin + 1
+    height = ymax - ymin + 1
+
+    grid = [["." for _ in range(width)] for _ in range(height)]
+
+    def put(x, y, ch):
+        if xmin <= x <= xmax and ymin <= y <= ymax:
+            grid[ymax - y][x - xmin] = ch
+
+    for ox, oy in map_mem.get("obstacles", []):
+        put(ox, oy, "#")
+    for rx, ry in map_mem.get("resources", []):
+        put(rx, ry, "o")
+    for p in rec.get("resource_cells", []) or []:
+        if len(p) == 2:
+            put(p[0], p[1], "$")
+
+    for w in rec.get("workers", []):
+        pos = w.get("pos") or []
+        if len(pos) == 2:
+            put(pos[0], pos[1], "B" if w.get("cargo") else "W")
+    for v in rec.get("vanguards", []):
+        pos = v.get("pos") or []
+        if len(pos) == 2:
+            put(pos[0], pos[1], "V")
+    for r in rec.get("rangers", []):
+        pos = r.get("pos") or []
+        if len(pos) == 2:
+            put(pos[0], pos[1], "R")
+    put(cx, cy, "C")
+
+    lines = []
+    for row_i, row in enumerate(grid):
+        y = ymax - row_i
+        prefix = f"{y:4d} " if (row_i % 2 == 0 or y in (ymin, ymax, cy)) else "     "
+        lines.append(prefix + "".join(row))
+    # x labels
+    labels = [" "] * width
+    for x in range(xmin, xmax + 1):
+        if x % 5 == 0:
+            s = str(x)
+            start = x - xmin
+            for i, ch in enumerate(s):
+                if 0 <= start + i < width:
+                    labels[start + i] = ch
+    lines.append("     " + "".join(labels))
+    return "\n".join(lines)
 
 
 def short_id(uid: str) -> str:
@@ -165,6 +240,8 @@ def generate_html() -> str:
     res_pct = 0 if not capacity else min(100, int(resources * 100 / capacity))
     enemies = rec.get("visible_enemies", 0)
     resource_cells = rec.get("resource_cells", [])
+    map_mem = load_map_memory()
+    ascii_map = render_ascii_map(rec, map_mem, radius=16)
     events = rec.get("events", [])[:8]
     running = age < 30
     status_text = "运行中" if running else "已停止"
@@ -226,6 +303,10 @@ def generate_html() -> str:
         resource_html = f'<div class="chip-row">{chips}</div>'
     else:
         resource_html = '<div class="muted">当前没有可见矿点</div>'
+    remembered_res = map_mem.get("resources", [])
+    if remembered_res:
+        mem_chips = "".join(f'<span class="chip mem">{format_pos(p)}</span>' for p in remembered_res[:12])
+        resource_html += f'<div class="muted" style="margin-top:8px">记忆矿点 {len(remembered_res)}</div><div class="chip-row">{mem_chips}</div>'
 
     event_html = ""
     if events:
@@ -499,6 +580,38 @@ body {{
   font-size: 12px;
   font-family: Consolas, monospace;
 }}
+.chip.mem {{
+  background: rgba(255,200,87,.10);
+  border-color: rgba(255,200,87,.18);
+  color: #ffe0a0;
+}}
+.map-panel pre {{
+  margin: 0;
+  overflow: auto;
+  max-height: 520px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+  line-height: 1.15;
+  color: #d7e3ff;
+  background: rgba(0,0,0,.25);
+  border: 1px solid rgba(255,255,255,.06);
+  border-radius: 14px;
+  padding: 12px;
+}}
+.map-legend {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}}
+.map-legend span {{
+  font-size: 11px;
+  color: var(--muted);
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(255,255,255,.04);
+  border: 1px solid rgba(255,255,255,.06);
+}}
 .muted {{ color: var(--muted); font-size: 13px; }}
 .empty {{
   grid-column: 1 / -1;
@@ -629,6 +742,18 @@ body {{
 
     {issues_html}
 
+    <section class="panel map-panel" style="margin-bottom:14px">
+      <div class="panel-title">
+        <span>已知地图</span>
+        <span class="count">墙 {map_mem.get('obstacle_count', 0)} · 记忆矿 {map_mem.get('resource_count', 0)} · 可见矿 {len(resource_cells)}</span>
+      </div>
+      <pre>{ascii_map}</pre>
+      <div class="map-legend">
+        <span>C 核心</span><span>B 带矿工人</span><span>W 空手工人</span><span>V 先锋</span><span>R 游侠</span>
+        <span># 永久障碍</span><span>$ 可见矿</span><span>o 记忆矿</span><span>. 未知</span>
+      </div>
+    </section>
+
     <div class="layout">
       <section class="panel">
         <div class="panel-title">
@@ -648,7 +773,7 @@ body {{
           <div class="unit-grid" style="grid-template-columns:1fr">{rg_cards}</div>
         </section>
         <section class="panel">
-          <div class="panel-title"><span>可见矿点</span><span class="count">{len(resource_cells)}</span></div>
+          <div class="panel-title"><span>矿点</span><span class="count">{len(resource_cells)} 可见</span></div>
           {resource_html}
         </section>
         <section class="panel">
