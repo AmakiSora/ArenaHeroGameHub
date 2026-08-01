@@ -12,6 +12,7 @@ map_memory.json
 map_memory.tmp
 tactic_config.json
 tactic_config.tmp
+production_queue.db*
 
 # Python cache
 __pycache__/
@@ -22,8 +23,13 @@ __pycache__/
 
 # Temp scripts
 fix_*.py
+_dash*.py
+_patch*.py
 watchdog.py
 diagnose.py
+dash*.log
+nul
+_nul
 # IDE
 .idea/
 

@@ -16,16 +16,17 @@ class ConfigField:
     label: str
     group: str
     kind: str
-    default: int | bool
+    default: int | bool | str
     minimum: int | None = None
     maximum: int | None = None
     step: int | None = None
+    placeholder: str | None = None
 
 
 CONFIG_GROUPS = (
     ("worker", "工人与寻路"),
     ("core", "核心"),
-    ("combat", "战斗"),
+    ("combat", "战斗分队"),
     ("runtime", "运行"),
 )
 
@@ -40,8 +41,33 @@ CONFIG_FIELDS = (
     ConfigField("repair_enabled", "允许修盾", "core", "boolean", True),
     ConfigField("peace_shield_target", "和平修盾目标", "core", "integer", 10, 0, 10, 1),
     ConfigField("combat_shield_target", "战斗修盾目标", "core", "integer", 3, 0, 10, 1),
-    ConfigField("vanguard_engage_enabled", "先锋主动接战", "combat", "boolean", True),
-    ConfigField("ranger_engage_enabled", "游侠主动接战", "combat", "boolean", True),
+    ConfigField(
+        "home_team",
+        "守家队名单",
+        "combat",
+        "string",
+        "",
+        placeholder="例如 V1,R1",
+    ),
+    ConfigField(
+        "attack_team",
+        "进攻队名单",
+        "combat",
+        "string",
+        "",
+        placeholder="例如 V2,R2",
+    ),
+    ConfigField(
+        "guerrilla_team",
+        "游击队名单",
+        "combat",
+        "string",
+        "",
+        placeholder="例如 V3,R3",
+    ),
+    ConfigField("home_patrol_radius", "守家巡逻半径", "combat", "integer", 5, 1, 30, 1),
+    ConfigField("attack_target_x", "进攻目标 X", "combat", "integer", 0, -500, 500, 1),
+    ConfigField("attack_target_y", "进攻目标 Y", "combat", "integer", 0, -500, 500, 1),
     ConfigField("ranger_attack_range", "游侠开火距离", "combat", "integer", 3, 1, 3, 1),
     ConfigField("map_save_interval_ticks", "地图保存间隔 Tick", "runtime", "integer", 10, 1, 200, 1),
 )
@@ -49,7 +75,13 @@ CONFIG_FIELDS = (
 _FIELDS_BY_KEY = {field.key: field for field in CONFIG_FIELDS}
 _cache_path: Path | None = None
 _cache_signature: tuple[int, int] | None = None
-_cache_value: dict[str, int | bool] | None = None
+_cache_value: dict[str, int | bool | str] | None = None
+
+# Legacy keys removed after combat teams were introduced.
+_LEGACY_KEYS = frozenset({
+    "vanguard_engage_enabled",
+    "ranger_engage_enabled",
+})
 
 
 class ConfigValidationError(ValueError):
@@ -58,7 +90,7 @@ class ConfigValidationError(ValueError):
         self.errors = errors
 
 
-def default_config() -> dict[str, int | bool]:
+def default_config() -> dict[str, int | bool | str]:
     return {field.key: field.default for field in CONFIG_FIELDS}
 
 
@@ -72,16 +104,20 @@ def config_schema() -> dict[str, Any]:
 def validate_config(
     values: dict[str, Any],
     *,
-    base: dict[str, int | bool] | None = None,
-) -> dict[str, int | bool]:
+    base: dict[str, int | bool | str] | None = None,
+) -> dict[str, int | bool | str]:
     config = default_config() if base is None else {**default_config(), **base}
     errors: dict[str, str] = {}
 
     for key in values:
+        if key in _LEGACY_KEYS:
+            continue
         if key not in _FIELDS_BY_KEY:
             errors[key] = "未知配置项"
 
     for key, raw_value in values.items():
+        if key in _LEGACY_KEYS:
+            continue
         field = _FIELDS_BY_KEY.get(key)
         if field is None:
             continue
@@ -90,6 +126,16 @@ def validate_config(
                 errors[key] = "必须是开关值"
                 continue
             config[key] = raw_value
+            continue
+
+        if field.kind == "string":
+            if not isinstance(raw_value, str):
+                errors[key] = "必须是文本"
+                continue
+            if len(raw_value) > 200:
+                errors[key] = "不能超过 200 个字符"
+                continue
+            config[key] = raw_value.strip()
             continue
 
         if isinstance(raw_value, bool) or not isinstance(raw_value, int):
@@ -116,7 +162,7 @@ def _path_signature(path: Path) -> tuple[int, int] | None:
     return stat.st_mtime_ns, stat.st_size
 
 
-def load_config(path: Path = CONFIG_PATH) -> dict[str, int | bool]:
+def load_config(path: Path = CONFIG_PATH) -> dict[str, int | bool | str]:
     global _cache_path, _cache_signature, _cache_value
     path = Path(path)
     signature = _path_signature(path)
@@ -138,7 +184,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, int | bool]:
     return config
 
 
-def save_config(values: dict[str, Any], path: Path = CONFIG_PATH) -> dict[str, int | bool]:
+def save_config(values: dict[str, Any], path: Path = CONFIG_PATH) -> dict[str, int | bool | str]:
     global _cache_path, _cache_signature, _cache_value
     path = Path(path)
     missing = {field.key for field in CONFIG_FIELDS} - values.keys()

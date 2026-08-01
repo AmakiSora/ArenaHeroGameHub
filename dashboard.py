@@ -7,9 +7,10 @@ import json
 import os
 import time
 from collections import defaultdict
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import production_queue
 from tactic_config import (
     CONFIG_PATH,
     ConfigValidationError,
@@ -185,17 +186,132 @@ def remove_manual_resource(x: int, y: int) -> dict:
     }
 
 
+TEAM_BOARD_KEYS = ("unassigned", "home", "attack", "guerrilla")
+TEAM_BOARD_META = {
+    "unassigned": {"label": "待命池", "hint": "未编队", "tone": "idle"},
+    "home": {"label": "守家队", "hint": "核心半径巡逻", "tone": "home"},
+    "attack": {"label": "进攻队", "hint": "集体推进接战", "tone": "attack"},
+    "guerrilla": {"label": "游击队", "hint": "八向分散袭扰", "tone": "guerrilla"},
+}
+TEAM_ROSTER_FIELDS = ("home_team", "attack_team", "guerrilla_team")
+TEAM_SETTING_FIELDS = (
+    "home_patrol_radius",
+    "attack_target_x",
+    "attack_target_y",
+    "ranger_attack_range",
+)
+
+
+def _parse_roster_names(raw: object) -> list[str]:
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
+        name = chunk.strip().upper()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    return names
+
+
+def _format_roster_names(names: list[str] | set[str]) -> str:
+    def sort_key(name: str) -> tuple[str, int, str]:
+        prefix = name[:1]
+        suffix = name[1:]
+        number = int(suffix) if suffix.isdigit() else 0
+        return prefix, number, name
+
+    return ", ".join(sorted({str(name).upper() for name in names if str(name).strip()}, key=sort_key))
+
+
+def _team_of_name(name: str, config: dict) -> str:
+    upper = name.upper()
+    if upper in _parse_roster_names(config.get("home_team", "")):
+        return "home"
+    if upper in _parse_roster_names(config.get("attack_team", "")):
+        return "attack"
+    if upper in _parse_roster_names(config.get("guerrilla_team", "")):
+        return "guerrilla"
+    return "unassigned"
+
+
+def collect_combat_units(rec: dict | None = None, config: dict | None = None) -> list[dict]:
+    """Merge live combat units with configured roster names for the drag board."""
+    rec = rec or {}
+    config = config if config is not None else load_config(CONFIG_PATH)
+    actions = rec.get("plan_unit_actions", {}) or {}
+    by_name: dict[str, dict] = {}
+
+    def upsert(name: str, *, kind: str, unit: dict | None = None) -> None:
+        key = name.upper()
+        if not key:
+            return
+        item = by_name.get(key) or {
+            "name": key,
+            "kind": kind,
+            "id": "",
+            "pos": None,
+            "hp": None,
+            "action": "",
+            "alive": False,
+            "team": _team_of_name(key, config),
+        }
+        item["kind"] = kind or item.get("kind") or ("VANGUARD" if key.startswith("V") else "RANGER")
+        item["team"] = _team_of_name(key, config)
+        if unit:
+            uid = str(unit.get("id") or "")
+            sid = short_id(uid)
+            item["id"] = sid
+            item["pos"] = unit.get("pos")
+            item["hp"] = unit.get("hp")
+            item["action"] = actions.get(sid) or actions.get(uid, "") or item.get("action", "")
+            item["alive"] = True
+        by_name[key] = item
+
+    for vanguard in rec.get("vanguards", []) or []:
+        name = str(vanguard.get("name") or "").upper()
+        if name:
+            upsert(name, kind="VANGUARD", unit=vanguard)
+    for ranger in rec.get("rangers", []) or []:
+        name = str(ranger.get("name") or "").upper()
+        if name:
+            upsert(name, kind="RANGER", unit=ranger)
+
+    for field_key in TEAM_ROSTER_FIELDS:
+        for name in _parse_roster_names(config.get(field_key, "")):
+            if name not in by_name:
+                kind = (
+                    "VANGUARD" if name.startswith("V")
+                    else "RANGER" if name.startswith("R")
+                    else "COMBAT"
+                )
+                upsert(name, kind=kind)
+
+    def sort_key(item: dict) -> tuple[str, int, str]:
+        name = str(item.get("name") or "")
+        suffix = name[1:]
+        number = int(suffix) if suffix.isdigit() else 0
+        return name[:1], number, name
+
+    return sorted(by_name.values(), key=sort_key)
+
+
 def render_config_panel() -> str:
     config = load_config(CONFIG_PATH)
     schema = config_schema()
     fields_by_group: dict[str, list[dict]] = defaultdict(list)
     for field in schema["fields"]:
+        # Combat rosters + team settings live on the dedicated teams card.
+        if field["group"] == "combat":
+            continue
         fields_by_group[field["group"]].append(field)
 
     groups = []
     for group in schema["groups"]:
         rows = []
-        for field in fields_by_group[group["key"]]:
+        for field in fields_by_group.get(group["key"], []):
             key = field["key"]
             value = config[key]
             if field["kind"] == "boolean":
@@ -215,6 +331,8 @@ def render_config_panel() -> str:
                 '<div class="config-row">'
                 f'<label for="cfg-{key}">{field["label"]}</label>{control}</div>'
             )
+        if not rows:
+            continue
         groups.append(
             '<fieldset class="config-group">'
             f'<legend>{group["label"]}</legend>{"".join(rows)}</fieldset>'
@@ -224,6 +342,18 @@ def render_config_panel() -> str:
         '<section class="panel config-panel">'
         '<div class="panel-title"><span>策略配置</span>'
         '<span class="count" id="configState">当前值</span></div>'
+        '<section class="production-section" aria-labelledby="productionQueueTitle">'
+        '<div class="production-title"><div><b id="productionQueueTitle">生产需求队列</b>'
+        '<span class="count" id="productionQueueCount">0 / 20</span></div>'
+        '<button type="button" class="queue-clear" id="productionQueueClear">清空</button></div>'
+        '<div class="production-add">'
+        '<button type="button" data-queue-unit="WORKER"><span>W</span>工人<small>5</small></button>'
+        '<button type="button" data-queue-unit="VANGUARD"><span>V</span>先锋<small>10</small></button>'
+        '<button type="button" data-queue-unit="RANGER"><span>R</span>游侠<small>12</small></button>'
+        '</div>'
+        '<div class="production-list" id="productionQueueList"></div>'
+        '<div class="production-status" id="productionQueueStatus" aria-live="polite"></div>'
+        '</section>'
         '<form id="tacticConfigForm">'
         f'<div class="config-groups">{"".join(groups)}</div>'
         '<div class="config-actions">'
@@ -234,6 +364,54 @@ def render_config_panel() -> str:
     )
 
 
+def render_teams_panel() -> str:
+    config = load_config(CONFIG_PATH)
+    columns = []
+    for key in TEAM_BOARD_KEYS:
+        meta = TEAM_BOARD_META[key]
+        columns.append(
+            f'<div class="team-column tone-{meta["tone"]}" data-team="{key}">'
+            f'<div class="team-column-head"><div><b>{meta["label"]}</b>'
+            f'<span>{meta["hint"]}</span></div>'
+            f'<em class="team-count" data-team-count="{key}">0</em></div>'
+            f'<div class="team-drop" data-team-drop="{key}" tabindex="0">'
+            f'<div class="team-empty">拖到这里</div></div></div>'
+        )
+
+    settings = (
+        '<div class="team-settings">'
+        '<label>守家半径'
+        f'<input id="teamHomeRadius" name="home_patrol_radius" type="number" min="1" max="30" '
+        f'step="1" value="{config["home_patrol_radius"]}"></label>'
+        '<label>进攻 X'
+        f'<input id="teamAttackX" name="attack_target_x" type="number" min="-500" max="500" '
+        f'step="1" value="{config["attack_target_x"]}"></label>'
+        '<label>进攻 Y'
+        f'<input id="teamAttackY" name="attack_target_y" type="number" min="-500" max="500" '
+        f'step="1" value="{config["attack_target_y"]}"></label>'
+        '<label>游侠射程'
+        f'<input id="teamRangerRange" name="ranger_attack_range" type="number" min="1" max="3" '
+        f'step="1" value="{config["ranger_attack_range"]}"></label>'
+        '</div>'
+    )
+
+    return (
+        '<section class="panel teams-panel" id="teamsPanel">'
+        '<div class="panel-title"><span>战斗分队</span>'
+        '<span class="count" id="teamsState">拖拽编队</span></div>'
+        '<div class="teams-hero">'
+        '<div><b>把先锋 / 游侠拖进队伍</b>'
+        '<p>新单位默认进守家队；拖到待命池可暂时不参战编成。</p></div>'
+        '<div class="teams-actions">'
+        '<button type="button" class="secondary" id="teamsResetBtn">重载</button>'
+        '<button type="button" id="teamsSaveBtn">保存分队</button>'
+        '</div></div>'
+        f'<div class="team-board">{"".join(columns)}</div>'
+        f'{settings}'
+        '<div class="teams-message" id="teamsMessage" aria-live="polite">'
+        '拖拽单位后自动保存，下个 Tick 生效</div>'
+        '</section>'
+    )
 
 
 def short_id(uid: str) -> str:
@@ -327,7 +505,8 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
     W, H = cols * cell + pad * 2, rows * cell + pad * 2
 
     def to_xy(x, y):
-        return pad + (x - xmin) * cell, pad + (ymax - y) * cell
+        # Game UP decreases Y, so smaller world-Y must sit higher on screen.
+        return pad + (x - xmin) * cell, pad + (y - ymin) * cell
 
     obs = {(int(a), int(b)) for a, b in mm.get("obstacles", [])}
     mem_r = {(int(a), int(b)) for a, b in mm.get("resources", [])}
@@ -613,7 +792,9 @@ body{margin:0;min-height:100vh;color:var(--text);
 .kv span{color:var(--muted)}
 .stat-chips{display:flex;flex-wrap:wrap;gap:6px}
 .mini-bar{height:6px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:8px}
-.mini-bar>span{display:block;height:100%;background:linear-gradient(90deg,#57d6a3,#6ea8ff)}.ore-form{display:grid;gap:8px;margin-top:4px}.ore-form .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.ore-form label{display:grid;gap:4px;font-size:12px;color:var(--muted)}.ore-form input{width:100%;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.25);color:#eef3ff;font-family:Consolas,monospace;font-size:13px;outline:none}.ore-form input:focus{border-color:rgba(110,168,255,.45);box-shadow:0 0 0 2px rgba(110,168,255,.12)}.ore-form .actions{display:flex;gap:8px;flex-wrap:wrap}.ore-form button{appearance:none;border:1px solid rgba(255,255,255,.10);background:rgba(110,168,255,.16);color:#eef3ff;border-radius:999px;padding:7px 12px;font-size:12px;cursor:pointer}.ore-form button.secondary{background:rgba(255,255,255,.05)}.ore-form button:hover{border-color:rgba(110,168,255,.35)}.ore-form .msg{min-height:16px;font-size:12px;color:var(--muted)}.ore-form .msg.ok{color:#8ef0c4}.ore-form .msg.err{color:#ff9b9b}.manual-tag{color:#ffd98a;font-size:11px}
+.mini-bar>span{display:block;height:100%;background:linear-gradient(90deg,#57d6a3,#6ea8ff)}.res-add-form{display:none;gap:8px;margin-top:10px;padding:10px;border-radius:12px;background:rgba(0,0,0,.2);border:1px solid rgba(110,168,255,.22)}.res-add-form.open{display:grid}.res-add-form .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.res-add-form label{display:grid;gap:4px;font-size:11px;color:var(--muted)}.res-add-form input{width:100%;padding:7px 9px;border-radius:8px;border:1px solid rgba(255,255,255,.10);background:#0b1222;color:#eef3ff;font-family:Consolas,monospace;font-size:12px;outline:none}.res-add-form input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}.res-add-form .actions{display:flex;gap:6px;flex-wrap:wrap}.res-add-form button{appearance:none;border:1px solid rgba(110,168,255,.35);background:#285b8f;color:#fff;border-radius:999px;padding:6px 11px;font-size:11px;font-weight:700;cursor:pointer}.res-add-form button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}.res-add-form button:hover{border-color:rgba(110,168,255,.55)}.res-add-form .msg{min-height:14px;font-size:11px;color:var(--muted)}.res-add-form .msg.ok{color:#8ef0c4}.res-add-form .msg.err{color:#ff9b9b}.chip.removable{position:relative;display:inline-flex;align-items:center;gap:6px;padding-right:4px}
+.chip.mem.manual{background:rgba(255,200,87,.18);border-color:rgba(255,200,87,.35);color:#ffe4a8}
+.chip.mem{background:rgba(255,200,87,.10);border-color:rgba(255,200,87,.18);color:#ffe0a0}.chip .chip-x{opacity:0;display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;background:rgba(255,100,100,.2);color:#ffb6b6;margin-left:4px;cursor:pointer;font-size:10px;line-height:1;border:none;padding:0;transition:opacity .12s,background .12s}.chip .chip-x:hover{background:rgba(255,100,100,.45);color:#fff}.chip.removable:hover .chip-x{opacity:1}.res-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}.res-head .title{display:flex;align-items:baseline;gap:8px}.res-head .add-ore-btn{appearance:none;border:1px solid rgba(110,168,255,.3);width:22px;height:22px;border-radius:50%;background:rgba(110,168,255,.12);color:#c7dbff;cursor:pointer;font-size:14px;line-height:1;padding:0;display:grid;place-items:center;transition:.12s}.res-head .add-ore-btn:hover{background:rgba(110,168,255,.28);border-color:rgba(110,168,255,.6);color:#fff}.res-section{display:grid;gap:8px}.res-section h4{margin:0;font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.8px}.manual-tag{color:#ffd98a;font-size:10px;margin-left:6px}
 .config-panel{margin-top:0}
 .config-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 26px}
 .config-group{margin:0;padding:0;border:0;min-width:0}
@@ -622,6 +803,49 @@ body{margin:0;min-height:100vh;color:var(--text);
 .config-row>label{color:var(--muted);font-size:12px;line-height:1.35}
 .config-row>input[type=number]{width:112px;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
 .config-row>input[type=number]:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
+.teams-panel{margin-top:0;overflow:hidden}
+.teams-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px;padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:
+  radial-gradient(circle at 12% 20%, rgba(87,214,163,.18), transparent 42%),
+  radial-gradient(circle at 88% 0%, rgba(255,107,157,.16), transparent 36%),
+  linear-gradient(135deg, rgba(17,28,48,.95), rgba(12,18,32,.92));}
+.teams-hero b{display:block;font-size:15px;color:#eef5ff;margin-bottom:4px}
+.teams-hero p{margin:0;color:var(--muted);font-size:12px;line-height:1.5}
+.teams-actions{display:flex;gap:8px;flex-wrap:wrap}
+.teams-actions button,.team-chip{appearance:none;border:1px solid rgba(110,168,255,.35);border-radius:999px;padding:8px 13px;background:#285b8f;color:#fff;font-size:12px;font-weight:700;cursor:pointer}
+.teams-actions button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}
+.teams-actions button:disabled{opacity:.55;cursor:wait}
+.team-board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.team-column{min-width:0;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.025);overflow:hidden;display:flex;flex-direction:column;min-height:220px}
+.team-column.tone-idle{background:linear-gradient(180deg,rgba(148,163,184,.08),rgba(255,255,255,.02))}
+.team-column.tone-home{background:linear-gradient(180deg,rgba(87,214,163,.12),rgba(255,255,255,.02));border-color:rgba(87,214,163,.22)}
+.team-column.tone-attack{background:linear-gradient(180deg,rgba(255,107,157,.12),rgba(255,255,255,.02));border-color:rgba(255,107,157,.22)}
+.team-column.tone-guerrilla{background:linear-gradient(180deg,rgba(179,140,255,.12),rgba(255,255,255,.02));border-color:rgba(179,140,255,.22)}
+.team-column.drag-over{box-shadow:0 0 0 2px rgba(110,168,255,.35) inset;transform:translateY(-1px)}
+.team-column-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:12px 12px 8px}
+.team-column-head b{display:block;font-size:13px;color:#eef3ff}
+.team-column-head span{display:block;margin-top:3px;color:var(--muted);font-size:11px}
+.team-count{min-width:24px;height:24px;border-radius:999px;display:grid;place-items:center;background:rgba(0,0,0,.22);color:#d7e8ff;font:700 11px Consolas,monospace;font-style:normal}
+.team-drop{flex:1;display:flex;flex-direction:column;gap:8px;padding:0 10px 12px;min-height:150px}
+.team-empty{margin:auto 0;padding:18px 10px;border:1px dashed rgba(255,255,255,.12);border-radius:14px;color:#7f8eab;font-size:12px;text-align:center}
+.team-chip{display:flex;align-items:center;gap:8px;width:100%;border-radius:14px;padding:9px 10px;background:rgba(8,14,26,.72);border:1px solid rgba(255,255,255,.10);color:#eef3ff;cursor:grab;text-align:left;box-shadow:0 8px 18px rgba(0,0,0,.18)}
+.team-chip:active{cursor:grabbing}
+.team-chip.dragging{opacity:.45}
+.team-chip .glyph{width:28px;height:28px;border-radius:10px;display:grid;place-items:center;font:800 12px Consolas,monospace;color:#081018}
+.team-chip.kind-VANGUARD .glyph{background:#ff6b9d}
+.team-chip.kind-RANGER .glyph{background:#b38cff}
+.team-chip.kind-COMBAT .glyph{background:#6ea8ff}
+.team-chip .meta{min-width:0;flex:1}
+.team-chip .meta b{display:block;font-size:12px;line-height:1.2}
+.team-chip .meta span{display:block;color:#93a0bf;font-size:10px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.team-chip.ghost{opacity:.55;border-style:dashed}
+.team-chip .pulse{width:8px;height:8px;border-radius:50%;background:#57d6a3;box-shadow:0 0 0 4px rgba(87,214,163,.12)}
+.team-chip.ghost .pulse{background:#7f8eab;box-shadow:none}
+.team-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}
+.team-settings label{display:grid;gap:6px;padding:10px 12px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);color:var(--muted);font-size:11px}
+.team-settings input{width:100%;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
+.team-settings input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
+.teams-message{min-height:18px;margin-top:10px;color:var(--muted);font-size:12px}
+.teams-message.ok{color:#8ef0c4}.teams-message.err{color:#ff9b9b}
 .config-switch{justify-self:end;position:relative;width:38px;height:22px}
 .config-switch input{position:absolute;opacity:0;pointer-events:none}
 .config-switch span{display:block;width:38px;height:22px;border-radius:11px;background:#263149;border:1px solid rgba(255,255,255,.12);cursor:pointer;transition:.16s}
@@ -635,6 +859,22 @@ body{margin:0;min-height:100vh;color:var(--text);
 .config-actions button:disabled{opacity:.55;cursor:wait}
 .config-message{min-height:18px;color:var(--muted);font-size:12px;margin-left:auto}
 .config-message.ok{color:#8ef0c4}.config-message.err{color:#ff9b9b}
+.production-section{margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid var(--line)}
+.production-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+.production-title>div{display:flex;align-items:baseline;gap:10px}.production-title b{font-size:13px;color:#c7dbff}
+.production-add{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:10px}
+.production-add button,.queue-clear{appearance:none;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:#162238;color:#eef3ff;cursor:pointer}
+.production-add button{display:flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:7px 10px;font-size:12px}
+.production-add button>span{display:grid;place-items:center;width:20px;height:20px;border-radius:4px;background:#285b8f;color:#fff;font:700 11px Consolas,monospace}
+.production-add button small{color:#ffc857;font:11px Consolas,monospace}.production-add button:hover{border-color:rgba(110,168,255,.5);background:#1b2b47}
+.production-add button:disabled,.queue-clear:disabled{opacity:.45;cursor:not-allowed}
+.queue-clear{padding:5px 9px;background:transparent;color:var(--muted);font-size:11px}
+.production-list{display:flex;align-items:center;gap:6px;min-height:34px;overflow-x:auto;padding:2px 0 5px}
+.production-item{flex:0 0 auto;display:flex;align-items:center;gap:6px;min-height:29px;padding:5px 7px;border:1px solid rgba(255,255,255,.09);border-radius:6px;background:rgba(255,255,255,.035);color:#e5edff;cursor:pointer}
+.production-item .order{display:grid;place-items:center;width:17px;height:17px;border-radius:3px;background:#25334d;color:#a9c8ff;font:10px Consolas,monospace}
+.production-item b{font-size:11px}.production-item small{color:#ffc857;font:10px Consolas,monospace}.production-item .remove{color:#7f8eab;font-size:14px;line-height:1}
+.production-item.inflight{border-color:rgba(87,214,163,.38);background:rgba(87,214,163,.08)}
+.production-empty,.production-status{color:var(--muted);font-size:11px}.production-status{min-height:15px;margin-top:3px}.production-status.err{color:#ff9b9b}
 .hero{display:none}
 .metrics{display:none}
 .layout{display:none}
@@ -648,9 +888,17 @@ body{margin:0;min-height:100vh;color:var(--text);
 @media (max-width:980px){
   .topbar{flex-direction:column}
 }
+@media (max-width:1100px){
+  .team-board{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .team-settings{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
 @media (max-width:680px){
   .config-groups{grid-template-columns:1fr}
   .config-message{width:100%;margin-left:0}
+  .production-add{grid-template-columns:1fr}
+  .team-board{grid-template-columns:1fr}
+  .team-settings{grid-template-columns:1fr}
+  .teams-hero{flex-direction:column}
 }
 
 """
@@ -658,7 +906,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 JS = r"""
 <script>
 (function(){
-  const KEY = 'arenaMapView.v2';
+  const KEY = 'arenaMapView.v3';
   let stage = document.getElementById('mapStage');
   let svg = document.getElementById('gameMap');
   let view = null;
@@ -666,6 +914,12 @@ JS = r"""
   let lastTick = null;
   let refreshing = false;
   let configDirty = false;
+  let productionQueueBusy = false;
+  let teamsDirty = false;
+  let teamsBusy = false;
+  let teamsUnits = [];
+  let teamsConfig = null;
+  let dragUnitName = null;
 
   function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
 
@@ -687,13 +941,14 @@ JS = r"""
 
   function worldToSvg(meta, wx, wy){
     const px = meta.pad + (wx - meta.xmin) * meta.cell + meta.cell / 2;
-    const py = meta.pad + (meta.ymax - wy) * meta.cell + meta.cell / 2;
+    // Match server/SVG: smaller world-Y is toward the top of the map.
+    const py = meta.pad + (wy - meta.ymin) * meta.cell + meta.cell / 2;
     return [px, py];
   }
 
   function svgToWorld(meta, px, py){
     const wx = meta.xmin + (px - meta.pad) / meta.cell - 0.5;
-    const wy = meta.ymax - (py - meta.pad) / meta.cell + 0.5;
+    const wy = meta.ymin + (py - meta.pad) / meta.cell - 0.5;
     return [wx, wy];
   }
 
@@ -783,7 +1038,7 @@ JS = r"""
       lx = e.clientX; ly = e.clientY;
       const meta = readSvgMeta(svg);
       view.worldX -= dx / (view.scale * meta.cell);
-      view.worldY += dy / (view.scale * meta.cell);
+      view.worldY -= dy / (view.scale * meta.cell);
       apply();
     };
     function endDrag(e){
@@ -850,7 +1105,7 @@ JS = r"""
       if(data.workersHtml) setHtml('#workersGrid', data.workersHtml);
       if(data.vgHtml) setHtml('#vgGrid', data.vgHtml);
       if(data.rgHtml) setHtml('#rgGrid', data.rgHtml);
-      if(data.resHtml) setHtml('#resSection', data.resHtml);
+      if(data.resHtml){ setHtml('#resSection', data.resHtml); bindOreForm(); }
       if(data.eventsHtml) setHtml('#eventsSection', data.eventsHtml);
       if(data.mapTitle) setHtml('#mapTitleCount', data.mapTitle);
       if(data.footerHtml) setHtml('#footerSection', data.footerHtml);
@@ -859,6 +1114,10 @@ JS = r"""
       if(data.rgCount !== undefined) setText('#rgCount', String(data.rgCount));
       if(data.resCount !== undefined) setText('#resCount', data.resCount + ' 可见');
       if(data.eventsCount !== undefined) setText('#eventsCount', String(data.eventsCount));
+      if(data.combatUnits && !teamsDirty && !teamsBusy){
+        teamsUnits = data.combatUnits;
+        renderTeamBoard();
+      }
 
       if(data.mapSvg){
         const stageEl = document.getElementById('mapStage');
@@ -879,20 +1138,44 @@ JS = r"""
 
   
   function bindOreForm(){
-    const form = document.getElementById('oreForm');
-    if(!form) return;
-    // always rebind after left column rerender
+    // Bind the right-column ore add form + chip delete buttons; idempotent.
+    const toggle = document.getElementById('resAddToggle');
+    const form = document.getElementById('resAddForm');
     const msg = document.getElementById('oreMsg');
     const xEl = document.getElementById('oreX');
     const yEl = document.getElementById('oreY');
-    async function postOre(path){
-      const x = Number(xEl && xEl.value);
-      const y = Number(yEl && yEl.value);
+    const addBtn = document.getElementById('oreAddBtn');
+    const cancelBtn = document.getElementById('oreCancelBtn');
+    const section = document.getElementById('resSection');
+
+    function setMsg(text, kind){
+      if(!msg) return;
+      msg.textContent = text || '';
+      msg.className = 'msg' + (kind ? ' ' + kind : '');
+    }
+    function openForm(){
+      if(form) form.classList.add('open');
+      if(toggle) toggle.textContent = '–';
+      setTimeout(function(){ if(xEl) xEl.focus(); }, 30);
+    }
+    function closeForm(){
+      if(form) form.classList.remove('open');
+      if(toggle) toggle.textContent = '+';
+      if(xEl) xEl.value = '';
+      if(yEl) yEl.value = '';
+      setMsg('输入坐标后点加入', '');
+    }
+    if(toggle) toggle.onclick = function(){
+      if(form && form.classList.contains('open')) closeForm(); else openForm();
+    };
+    if(cancelBtn) cancelBtn.onclick = closeForm;
+
+    async function postOre(path, x, y){
       if(!Number.isFinite(x) || !Number.isFinite(y)){
-        if(msg){ msg.className='msg err'; msg.textContent='请输入有效整数坐标'; }
+        setMsg('请输入有效整数坐标', 'err');
         return;
       }
-      if(msg){ msg.className='msg'; msg.textContent='提交中…'; }
+      setMsg('提交中…', '');
       try{
         const res = await fetch(path, {
           method:'POST',
@@ -901,26 +1184,150 @@ JS = r"""
         });
         const data = await res.json();
         if(!res.ok || !data.ok){
-          if(msg){ msg.className='msg err'; msg.textContent=(data && data.error) || '失败'; }
+          setMsg((data && data.error) || '失败', 'err');
           return;
         }
-        if(msg){
-          msg.className='msg ok';
-          msg.textContent = (path.indexOf('remove')>=0 ? '已删除 ' : '已加入 ') +
-            '(' + data.pos[0] + ', ' + data.pos[1] + ') · 记忆 ' + data.resource_count;
-        }
+        setMsg(
+          (path.indexOf('remove')>=0 ? '已删除 ' : '已加入 ') +
+          '(' + data.pos[0] + ', ' + data.pos[1] + ') · 记忆 ' + data.resource_count, 'ok'
+        );
+        if(xEl) xEl.value = '';
+        if(yEl) yEl.value = '';
+        if(path.indexOf('remove') < 0) setTimeout(closeForm, 900);
         lastTick = null;
         softRefresh();
       }catch(e){
-        if(msg){ msg.className='msg err'; msg.textContent='网络错误'; }
+        setMsg('网络错误', 'err');
       }
     }
-    form.onsubmit = function(e){
-      e.preventDefault();
-      postOre('/api/resource/add');
+    if(addBtn) addBtn.onclick = function(){
+      postOre('/api/resource/add', Number(xEl && xEl.value), Number(yEl && yEl.value));
     };
-    const delBtn = document.getElementById('oreDelBtn');
-    if(delBtn) delBtn.onclick = function(){ postOre('/api/resource/remove'); };
+    if(form){
+      form.onsubmit = function(e){ e.preventDefault(); };
+      if(xEl && yEl){
+        xEl.addEventListener('keydown', function(e){
+          if(e.key === 'Escape') closeForm();
+          if(e.key === 'Enter'){ e.preventDefault(); postOre('/api/resource/add', Number(xEl.value), Number(yEl.value)); }
+        });
+        yEl.addEventListener('keydown', function(e){
+          if(e.key === 'Escape') closeForm();
+          if(e.key === 'Enter'){ e.preventDefault(); postOre('/api/resource/add', Number(xEl.value), Number(yEl.value)); }
+        });
+      }
+    }
+    if(section){
+      section.querySelectorAll('button.chip-x[data-remove-x]').forEach(function(btn){
+        if(btn.dataset.bound === '1') return;
+        btn.dataset.bound = '1';
+        btn.onclick = function(){
+          const x = Number(btn.dataset.removeX);
+          const y = Number(btn.dataset.removeY);
+          postOre('/api/resource/remove', x, y);
+        };
+      });
+    }
+  }
+
+  function setProductionQueueStatus(text, isError){
+    const status = document.getElementById('productionQueueStatus');
+    if(!status) return;
+    status.textContent = text || '';
+    status.className = 'production-status' + (isError ? ' err' : '');
+  }
+
+  function renderProductionQueue(data){
+    if(!data || !Array.isArray(data.items)) return;
+    const list = document.getElementById('productionQueueList');
+    const count = document.getElementById('productionQueueCount');
+    const clear = document.getElementById('productionQueueClear');
+    const full = data.count >= data.limit;
+    if(count) count.textContent = data.count + ' / ' + data.limit;
+    document.querySelectorAll('[data-queue-unit]').forEach(function(button){
+      button.disabled = full || productionQueueBusy;
+    });
+    if(clear) clear.disabled = data.count === 0 || productionQueueBusy;
+    if(list){
+      list.replaceChildren();
+      if(data.items.length === 0){
+        const empty = document.createElement('span');
+        empty.className = 'production-empty';
+        empty.textContent = '暂无生产需求';
+        list.appendChild(empty);
+      }else{
+        data.items.forEach(function(item, index){
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'production-item' + (item.status === 'inflight' ? ' inflight' : '');
+          button.title = '移除 ' + item.label;
+          const order = document.createElement('span');
+          order.className = 'order'; order.textContent = String(index + 1);
+          const label = document.createElement('b'); label.textContent = item.label;
+          const cost = document.createElement('small'); cost.textContent = String(item.cost);
+          const remove = document.createElement('span');
+          remove.className = 'remove'; remove.textContent = '×'; remove.setAttribute('aria-hidden', 'true');
+          button.append(order, label, cost, remove);
+          button.onclick = function(){ mutateProductionQueue('/api/production-queue/remove', {id:item.id}); };
+          list.appendChild(button);
+        });
+      }
+    }
+    const head = data.items[0];
+    if(head){
+      setProductionQueueStatus(
+        head.status === 'inflight'
+          ? '正在生产：' + head.label
+          : '队首：' + head.label + ' · ' + head.cost + ' 资源',
+        false
+      );
+    }else{
+      setProductionQueueStatus('', false);
+    }
+  }
+
+  async function loadProductionQueue(){
+    if(productionQueueBusy || document.hidden) return;
+    try{
+      const res = await fetch('/api/production-queue?ts=' + Date.now(), {cache:'no-store'});
+      const data = await res.json();
+      if(res.ok && data.ok) renderProductionQueue(data);
+    }catch(e){}
+  }
+
+  async function mutateProductionQueue(path, payload){
+    if(productionQueueBusy) return;
+    productionQueueBusy = true;
+    document.querySelectorAll('[data-queue-unit]').forEach(function(button){ button.disabled = true; });
+    const clear = document.getElementById('productionQueueClear');
+    if(clear) clear.disabled = true;
+    setProductionQueueStatus('同步中…', false);
+    let nextData = null;
+    try{
+      const res = await fetch(path, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(payload || {})
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok) throw new Error(data.error || '队列操作失败');
+      nextData = data;
+    }catch(err){
+      setProductionQueueStatus(err.message || '网络错误', true);
+    }finally{
+      productionQueueBusy = false;
+      if(nextData) renderProductionQueue(nextData);
+      else loadProductionQueue();
+    }
+  }
+
+  function bindProductionQueue(){
+    document.querySelectorAll('[data-queue-unit]').forEach(function(button){
+      button.onclick = function(){
+        mutateProductionQueue('/api/production-queue/add', {unit_type:button.dataset.queueUnit});
+      };
+    });
+    const clear = document.getElementById('productionQueueClear');
+    if(clear) clear.onclick = function(){ mutateProductionQueue('/api/production-queue/clear', {}); };
   }
 
   function applyConfigValues(config){
@@ -931,6 +1338,238 @@ JS = r"""
       if(input.dataset.kind === 'boolean') input.checked = Boolean(config[input.name]);
       else input.value = String(config[input.name]);
     });
+  }
+
+  function teamKindLabel(kind){
+    if(kind === 'VANGUARD') return '先锋';
+    if(kind === 'RANGER') return '游侠';
+    return '作战';
+  }
+
+  function teamMetaLine(unit){
+    const bits = [];
+    bits.push(teamKindLabel(unit.kind));
+    if(unit.alive){
+      if(unit.pos) bits.push('(' + unit.pos[0] + ', ' + unit.pos[1] + ')');
+      if(unit.hp != null) bits.push('HP ' + unit.hp);
+    }else{
+      bits.push('配置中');
+    }
+    return bits.join(' · ');
+  }
+
+  function setTeamsMessage(text, kind){
+    const msg = document.getElementById('teamsMessage');
+    if(msg){
+      msg.textContent = text || '';
+      msg.className = 'teams-message' + (kind ? ' ' + kind : '');
+    }
+    const state = document.getElementById('teamsState');
+    if(state){
+      state.textContent = kind === 'err' ? '保存失败' : (kind === 'ok' ? '已同步' : (teamsDirty ? '待保存' : '拖拽编队'));
+    }
+  }
+
+  function currentTeamSettings(){
+    return {
+      home_patrol_radius: Number((document.getElementById('teamHomeRadius') || {}).value || 5),
+      attack_target_x: Number((document.getElementById('teamAttackX') || {}).value || 0),
+      attack_target_y: Number((document.getElementById('teamAttackY') || {}).value || 0),
+      ranger_attack_range: Number((document.getElementById('teamRangerRange') || {}).value || 3)
+    };
+  }
+
+  function applyTeamSettings(config){
+    if(!config) return;
+    const map = {
+      home_patrol_radius: 'teamHomeRadius',
+      attack_target_x: 'teamAttackX',
+      attack_target_y: 'teamAttackY',
+      ranger_attack_range: 'teamRangerRange'
+    };
+    Object.keys(map).forEach(function(key){
+      const el = document.getElementById(map[key]);
+      if(el && key in config) el.value = String(config[key]);
+    });
+  }
+
+  function rosterFromUnits(team){
+    return teamsUnits
+      .filter(function(unit){ return unit.team === team; })
+      .map(function(unit){ return unit.name; })
+      .sort(function(a, b){
+        const na = parseInt(a.slice(1), 10) || 0;
+        const nb = parseInt(b.slice(1), 10) || 0;
+        if(a[0] !== b[0]) return a[0] < b[0] ? -1 : 1;
+        return na - nb;
+      })
+      .join(', ');
+  }
+
+  function buildTeamsPayload(){
+    const settings = currentTeamSettings();
+    return {
+      home_team: rosterFromUnits('home'),
+      attack_team: rosterFromUnits('attack'),
+      guerrilla_team: rosterFromUnits('guerrilla'),
+      home_patrol_radius: settings.home_patrol_radius,
+      attack_target_x: settings.attack_target_x,
+      attack_target_y: settings.attack_target_y,
+      ranger_attack_range: settings.ranger_attack_range
+    };
+  }
+
+  function renderTeamBoard(){
+    const counts = {unassigned:0, home:0, attack:0, guerrilla:0};
+    document.querySelectorAll('[data-team-drop]').forEach(function(drop){
+      drop.innerHTML = '';
+      drop.classList.remove('drag-over');
+    });
+    (teamsUnits || []).forEach(function(unit){
+      const team = unit.team || 'unassigned';
+      const drop = document.querySelector('[data-team-drop="' + team + '"]');
+      if(!drop) return;
+      counts[team] = (counts[team] || 0) + 1;
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'team-chip kind-' + (unit.kind || 'COMBAT') + (unit.alive ? '' : ' ghost');
+      chip.draggable = true;
+      chip.dataset.unitName = unit.name;
+      chip.dataset.team = team;
+      chip.title = '拖到其他队伍';
+      const glyph = document.createElement('span');
+      glyph.className = 'glyph';
+      glyph.textContent = String(unit.name || '?').slice(0,2);
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      const title = document.createElement('b');
+      title.textContent = unit.name;
+      const sub = document.createElement('span');
+      sub.textContent = teamMetaLine(unit);
+      meta.append(title, sub);
+      const pulse = document.createElement('span');
+      pulse.className = 'pulse';
+      chip.append(glyph, meta, pulse);
+      chip.addEventListener('dragstart', function(e){
+        dragUnitName = unit.name;
+        chip.classList.add('dragging');
+        try{
+          e.dataTransfer.setData('text/plain', unit.name);
+          e.dataTransfer.effectAllowed = 'move';
+        }catch(err){}
+      });
+      chip.addEventListener('dragend', function(){
+        dragUnitName = null;
+        chip.classList.remove('dragging');
+        document.querySelectorAll('.team-column').forEach(function(col){ col.classList.remove('drag-over'); });
+      });
+      drop.appendChild(chip);
+    });
+    Object.keys(counts).forEach(function(team){
+      const el = document.querySelector('[data-team-count="' + team + '"]');
+      if(el) el.textContent = String(counts[team] || 0);
+      const drop = document.querySelector('[data-team-drop="' + team + '"]');
+      if(drop && !(counts[team] > 0)){
+        const empty = document.createElement('div');
+        empty.className = 'team-empty';
+        empty.textContent = '拖到这里';
+        drop.appendChild(empty);
+      }
+    });
+  }
+
+  function moveUnitToTeam(name, team){
+    if(!name || !team) return false;
+    let changed = false;
+    teamsUnits = (teamsUnits || []).map(function(unit){
+      if(unit.name !== name || unit.team === team) return unit;
+      changed = true;
+      return Object.assign({}, unit, {team: team});
+    });
+    if(changed){
+      teamsDirty = true;
+      renderTeamBoard();
+      setTeamsMessage('已调整编队，保存中…', '');
+      saveTeams(true);
+    }
+    return changed;
+  }
+
+  async function saveTeams(auto){
+    if(teamsBusy) return;
+    const saveBtn = document.getElementById('teamsSaveBtn');
+    teamsBusy = true;
+    if(saveBtn) saveBtn.disabled = true;
+    setTeamsMessage(auto ? '自动保存中…' : '保存中…', '');
+    try{
+      const res = await fetch('/api/teams', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(buildTeamsPayload())
+      });
+      const data = await res.json();
+      if(!res.ok || !data.ok) throw new Error(data.error || '保存失败');
+      teamsConfig = data.config;
+      teamsUnits = data.combat_units || teamsUnits;
+      applyTeamSettings(data.config);
+      teamsDirty = false;
+      renderTeamBoard();
+      setTeamsMessage(auto ? '已自动保存，下个 Tick 生效' : '分队已保存，下个 Tick 生效', 'ok');
+    }catch(err){
+      setTeamsMessage(err.message || '网络错误', 'err');
+    }finally{
+      teamsBusy = false;
+      if(saveBtn) saveBtn.disabled = false;
+    }
+  }
+
+  async function loadTeams(force){
+    if(!force && (teamsDirty || teamsBusy)) return;
+    try{
+      const res = await fetch('/api/teams?ts=' + Date.now(), {cache:'no-store'});
+      const data = await res.json();
+      if(!res.ok || !data.ok) return;
+      teamsConfig = data.config;
+      teamsUnits = data.combat_units || [];
+      applyTeamSettings(data.config);
+      teamsDirty = false;
+      renderTeamBoard();
+      setTeamsMessage('拖拽单位即可调整分队', '');
+    }catch(e){}
+  }
+
+  function bindTeamsBoard(){
+    document.querySelectorAll('.team-column').forEach(function(column){
+      const team = column.dataset.team;
+      column.addEventListener('dragover', function(e){
+        e.preventDefault();
+        column.classList.add('drag-over');
+        try{ e.dataTransfer.dropEffect = 'move'; }catch(err){}
+      });
+      column.addEventListener('dragleave', function(e){
+        if(!column.contains(e.relatedTarget)) column.classList.remove('drag-over');
+      });
+      column.addEventListener('drop', function(e){
+        e.preventDefault();
+        column.classList.remove('drag-over');
+        let name = dragUnitName;
+        try{ name = e.dataTransfer.getData('text/plain') || name; }catch(err){}
+        moveUnitToTeam(name, team);
+      });
+    });
+    ['teamHomeRadius','teamAttackX','teamAttackY','teamRangerRange'].forEach(function(id){
+      const el = document.getElementById(id);
+      if(!el) return;
+      el.addEventListener('change', function(){
+        teamsDirty = true;
+        setTeamsMessage('参数已修改，保存中…', '');
+        saveTeams(true);
+      });
+    });
+    const saveBtn = document.getElementById('teamsSaveBtn');
+    const resetBtn = document.getElementById('teamsResetBtn');
+    if(saveBtn) saveBtn.onclick = function(){ saveTeams(false); };
+    if(resetBtn) resetBtn.onclick = function(){ loadTeams(true); };
   }
 
   function setConfigMessage(text, kind){
@@ -967,8 +1606,12 @@ JS = r"""
       if(!form.reportValidity()) return;
       const config = {};
       form.querySelectorAll('[name]').forEach(function(input){
-        config[input.name] = input.dataset.kind === 'boolean' ? input.checked : Number(input.value);
+        if(input.dataset.kind === 'boolean') config[input.name] = input.checked;
+        else config[input.name] = Number(input.value);
       });
+      // Keep combat rosters/settings owned by the teams board.
+      const teamPayload = buildTeamsPayload();
+      Object.keys(teamPayload).forEach(function(key){ config[key] = teamPayload[key]; });
       if(saveBtn) saveBtn.disabled = true;
       setConfigMessage('保存中…', '');
       try{
@@ -982,6 +1625,9 @@ JS = r"""
         applyConfigValues(data.config);
         configDirty = false;
         setConfigMessage('已保存，下个 Tick 生效', 'ok');
+        teamsConfig = data.config;
+        applyTeamSettings(data.config);
+        loadTeams(true);
       }catch(err){
         setConfigMessage(err.message || '网络错误', 'err');
       }finally{
@@ -1000,6 +1646,9 @@ JS = r"""
         applyConfigValues(data.config);
         configDirty = false;
         setConfigMessage('已恢复默认值', 'ok');
+        teamsConfig = data.config;
+        applyTeamSettings(data.config);
+        loadTeams(true);
       }catch(err){
         setConfigMessage(err.message || '网络错误', 'err');
       }finally{
@@ -1009,7 +1658,11 @@ JS = r"""
   }
 
   bindOreForm();
+  bindProductionQueue();
+  loadProductionQueue();
   bindConfigForm();
+  bindTeamsBoard();
+  loadTeams(true);
   ensureView();
   bindStage();
   apply();
@@ -1022,7 +1675,9 @@ JS = r"""
     }, {passive:false});
   }
   setInterval(softRefresh, 2000);
+  setInterval(loadProductionQueue, 2000);
   setInterval(function(){ loadConfig(false); }, 10000);
+  setInterval(function(){ loadTeams(false); }, 5000);
 })();
 </script>
 """
@@ -1089,11 +1744,23 @@ def build_parts():
             f'<div class="unit-action">{act}</div></div>'
         )
 
-    def ucard(u, color_cls, label):
+    def team_label(act: str) -> str:
+        if "[home]" in act:
+            return "守家"
+        if "[attack]" in act:
+            return "进攻"
+        if "[guerrilla]" in act:
+            return "游击"
+        if "[unassigned]" in act:
+            return "未编队"
+        return "作战"
+
+    def ucard(u, color_cls):
         uid = u.get("id", "")
         sid = short_id(uid)
         name = u.get("name") or sid
         act = actions.get(sid) or actions.get(uid, "")
+        label = team_label(act)
         return (
             f'<div class="unit {color_cls}"><div class="unit-top">'
             f'<div class="unit-id">{name}<span class="count">{sid}</span></div>'
@@ -1104,8 +1771,9 @@ def build_parts():
         )
 
     w_html = "".join(wcard(w) for w in workers) or '<div class="empty">暂无工人</div>'
-    vg_html = "".join(ucard(v, "combat", "作战") for v in vgs) or '<div class="empty">暂无先锋</div>'
-    rg_html = "".join(ucard(r, "combat", "作战") for r in rgs) or '<div class="empty">暂无游侠</div>'
+    vg_html = "".join(ucard(v, "combat") for v in vgs) or '<div class="empty">暂无先锋</div>'
+    rg_html = "".join(ucard(r, "combat") for r in rgs) or '<div class="empty">暂无游侠</div>'
+    combat_units = collect_combat_units(rec, load_config(CONFIG_PATH))
 
     if issues:
         items = "".join(
@@ -1120,19 +1788,53 @@ def build_parts():
     else:
         issues_html = ""
 
-    chips = (
-        "".join(f'<span class="chip">{fmt_pos(p)}</span>' for p in rcells[:12])
-        if rcells else '<div class="muted">当前无可见矿点</div>'
-    )
-    mem_chips = "".join(
-        f'<span class="chip mem">{fmt_pos(p)}</span>' for p in mm.get("resources", [])[:12]
-    )
-    res_html = chips
-    if mm.get("resources"):
-        res_html += (
-            f'<div class="muted" style="margin-top:8px">记忆矿点 {mm.get("resource_count",0)}</div>'
-            f'<div class="chip-row">{mem_chips}</div>'
+    def _res_chip(p, removable: bool, manual: bool = False):
+        x, y = int(p[0]), int(p[1])
+        x_btn = (
+            f'<button type="button" class="chip-x" data-remove-x="{x}" data-remove-y="{y}" '
+            f'aria-label="删除 ({x},{y})" title="删除">×</button>' if removable else ""
         )
+        base_cls = "chip removable"
+        if manual:
+            cls = base_cls + " mem manual"
+        elif removable:
+            cls = base_cls + " mem"
+        else:
+            cls = "chip"
+        return f'<span class="{cls}">{fmt_pos(p)}{x_btn}</span>'
+
+    vis_chips_html = "".join(_res_chip(p, False) for p in rcells)
+    if not vis_chips_html:
+        vis_chips_html = '<div class="muted">当前无可见矿点</div>'
+    mem_resources = list(mm.get("resources", []) or [])
+    manual_set = {tuple(p) for p in (mm.get("manual_resources") or [])}
+    mem_auto = [p for p in mem_resources if tuple(p) not in manual_set]
+    mem_manual = [p for p in mem_resources if tuple(p) in manual_set]
+    auto_chips = "".join(_res_chip(p, True, manual=False) for p in mem_auto)
+    manual_chips = "".join(_res_chip(p, True, manual=True) for p in mem_manual)
+
+    res_html = '<div class="res-section">'
+    res_html += '<h4>可见矿点</h4><div class="chip-row">' + vis_chips_html + '</div>'
+    if mem_auto:
+        res_html += f'<h4>记忆矿点 {len(mem_auto)}</h4><div class="chip-row">{auto_chips}</div>'
+    if mem_manual:
+        res_html += f'<h4>手动录入 <span class="manual-tag">{len(mem_manual)}</span></h4><div class="chip-row">{manual_chips}</div>'
+    if not mem_resources:
+        res_html += '<h4>记忆矿点</h4><div class="muted">暂无记忆矿点</div>'
+    res_html += (
+        '<div class="res-add-form" id="resAddForm">'
+        '<div class="row">'
+        '<label>X<input id="oreX" name="x" type="number" step="1" placeholder="-30" required></label>'
+        '<label>Y<input id="oreY" name="y" type="number" step="1" placeholder="65" required></label>'
+        '</div>'
+        '<div class="actions">'
+        '<button type="button" id="oreAddBtn">加入记忆</button>'
+        '<button type="button" class="secondary" id="oreCancelBtn">取消</button>'
+        '</div>'
+        '<div class="msg" id="oreMsg">输入坐标后点加入</div>'
+        '</div>'
+        '</div>'
+    )
 
     if events:
         rows = ""
@@ -1228,23 +1930,6 @@ def build_parts():
         f'<span class="pill">等待 {stats["wait"]}</span>'
         f'<span class="pill">挖矿 {stats["harvest"]}</span></div>'
     )
-    mem_list = list(mm.get("resources", []) or [])
-    manual_set = {tuple(p) for p in (mm.get("manual_resources") or [])}
-    if mem_list:
-        def _ore_row(p):
-            tag = ' <span class="manual-tag">手动</span>' if tuple(p) in manual_set else ""
-            return f'<div class="kv"><span>矿{tag}</span><b>{fmt_pos(p)}</b></div>'
-        left_ores = "".join(_ore_row(p) for p in mem_list[:18])
-        if len(mem_list) > 18:
-            left_ores += f'<div class="muted">…还有 {len(mem_list)-18} 个</div>'
-    else:
-        left_ores = '<div class="muted">暂无记忆矿点</div>'
-    if rcells:
-        left_vis = "".join(
-            f'<div class="kv"><span>可见</span><b>{fmt_pos(p)}</b></div>' for p in rcells[:10]
-        )
-    else:
-        left_vis = '<div class="muted">当前无可见矿</div>'
     if issues:
         left_issues = "".join(
             f'<div class="issue {i["level"]}"><strong>{i["title"]}</strong><span>{i["detail"]}</span></div>'
@@ -1253,28 +1938,11 @@ def build_parts():
     else:
         left_issues = '<div class="muted">暂无异常</div>'
 
-    ore_form = (
-        '<section class="panel">'
-        '<div class="panel-title"><span>录入矿点</span><span class="count">手动</span></div>'
-        '<form class="ore-form" id="oreForm">'
-        '<div class="row">'
-        '<label>X<input id="oreX" name="x" type="number" step="1" placeholder="-30" required></label>'
-        '<label>Y<input id="oreY" name="y" type="number" step="1" placeholder="65" required></label>'
-        '</div>'
-        '<div class="actions">'
-        '<button type="submit" id="oreAddBtn">加入记忆</button>'
-        '<button type="button" class="secondary" id="oreDelBtn">删除该点</button>'
-        '</div>'
-        '<div class="msg" id="oreMsg">输入坐标后点加入</div>'
-        '</form></section>'
-    )
     left_html = (
-        f'{ore_form}<section class="panel"><div class="panel-title"><span>核心</span><span class="count">状态</span></div>{left_core}</section>'
+        f'<section class="panel"><div class="panel-title"><span>核心</span><span class="count">状态</span></div>{left_core}</section>'
         f'<section class="panel"><div class="panel-title"><span>资源</span><span class="count">{pct}%</span></div>{left_res}</section>'
         f'<section class="panel"><div class="panel-title"><span>战场</span><span class="count">摘要</span></div>{left_fight}</section>'
         f'<section class="panel"><div class="panel-title"><span>异常</span><span class="count">{len(issues)}</span></div><div class="compact-list">{left_issues}</div></section>'
-        f'<section class="panel"><div class="panel-title"><span>可见矿</span><span class="count">{len(rcells)}</span></div><div class="compact-list">{left_vis}</div></section>'
-        f'<section class="panel"><div class="panel-title"><span>记忆矿</span><span class="count">{len(mem_list)}</span></div><div class="compact-list">{left_ores}</div></section>'
     )
 
     return {
@@ -1299,6 +1967,7 @@ def build_parts():
         "rgCount": len(rgs),
         "resCount": len(rcells),
         "eventsCount": len(events),
+        "combatUnits": combat_units,
     }
 
 
@@ -1357,6 +2026,7 @@ def generate_html() -> str:
         <span><i class="dot target-ring"></i>目标</span>
        </div>
       </section>
+      {render_teams_panel()}
       {render_config_panel()}
       <div id="issuesSection" style="display:none">{parts['issuesHtml']}</div>
     </section>
@@ -1374,8 +2044,11 @@ def generate_html() -> str:
         <div class="panel-title"><span>游侠</span><span class="count" id="rgCount">{parts['rgCount']}</span></div>
         <div class="unit-grid" id="rgGrid">{parts['rgHtml']}</div>
       </section>
-      <section class="panel">
-        <div class="panel-title"><span>矿点</span><span class="count" id="resCount">{parts['resCount']} 可见</span></div>
+      <section class="panel res-panel" id="resPanel">
+        <div class="res-head">
+          <div class="panel-title" style="margin-bottom:0"><span>矿点</span><span class="count" id="resCount">{parts['resCount']} 可见</span></div>
+          <button type="button" class="add-ore-btn" id="resAddToggle" title="录入矿点">+</button>
+        </div>
         <div id="resSection">{parts['resHtml']}</div>
       </section>
       <section class="panel">
@@ -1394,12 +2067,20 @@ def generate_html() -> str:
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, body: bytes, content_type: str):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            # Client disconnected mid-response; nothing to do.
+            pass
+
+    def log_message(self, format: str, *args) -> None:  # noqa: A003
+        # Silence per-request noise; errors still print via handle_one_request.
+        return
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0") or 0)
@@ -1430,6 +2111,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             self._send_json(200, {"ok": True, "config": load_config(CONFIG_PATH)})
             return
+        if path == "/api/teams":
+            config = load_config(CONFIG_PATH)
+            history = read_history(1)
+            rec = history[0] if history else {}
+            self._send_json(200, {
+                "ok": True,
+                "config": config,
+                "combat_units": collect_combat_units(rec, config),
+            })
+            return
+        if path == "/api/production-queue":
+            try:
+                self._send_json(200, production_queue.queue_payload())
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"读取队列失败: {exc}"})
+            return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
@@ -1438,6 +2135,13 @@ class Handler(BaseHTTPRequestHandler):
         if path in {"/api/config", "/api/config/reset"}:
             try:
                 values = default_config() if path.endswith("/reset") else data
+                if path == "/api/config":
+                    # Strategy form no longer owns combat rosters/settings.
+                    current = load_config(CONFIG_PATH)
+                    merged = dict(current)
+                    for key, value in values.items():
+                        merged[key] = value
+                    values = merged
                 config = save_config(values, CONFIG_PATH)
             except ConfigValidationError as exc:
                 self._send_json(400, {
@@ -1450,6 +2154,61 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"ok": False, "error": f"保存失败: {exc}"})
                 return
             self._send_json(200, {"ok": True, "config": config})
+            return
+
+        if path == "/api/teams":
+            try:
+                current = load_config(CONFIG_PATH)
+                merged = dict(current)
+                for key in list(TEAM_ROSTER_FIELDS) + list(TEAM_SETTING_FIELDS):
+                    if key in data:
+                        merged[key] = data[key]
+                # Normalize roster text for stable dashboard/tactic display.
+                for key in TEAM_ROSTER_FIELDS:
+                    merged[key] = _format_roster_names(_parse_roster_names(merged.get(key, "")))
+                config = save_config(merged, CONFIG_PATH)
+            except ConfigValidationError as exc:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "分队配置无效",
+                    "fields": exc.errors,
+                })
+                return
+            except OSError as exc:
+                self._send_json(500, {"ok": False, "error": f"保存失败: {exc}"})
+                return
+            history = read_history(1)
+            rec = history[0] if history else {}
+            self._send_json(200, {
+                "ok": True,
+                "config": config,
+                "combat_units": collect_combat_units(rec, config),
+            })
+            return
+
+        if path == "/api/production-queue/add":
+            try:
+                production_queue.enqueue(str(data.get("unit_type", "")))
+                self._send_json(200, production_queue.queue_payload())
+            except production_queue.InvalidUnitTypeError:
+                self._send_json(400, {"ok": False, "error": "未知单位类型"})
+            except production_queue.QueueFullError:
+                self._send_json(409, {"ok": False, "error": "需求队列已达到 20 个"})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": f"加入队列失败: {exc}"})
+            return
+        if path == "/api/production-queue/remove":
+            try:
+                request_id = int(data.get("id"))
+            except (TypeError, ValueError):
+                self._send_json(400, {"ok": False, "error": "无效的队列编号"})
+                return
+            production_queue.remove_request(request_id)
+            self._send_json(200, production_queue.queue_payload())
+            return
+        if path == "/api/production-queue/clear":
+            production_queue.clear_requests()
+            self._send_json(200, production_queue.queue_payload())
             return
 
         try:
@@ -1478,7 +2237,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    srv = HTTPServer((HOST, PORT), Handler)
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    srv.daemon_threads = True
     print(f"[dashboard] http://localhost:{PORT}")
     print("[dashboard] soft refresh /api/state · Ctrl+C 停止")
     try:

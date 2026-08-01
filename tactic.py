@@ -23,7 +23,8 @@ from arena_hero import (
     Direction,
     UnitType,
 )
-from tactic_config import load_config
+import production_queue
+from tactic_config import load_config, save_config
 
 MAP_MEMORY_PATH = Path("map_memory.json")
 
@@ -461,105 +462,578 @@ def _plan_worker(
     return ("WAIT", "no_action")
 
 
-def _plan_vanguard(
-    vanguard,
+# Cardinal + diagonal offsets used by guerrilla units to fan out.
+_EIGHT_WAY_DELTAS: tuple[tuple[int, int], ...] = (
+    (0, -1),   # N
+    (1, -1),   # NE
+    (1, 0),    # E
+    (1, 1),    # SE
+    (0, 1),    # S
+    (-1, 1),   # SW
+    (-1, 0),   # W
+    (-1, -1),  # NW
+)
+_EIGHT_WAY_LABELS: tuple[str, ...] = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+
+
+def _parse_team_names(raw: Any) -> set[str]:
+    """Parse a comma/space/semicolon separated combat roster into unit names."""
+    if not isinstance(raw, str) or not raw.strip():
+        return set()
+    names: set[str] = set()
+    for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
+        name = chunk.strip().upper()
+        if name:
+            names.add(name)
+    return names
+
+
+def _combat_team_for(unit_name: str, config: dict[str, Any]) -> str:
+    """Return home / attack / guerrilla / unassigned for a named combat unit."""
+    name = unit_name.upper()
+    if name in _parse_team_names(config.get("home_team", "")):
+        return "home"
+    if name in _parse_team_names(config.get("attack_team", "")):
+        return "attack"
+    if name in _parse_team_names(config.get("guerrilla_team", "")):
+        return "guerrilla"
+    return "unassigned"
+
+
+def _format_team_roster(names: set[str]) -> str:
+    """Stable, human-friendly roster text for the dashboard config fields."""
+
+    def sort_key(name: str) -> tuple[str, int, str]:
+        prefix = name[:1]
+        suffix = name[1:]
+        number = int(suffix) if suffix.isdigit() else 0
+        return prefix, number, name
+
+    return ", ".join(sorted((name.upper() for name in names), key=sort_key))
+
+
+def _ensure_home_team_membership(
+    config: dict[str, Any],
+    unit_names: Iterable[str],
+) -> dict[str, Any]:
+    """Auto-enlist unassigned Vanguards/Rangers into the home team roster."""
+    home = _parse_team_names(config.get("home_team", ""))
+    attack = _parse_team_names(config.get("attack_team", ""))
+    guerrilla = _parse_team_names(config.get("guerrilla_team", ""))
+    added: list[str] = []
+    for raw_name in unit_names:
+        name = str(raw_name).strip().upper()
+        if not name or name in home or name in attack or name in guerrilla:
+            continue
+        home.add(name)
+        added.append(name)
+    if not added:
+        return config
+
+    updated = dict(config)
+    updated["home_team"] = _format_team_roster(home)
+    try:
+        saved = save_config(updated)
+        print(
+            f"[team] auto-enlisted {', '.join(added)} -> home_team={saved['home_team']}",
+            flush=True,
+        )
+        return saved
+    except Exception as exc:
+        print(f"[team] auto-enlist save failed: {exc}", flush=True)
+        return updated
+
+
+def _auto_enlist_new_combat_units(turn: Any, config: dict[str, Any]) -> dict[str, Any]:
+    """Give every living Vanguard/Ranger a name and default them to home."""
+    names: list[str] = []
+    for vanguard in getattr(turn, "vanguards", ()) or ():
+        names.append(_object_name(vanguard.id, "V"))
+    for ranger in getattr(turn, "rangers", ()) or ():
+        names.append(_object_name(ranger.id, "R"))
+    return _ensure_home_team_membership(config, names)
+
+
+def _cardinal_toward_delta(dx: int, dy: int) -> Direction | None:
+    """Convert any free-form offset into the nearest legal cardinal move."""
+    if dx == 0 and dy == 0:
+        return None
+    if abs(dx) >= abs(dy):
+        return Direction.RIGHT if dx > 0 else Direction.LEFT
+    return Direction.DOWN if dy > 0 else Direction.UP
+
+
+def _try_move(
+    unit: Any,
+    direction: Direction,
+    pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+) -> bool:
+    nx, ny = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
+    if (nx, ny) in obstacle_cells:
+        return False
+    unit.move(direction)
+    _worker_last_pos[str(unit.id)] = pos
+    return True
+
+
+def _move_towards(
+    unit: Any,
+    pos: tuple[int, int],
+    goal: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    *,
+    detail_prefix: str,
+) -> tuple[str, str] | None:
+    if pos == goal:
+        return None
+    direction = _step_towards(pos, goal)
+    if direction is None:
+        return None
+    if _try_move(unit, direction, pos, obstacle_cells):
+        return ("MOVE", f"{direction.name} {detail_prefix} {goal}")
+    # Prefer alternate axis when the primary step is blocked.
+    dx = goal[0] - pos[0]
+    dy = goal[1] - pos[1]
+    alternates: list[Direction] = []
+    if abs(dx) >= abs(dy):
+        if dy > 0:
+            alternates.append(Direction.DOWN)
+        elif dy < 0:
+            alternates.append(Direction.UP)
+        if dx > 0:
+            alternates.append(Direction.RIGHT)
+        elif dx < 0:
+            alternates.append(Direction.LEFT)
+    else:
+        if dx > 0:
+            alternates.append(Direction.RIGHT)
+        elif dx < 0:
+            alternates.append(Direction.LEFT)
+        if dy > 0:
+            alternates.append(Direction.DOWN)
+        elif dy < 0:
+            alternates.append(Direction.UP)
+    for alt in alternates:
+        if alt == direction:
+            continue
+        if _try_move(unit, alt, pos, obstacle_cells):
+            return ("MOVE", f"{alt.name} {detail_prefix} {goal}")
+    return None
+
+
+def _vanguard_adjacent_sweep(
+    vanguard: Any,
+    pos: tuple[int, int],
+    enemies: tuple,
+) -> tuple[str, str] | None:
+    for direction in (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT):
+        tx = pos[0] + direction.delta[0]
+        ty = pos[1] + direction.delta[1]
+        for enemy in enemies:
+            if tuple(enemy.position) == (tx, ty):
+                vanguard.sweep(direction)
+                return ("SWEEP", f"{direction.name} -> enemy at {enemy.position}")
+    return None
+
+
+def _ranger_best_shot(
+    ranger: Any,
+    pos: tuple[int, int],
     enemies: tuple,
     obstacle_cells: frozenset[tuple[int, int]],
-    config: dict[str, int | bool],
+    attack_range: int,
+) -> tuple[str, str] | None:
+    best_dist = 10_000
+    best_target = None
+    for enemy in enemies:
+        dist = _manhattan(pos, enemy.position)
+        if not (1 <= dist <= attack_range):
+            continue
+        if _line_blocked(pos, enemy.position, obstacle_cells):
+            continue
+        if dist < best_dist:
+            best_dist = dist
+            best_target = enemy
+    if best_target is None:
+        return None
+    ranger.shoot(best_target)
+    return ("SHOOT", f"enemy at {best_target.position} dist={best_dist}")
+
+
+def _scout_cardinal(
+    unit: Any,
+    pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, Any],
+    *,
+    label: str,
 ) -> tuple[str, str]:
-    """Return (action_name, detail)."""
-    pos = vanguard.position
-
-    if config["vanguard_engage_enabled"]:
-        for direction in (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT):
-            tx, ty = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
-            for enemy in enemies:
-                if enemy.position == (tx, ty):
-                    vanguard.sweep(direction)
-                    return ("SWEEP", f"{direction.name} -> enemy at {enemy.position}")
-
-        if enemies:
-            nearest = min(enemies, key=lambda e: _manhattan(pos, e.position))
-            direction = _step_towards(pos, nearest.position)
-            if direction is not None:
-                nx, ny = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
-                if (nx, ny) not in obstacle_cells:
-                    vanguard.move(direction)
-                    return ("MOVE", f"{direction.name} -> enemy at {nearest.position}")
-
-    # No enemies: scout with UUID rotation + backtrack avoidance
-    prev = _worker_last_pos.get(str(vanguard.id))
-    idx = hash(str(vanguard.id)) % 4
+    prev = _worker_last_pos.get(str(unit.id))
+    idx = hash(str(unit.id)) % 4
     base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
     rotated = base[idx:] + base[:idx]
     rotated.sort(
         key=lambda d: 1
-        if config["avoid_backtracking"]
+        if config.get("avoid_backtracking")
         and prev
         and (pos[0] + d.delta[0], pos[1] + d.delta[1]) == prev
         else 0
     )
-    for d in rotated:
-        nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
-        if (nx, ny) not in obstacle_cells:
-            vanguard.move(d)
-            _worker_last_pos[str(vanguard.id)] = pos
-            return ("MOVE", f"{d.name} scout")
-
-    vanguard.wait()
+    for direction in rotated:
+        if _try_move(unit, direction, pos, obstacle_cells):
+            return ("MOVE", f"{direction.name} {label}")
+    unit.wait()
     return ("WAIT", "no_way")
+
+
+def _home_patrol_goal(
+    unit_id: str,
+    core_pos: tuple[int, int],
+    radius: int,
+) -> tuple[int, int]:
+    """Pick a stable perimeter offset around the Core for this unit."""
+    radius = max(1, int(radius))
+    # Eight slots around the ring keep multiple defenders spread out.
+    slots = (
+        (0, -radius),
+        (radius, -radius),
+        (radius, 0),
+        (radius, radius),
+        (0, radius),
+        (-radius, radius),
+        (-radius, 0),
+        (-radius, -radius),
+    )
+    slot = slots[hash(str(unit_id)) % len(slots)]
+    return (core_pos[0] + slot[0], core_pos[1] + slot[1])
+
+
+def _plan_home_combat(
+    unit: Any,
+    *,
+    unit_kind: str,
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    core_pos: tuple[int, int],
+    config: dict[str, Any],
+) -> tuple[str, str]:
+    """Defend near the Core: engage nearby threats, otherwise patrol the ring."""
+    pos = tuple(unit.position)
+    radius = int(config["home_patrol_radius"])
+
+    if unit_kind == "vanguard":
+        sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
+        if sweep is not None:
+            return sweep
+    else:
+        shot = _ranger_best_shot(
+            unit,
+            pos,
+            enemies,
+            obstacle_cells,
+            int(config["ranger_attack_range"]),
+        )
+        if shot is not None:
+            return shot
+
+    # Only chase enemies that are already inside the home perimeter.
+    local_enemies = [
+        enemy for enemy in enemies
+        if _manhattan(core_pos, enemy.position) <= radius + 1
+    ]
+    if local_enemies:
+        nearest = min(local_enemies, key=lambda e: _manhattan(pos, e.position))
+        moved = _move_towards(
+            unit,
+            pos,
+            tuple(nearest.position),
+            obstacle_cells,
+            detail_prefix="home-engage",
+        )
+        if moved is not None:
+            return moved
+
+    if _manhattan(pos, core_pos) > radius:
+        moved = _move_towards(
+            unit, pos, core_pos, obstacle_cells, detail_prefix="home-return",
+        )
+        if moved is not None:
+            return moved
+
+    goal = _home_patrol_goal(str(unit.id), core_pos, radius)
+    if pos != goal:
+        moved = _move_towards(
+            unit, pos, goal, obstacle_cells, detail_prefix="home-patrol",
+        )
+        if moved is not None:
+            return moved
+
+    return _scout_cardinal(
+        unit, pos, obstacle_cells, config, label="home-patrol",
+    )
+
+
+def _plan_attack_combat(
+    unit: Any,
+    *,
+    unit_kind: str,
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, Any],
+) -> tuple[str, str]:
+    """March as a group toward the configured coordinate; engage en route."""
+    pos = tuple(unit.position)
+    target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
+
+    if unit_kind == "vanguard":
+        sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
+        if sweep is not None:
+            return sweep
+    else:
+        shot = _ranger_best_shot(
+            unit,
+            pos,
+            enemies,
+            obstacle_cells,
+            int(config["ranger_attack_range"]),
+        )
+        if shot is not None:
+            return shot
+
+    if enemies:
+        nearest = min(enemies, key=lambda e: _manhattan(pos, e.position))
+        moved = _move_towards(
+            unit,
+            pos,
+            tuple(nearest.position),
+            obstacle_cells,
+            detail_prefix="attack-engage",
+        )
+        if moved is not None:
+            return moved
+
+    if pos == target:
+        unit.wait()
+        return ("WAIT", f"attack-hold {target}")
+
+    moved = _move_towards(
+        unit, pos, target, obstacle_cells, detail_prefix="attack-march",
+    )
+    if moved is not None:
+        return moved
+
+    unit.wait()
+    return ("WAIT", f"attack-blocked {target}")
+
+
+def _plan_guerrilla_combat(
+    unit: Any,
+    *,
+    unit_kind: str,
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, Any],
+) -> tuple[str, str]:
+    """Fan out on 8 bearings; pick off singles, retreat from packs."""
+    pos = tuple(unit.position)
+    enemy_count = len(enemies)
+
+    if enemy_count >= 3:
+        # Retreat away from the enemy cluster centroid.
+        cx = sum(int(e.position[0]) for e in enemies) / enemy_count
+        cy = sum(int(e.position[1]) for e in enemies) / enemy_count
+        flee_dx = pos[0] - cx
+        flee_dy = pos[1] - cy
+        if flee_dx == 0 and flee_dy == 0:
+            # Already on the centroid: pick any hashed cardinal escape.
+            direction = (
+                Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT
+            )[hash(str(unit.id)) % 4]
+        else:
+            direction = _cardinal_toward_delta(
+                1 if flee_dx > 0 else (-1 if flee_dx < 0 else 0),
+                1 if flee_dy > 0 else (-1 if flee_dy < 0 else 0),
+            )
+        if direction is not None and _try_move(unit, direction, pos, obstacle_cells):
+            return ("MOVE", f"{direction.name} guerrilla-retreat n={enemy_count}")
+        # If primary escape is blocked, try remaining cardinals.
+        for fallback in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+            if direction is not None and fallback == direction:
+                continue
+            if _try_move(unit, fallback, pos, obstacle_cells):
+                return ("MOVE", f"{fallback.name} guerrilla-retreat n={enemy_count}")
+        unit.wait()
+        return ("WAIT", f"guerrilla-retreat-blocked n={enemy_count}")
+
+    if enemy_count == 1:
+        if unit_kind == "vanguard":
+            sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
+            if sweep is not None:
+                return sweep
+        else:
+            shot = _ranger_best_shot(
+                unit,
+                pos,
+                enemies,
+                obstacle_cells,
+                int(config["ranger_attack_range"]),
+            )
+            if shot is not None:
+                return shot
+        nearest = enemies[0]
+        moved = _move_towards(
+            unit,
+            pos,
+            tuple(nearest.position),
+            obstacle_cells,
+            detail_prefix="guerrilla-engage",
+        )
+        if moved is not None:
+            return moved
+
+    if enemy_count == 2:
+        # Two enemies: hold position if already able to strike, else keep roaming.
+        if unit_kind == "vanguard":
+            sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
+            if sweep is not None:
+                return sweep
+        else:
+            shot = _ranger_best_shot(
+                unit,
+                pos,
+                enemies,
+                obstacle_cells,
+                int(config["ranger_attack_range"]),
+            )
+            if shot is not None:
+                return shot
+
+    # Roam on a fixed 8-way bearing. Diagonals become alternating cardinals.
+    bearing = hash(str(unit.id)) % 8
+    dx, dy = _EIGHT_WAY_DELTAS[bearing]
+    label = _EIGHT_WAY_LABELS[bearing]
+    if dx != 0 and dy != 0:
+        # Alternate the two component axes so the path approximates the diagonal.
+        tick_bit = int(getattr(turn_context, "tick", 0) or 0) & 1
+        primary = (
+            (Direction.RIGHT if dx > 0 else Direction.LEFT)
+            if tick_bit == 0
+            else (Direction.DOWN if dy > 0 else Direction.UP)
+        )
+        secondary = (
+            (Direction.DOWN if dy > 0 else Direction.UP)
+            if tick_bit == 0
+            else (Direction.RIGHT if dx > 0 else Direction.LEFT)
+        )
+        for direction in (primary, secondary):
+            if _try_move(unit, direction, pos, obstacle_cells):
+                return ("MOVE", f"{direction.name} guerrilla-roam {label}")
+    else:
+        direction = _cardinal_toward_delta(dx, dy)
+        if direction is not None and _try_move(unit, direction, pos, obstacle_cells):
+            return ("MOVE", f"{direction.name} guerrilla-roam {label}")
+
+    return _scout_cardinal(
+        unit, pos, obstacle_cells, config, label=f"guerrilla-roam {label}",
+    )
+
+
+def _plan_vanguard(
+    vanguard,
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, Any],
+    *,
+    core_pos: tuple[int, int],
+    team: str,
+) -> tuple[str, str]:
+    """Dispatch a Vanguard according to its combat team assignment."""
+    if team == "home":
+        return _plan_home_combat(
+            vanguard,
+            unit_kind="vanguard",
+            enemies=enemies,
+            obstacle_cells=obstacle_cells,
+            core_pos=core_pos,
+            config=config,
+        )
+    if team == "attack":
+        return _plan_attack_combat(
+            vanguard,
+            unit_kind="vanguard",
+            enemies=enemies,
+            obstacle_cells=obstacle_cells,
+            config=config,
+        )
+    if team == "guerrilla":
+        return _plan_guerrilla_combat(
+            vanguard,
+            unit_kind="vanguard",
+            enemies=enemies,
+            obstacle_cells=obstacle_cells,
+            config=config,
+        )
+
+    # Unassigned units keep a conservative default: local scout only.
+    pos = tuple(vanguard.position)
+    sweep = _vanguard_adjacent_sweep(vanguard, pos, enemies)
+    if sweep is not None:
+        return sweep
+    return _scout_cardinal(
+        vanguard, pos, obstacle_cells, config, label="unassigned-scout",
+    )
 
 
 def _plan_ranger(
     ranger,
     enemies: tuple,
     obstacle_cells: frozenset[tuple[int, int]],
-    config: dict[str, int | bool],
+    config: dict[str, Any],
+    *,
+    core_pos: tuple[int, int],
+    team: str,
 ) -> tuple[str, str]:
-    """Return (action_name, detail)."""
-    pos = ranger.position
+    """Dispatch a Ranger according to its combat team assignment."""
+    if team == "home":
+        return _plan_home_combat(
+            ranger,
+            unit_kind="ranger",
+            enemies=enemies,
+            obstacle_cells=obstacle_cells,
+            core_pos=core_pos,
+            config=config,
+        )
+    if team == "attack":
+        return _plan_attack_combat(
+            ranger,
+            unit_kind="ranger",
+            enemies=enemies,
+            obstacle_cells=obstacle_cells,
+            config=config,
+        )
+    if team == "guerrilla":
+        return _plan_guerrilla_combat(
+            ranger,
+            unit_kind="ranger",
+            enemies=enemies,
+            obstacle_cells=obstacle_cells,
+            config=config,
+        )
 
-    # 1. Shoot nearest in-range enemy with clear LOS
-    best_dist = 10_000
-    best_target = None
-
-    if config["ranger_engage_enabled"]:
-        for enemy in enemies:
-            dist = _manhattan(pos, enemy.position)
-            if not (1 <= dist <= int(config["ranger_attack_range"])):
-                continue
-            if _line_blocked(pos, enemy.position, obstacle_cells):
-                continue
-            if dist < best_dist:
-                best_dist = dist
-                best_target = enemy
-
-    if best_target is not None:
-        ranger.shoot(best_target)
-        return ("SHOOT", f"enemy at {best_target.position} dist={best_dist}")
-
-    # 2. Enemies visible but out of range: move toward them
-    if config["ranger_engage_enabled"] and enemies:
-        nearest = min(enemies, key=lambda e: _manhattan(pos, e.position))
-        direction = _step_towards(pos, nearest.position)
-        if direction is not None:
-            nx, ny = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
-            if (nx, ny) not in obstacle_cells:
-                ranger.move(direction)
-                return ("MOVE", f"{direction.name} -> enemy at {nearest.position}")
-
-    # 3. No enemies: scout in unique direction (based on UUID hash)
-    idx = hash(str(ranger.id)) % 4
-    base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
-    rotated = base[idx:] + base[:idx]
-    for d in rotated:
-        nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
-        if (nx, ny) not in obstacle_cells:
-            ranger.move(d)
-            return ("MOVE", f"{d.name} scout")
-
-    ranger.wait()
-    return ("WAIT", "no_way")
+    pos = tuple(ranger.position)
+    shot = _ranger_best_shot(
+        ranger,
+        pos,
+        enemies,
+        obstacle_cells,
+        int(config["ranger_attack_range"]),
+    )
+    if shot is not None:
+        return shot
+    return _scout_cardinal(
+        ranger, pos, obstacle_cells, config, label="unassigned-scout",
+    )
 
 
 # ── top-level tactic ─────────────────────────────────────────────────────────
@@ -706,8 +1180,44 @@ def _update_resource_memory(turn) -> None:
 turn_context = type(
     "_Ctx",
     (),
-    {"resource_space": 0, "config": {}, "worker_routes": {}},
+    {"resource_space": 0, "config": {}, "worker_routes": {}, "tick": 0},
 )()
+
+
+def _sync_production_queue(turn: Any) -> None:
+    """Resolve the one spawn request issued on a previous Tick."""
+    inflight = production_queue.inflight_request()
+    if inflight is None:
+        return
+
+    event_types = {str(event.event_type) for event in turn.events}
+    if "CORE_SPAWN_SUCCEEDED" in event_types:
+        production_queue.finish_inflight(inflight["id"], succeeded=True)
+    elif "CORE_SPAWN_FAILED" in event_types:
+        production_queue.finish_inflight(inflight["id"], succeeded=False)
+    else:
+        production_queue.reset_stale_inflight(int(turn.tick))
+
+
+def _plan_queued_spawn(turn: Any, core: Any, resources: int) -> str | None:
+    """Queue the affordable FIFO production request when the Core cell is free."""
+    if production_queue.inflight_request() is not None:
+        return None
+
+    request = production_queue.head_request()
+    if request is None or resources < int(request["cost"]):
+        return None
+    if any(tuple(unit.position) == tuple(core.position) for unit in turn.units):
+        return None
+    if not production_queue.claim_request(request["id"], int(turn.tick)):
+        return None
+
+    try:
+        core.spawn(UnitType(request["unit_type"]))
+    except Exception:
+        production_queue.finish_inflight(request["id"], succeeded=False)
+        return None
+    return f'SPAWN_{request["unit_type"]}'
 
 
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
@@ -717,6 +1227,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     config = load_config()
     turn_context.config = config
     turn_context.worker_routes = {}
+    turn_context.tick = int(getattr(turn, "tick", 0) or 0)
+    _sync_production_queue(turn)
 
     # ── Update permanent map memory ────────────────────────────────────
     known_obstacles = _update_obstacle_memory(turn)
@@ -729,6 +1241,10 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     # ── Lifecycle guard ─────────────────────────────────────────────────
     if turn.core is None:
         return ("RESPAWN", {})
+
+    # Newly produced (or previously unassigned) combat units join 守家队.
+    config = _auto_enlist_new_combat_units(turn, config)
+    turn_context.config = config
 
     core = turn.core
     core_pos = core.position
@@ -788,6 +1304,12 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         core_action_name = "PICKUP_BEACON"
         core_done = True
 
+    if not core_done:
+        queued_spawn = _plan_queued_spawn(turn, core, resources)
+        if queued_spawn is not None:
+            core_action_name = queued_spawn
+            core_done = True
+
     if not core_done and config["repair_enabled"] and resources >= 1:
         effective_cap = 10 if beacon_carried_by_core else 5
         shield_target = (
@@ -801,7 +1323,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             core_action_name = "REPAIR_SHIELD"
             core_done = True
 
-    # ── No auto-spawn ── manual control only ─────────────────────────────
+    # ── Core movement ────────────────────────────────────────────────────
     if not core_done and config["core_movement_enabled"]:
         # Stop if a cargo worker is close, otherwise move toward them
         close_cargo = any(
@@ -872,11 +1394,29 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             )
             unit_actions_detail[uid] = f"{action}:{detail}"
         elif unit.unit_type == UnitType.VANGUARD:
-            action, detail = _plan_vanguard(unit, enemies, obstacle_cells, config)
-            unit_actions_detail[uid] = f"{action}:{detail}"
+            unit_name = _object_name(unit.id, "V")
+            team = _combat_team_for(unit_name, config)
+            action, detail = _plan_vanguard(
+                unit,
+                enemies,
+                obstacle_cells,
+                config,
+                core_pos=tuple(core_pos),
+                team=team,
+            )
+            unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
         elif unit.unit_type == UnitType.RANGER:
-            action, detail = _plan_ranger(unit, enemies, obstacle_cells, config)
-            unit_actions_detail[uid] = f"{action}:{detail}"
+            unit_name = _object_name(unit.id, "R")
+            team = _combat_team_for(unit_name, config)
+            action, detail = _plan_ranger(
+                unit,
+                enemies,
+                obstacle_cells,
+                config,
+                core_pos=tuple(core_pos),
+                team=team,
+            )
+            unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
 
     return core_action_name, unit_actions_detail
 
