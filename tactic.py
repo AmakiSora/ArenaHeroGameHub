@@ -425,9 +425,12 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 
     # ── No auto-spawn ── manual control only ─────────────────────────────
     if not core_done:
-        # Check if any worker has cargo (stop for them to deposit)
-        any_cargo = any(w.cargo > 0 for w in turn.workers)
-        if not any_cargo:
+        # Stop if a cargo worker is close (5 cells), otherwise move toward them
+        close_cargo = any(
+            w.cargo > 0 and _manhattan(w.position, core_pos) <= 5
+            for w in turn.workers
+        )
+        if not close_cargo:
             # Move toward workers + resources center of mass
             # Compute average worker position
             wx = [w.position[0] for w in turn.workers]
