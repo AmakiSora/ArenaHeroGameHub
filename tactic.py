@@ -279,8 +279,26 @@ def _plan_worker(
                 worker.move(bfs_dir)
                 _worker_last_pos[str(worker.id)] = pos
                 return ("MOVE", f"{bfs_dir.name} -> {goal}")
-        # BFS failed (trapped) - fall through to explore instead of oscillating
+        # BFS failed (trapped) - fall through to explore or greedy fallback
         goal = None
+
+    # Cargo worker with BFS failed: greedy move toward core
+    if worker.cargo and goal is None:
+        prev = _worker_last_pos.get(str(worker.id))
+        def _cargo_sort(d):
+            nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+            dist = _manhattan((nx, ny), core.position)
+            if prev and (nx, ny) == prev:
+                dist += 10
+            return dist
+        all_dirs = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
+        all_dirs.sort(key=_cargo_sort)
+        for d in all_dirs:
+            nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+            if (nx, ny) not in obstacle_cells:
+                worker.move(d)
+                _worker_last_pos[str(worker.id)] = pos
+                return ("MOVE", f"{d.name} -> {core.position}")
 
     # No goal at all: fan out with backtracking avoidance
     if goal is None and not worker.cargo:
@@ -473,11 +491,20 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     beacon_on_ground_here = beacon.status == "GROUND" and beacon.position == core_pos
     beacon_carried_by_core = beacon.status == "CARRIED" and beacon.carrier_id == core.id
 
+    # Build depleted set from previous Tick events
+    depleted: set[tuple[int, int]] = set()
+    for event in turn.events:
+        if (
+            event.event_type == "HARVEST_FAILED"
+            and event.reason_code == "RESOURCE_DEPLETED"
+            and event.position
+        ):
+            depleted.add(event.position)
+
     # Assign each resource to the closest worker (avoid stampede)
     _resource_assignments.clear()
     all_resources = list(turn.resource_cells) + [p for p in _resource_memory if p not in depleted]
     worker_list = [(str(w.id), tuple(w.position)) for w in turn.workers]
-    # For each resource, find the closest worker that hasn't been assigned elsewhere
     assigned_workers: set[str] = set()
     for res in sorted(all_resources, key=lambda p: min(_manhattan(p, w[1]) for w in worker_list) if worker_list else 0):
         if not worker_list:
@@ -487,9 +514,6 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         if wid not in assigned_workers:
             _resource_assignments[wid] = res
             assigned_workers.add(wid)
-
-    # Build depleted set from previous Tick events
-    depleted: set[tuple[int, int]] = set()
     for event in turn.events:
         if (
             event.event_type == "HARVEST_FAILED"
