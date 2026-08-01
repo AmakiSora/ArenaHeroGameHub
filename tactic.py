@@ -237,6 +237,23 @@ def _plan_worker(
         if remembered:
             goal = min(remembered, key=lambda p: _manhattan(pos, p))
 
+    # No goal at all: fan out in unique direction based on worker ID
+    if goal is None and not worker.cargo:
+        # Use UUID hash to pick a unique exploration direction
+        idx = hash(str(worker.id)) % 4
+        dirs = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
+        preferred = dirs[idx]
+        nx, ny = pos[0] + preferred.delta[0], pos[1] + preferred.delta[1]
+        if (nx, ny) not in obstacle_cells:
+            worker.move(preferred)
+            return ("MOVE", f"{preferred.name} explore")
+        # Fallback: try other directions
+        for d in dirs:
+            nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+            if (nx, ny) not in obstacle_cells:
+                worker.move(d)
+                return ("MOVE", f"{d.name} explore")
+
     if goal is not None and goal != pos:
         direction = _step_towards(pos, goal)
         if direction is not None:
