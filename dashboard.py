@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 LOG_FILE = "tactic_log.jsonl"
 HOST = "0.0.0.0"
-PORT = 8080
+PORT = 4399
 
 
 def read_latest():
