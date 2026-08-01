@@ -74,61 +74,158 @@ def load_map_memory():
         return {"obstacles": [], "resources": [], "obstacle_count": 0, "resource_count": 0}
 
 
-def render_ascii_map(rec, map_mem, radius: int = 18) -> str:
-    """Render a local known-map around the core using permanent obstacle memory."""
+def render_svg_map(rec, map_mem, radius: int = 16, cell: int = 18) -> str:
+    """Render a polished local SVG map around the core."""
     core = rec.get("core_pos")
     if not core:
-        return "暂无核心位置"
-    cx, cy = core[0], core[1]
+        return '<div class="muted">暂无核心位置</div>'
+
+    cx, cy = int(core[0]), int(core[1])
     xmin, xmax = cx - radius, cx + radius
     ymin, ymax = cy - radius, cy + radius
-    width = xmax - xmin + 1
-    height = ymax - ymin + 1
+    cols = xmax - xmin + 1
+    rows = ymax - ymin + 1
+    pad = 28
+    width = cols * cell + pad * 2
+    height = rows * cell + pad * 2
 
-    grid = [["." for _ in range(width)] for _ in range(height)]
+    def in_view(x, y):
+        return xmin <= x <= xmax and ymin <= y <= ymax
 
-    def put(x, y, ch):
-        if xmin <= x <= xmax and ymin <= y <= ymax:
-            grid[ymax - y][x - xmin] = ch
+    def to_xy(x, y):
+        # SVG y grows downward; game y grows upward
+        return pad + (x - xmin) * cell, pad + (ymax - y) * cell
 
-    for ox, oy in map_mem.get("obstacles", []):
-        put(ox, oy, "#")
-    for rx, ry in map_mem.get("resources", []):
-        put(rx, ry, "o")
+    obstacles = {(int(x), int(y)) for x, y in map_mem.get("obstacles", []) if in_view(int(x), int(y))}
+    mem_res = {(int(x), int(y)) for x, y in map_mem.get("resources", []) if in_view(int(x), int(y))}
+    vis_res = set()
     for p in rec.get("resource_cells", []) or []:
-        if len(p) == 2:
-            put(p[0], p[1], "$")
+        if len(p) == 2 and in_view(int(p[0]), int(p[1])):
+            vis_res.add((int(p[0]), int(p[1])))
+
+    parts = [
+        f'<svg class="game-map" viewBox="0 0 {width} {height}" role="img" aria-label="known-map">',
+        '<defs>',
+        '<linearGradient id="floorGrad" x1="0" y1="0" x2="1" y2="1">',
+        '<stop offset="0%" stop-color="#121a2f"/>',
+        '<stop offset="100%" stop-color="#0b1222"/>',
+        '</linearGradient>',
+        '<radialGradient id="coreGlow" cx="50%" cy="50%" r="50%">',
+        '<stop offset="0%" stop-color="#6ea8ff" stop-opacity="0.55"/>',
+        '<stop offset="100%" stop-color="#6ea8ff" stop-opacity="0"/>',
+        '</radialGradient>',
+        '<filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">',
+        '<feGaussianBlur stdDeviation="2.2" result="coloredBlur"/>',
+        '<feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>',
+        '</filter>',
+        '</defs>',
+        f'<rect x="0" y="0" width="{width}" height="{height}" rx="18" fill="url(#floorGrad)"/>',
+        f'<rect x="{pad-8}" y="{pad-8}" width="{cols*cell+16}" height="{rows*cell+16}" rx="14" fill="rgba(255,255,255,0.02)" stroke="rgba(255,255,255,0.06)"/>',
+    ]
+
+    # floor grid
+    for gy in range(rows):
+        for gx in range(cols):
+            x = pad + gx * cell
+            y = pad + gy * cell
+            tone = "#152038" if (gx + gy) % 2 == 0 else "#10182c"
+            parts.append(
+                f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" fill="{tone}" stroke="rgba(255,255,255,0.025)"/>'
+            )
+
+    # obstacles
+    for ox, oy in obstacles:
+        x, y = to_xy(ox, oy)
+        parts.append(
+            f'<rect x="{x+1.5}" y="{y+1.5}" width="{cell-3}" height="{cell-3}" rx="4" '
+            f'fill="#3a455f" stroke="#7f8eab" stroke-width="1"/>'
+        )
+        parts.append(
+            f'<path d="M{x+5} {y+5} L{x+cell-5} {y+cell-5} M{x+cell-5} {y+5} L{x+5} {y+cell-5}" '
+            f'stroke="rgba(180,195,220,0.35)" stroke-width="1"/>'
+        )
+
+    # remembered resources
+    for rx, ry in mem_res - vis_res:
+        x, y = to_xy(rx, ry)
+        cxr, cyr = x + cell / 2, y + cell / 2
+        parts.append(f'<circle cx="{cxr}" cy="{cyr}" r="5" fill="#c9a227" opacity="0.55"/>')
+        parts.append(f'<circle cx="{cxr}" cy="{cyr}" r="2.5" fill="#ffe08a" opacity="0.8"/>')
+
+    # visible resources
+    for rx, ry in vis_res:
+        x, y = to_xy(rx, ry)
+        cxr, cyr = x + cell / 2, y + cell / 2
+        parts.append(f'<circle cx="{cxr}" cy="{cyr}" r="7" fill="#ffc857" filter="url(#softGlow)"/>')
+        parts.append(f'<circle cx="{cxr}" cy="{cyr}" r="3" fill="#fff3c4"/>')
+
+    def unit_marker(pos, color, label, glow=False, ring=None):
+        if not pos or len(pos) != 2 or not in_view(int(pos[0]), int(pos[1])):
+            return
+        x, y = to_xy(int(pos[0]), int(pos[1]))
+        ux, uy = x + cell / 2, y + cell / 2
+        if glow:
+            parts.append(f'<circle cx="{ux}" cy="{uy}" r="12" fill="{color}" opacity="0.18"/>')
+        if ring:
+            parts.append(f'<circle cx="{ux}" cy="{uy}" r="9" fill="none" stroke="{ring}" stroke-width="2"/>')
+        parts.append(
+            f'<circle cx="{ux}" cy="{uy}" r="6.5" fill="{color}" filter="url(#softGlow)" '
+            f'stroke="rgba(255,255,255,0.65)" stroke-width="1.2"/>'
+        )
+        parts.append(
+            f'<text x="{ux}" y="{uy+3.2}" text-anchor="middle" font-size="8" font-family="Segoe UI, Microsoft YaHei, sans-serif" '
+            f'font-weight="700" fill="#0b1020">{label}</text>'
+        )
 
     for w in rec.get("workers", []):
-        pos = w.get("pos") or []
-        if len(pos) == 2:
-            put(pos[0], pos[1], "B" if w.get("cargo") else "W")
+        cargo = bool(w.get("cargo"))
+        unit_marker(
+            w.get("pos"),
+            "#57d6a3" if cargo else "#8aa4ff",
+            "B" if cargo else "W",
+            glow=cargo,
+            ring="#9ef0c8" if cargo else None,
+        )
     for v in rec.get("vanguards", []):
-        pos = v.get("pos") or []
-        if len(pos) == 2:
-            put(pos[0], pos[1], "V")
+        unit_marker(v.get("pos"), "#ff6b9d", "V", glow=True)
     for r in rec.get("rangers", []):
-        pos = r.get("pos") or []
-        if len(pos) == 2:
-            put(pos[0], pos[1], "R")
-    put(cx, cy, "C")
+        unit_marker(r.get("pos"), "#b38cff", "R", glow=True)
 
-    lines = []
-    for row_i, row in enumerate(grid):
-        y = ymax - row_i
-        prefix = f"{y:4d} " if (row_i % 2 == 0 or y in (ymin, ymax, cy)) else "     "
-        lines.append(prefix + "".join(row))
-    # x labels
-    labels = [" "] * width
+    # core last so it sits on top
+    x, y = to_xy(cx, cy)
+    ux, uy = x + cell / 2, y + cell / 2
+    parts.append(f'<circle cx="{ux}" cy="{uy}" r="16" fill="url(#coreGlow)"/>')
+    parts.append(
+        f'<rect x="{ux-7}" y="{uy-7}" width="14" height="14" rx="3" transform="rotate(45 {ux} {uy})" '
+        f'fill="#6ea8ff" stroke="#d7e8ff" stroke-width="1.4" filter="url(#softGlow)"/>'
+    )
+    parts.append(
+        f'<text x="{ux}" y="{uy+3.2}" text-anchor="middle" font-size="8" font-family="Segoe UI, Microsoft YaHei, sans-serif" '
+        f'font-weight="700" fill="#081018">C</text>'
+    )
+
+    # axis labels every 5 cells
     for x in range(xmin, xmax + 1):
         if x % 5 == 0:
-            s = str(x)
-            start = x - xmin
-            for i, ch in enumerate(s):
-                if 0 <= start + i < width:
-                    labels[start + i] = ch
-    lines.append("     " + "".join(labels))
-    return "\n".join(lines)
+            px, _ = to_xy(x, ymin)
+            parts.append(
+                f'<text x="{px + cell/2}" y="{height - 8}" text-anchor="middle" fill="#7f8eab" font-size="9" '
+                f'font-family="Consolas, monospace">{x}</text>'
+            )
+    for yv in range(ymin, ymax + 1):
+        if yv % 5 == 0:
+            _, py = to_xy(xmin, yv)
+            parts.append(
+                f'<text x="{12}" y="{py + cell/2 + 3}" text-anchor="middle" fill="#7f8eab" font-size="9" '
+                f'font-family="Consolas, monospace">{yv}</text>'
+            )
+
+    parts.append(
+        f'<text x="{pad}" y="{18}" fill="#93a0bf" font-size="11" font-family="Segoe UI, Microsoft YaHei, sans-serif">'
+        f'center {cx},{cy} | range +/-{radius}</text>'
+    )
+    parts.append("</svg>")
+    return "".join(parts)
 
 
 def short_id(uid: str) -> str:
@@ -241,7 +338,7 @@ def generate_html() -> str:
     enemies = rec.get("visible_enemies", 0)
     resource_cells = rec.get("resource_cells", [])
     map_mem = load_map_memory()
-    ascii_map = render_ascii_map(rec, map_mem, radius=16)
+    svg_map = render_svg_map(rec, map_mem, radius=16)
     events = rec.get("events", [])[:8]
     running = age < 30
     status_text = "运行中" if running else "已停止"
@@ -585,18 +682,17 @@ body {{
   border-color: rgba(255,200,87,.18);
   color: #ffe0a0;
 }}
-.map-panel pre {{
-  margin: 0;
-  overflow: auto;
-  max-height: 520px;
-  font-family: Consolas, "Cascadia Mono", monospace;
-  font-size: 11px;
-  line-height: 1.15;
-  color: #d7e3ff;
-  background: rgba(0,0,0,.25);
+.map-panel .game-map {{
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 16px;
+  background: rgba(0,0,0,.18);
   border: 1px solid rgba(255,255,255,.06);
-  border-radius: 14px;
-  padding: 12px;
+}}
+.map-stage {{
+  overflow: auto;
+  border-radius: 16px;
 }}
 .map-legend {{
   display: flex;
@@ -612,6 +708,24 @@ body {{
   background: rgba(255,255,255,.04);
   border: 1px solid rgba(255,255,255,.06);
 }}
+.map-legend .dot {{
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: -1px;
+  box-shadow: 0 0 8px currentColor;
+}}
+.map-legend .dot.core {{ background:#6ea8ff; color:#6ea8ff; border-radius:2px; transform:rotate(45deg); }}
+.map-legend .dot.cargo {{ background:#57d6a3; color:#57d6a3; }}
+.map-legend .dot.worker {{ background:#8aa4ff; color:#8aa4ff; }}
+.map-legend .dot.vg {{ background:#ff6b9d; color:#ff6b9d; }}
+.map-legend .dot.rg {{ background:#b38cff; color:#b38cff; }}
+.map-legend .dot.wall {{ background:#3a455f; color:#7f8eab; border-radius:2px; box-shadow:none; border:1px solid #7f8eab; }}
+.map-legend .dot.ore {{ background:#ffc857; color:#ffc857; }}
+.map-legend .dot.ore-mem {{ background:#c9a227; color:#c9a227; opacity:.8; }}
+
 .muted {{ color: var(--muted); font-size: 13px; }}
 .empty {{
   grid-column: 1 / -1;
@@ -747,10 +861,16 @@ body {{
         <span>已知地图</span>
         <span class="count">墙 {map_mem.get('obstacle_count', 0)} · 记忆矿 {map_mem.get('resource_count', 0)} · 可见矿 {len(resource_cells)}</span>
       </div>
-      <pre>{ascii_map}</pre>
+      <div class="map-stage">{svg_map}</div>
       <div class="map-legend">
-        <span>C 核心</span><span>B 带矿工人</span><span>W 空手工人</span><span>V 先锋</span><span>R 游侠</span>
-        <span># 永久障碍</span><span>$ 可见矿</span><span>o 记忆矿</span><span>. 未知</span>
+        <span><i class="dot core"></i>核心</span>
+        <span><i class="dot cargo"></i>带矿工人</span>
+        <span><i class="dot worker"></i>空手工人</span>
+        <span><i class="dot vg"></i>先锋</span>
+        <span><i class="dot rg"></i>游侠</span>
+        <span><i class="dot wall"></i>永久障碍</span>
+        <span><i class="dot ore"></i>可见矿</span>
+        <span><i class="dot ore-mem"></i>记忆矿</span>
       </div>
     </section>
 
