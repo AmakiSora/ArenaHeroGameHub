@@ -290,7 +290,7 @@ body{margin:0;min-height:100vh;color:var(--text);
   radial-gradient(900px 500px at 100% 0%,rgba(255,107,157,.12),transparent 45%),
   radial-gradient(700px 400px at 70% 100%,rgba(87,214,163,.10),transparent 40%),
   linear-gradient(180deg,#0a1020 0%,#070b16 100%);}
-.wrap{max-width:1280px;margin:0 auto;padding:24px 20px 40px}
+.wrap{max-width:1480px;margin:0 auto;padding:18px 16px 28px}
 .topbar{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:18px}
 .brand h1{margin:0;font-size:28px;letter-spacing:.3px}
 .brand p{margin:6px 0 0;color:var(--muted);font-size:14px}
@@ -316,7 +316,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .layout{display:grid;grid-template-columns:1.4fr .9fr;gap:14px}
 .panel-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-size:16px;font-weight:700}
 .count{color:var(--muted);font-size:13px;font-weight:500}
-.unit-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.unit-grid{display:grid;grid-template-columns:1fr;gap:8px}
 .unit{border-radius:16px;padding:12px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);transition:transform .15s,border-color .15s}
 .unit:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.14)}
 .unit.cargo{background:rgba(87,214,163,.08)}
@@ -359,7 +359,7 @@ body{margin:0;min-height:100vh;color:var(--text);
  touch-action:none;user-select:none;max-width:none;transform-origin:0 0;
  will-change:transform}
 .map-panel .game-map.dragging{cursor:grabbing}
-.map-stage{position:relative;height:min(68vh,720px);overflow:hidden;border-radius:16px;
+.map-stage{position:relative;height:min(52vh,520px);overflow:hidden;border-radius:16px;
  border:1px solid rgba(255,255,255,.06);
  background:radial-gradient(800px 400px at 20% 0%,rgba(110,168,255,.08),transparent 55%),
   radial-gradient(700px 360px at 90% 100%,rgba(255,107,157,.06),transparent 50%),#0b1222}
@@ -381,7 +381,38 @@ body{margin:0;min-height:100vh;color:var(--text);
 .map-legend .dot.wall{background:#3a455f;color:#7f8eab;border-radius:2px;box-shadow:none;border:1px solid #7f8eab;width:9px;height:9px}
 .map-legend .dot.ore{background:#ffc857;color:#ffc857}
 .map-legend .dot.ore-mem{background:#c9a227;color:#c9a227;opacity:.8}
-@media (max-width:980px){.hero,.metrics,.layout,.unit-grid{grid-template-columns:1fr}.topbar{flex-direction:column}}
+
+.main-grid{display:grid;grid-template-columns:280px minmax(0,1fr) 320px;gap:14px;align-items:start}
+.side-col{display:grid;gap:12px;min-width:0}
+.side-col .panel{padding:14px}
+.side-col .panel-title{font-size:14px;margin-bottom:10px}
+.center-col{display:grid;gap:12px;min-width:0}
+.map-panel{margin:0}
+.map-panel .map-toolbar{margin-bottom:8px}
+.map-legend{margin-top:8px}
+.compact-list{display:grid;gap:8px;max-height:42vh;overflow:auto;padding-right:2px}
+.compact-list::-webkit-scrollbar{width:6px}
+.compact-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:99px}
+.kv{display:flex;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:12px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);font-size:12px}
+.kv b{color:#eef3ff;font-weight:700}
+.kv span{color:var(--muted)}
+.stat-chips{display:flex;flex-wrap:wrap;gap:6px}
+.mini-bar{height:6px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:8px}
+.mini-bar>span{display:block;height:100%;background:linear-gradient(90deg,#57d6a3,#6ea8ff)}
+.hero{display:none}
+.metrics{display:none}
+.layout{display:none}
+@media (max-width:1100px){
+  .main-grid{grid-template-columns:1fr}
+  .compact-list{max-height:none}
+  .map-stage{height:min(48vh,460px)}
+  .hero{display:grid}
+  .metrics{display:grid}
+}
+@media (max-width:980px){
+  .topbar{flex-direction:column}
+}
+
 """
 
 JS = r"""
@@ -569,6 +600,7 @@ JS = r"""
       lastTick = data.tick;
 
       if(data.brand) setHtml('#brandLine', data.brand);
+      if(data.leftHtml) setHtml('#leftColumn', data.leftHtml);
       if(data.statusHtml) setHtml('#statusPill', data.statusHtml);
       if(data.statusClass) setClass('#statusPill', 'status-pill ' + data.statusClass);
       if(data.heroHtml) setHtml('#heroSection', data.heroHtml);
@@ -781,8 +813,67 @@ def build_parts():
         f'<div>更新于 {time.strftime("%H:%M:%S")} · Tick {rec.get("tick")}</div>'
     )
 
+
+    left_core = (
+        f'<div class="kv"><span>位置</span><b>{fmt_pos(rec.get("core_pos"))}</b></div>'
+        f'<div class="kv"><span>动作</span><b>{rec.get("core_action") or "—"}</b></div>'
+        f'<div class="kv"><span>状态</span><b>{rec.get("core_state") or "—"}</b></div>'
+        f'<div class="kv"><span>HP / 盾</span><b>{rec.get("core_hp","?")} / {rec.get("core_shield","?")}</b></div>'
+        f'<div class="kv"><span>人口</span><b>{rec.get("population",0)} · 层{rec.get("population_tier",0)}</b></div>'
+        f'<div class="kv"><span>信标</span><b>{fmt_pos(rec.get("beacon_pos"))}</b></div>'
+    )
+    left_res = (
+        f'<div class="kv"><span>库存</span><b>{resources} / {cap}</b></div>'
+        f'<div class="mini-bar"><span style="width:{pct}%"></span></div>'
+        f'<div class="kv" style="margin-top:8px"><span>可见矿</span><b>{len(rcells)}</b></div>'
+        f'<div class="kv"><span>记忆矿</span><b>{mm.get("resource_count",0)}</b></div>'
+        f'<div class="kv"><span>墙记忆</span><b>{mm.get("obstacle_count",0)}</b></div>'
+        f'<div class="kv"><span>可见墙</span><b>{rec.get("obstacle_cells_visible",0)}</b></div>'
+    )
+    left_fight = (
+        f'<div class="kv"><span>敌人</span><b>{enemies}</b></div>'
+        f'<div class="kv"><span>工人</span><b>{len(workers)}</b></div>'
+        f'<div class="kv"><span>先锋 / 游侠</span><b>{len(vgs)} / {len(rgs)}</b></div>'
+        f'<div class="stat-chips" style="margin-top:8px">'
+        f'<span class="pill">回矿 {stats["cargo"]+stats["deposit"]}</span>'
+        f'<span class="pill">探索 {stats["explore"]}</span>'
+        f'<span class="pill">等待 {stats["wait"]}</span>'
+        f'<span class="pill">挖矿 {stats["harvest"]}</span></div>'
+    )
+    mem_list = list(mm.get("resources", []) or [])
+    if mem_list:
+        left_ores = "".join(
+            f'<div class="kv"><span>矿</span><b>{fmt_pos(p)}</b></div>' for p in mem_list[:18]
+        )
+        if len(mem_list) > 18:
+            left_ores += f'<div class="muted">…还有 {len(mem_list)-18} 个</div>'
+    else:
+        left_ores = '<div class="muted">暂无记忆矿点</div>'
+    if rcells:
+        left_vis = "".join(
+            f'<div class="kv"><span>可见</span><b>{fmt_pos(p)}</b></div>' for p in rcells[:10]
+        )
+    else:
+        left_vis = '<div class="muted">当前无可见矿</div>'
+    if issues:
+        left_issues = "".join(
+            f'<div class="issue {i["level"]}"><strong>{i["title"]}</strong><span>{i["detail"]}</span></div>'
+            for i in issues[:8]
+        )
+    else:
+        left_issues = '<div class="muted">暂无异常</div>'
+    left_html = (
+        f'<section class="panel"><div class="panel-title"><span>核心</span><span class="count">状态</span></div>{left_core}</section>'
+        f'<section class="panel"><div class="panel-title"><span>资源</span><span class="count">{pct}%</span></div>{left_res}</section>'
+        f'<section class="panel"><div class="panel-title"><span>战场</span><span class="count">摘要</span></div>{left_fight}</section>'
+        f'<section class="panel"><div class="panel-title"><span>异常</span><span class="count">{len(issues)}</span></div><div class="compact-list">{left_issues}</div></section>'
+        f'<section class="panel"><div class="panel-title"><span>可见矿</span><span class="count">{len(rcells)}</span></div><div class="compact-list">{left_vis}</div></section>'
+        f'<section class="panel"><div class="panel-title"><span>记忆矿</span><span class="count">{len(mem_list)}</span></div><div class="compact-list">{left_ores}</div></section>'
+    )
+
     return {
         "tick": rec.get("tick"),
+        "leftHtml": left_html,
         "brand": brand,
         "statusHtml": status_html,
         "statusClass": status_cls,
@@ -831,43 +922,57 @@ def generate_html() -> str:
     <div class="status-pill {parts['statusClass']}" id="statusPill">{parts['statusHtml']}</div>
   </div>
 
-  <div class="hero" id="heroSection">{parts['heroHtml']}</div>
-  <div class="metrics" id="metricsSection">{parts['metricsHtml']}</div>
-  <div id="issuesSection">{parts['issuesHtml']}</div>
+  <div class="main-grid">
+    <aside class="side-col" id="leftColumn">{parts['leftHtml']}</aside>
 
-  <section class="panel map-panel" style="margin-bottom:14px">
-   <div class="panel-title"><span>已知地图</span><span class="count" id="mapTitleCount">{parts['mapTitle']}</span></div>
-   <div class="map-toolbar">
-    <button type="button" id="zoomOutBtn">-</button>
-    <button type="button" id="zoomInBtn">+</button>
-    <button type="button" id="resetViewBtn">重置视角</button>
-    <button type="button" id="focusCoreBtn">定位核心</button>
-    <span id="zoomLabel">100%</span>
-    <span class="hint">拖动平移 · 滚轮缩放 · 软刷新不重置</span>
-   </div>
-   <div class="map-stage" id="mapStage">{parts['mapSvg']}</div>
-   <div class="map-legend">
-    <span><i class="dot core"></i>核心</span>
-    <span><i class="dot cargo"></i>带矿工人</span>
-    <span><i class="dot worker"></i>空手工人</span>
-    <span><i class="dot vg"></i>先锋</span>
-    <span><i class="dot rg"></i>游侠</span>
-    <span><i class="dot wall"></i>永久障碍</span>
-    <span><i class="dot ore"></i>可见矿</span>
-    <span><i class="dot ore-mem"></i>记忆矿</span>
-   </div>
-  </section>
-
-  <div class="layout">
-    <section class="panel"><div class="panel-title"><span>工人</span><span class="count" id="workersCount">{parts['workersCount']} 个</span></div>
-     <div class="unit-grid" id="workersGrid">{parts['workersHtml']}</div>
+    <section class="center-col">
+      <section class="panel map-panel">
+       <div class="panel-title"><span>已知地图</span><span class="count" id="mapTitleCount">{parts['mapTitle']}</span></div>
+       <div class="map-toolbar">
+        <button type="button" id="zoomOutBtn">-</button>
+        <button type="button" id="zoomInBtn">+</button>
+        <button type="button" id="resetViewBtn">重置视角</button>
+        <button type="button" id="focusCoreBtn">定位核心</button>
+        <span id="zoomLabel">100%</span>
+        <span class="hint">拖动 · 滚轮 · 软刷新</span>
+       </div>
+       <div class="map-stage" id="mapStage">{parts['mapSvg']}</div>
+       <div class="map-legend">
+        <span><i class="dot core"></i>核心</span>
+        <span><i class="dot cargo"></i>带矿</span>
+        <span><i class="dot worker"></i>空手</span>
+        <span><i class="dot vg"></i>先锋</span>
+        <span><i class="dot rg"></i>游侠</span>
+        <span><i class="dot wall"></i>墙</span>
+        <span><i class="dot ore"></i>可见矿</span>
+        <span><i class="dot ore-mem"></i>记忆矿</span>
+       </div>
+      </section>
+      <div id="issuesSection" style="display:none">{parts['issuesHtml']}</div>
     </section>
-    <div class="side-stack">
-     <section class="panel"><div class="panel-title"><span>先锋</span><span class="count" id="vgCount">{parts['vgCount']}</span></div><div class="unit-grid" id="vgGrid" style="grid-template-columns:1fr">{parts['vgHtml']}</div></section>
-     <section class="panel"><div class="panel-title"><span>游侠</span><span class="count" id="rgCount">{parts['rgCount']}</span></div><div class="unit-grid" id="rgGrid" style="grid-template-columns:1fr">{parts['rgHtml']}</div></section>
-     <section class="panel"><div class="panel-title"><span>矿点</span><span class="count" id="resCount">{parts['resCount']} 可见</span></div><div id="resSection">{parts['resHtml']}</div></section>
-     <section class="panel"><div class="panel-title"><span>本帧事件</span><span class="count" id="eventsCount">{parts['eventsCount']}</span></div><div id="eventsSection">{parts['eventsHtml']}</div></section>
-    </div>
+
+    <aside class="side-col">
+      <section class="panel">
+        <div class="panel-title"><span>工人</span><span class="count" id="workersCount">{parts['workersCount']} 个</span></div>
+        <div class="unit-grid compact-list" id="workersGrid">{parts['workersHtml']}</div>
+      </section>
+      <section class="panel">
+        <div class="panel-title"><span>先锋</span><span class="count" id="vgCount">{parts['vgCount']}</span></div>
+        <div class="unit-grid" id="vgGrid">{parts['vgHtml']}</div>
+      </section>
+      <section class="panel">
+        <div class="panel-title"><span>游侠</span><span class="count" id="rgCount">{parts['rgCount']}</span></div>
+        <div class="unit-grid" id="rgGrid">{parts['rgHtml']}</div>
+      </section>
+      <section class="panel">
+        <div class="panel-title"><span>矿点</span><span class="count" id="resCount">{parts['resCount']} 可见</span></div>
+        <div id="resSection">{parts['resHtml']}</div>
+      </section>
+      <section class="panel">
+        <div class="panel-title"><span>事件</span><span class="count" id="eventsCount">{parts['eventsCount']}</span></div>
+        <div id="eventsSection">{parts['eventsHtml']}</div>
+      </section>
+    </aside>
   </div>
 
   <div class="footer" id="footerSection">{parts['footerHtml']}</div>
