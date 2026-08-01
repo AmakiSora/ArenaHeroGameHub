@@ -425,8 +425,50 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 
     # ── No auto-spawn ── manual control only ─────────────────────────────
     if not core_done:
-        core.wait()
-        core_action_name = "WAIT"
+        # Check if any worker has cargo (stop for them to deposit)
+        any_cargo = any(w.cargo > 0 for w in turn.workers)
+        if not any_cargo:
+            # Move toward workers + resources center of mass
+            # Compute average worker position
+            wx = [w.position[0] for w in turn.workers]
+            wy = [w.position[1] for w in turn.workers]
+            if wx and wy:
+                avg_x = sum(wx) // len(wx)
+                avg_y = sum(wy) // len(wy)
+            else:
+                avg_x, avg_y = core_pos
+            # Also consider nearest resource (visible or remembered)
+            res_target = None
+            all_res = list(turn.resource_cells) + [p for p in _resource_memory if p not in depleted]
+            if all_res:
+                res_target = min(all_res, key=lambda p: _manhattan(core_pos, p))
+            # Choose target: nearest resource or worker center, whichever is closer
+            if res_target and _manhattan(core_pos, res_target) < _manhattan(core_pos, (avg_x, avg_y)):
+                target = res_target
+            else:
+                target = (avg_x, avg_y)
+            # Determine best direction
+            dx = target[0] - core_pos[0]
+            dy = target[1] - core_pos[1]
+            dirs = []
+            if abs(dx) >= abs(dy):
+                if dx > 0: dirs.append(Direction.RIGHT)
+                elif dx < 0: dirs.append(Direction.LEFT)
+                if dy > 0: dirs.append(Direction.DOWN)
+                elif dy < 0: dirs.append(Direction.UP)
+            else:
+                if dy > 0: dirs.append(Direction.DOWN)
+                elif dy < 0: dirs.append(Direction.UP)
+                if dx > 0: dirs.append(Direction.RIGHT)
+                elif dx < 0: dirs.append(Direction.LEFT)
+            # Try each direction (obstacle-aware)
+            for d in dirs:
+                nx, ny = core_pos[0] + d.delta[0], core_pos[1] + d.delta[1]
+                if (nx, ny) not in obstacle_cells:
+                    core.start_move(d)
+                    core_action_name = f"MOVE_{d.name}"
+                    core_done = True
+                    break
 
     if not core_done:
         core.wait()
