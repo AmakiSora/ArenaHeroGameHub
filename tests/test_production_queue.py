@@ -10,6 +10,7 @@ from arena_hero import UnitType
 
 import production_queue
 import tactic
+from tactic_config import default_config
 
 
 class ProductionQueueTests(unittest.TestCase):
@@ -59,6 +60,9 @@ class QueuedSpawnPlannerTests(unittest.TestCase):
         def spawn(self, unit_type: UnitType) -> None:
             self.spawned = unit_type
 
+    def setUp(self) -> None:
+        self.config = default_config()
+
     def test_affordable_head_is_spawned_and_success_removes_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "queue.db"
@@ -67,10 +71,10 @@ class QueuedSpawnPlannerTests(unittest.TestCase):
                 turn = SimpleNamespace(tick=10, units=(), events=())
                 core = self.Core()
 
-                self.assertIsNone(tactic._plan_queued_spawn(turn, core, resources=11))
+                self.assertIsNone(tactic._plan_queued_spawn(turn, core, resources=11, config=self.config))
                 self.assertEqual(production_queue.head_request()["status"], "pending")
                 self.assertEqual(
-                    tactic._plan_queued_spawn(turn, core, resources=12),
+                    tactic._plan_queued_spawn(turn, core, resources=12, config=self.config),
                     "SPAWN_RANGER",
                 )
                 self.assertEqual(core.spawned, UnitType.RANGER)
@@ -93,10 +97,46 @@ class QueuedSpawnPlannerTests(unittest.TestCase):
                 occupying_unit = SimpleNamespace(position=(0, 0))
                 turn = SimpleNamespace(tick=20, units=(occupying_unit,), events=())
 
-                action = tactic._plan_queued_spawn(turn, self.Core(), resources=20)
+                action = tactic._plan_queued_spawn(turn, self.Core(), resources=20, config=self.config)
 
                 self.assertIsNone(action)
                 self.assertEqual(production_queue.head_request()["status"], "pending")
+
+    def test_resource_reserve_blocks_spawn_when_insufficient(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "queue.db"
+            with patch.object(production_queue, "QUEUE_PATH", path):
+                production_queue.enqueue("WORKER")
+                turn = SimpleNamespace(tick=30, units=(), events=())
+                core = self.Core()
+                config = dict(self.config)
+                config["resource_reserve"] = 20
+
+                # Worker costs 5, need 5+20=25. 24 is too low.
+                self.assertIsNone(tactic._plan_queued_spawn(turn, core, resources=24, config=config))
+                self.assertEqual(production_queue.head_request()["status"], "pending")
+
+                # 25 is exactly enough.
+                self.assertEqual(
+                    tactic._plan_queued_spawn(turn, core, resources=25, config=config),
+                    "SPAWN_WORKER",
+                )
+
+    def test_default_zero_reserve_behaves_as_before(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "queue.db"
+            with patch.object(production_queue, "QUEUE_PATH", path):
+                production_queue.enqueue("WORKER")
+                turn = SimpleNamespace(tick=40, units=(), events=())
+                core = self.Core()
+                config = dict(self.config)
+                config["resource_reserve"] = 0
+
+                # Worker costs 5, reserve 0, so 5 is enough.
+                self.assertEqual(
+                    tactic._plan_queued_spawn(turn, core, resources=5, config=config),
+                    "SPAWN_WORKER",
+                )
 
 
 if __name__ == "__main__":

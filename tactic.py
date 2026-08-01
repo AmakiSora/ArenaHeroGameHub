@@ -1199,13 +1199,20 @@ def _sync_production_queue(turn: Any) -> None:
         production_queue.reset_stale_inflight(int(turn.tick))
 
 
-def _plan_queued_spawn(turn: Any, core: Any, resources: int) -> str | None:
-    """Queue the affordable FIFO production request when the Core cell is free."""
+def _plan_queued_spawn(turn: Any, core: Any, resources: int, config: dict[str, Any]) -> str | None:
+    """Queue the affordable FIFO production request when the Core cell is free.
+
+    Ensures at least `resource_reserve` resources remain after spending.
+    """
     if production_queue.inflight_request() is not None:
         return None
 
     request = production_queue.head_request()
-    if request is None or resources < int(request["cost"]):
+    if request is None:
+        return None
+    cost = int(request["cost"])
+    reserve = int(config.get("resource_reserve", 0))
+    if resources < cost + reserve:
         return None
     if any(tuple(unit.position) == tuple(core.position) for unit in turn.units):
         return None
@@ -1305,7 +1312,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         core_done = True
 
     if not core_done:
-        queued_spawn = _plan_queued_spawn(turn, core, resources)
+        queued_spawn = _plan_queued_spawn(turn, core, resources, config)
         if queued_spawn is not None:
             core_action_name = queued_spawn
             core_done = True
