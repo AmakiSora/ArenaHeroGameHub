@@ -1,6 +1,6 @@
 """Real-time tactic dashboard - lightweight HTTP server.
 Run: python dashboard.py
-Then open http://localhost:8080 in your browser.
+Then open http://localhost:4399 in your browser.
 """
 import json
 import os
@@ -63,19 +63,11 @@ def check_stuck(history):
             continue
         recent = positions[:8]
         if len(set(recent)) == 1:
-            issues.append(f"STUCK {wid[:8]} at {recent[0]} ({len(positions)} ticks)")
+            issues.append(f"卡住 {wid[:8]} 在 {recent[0]} ({len(positions)} 帧)")
         elif len(set(recent)) <= 2 and len(set(recent)) < len(recent):
             unique = list(set(recent))
-            issues.append(f"OSCILLATE {wid[:8]} between {unique}")
+            issues.append(f"来回走 {wid[:8]} 在 {unique} 之间")
     return issues
-
-
-def resource_trend(history):
-    """Track resource count over time."""
-    ticks = []
-    for rec in reversed(history):
-        ticks.append((rec["tick"], rec.get("res", 0)))
-    return ticks
 
 
 def format_pos(pos):
@@ -91,14 +83,14 @@ def generate_html():
     age = time.time() - mtime if mtime else 0
 
     if not rec:
-        return "<html><body><h1>No data yet</h1></body></html>"
+        return "<html><body><h1>暂无数据</h1></body></html>"
 
     workers = rec.get("workers", [])
     vgs = rec.get("vanguards", [])
     rgs = rec.get("rangers", [])
     actions = rec.get("plan_unit_actions", {})
 
-    alive = "RUNNING" if age < 30 else "DOWN"
+    alive = "运行中" if age < 30 else "已停止"
     alive_color = "green" if age < 30 else "red"
 
     w_rows = ""
@@ -107,33 +99,33 @@ def generate_html():
         action = actions.get(wid, "?")
         cargo = w.get("cargo", 0)
         cls = "cargo" if cargo else "explore" if "explore" in action else "wait" if "WAIT" in action else "harvest" if "HARVEST" in action else ""
-        marker = "&#x1F4E6;" if cargo else "&#x1F50D;" if "explore" in action else "&#x23F3;" if "WAIT" in action else "&#x26CF;"
+        marker = "📦" if cargo else "🔍" if "explore" in action else "⏳" if "WAIT" in action else "⛏" if "HARVEST" in action else "💰" if "DEPOSIT" in action else "❓"
         w_rows += f"<tr class='{cls}'><td>{marker}</td><td>{wid[:8]}</td><td>{format_pos(w.get('pos',[]))}</td><td>{cargo}</td><td>{action}</td></tr>"
 
     vg_rows = ""
     for v in vgs:
         vid = v.get("id", "")
         action = actions.get(vid, "?")
-        vg_rows += f"<tr><td>&#x2694;</td><td>{vid[:8]}</td><td>{format_pos(v.get('pos',[]))}</td><td>{v.get('hp','?')}</td><td>{action}</td></tr>"
+        vg_rows += f"<tr><td>⚔️</td><td>{vid[:8]}</td><td>{format_pos(v.get('pos',[]))}</td><td>{v.get('hp','?')}</td><td>{action}</td></tr>"
 
     rg_rows = ""
     for r in rgs:
         rid = r.get("id", "")
         action = actions.get(rid, "?")
-        rg_rows += f"<tr><td>&#x1F3F9;</td><td>{rid[:8]}</td><td>{format_pos(r.get('pos',[]))}</td><td>{r.get('hp','?')}</td><td>{action}</td></tr>"
+        rg_rows += f"<tr><td>🏹</td><td>{rid[:8]}</td><td>{format_pos(r.get('pos',[]))}</td><td>{r.get('hp','?')}</td><td>{action}</td></tr>"
 
     issues_html = ""
     if issues:
-        issues_html = "<div class='issues'><h3>Issues</h3><ul>" + "".join(f"<li>{i}</li>" for i in issues) + "</ul></div>"
+        issues_html = "<div class='issues'><h3>异常</h3><ul>" + "".join(f"<li>{i}</li>" for i in issues) + "</ul></div>"
 
     return f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="refresh" content="3">
-<title>Arena Hero Tactic Dashboard</title>
+<title>Arena Hero 战术仪表盘</title>
 <style>
-body {{ font-family: 'Segoe UI', sans-serif; margin: 20px; background: #1a1a2e; color: #e0e0e0; }}
+body {{ font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; margin: 20px; background: #1a1a2e; color: #e0e0e0; }}
 h1, h2, h3 {{ color: #e94560; }}
 .status {{ display: inline-block; padding: 4px 12px; border-radius: 4px; font-weight: bold; }}
 table {{ border-collapse: collapse; width: 100%; margin: 8px 0; }}
@@ -152,38 +144,38 @@ tr:hover {{ background: #0f3460; }}
 </style>
 </head>
 <body>
-<h1>Arena Hero Tactic</h1>
+<h1>Arena Hero 战术仪表盘</h1>
 <div class="meta">
   Tick: <strong>{rec['tick']}</strong> |
-  Core: {format_pos(rec.get('core_pos'))} -> {rec.get('core_action','?')} |
-  Resources: {rec.get('res',0)}/{rec.get('max_res',50)} |
-  Enemies: {rec.get('enemies',0)} |
-  <span class="status" style="background:{alive_color};">{alive}</span> (log age: {age:.0f}s)
+  核心: {format_pos(rec.get('core_pos'))} -> {rec.get('core_action','?')} |
+  资源: {rec.get('res',0)}/{rec.get('max_res',50)} |
+  敌人: {rec.get('enemies',0)} |
+  <span class="status" style="background:{alive_color};">{alive}</span> (日志 {age:.0f}s 前)
 </div>
 {issues_html}
 <div class="grid">
   <div>
-    <h2>Workers ({len(workers)})</h2>
+    <h2>工人 ({len(workers)})</h2>
     <table>
-      <tr><th></th><th>ID</th><th>Pos</th><th>Cargo</th><th>Action</th></tr>
+      <tr><th></th><th>ID</th><th>位置</th><th>矿</th><th>动作</th></tr>
       {w_rows}
     </table>
   </div>
   <div>
-    <h2>Vanguards ({len(vgs)})</h2>
+    <h2>先锋 ({len(vgs)})</h2>
     <table>
-      <tr><th></th><th>ID</th><th>Pos</th><th>HP</th><th>Action</th></tr>
+      <tr><th></th><th>ID</th><th>位置</th><th>HP</th><th>动作</th></tr>
       {vg_rows}
     </table>
-    <h2>Rangers ({len(rgs)})</h2>
+    <h2>游侠 ({len(rgs)})</h2>
     <table>
-      <tr><th></th><th>ID</th><th>Pos</th><th>HP</th><th>Action</th></tr>
+      <tr><th></th><th>ID</th><th>位置</th><th>HP</th><th>动作</th></tr>
       {rg_rows}
     </table>
   </div>
 </div>
 <div class="meta">
-  Last updated: {time.strftime('%H:%M:%S')} | Auto-refresh every 3s
+  更新: {time.strftime('%H:%M:%S')} | 每 3 秒自动刷新
 </div>
 </body>
 </html>"""
@@ -201,17 +193,17 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        pass  # suppress logs
+        pass
 
 
 def main():
     server = HTTPServer((HOST, PORT), Handler)
-    print(f"[Dashboard] http://localhost:{PORT}")
-    print(f"[Dashboard] Press Ctrl+C to stop")
+    print(f"[仪表盘] http://localhost:{PORT}")
+    print(f"[仪表盘] Ctrl+C 停止")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[Dashboard] stopped")
+        print("\n[仪表盘] 已停止")
         server.server_close()
 
 
