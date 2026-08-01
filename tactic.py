@@ -368,6 +368,14 @@ def _plan_worker(
         if assigned and assigned in _resource_memory:
             goal = assigned
 
+    # Reaching a remembered target without seeing a resource confirms that the
+    # memory is stale. Forget it and explore immediately instead of waiting on
+    # the empty cell forever.
+    if goal == pos and not worker.cargo and pos not in resource_cells:
+        _forget_resource(pos)
+        _resource_assignments.pop(str(worker.id), None)
+        goal = None
+
     # Move toward goal (BFS multi-step pathfinding, avoids dead ends)
     if config["worker_bfs_enabled"] and goal is not None and goal != pos:
         path = _bfs_path(
@@ -558,6 +566,9 @@ def _plan_ranger(
 
 # ── shared map memory (persists across ticks + process restarts) ───────────
 _resource_memory: set[tuple[int, int]] = set()
+# Resources confirmed absent but not yet flushed to map_memory.json. Tombstones
+# prevent sticky manual entries on disk from being merged back during a save.
+_resource_tombstones: set[tuple[int, int]] = set()
 # Permanent obstacles: once seen, always blocked
 _obstacle_memory: set[tuple[int, int]] = set()
 # Track each worker's previous position to avoid backtracking
@@ -618,8 +629,8 @@ def _save_map_memory(
         except Exception:
             manual = set()
 
-    # keep all known resources, plus sticky manual ones
-    resources = set(_resource_memory) | manual
+    manual -= _resource_tombstones
+    resources = (set(_resource_memory) | manual) - _resource_tombstones
     _resource_memory.clear()
     _resource_memory.update(resources)
 
@@ -636,6 +647,7 @@ def _save_map_memory(
     tmp = MAP_MEMORY_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(MAP_MEMORY_PATH)
+    _resource_tombstones.clear()
     _map_dirty = False
     if tick is not None:
         _last_map_save_tick = tick
@@ -653,6 +665,15 @@ def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
     return frozenset(_obstacle_memory)
 
 
+def _forget_resource(position: tuple[int, int]) -> None:
+    """Mark a resource as absent in memory and the next persisted map."""
+    global _map_dirty
+    pos = tuple(position)
+    _resource_memory.discard(pos)
+    _resource_tombstones.add(pos)
+    _map_dirty = True
+
+
 def _update_resource_memory(turn) -> None:
     """Remember visible resources permanently until depletion is confirmed.
 
@@ -663,7 +684,9 @@ def _update_resource_memory(turn) -> None:
     before = set(_resource_memory)
 
     for p in turn.resource_cells:
-        _resource_memory.add(tuple(p) if not isinstance(p, tuple) else p)
+        pos = tuple(p) if not isinstance(p, tuple) else p
+        _resource_memory.add(pos)
+        _resource_tombstones.discard(pos)
 
     for event in turn.events:
         if (
@@ -672,20 +695,7 @@ def _update_resource_memory(turn) -> None:
             and event.position
         ):
             pos = tuple(event.position)
-            _resource_memory.discard(pos)
-            # also drop from sticky manual list on disk
-            if MAP_MEMORY_PATH.exists():
-                try:
-                    data = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
-                    manual = [p for p in data.get("manual_resources", []) if tuple(p) != pos]
-                    if len(manual) != len(data.get("manual_resources", [])):
-                        data["manual_resources"] = manual
-                        data["manual_count"] = len(manual)
-                        MAP_MEMORY_PATH.write_text(
-                            json.dumps(data, ensure_ascii=False), encoding="utf-8"
-                        )
-                except Exception:
-                    pass
+            _forget_resource(pos)
 
     if _resource_memory != before:
         _map_dirty = True

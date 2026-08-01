@@ -23,8 +23,90 @@ class ResourceMergeTests(unittest.TestCase):
 
         self.assertEqual(resources, [(2, 3), (6, 7)])
 
+    def test_forgotten_manual_resource_is_not_restored_on_save(self) -> None:
+        stale_resource = (1, 1)
+        active_resource = (2, 2)
+        original_memory = set(tactic._resource_memory)
+        original_tombstones = set(tactic._resource_tombstones)
+        original_dirty = tactic._map_dirty
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                memory_path = Path(temp_dir) / "map_memory.json"
+                memory_path.write_text(json.dumps({
+                    "obstacles": [],
+                    "resources": [list(stale_resource), list(active_resource)],
+                    "manual_resources": [list(stale_resource)],
+                }), encoding="utf-8")
+                tactic._resource_memory.clear()
+                tactic._resource_memory.update({stale_resource, active_resource})
+                tactic._resource_tombstones.clear()
+
+                with patch.object(tactic, "MAP_MEMORY_PATH", memory_path):
+                    tactic._forget_resource(stale_resource)
+                    tactic._save_map_memory(force=True)
+
+                saved = json.loads(memory_path.read_text(encoding="utf-8"))
+        finally:
+            tactic._resource_memory.clear()
+            tactic._resource_memory.update(original_memory)
+            tactic._resource_tombstones.clear()
+            tactic._resource_tombstones.update(original_tombstones)
+            tactic._map_dirty = original_dirty
+
+        self.assertEqual(saved["resources"], [list(active_resource)])
+        self.assertEqual(saved["manual_resources"], [])
+
 
 class ConfiguredPlannerTests(unittest.TestCase):
+    def test_worker_forgets_empty_remembered_target_and_explores(self) -> None:
+        class Worker:
+            id = "worker-1"
+            position = (0, 0)
+            cargo = 0
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        stale_resource = worker.position
+        config = default_config()
+        original_memory = set(tactic._resource_memory)
+        original_tombstones = set(tactic._resource_tombstones)
+        original_dirty = tactic._map_dirty
+        tactic._resource_memory.clear()
+        tactic._resource_memory.add(stale_resource)
+        tactic._resource_tombstones.clear()
+        tactic._resource_assignments[str(worker.id)] = stale_resource
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                Core(),
+                resource_cells=frozenset(),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+            )
+            forgotten = stale_resource not in tactic._resource_memory
+            tombstoned = stale_resource in tactic._resource_tombstones
+        finally:
+            tactic._resource_memory.clear()
+            tactic._resource_memory.update(original_memory)
+            tactic._resource_tombstones.clear()
+            tactic._resource_tombstones.update(original_tombstones)
+            tactic._resource_assignments.clear()
+            tactic._map_dirty = original_dirty
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("explore", detail)
+        self.assertTrue(forgotten)
+        self.assertTrue(tombstoned)
+
     def test_worker_uses_configured_bfs_limit(self) -> None:
         class Worker:
             id = "worker-1"
