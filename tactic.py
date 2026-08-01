@@ -22,6 +22,7 @@ from arena_hero import (
     Direction,
     UnitType,
 )
+from tactic_config import load_config
 
 MAP_MEMORY_PATH = Path("map_memory.json")
 
@@ -262,6 +263,7 @@ def _plan_worker(
     resource_cells: frozenset[tuple[int, int]],
     obstacle_cells: frozenset[tuple[int, int]],
     depleted: set[tuple[int, int]],
+    config: dict[str, int | bool],
 ) -> tuple[str, str]:
     """Return (action_name, detail)."""
     pos = worker.position
@@ -290,8 +292,13 @@ def _plan_worker(
             goal = assigned
 
     # Move toward goal (BFS multi-step pathfinding, avoids dead ends)
-    if goal is not None and goal != pos:
-        bfs_dir = _bfs_direction(pos, goal, obstacle_cells)
+    if config["worker_bfs_enabled"] and goal is not None and goal != pos:
+        bfs_dir = _bfs_direction(
+            pos,
+            goal,
+            obstacle_cells,
+            max_steps=int(config["bfs_max_steps"]),
+        )
         if bfs_dir is not None:
             nx, ny = pos[0] + bfs_dir.delta[0], pos[1] + bfs_dir.delta[1]
             if (nx, ny) not in obstacle_cells:
@@ -308,7 +315,7 @@ def _plan_worker(
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
             dist = _manhattan((nx, ny), core.position)
             if prev and (nx, ny) == prev:
-                dist += 10
+                dist += int(config["backtrack_penalty"])
             return dist
         all_dirs = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
         all_dirs.sort(key=_cargo_sort)
@@ -329,7 +336,7 @@ def _plan_worker(
         # Sort: deprioritize direction that goes back to previous position
         def _sort_key(d):
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
-            if prev and (nx, ny) == prev:
+            if config["avoid_backtracking"] and prev and (nx, ny) == prev:
                 return 1  # backtracking = bad
             return 0
         rotated.sort(key=_sort_key)
@@ -357,32 +364,40 @@ def _plan_vanguard(
     vanguard,
     enemies: tuple,
     obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, int | bool],
 ) -> tuple[str, str]:
     """Return (action_name, detail)."""
     pos = vanguard.position
 
-    for direction in (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT):
-        tx, ty = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
-        for enemy in enemies:
-            if enemy.position == (tx, ty):
-                vanguard.sweep(direction)
-                return ("SWEEP", f"{direction.name} -> enemy at {enemy.position}")
+    if config["vanguard_engage_enabled"]:
+        for direction in (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT):
+            tx, ty = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
+            for enemy in enemies:
+                if enemy.position == (tx, ty):
+                    vanguard.sweep(direction)
+                    return ("SWEEP", f"{direction.name} -> enemy at {enemy.position}")
 
-    if enemies:
-        nearest = min(enemies, key=lambda e: _manhattan(pos, e.position))
-        direction = _step_towards(pos, nearest.position)
-        if direction is not None:
-            nx, ny = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
-            if (nx, ny) not in obstacle_cells:
-                vanguard.move(direction)
-                return ("MOVE", f"{direction.name} -> enemy at {nearest.position}")
+        if enemies:
+            nearest = min(enemies, key=lambda e: _manhattan(pos, e.position))
+            direction = _step_towards(pos, nearest.position)
+            if direction is not None:
+                nx, ny = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
+                if (nx, ny) not in obstacle_cells:
+                    vanguard.move(direction)
+                    return ("MOVE", f"{direction.name} -> enemy at {nearest.position}")
 
     # No enemies: scout with UUID rotation + backtrack avoidance
     prev = _worker_last_pos.get(str(vanguard.id))
     idx = hash(str(vanguard.id)) % 4
     base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
     rotated = base[idx:] + base[:idx]
-    rotated.sort(key=lambda d: 1 if prev and (pos[0]+d.delta[0], pos[1]+d.delta[1]) == prev else 0)
+    rotated.sort(
+        key=lambda d: 1
+        if config["avoid_backtracking"]
+        and prev
+        and (pos[0] + d.delta[0], pos[1] + d.delta[1]) == prev
+        else 0
+    )
     for d in rotated:
         nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
         if (nx, ny) not in obstacle_cells:
@@ -398,6 +413,7 @@ def _plan_ranger(
     ranger,
     enemies: tuple,
     obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, int | bool],
 ) -> tuple[str, str]:
     """Return (action_name, detail)."""
     pos = ranger.position
@@ -406,22 +422,23 @@ def _plan_ranger(
     best_dist = 10_000
     best_target = None
 
-    for enemy in enemies:
-        dist = _manhattan(pos, enemy.position)
-        if not (1 <= dist <= 3):
-            continue
-        if _line_blocked(pos, enemy.position, obstacle_cells):
-            continue
-        if dist < best_dist:
-            best_dist = dist
-            best_target = enemy
+    if config["ranger_engage_enabled"]:
+        for enemy in enemies:
+            dist = _manhattan(pos, enemy.position)
+            if not (1 <= dist <= int(config["ranger_attack_range"])):
+                continue
+            if _line_blocked(pos, enemy.position, obstacle_cells):
+                continue
+            if dist < best_dist:
+                best_dist = dist
+                best_target = enemy
 
     if best_target is not None:
         ranger.shoot(best_target)
         return ("SHOOT", f"enemy at {best_target.position} dist={best_dist}")
 
     # 2. Enemies visible but out of range: move toward them
-    if enemies:
+    if config["ranger_engage_enabled"] and enemies:
         nearest = min(enemies, key=lambda e: _manhattan(pos, e.position))
         direction = _step_towards(pos, nearest.position)
         if direction is not None:
@@ -480,7 +497,11 @@ def _load_map_memory() -> None:
 
 
 
-def _save_map_memory(tick: int | None = None, force: bool = False) -> None:
+def _save_map_memory(
+    tick: int | None = None,
+    force: bool = False,
+    save_interval_ticks: int = 10,
+) -> None:
     """Persist permanent map memory. Obstacles never shrink.
 
     Manual resources entered from the dashboard are preserved across saves.
@@ -488,7 +509,12 @@ def _save_map_memory(tick: int | None = None, force: bool = False) -> None:
     global _map_dirty, _last_map_save_tick
     if not force and not _map_dirty:
         return
-    if not force and tick is not None and _last_map_save_tick >= 0 and tick - _last_map_save_tick < 10:
+    if (
+        not force
+        and tick is not None
+        and _last_map_save_tick >= 0
+        and tick - _last_map_save_tick < save_interval_ticks
+    ):
         return
 
     manual: set[tuple[int, int]] = set()
@@ -574,18 +600,23 @@ def _update_resource_memory(turn) -> None:
 
 
 # Context holder for the current turn's resource_space (set by choose_actions)
-turn_context = type("_Ctx", (), {"resource_space": 0})()
+turn_context = type("_Ctx", (), {"resource_space": 0, "config": {}})()
 
 
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
     """Queue actions, return (core_action_name, {unit_id: action_detail})."""
     unit_actions_detail: dict[str, str] = {}
     core_action_name = "WAIT"
+    config = load_config()
+    turn_context.config = config
 
     # ── Update permanent map memory ────────────────────────────────────
     known_obstacles = _update_obstacle_memory(turn)
     _update_resource_memory(turn)
-    _save_map_memory(tick=getattr(turn, "tick", None))
+    _save_map_memory(
+        tick=getattr(turn, "tick", None),
+        save_interval_ticks=int(config["map_save_interval_ticks"]),
+    )
 
     # ── Lifecycle guard ─────────────────────────────────────────────────
     if turn.core is None:
@@ -649,19 +680,25 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         core_action_name = "PICKUP_BEACON"
         core_done = True
 
-    if not core_done and resources >= 1:
+    if not core_done and config["repair_enabled"] and resources >= 1:
         effective_cap = 10 if beacon_carried_by_core else 5
-        want_repair = core.shield < min(effective_cap, 3 if enemies else effective_cap)
+        shield_target = (
+            int(config["combat_shield_target"])
+            if enemies
+            else int(config["peace_shield_target"])
+        )
+        want_repair = core.shield < min(effective_cap, shield_target)
         if want_repair:
             core.repair_shield()
             core_action_name = "REPAIR_SHIELD"
             core_done = True
 
     # ── No auto-spawn ── manual control only ─────────────────────────────
-    if not core_done:
-        # Stop if a cargo worker is close (5 cells), otherwise move toward them
+    if not core_done and config["core_movement_enabled"]:
+        # Stop if a cargo worker is close, otherwise move toward them
         close_cargo = any(
-            w.cargo > 0 and _manhattan(w.position, core_pos) <= 5
+            w.cargo > 0
+            and _manhattan(w.position, core_pos) <= int(config["cargo_wait_distance"])
             for w in turn.workers
         )
         if not close_cargo:
@@ -679,7 +716,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             if all_resources:
                 res_target = min(all_resources, key=lambda p: _manhattan(core_pos, p))
             # Choose target: nearest resource or worker center, whichever is closer
-            if res_target and _manhattan(core_pos, res_target) < _manhattan(core_pos, (avg_x, avg_y)):
+            if (
+                config["prefer_resources_for_core"]
+                and res_target
+                and _manhattan(core_pos, res_target) < _manhattan(core_pos, (avg_x, avg_y))
+            ):
                 target = res_target
             else:
                 target = (avg_x, avg_y)
@@ -719,13 +760,14 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 resource_cells=resource_cells,
                 obstacle_cells=obstacle_cells,
                 depleted=depleted,
+                config=config,
             )
             unit_actions_detail[uid] = f"{action}:{detail}"
         elif unit.unit_type == UnitType.VANGUARD:
-            action, detail = _plan_vanguard(unit, enemies, obstacle_cells)
+            action, detail = _plan_vanguard(unit, enemies, obstacle_cells, config)
             unit_actions_detail[uid] = f"{action}:{detail}"
         elif unit.unit_type == UnitType.RANGER:
-            action, detail = _plan_ranger(unit, enemies, obstacle_cells)
+            action, detail = _plan_ranger(unit, enemies, obstacle_cells, config)
             unit_actions_detail[uid] = f"{action}:{detail}"
 
     return core_action_name, unit_actions_detail

@@ -10,6 +10,8 @@ log_check*.txt
 # Runtime map memory (auto-generated)
 map_memory.json
 map_memory.tmp
+tactic_config.json
+tactic_config.tmp
 
 # Python cache
 __pycache__/

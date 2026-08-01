@@ -10,6 +10,15 @@ from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
+from tactic_config import (
+    CONFIG_PATH,
+    ConfigValidationError,
+    config_schema,
+    default_config,
+    load_config,
+    save_config,
+)
+
 LOG_FILE = "tactic_log.jsonl"
 MAP_FILE = "map_memory.json"
 HOST = "0.0.0.0"
@@ -174,6 +183,55 @@ def remove_manual_resource(x: int, y: int) -> dict:
         "resource_count": len(resources),
         "manual_count": len(manual),
     }
+
+
+def render_config_panel() -> str:
+    config = load_config(CONFIG_PATH)
+    schema = config_schema()
+    fields_by_group: dict[str, list[dict]] = defaultdict(list)
+    for field in schema["fields"]:
+        fields_by_group[field["group"]].append(field)
+
+    groups = []
+    for group in schema["groups"]:
+        rows = []
+        for field in fields_by_group[group["key"]]:
+            key = field["key"]
+            value = config[key]
+            if field["kind"] == "boolean":
+                checked = " checked" if value else ""
+                control = (
+                    f'<label class="config-switch" for="cfg-{key}">'
+                    f'<input id="cfg-{key}" name="{key}" type="checkbox" '
+                    f'data-kind="boolean"{checked}><span></span></label>'
+                )
+            else:
+                control = (
+                    f'<input id="cfg-{key}" name="{key}" type="number" '
+                    f'data-kind="integer" value="{value}" min="{field["minimum"]}" '
+                    f'max="{field["maximum"]}" step="{field["step"]}" required>'
+                )
+            rows.append(
+                '<div class="config-row">'
+                f'<label for="cfg-{key}">{field["label"]}</label>{control}</div>'
+            )
+        groups.append(
+            '<fieldset class="config-group">'
+            f'<legend>{group["label"]}</legend>{"".join(rows)}</fieldset>'
+        )
+
+    return (
+        '<section class="panel config-panel">'
+        '<div class="panel-title"><span>策略配置</span>'
+        '<span class="count" id="configState">当前值</span></div>'
+        '<form id="tacticConfigForm">'
+        f'<div class="config-groups">{"".join(groups)}</div>'
+        '<div class="config-actions">'
+        '<button type="submit" id="configSaveBtn">保存配置</button>'
+        '<button type="button" class="secondary" id="configResetBtn">恢复默认</button>'
+        '<span class="config-message" id="configMessage" aria-live="polite"></span>'
+        '</div></form></section>'
+    )
 
 
 
@@ -508,6 +566,27 @@ body{margin:0;min-height:100vh;color:var(--text);
 .stat-chips{display:flex;flex-wrap:wrap;gap:6px}
 .mini-bar{height:6px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:8px}
 .mini-bar>span{display:block;height:100%;background:linear-gradient(90deg,#57d6a3,#6ea8ff)}.ore-form{display:grid;gap:8px;margin-top:4px}.ore-form .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.ore-form label{display:grid;gap:4px;font-size:12px;color:var(--muted)}.ore-form input{width:100%;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.25);color:#eef3ff;font-family:Consolas,monospace;font-size:13px;outline:none}.ore-form input:focus{border-color:rgba(110,168,255,.45);box-shadow:0 0 0 2px rgba(110,168,255,.12)}.ore-form .actions{display:flex;gap:8px;flex-wrap:wrap}.ore-form button{appearance:none;border:1px solid rgba(255,255,255,.10);background:rgba(110,168,255,.16);color:#eef3ff;border-radius:999px;padding:7px 12px;font-size:12px;cursor:pointer}.ore-form button.secondary{background:rgba(255,255,255,.05)}.ore-form button:hover{border-color:rgba(110,168,255,.35)}.ore-form .msg{min-height:16px;font-size:12px;color:var(--muted)}.ore-form .msg.ok{color:#8ef0c4}.ore-form .msg.err{color:#ff9b9b}.manual-tag{color:#ffd98a;font-size:11px}
+.config-panel{margin-top:0}
+.config-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 26px}
+.config-group{margin:0;padding:0;border:0;min-width:0}
+.config-group legend{width:100%;padding:0 0 8px;color:#c7dbff;font-size:13px;font-weight:700;border-bottom:1px solid var(--line)}
+.config-row{display:grid;grid-template-columns:minmax(0,1fr) 112px;align-items:center;gap:12px;min-height:42px;border-bottom:1px solid rgba(255,255,255,.05)}
+.config-row>label{color:var(--muted);font-size:12px;line-height:1.35}
+.config-row>input[type=number]{width:112px;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
+.config-row>input[type=number]:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
+.config-switch{justify-self:end;position:relative;width:38px;height:22px}
+.config-switch input{position:absolute;opacity:0;pointer-events:none}
+.config-switch span{display:block;width:38px;height:22px;border-radius:11px;background:#263149;border:1px solid rgba(255,255,255,.12);cursor:pointer;transition:.16s}
+.config-switch span::after{content:"";display:block;width:16px;height:16px;margin:2px;border-radius:50%;background:#a9b5cc;transition:.16s}
+.config-switch input:checked+span{background:#326c5d;border-color:#57d6a3}
+.config-switch input:checked+span::after{transform:translateX(16px);background:#b9f5dc}
+.config-switch input:focus-visible+span{box-shadow:0 0 0 2px rgba(110,168,255,.35)}
+.config-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:16px;padding-top:14px;border-top:1px solid var(--line)}
+.config-actions button{border:1px solid rgba(110,168,255,.35);border-radius:6px;padding:8px 13px;background:#285b8f;color:#fff;font-size:12px;font-weight:700;cursor:pointer}
+.config-actions button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}
+.config-actions button:disabled{opacity:.55;cursor:wait}
+.config-message{min-height:18px;color:var(--muted);font-size:12px;margin-left:auto}
+.config-message.ok{color:#8ef0c4}.config-message.err{color:#ff9b9b}
 .hero{display:none}
 .metrics{display:none}
 .layout{display:none}
@@ -520,6 +599,10 @@ body{margin:0;min-height:100vh;color:var(--text);
 }
 @media (max-width:980px){
   .topbar{flex-direction:column}
+}
+@media (max-width:680px){
+  .config-groups{grid-template-columns:1fr}
+  .config-message{width:100%;margin-left:0}
 }
 
 """
@@ -534,6 +617,7 @@ JS = r"""
   let drag = false, lx = 0, ly = 0;
   let lastTick = null;
   let refreshing = false;
+  let configDirty = false;
 
   function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
 
@@ -791,7 +875,93 @@ JS = r"""
     if(delBtn) delBtn.onclick = function(){ postOre('/api/resource/remove'); };
   }
 
+  function applyConfigValues(config){
+    const form = document.getElementById('tacticConfigForm');
+    if(!form || !config) return;
+    form.querySelectorAll('[name]').forEach(function(input){
+      if(!(input.name in config)) return;
+      if(input.dataset.kind === 'boolean') input.checked = Boolean(config[input.name]);
+      else input.value = String(config[input.name]);
+    });
+  }
+
+  function setConfigMessage(text, kind){
+    const msg = document.getElementById('configMessage');
+    if(msg){
+      msg.textContent = text || '';
+      msg.className = 'config-message' + (kind ? ' ' + kind : '');
+    }
+    const state = document.getElementById('configState');
+    if(state) state.textContent = kind === 'err' ? '保存失败' : (kind === 'ok' ? '已同步' : '待保存');
+  }
+
+  async function loadConfig(force){
+    const form = document.getElementById('tacticConfigForm');
+    if(!form || (!force && (configDirty || form.contains(document.activeElement)))) return;
+    try{
+      const res = await fetch('/api/config?ts=' + Date.now(), {cache:'no-store'});
+      const data = await res.json();
+      if(res.ok && data.ok){ applyConfigValues(data.config); configDirty = false; }
+    }catch(e){}
+  }
+
+  function bindConfigForm(){
+    const form = document.getElementById('tacticConfigForm');
+    if(!form) return;
+    const saveBtn = document.getElementById('configSaveBtn');
+    const resetBtn = document.getElementById('configResetBtn');
+    form.addEventListener('input', function(){
+      configDirty = true;
+      setConfigMessage('有未保存修改', '');
+    });
+    form.onsubmit = async function(e){
+      e.preventDefault();
+      if(!form.reportValidity()) return;
+      const config = {};
+      form.querySelectorAll('[name]').forEach(function(input){
+        config[input.name] = input.dataset.kind === 'boolean' ? input.checked : Number(input.value);
+      });
+      if(saveBtn) saveBtn.disabled = true;
+      setConfigMessage('保存中…', '');
+      try{
+        const res = await fetch('/api/config', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify(config)
+        });
+        const data = await res.json();
+        if(!res.ok || !data.ok) throw new Error(data.error || '保存失败');
+        applyConfigValues(data.config);
+        configDirty = false;
+        setConfigMessage('已保存，下个 Tick 生效', 'ok');
+      }catch(err){
+        setConfigMessage(err.message || '网络错误', 'err');
+      }finally{
+        if(saveBtn) saveBtn.disabled = false;
+      }
+    };
+    if(resetBtn) resetBtn.onclick = async function(){
+      resetBtn.disabled = true;
+      setConfigMessage('恢复中…', '');
+      try{
+        const res = await fetch('/api/config/reset', {
+          method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'
+        });
+        const data = await res.json();
+        if(!res.ok || !data.ok) throw new Error(data.error || '恢复失败');
+        applyConfigValues(data.config);
+        configDirty = false;
+        setConfigMessage('已恢复默认值', 'ok');
+      }catch(err){
+        setConfigMessage(err.message || '网络错误', 'err');
+      }finally{
+        resetBtn.disabled = false;
+      }
+    };
+  }
+
   bindOreForm();
+  bindConfigForm();
   ensureView();
   bindStage();
   apply();
@@ -804,6 +974,7 @@ JS = r"""
     }, {passive:false});
   }
   setInterval(softRefresh, 2000);
+  setInterval(function(){ loadConfig(false); }, 10000);
 })();
 </script>
 """
@@ -1087,7 +1258,7 @@ def generate_html() -> str:
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8"><title>Arena Hero 战术仪表盘</title>
+<meta charset="UTF-8"><link rel="icon" href="data:,"><title>Arena Hero 战术仪表盘</title>
 <style>{CSS}</style>
 </head>
 <body>
@@ -1126,6 +1297,7 @@ def generate_html() -> str:
         <span><i class="dot ore-mem"></i>记忆矿</span>
        </div>
       </section>
+      {render_config_panel()}
       <div id="issuesSection" style="display:none">{parts['issuesHtml']}</div>
     </section>
 
@@ -1178,6 +1350,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _send_json(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send(code, body, "application/json; charset=utf-8")
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/":
@@ -1191,11 +1367,31 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(parts, ensure_ascii=False).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8")
             return
+        if path == "/api/config":
+            self._send_json(200, {"ok": True, "config": load_config(CONFIG_PATH)})
+            return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
         path = urlparse(self.path).path
         data = self._read_json()
+        if path in {"/api/config", "/api/config/reset"}:
+            try:
+                values = default_config() if path.endswith("/reset") else data
+                config = save_config(values, CONFIG_PATH)
+            except ConfigValidationError as exc:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "配置值无效",
+                    "fields": exc.errors,
+                })
+                return
+            except OSError as exc:
+                self._send_json(500, {"ok": False, "error": f"保存失败: {exc}"})
+                return
+            self._send_json(200, {"ok": True, "config": config})
+            return
+
         try:
             x = int(data.get("x"))
             y = int(data.get("y"))

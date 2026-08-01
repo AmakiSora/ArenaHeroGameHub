@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import dashboard
 import tactic
+from tactic_config import default_config
 
 
 class ResourceMergeTests(unittest.TestCase):
@@ -21,6 +22,40 @@ class ResourceMergeTests(unittest.TestCase):
         )
 
         self.assertEqual(resources, [(2, 3), (6, 7)])
+
+
+class ConfiguredPlannerTests(unittest.TestCase):
+    def test_worker_uses_configured_bfs_limit(self) -> None:
+        class Worker:
+            id = "worker-1"
+            position = (0, 0)
+            cargo = 0
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        config = default_config()
+        config["bfs_max_steps"] = 1250
+        tactic._resource_assignments[str(worker.id)] = (2, 0)
+        try:
+            with patch.object(tactic, "_bfs_direction", return_value=tactic.Direction.RIGHT) as bfs:
+                action, _ = tactic._plan_worker(
+                    worker,
+                    Core(),
+                    resource_cells=frozenset({(2, 0)}),
+                    obstacle_cells=frozenset(),
+                    depleted=set(),
+                    config=config,
+                )
+        finally:
+            tactic._resource_assignments.clear()
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(bfs.call_args.kwargs["max_steps"], 1250)
 
 
 class SummaryTests(unittest.TestCase):
