@@ -381,17 +381,33 @@ _resource_memory: set[tuple[int, int]] = set()
 
 
 def _update_resource_memory(turn) -> None:
-    """Remember visible resources, remove harvested ones."""
+    """Remember visible resources, remove harvested/depleted ones."""
     global _resource_memory
     # Add newly visible resources
     for p in turn.resource_cells:
         _resource_memory.add(p)
-    # Remove resources that were successfully harvested
+    # Remove resources confirmed harvested (from events)
     for event in turn.events:
         if event.event_type == "HARVEST_SUCCEEDED" and event.position:
             _resource_memory.discard(event.position)
         if event.event_type == "HARVEST_FAILED" and event.reason_code == "RESOURCE_DEPLETED" and event.position:
             _resource_memory.discard(event.position)
+    # Remove remembered resources: a friendly unit can see the cell but no resource there
+    dead = set()
+    for pos in _resource_memory:
+        if pos in turn.resource_cells:
+            continue
+        # Check if Core or any Worker/Vanguard/Ranger can see this cell
+        for obj in turn.state.objects:
+            if not getattr(obj, "controlled", False):
+                continue
+            obj_pos = getattr(obj, "position", None)
+            if obj_pos is None:
+                continue
+            if _manhattan(tuple(obj_pos), pos) <= 5:
+                dead.add(pos)
+                break
+    _resource_memory -= dead
 
 
 # Context holder for the current turn's resource_space (set by choose_actions)
@@ -557,7 +573,7 @@ def play(api_key: str, log_path: str = "tactic_log.jsonl") -> None:
                         f"workers={len(turn.workers)} "
                         f"enemies={len(turn.visible_enemies)} "
                         f"resources_visible={len(turn.resource_cells)} "
-                        f"latency={latency:.0f}ms",
+                        f"memory={len(_resource_memory)}",
                         flush=True,
                     )
                 except Exception as e:
