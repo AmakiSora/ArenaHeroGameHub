@@ -63,6 +63,37 @@ def _line_blocked(
     return False
 
 
+# ── BFS pathfinding (multi-step lookahead) ────────────────────────────────────
+
+def _bfs_direction(
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    obstacles: frozenset[tuple[int, int]],
+    max_steps: int = 200,
+) -> Direction | None:
+    """BFS shortest path, return first step direction or None if no path."""
+    from collections import deque
+    if start == goal:
+        return None
+    queue: deque[tuple[tuple[int, int], Direction | None]] = deque()
+    queue.append((start, None))
+    visited = {start}
+    steps = 0
+    while queue and steps < max_steps:
+        steps += 1
+        (x, y), first_dir = queue.popleft()
+        for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+            nx, ny = x + d.delta[0], y + d.delta[1]
+            if (nx, ny) in visited or (nx, ny) in obstacles:
+                continue
+            visited.add((nx, ny))
+            action = first_dir if first_dir is not None else d
+            if (nx, ny) == goal:
+                return action
+            queue.append(((nx, ny), action))
+    return None
+
+
 # ── decision logger ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -237,26 +268,16 @@ def _plan_worker(
         if remembered:
             goal = min(remembered, key=lambda p: _manhattan(pos, p))
 
-    # Move toward goal (try all 4 dirs, sorted by proximity to goal, avoid backtrack)
+    # Move toward goal (BFS multi-step pathfinding, avoids dead ends)
     if goal is not None and goal != pos:
-        prev = _worker_last_pos.get(str(worker.id))
-        def _goal_sort_key(d):
-            nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
-            dist = _manhattan((nx, ny), goal)
-            if prev and (nx, ny) == prev:
-                dist += 10  # deprioritize going back
-            return dist
-        all_dirs = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
-        all_dirs.sort(key=_goal_sort_key)
-        for d in all_dirs:
-            if d is None:
-                continue
-            nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+        bfs_dir = _bfs_direction(pos, goal, obstacle_cells)
+        if bfs_dir is not None:
+            nx, ny = pos[0] + bfs_dir.delta[0], pos[1] + bfs_dir.delta[1]
             if (nx, ny) not in obstacle_cells:
-                worker.move(d)
+                worker.move(bfs_dir)
                 _worker_last_pos[str(worker.id)] = pos
-                return ("MOVE", f"{d.name} -> {goal}")
-        # All blocked, fall through to explore
+                return ("MOVE", f"{bfs_dir.name} -> {goal}")
+        # BFS failed (trapped) - fall through to explore instead of oscillating
         goal = None
 
     # No goal at all: fan out with backtracking avoidance
