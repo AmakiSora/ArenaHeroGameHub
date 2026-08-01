@@ -237,6 +237,20 @@ def _plan_worker(
         if remembered:
             goal = min(remembered, key=lambda p: _manhattan(pos, p))
 
+    # Move toward goal (try all 4 dirs if blocked)
+    if goal is not None and goal != pos:
+        direction = _step_towards(pos, goal)
+        dirs_try = [direction] if direction else []
+        for d in dirs_try + [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]:
+            if d is None:
+                continue
+            nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+            if (nx, ny) not in obstacle_cells:
+                worker.move(d)
+                return ("MOVE", f"{d.name} -> {goal}")
+        # All blocked, fall through to explore
+        goal = None
+
     # No goal at all: fan out in unique direction based on worker ID
     if goal is None and not worker.cargo:
         # Use UUID hash to pick a unique exploration direction
