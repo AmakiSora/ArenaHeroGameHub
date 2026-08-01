@@ -44,7 +44,7 @@ server --WebSocket state--> SDK --Turn--> choose_actions() --plan--> SDK --HTTP 
 每 Tick 重新计算，防止所有工人冲同一个矿点。
 
 **分配算法：**
-1. 收集所有可见矿点 + 记忆矿点
+1. 合并所有可见矿点与记忆矿点，并按坐标去重
 2. 按**最近距离**排序矿点
 3. 每个矿点分配给**最近且未分配**的工人
 4. 一个工人最多分到一个矿点
@@ -72,7 +72,7 @@ N 个 Worker（手动生成），优先级从高到低：
 | 6 | 无货 + 无指派 | **MOVE** UUID 旋转方向探索 | 见下方探索逻辑 |
 
 **BFS 路径规划：**
-- 使用广度优先搜索（BFS）探索最多 200 步
+- 使用广度优先搜索（BFS）探索最多 800 步
 - 找到最短路径，绕过障碍物
 - 避免走入死胡同
 - BFS 无路可走时 → 切换到探索模式（不原地打转）
@@ -154,7 +154,7 @@ tick=35060 core=MOVE_RIGHT res=9/45 pop=9 workers=7 enemies=0 resources_visible=
 - 可见敌人数量、可见矿点、记忆矿点数
 - 每单位发出的指令
 - 上 Tick 的解析事件（采集成功/失败、卸货成功等）
-- 决策耗时
+- 决策与提交总耗时
 
 ### 运行结束汇总
 ```
@@ -208,6 +208,8 @@ b558d97 feat: add direct-play wrapper with BFS pathfinding, enemy avoidance, aut
 ```
 tactic.py          # 主战术脚本（核心逻辑）
 direct_wrapper.py  # 直接控制桥接器（备用，BFS 寻路）
+dashboard.py       # Web 战术仪表盘
+status.py          # 命令行状态查看器
 requirements.txt   # 依赖：arena-hero>=0.2.4,<0.3
 BEHAVIOR.md        # 本文件，行为逻辑说明
 tactic_log.jsonl   # 运行日志（JSONL 格式，可分析）
@@ -216,9 +218,10 @@ tactic_play.log    # 控制台输出记录
 
 ## 十、启动方式
 
-```bash
-set ARENA_HERO_API_KEY=your_key
-python tactic.py
+```powershell
+$env:ARENA_HERO_API_KEY = "your_key"
+python .\tactic.py
 ```
 
-脚本自动以 `DETACHED_PROCESS` 方式后台运行，不受当前 shell 退出影响。如需停止，在任务管理器中结束 `python.exe` 进程。
+脚本在当前终端前台运行，按 `Ctrl+C` 会保存地图记忆、写入日志汇总并退出。另开终端运行
+`python .\dashboard.py`，可通过 `http://localhost:4399` 查看战术仪表盘。

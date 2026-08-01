@@ -18,35 +18,49 @@ PORT = 4399
 
 # ---------- data loading --------------------------------------------------
 
+def _iter_log_lines_reverse(path: str, chunk_size: int = 64 * 1024):
+    """Yield non-empty log lines from newest to oldest without loading the file."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        position = f.tell()
+        remainder = b""
+
+        while position > 0:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            f.seek(position)
+            parts = (f.read(read_size) + remainder).split(b"\n")
+            remainder = parts[0]
+            for raw_line in reversed(parts[1:]):
+                raw_line = raw_line.rstrip(b"\r")
+                if raw_line.strip():
+                    yield raw_line.decode("utf-8", errors="replace")
+
+        remainder = remainder.rstrip(b"\r")
+        if remainder.strip():
+            yield remainder.decode("utf-8", errors="replace")
+
+
 def read_latest():
     if not os.path.exists(LOG_FILE):
         return None, time.time()
-    mtime = os.path.getmtime(LOG_FILE)
-    with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-        for line in reversed([l.strip() for l in f if l.strip()]):
-            try:
-                rec = json.loads(line)
-                if rec.get("tick") and "plan_unit_actions" in rec:
-                    return rec, mtime
-            except Exception:
-                continue
-    return None, mtime
+    history = read_history(1)
+    return (history[0] if history else None), os.path.getmtime(LOG_FILE)
 
 
 def read_history(ticks: int = 40):
-    if not os.path.exists(LOG_FILE):
+    if ticks <= 0 or not os.path.exists(LOG_FILE):
         return []
     out = []
-    with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-        for line in reversed([l.strip() for l in f if l.strip()]):
-            try:
-                rec = json.loads(line)
-                if rec.get("tick") and "plan_unit_actions" in rec:
-                    out.append(rec)
-                    if len(out) >= ticks:
-                        break
-            except Exception:
-                continue
+    for line in _iter_log_lines_reverse(LOG_FILE):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and rec.get("tick") and "plan_unit_actions" in rec:
+            out.append(rec)
+            if len(out) >= ticks:
+                break
     return out
 
 
@@ -655,8 +669,12 @@ JS = r"""
 
 def build_parts():
     """Build all dashboard fragments + map for page and /api/state."""
-    rec, mtime = read_latest()
     history = read_history(40)
+    rec = history[0] if history else None
+    try:
+        mtime = os.path.getmtime(LOG_FILE)
+    except OSError:
+        mtime = time.time()
     issues = check_stuck(history)
     age = time.time() - mtime if mtime else 0
     if not rec:

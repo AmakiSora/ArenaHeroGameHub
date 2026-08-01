@@ -10,7 +10,7 @@ import json
 import math
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from getpass import getpass
@@ -30,6 +30,17 @@ MAP_MEMORY_PATH = Path("map_memory.json")
 
 def _manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def _merge_resource_cells(
+    visible: Iterable[tuple[int, int]],
+    remembered: set[tuple[int, int]],
+    depleted: set[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Return unique, available resource cells in deterministic order."""
+    cells = {tuple(position) for position in visible}
+    cells.update(tuple(position) for position in remembered)
+    return sorted(cells - depleted)
 
 
 def _step_towards(
@@ -578,8 +589,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     _resource_assignments.clear()
     # Only assign to workers without cargo (cargo workers are heading home)
     idle_workers = [(str(w.id), tuple(w.position)) for w in turn.workers if not w.cargo]
-    all_resources = list(turn.resource_cells) + [p for p in _resource_memory if p not in depleted]
-    assigned_workers: set[str] = set()
+    all_resources = _merge_resource_cells(
+        turn.resource_cells,
+        _resource_memory,
+        depleted,
+    )
     # Sort resources by distance to nearest idle worker, assign each to closest
     available = list(idle_workers)  # copy, will remove assigned workers
     for res in sorted(all_resources, key=lambda p: min(_manhattan(p, w[1]) for w in available) if available else 0):
@@ -632,9 +646,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 avg_x, avg_y = core_pos
             # Also consider nearest resource (visible or remembered)
             res_target = None
-            all_res = list(turn.resource_cells) + [p for p in _resource_memory if p not in depleted]
-            if all_res:
-                res_target = min(all_res, key=lambda p: _manhattan(core_pos, p))
+            if all_resources:
+                res_target = min(all_resources, key=lambda p: _manhattan(core_pos, p))
             # Choose target: nearest resource or worker center, whichever is closer
             if res_target and _manhattan(core_pos, res_target) < _manhattan(core_pos, (avg_x, avg_y)):
                 target = res_target
@@ -743,10 +756,17 @@ def play(api_key: str, log_path: str = "tactic_log.jsonl") -> None:
 def _print_summary(log_path: str) -> None:
     """Quick summary from the log file."""
     try:
+        ticks = []
         with open(log_path, "r", encoding="utf-8") as f:
-            lines = [json.loads(l) for l in f if l.strip() and not l.startswith("{")]
-
-        ticks = [l for l in lines if "tick" in l and "_meta" not in l and "_summary" not in l]
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and "tick" in record:
+                    ticks.append(record)
         if not ticks:
             return
 
