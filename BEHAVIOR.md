@@ -41,7 +41,7 @@ server --WebSocket state--> SDK --Turn--> choose_actions() --plan--> SDK --HTTP 
 
 ### 3.1 Worker（工人）
 
-5 个 Worker（手动生成），优先级从高到低：
+N 个 Worker（手动生成），优先级从高到低：
 
 | 优先级 | 条件 | 动作 | 说明 |
 |--------|------|------|------|
