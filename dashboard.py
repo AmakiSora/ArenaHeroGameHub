@@ -171,11 +171,11 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
 
     out = []
     a = out.append
-    a(f'<svg class="game-map" id="gameMap" viewBox="0 0 {W} {H}" '
+    a(f'<svg class="game-map" id="gameMap" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
       f'data-width="{W}" data-height="{H}" '
-      f'data-focus-x="{core_cx if core_cx else W/2:.1f}" '
-      f'data-focus-y="{core_cy if core_cy else H/2:.1f}" '
-      f'role="img" aria-label="known-map">')
+      f'data-focus-x="{(core_cx if core_cx is not None else W/2):.1f}" '
+      f'data-focus-y="{(core_cy if core_cy is not None else H/2):.1f}" '
+      f'role="img" aria-label="known-map" style="width:{W}px;height:{H}px">')
     a('<defs>'
       '<pattern id="gridPat" width="{c}" height="{c}" patternUnits="userSpaceOnUse">'
       '<rect width="{c}" height="{c}" fill="#10182c"/>'
@@ -354,8 +354,9 @@ body{margin:0;min-height:100vh;color:var(--text);
 .events th,.events td{text-align:left;padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.06)}
 .events th{color:var(--muted);font-weight:600}
 .footer{margin-top:16px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px}
-.map-panel .game-map{width:100%;height:100%;display:block;background:transparent;cursor:grab;
- touch-action:none;user-select:none}
+.map-panel .game-map{display:block;background:transparent;cursor:grab;
+ touch-action:none;user-select:none;max-width:none;transform-origin:0 0;
+ will-change:transform}
 .map-panel .game-map.dragging{cursor:grabbing}
 .map-stage{position:relative;height:min(68vh,720px);overflow:hidden;border-radius:16px;
  border:1px solid rgba(255,255,255,.06);
@@ -389,60 +390,135 @@ JS = r"""
   const stage=document.getElementById('mapStage');
   const svg=document.getElementById('gameMap');
   if(!stage||!svg){return;}
-  const baseW=Number(svg.dataset.width||800), baseH=Number(svg.dataset.height||600);
-  const focusX=Number(svg.dataset.focusX||baseW/2), focusY=Number(svg.dataset.focusY||baseH/2);
+
+  // Prevent native image/svg drag ghosts
+  svg.addEventListener('dragstart', function(e){ e.preventDefault(); });
+  stage.addEventListener('dragstart', function(e){ e.preventDefault(); });
+
+  const baseW=Number(svg.dataset.width||svg.getAttribute('width')||800);
+  const baseH=Number(svg.dataset.height||svg.getAttribute('height')||600);
+  const focusX=Number(svg.dataset.focusX||(baseW/2));
+  const focusY=Number(svg.dataset.focusY||(baseH/2));
+
   let view=null;
-  try{view=JSON.parse(localStorage.getItem(KEY)||'null');}catch(e){view=null;}
-  function clamp(v,lo,hi){return Math.max(lo,Math.min(hi,v));}
+  try{ view=JSON.parse(localStorage.getItem(KEY)||'null'); }catch(e){ view=null; }
+
+  function clamp(v,lo,hi){ return Math.max(lo, Math.min(hi, v)); }
+
   function defaultView(){
     const r=stage.getBoundingClientRect();
-    const s=clamp(Math.min(r.width/baseW,r.height/baseH)*1.1,0.25,3.5);
-    return{scale:s,x:r.width/2-focusX*s,y:r.height/2-focusY*s};
+    // fit whole map with a little padding, but not too tiny
+    const fit = Math.min(r.width/baseW, r.height/baseH) * 0.92;
+    const s = clamp(fit, 0.15, 2.5);
+    return {
+      scale: s,
+      x: r.width/2 - focusX * s,
+      y: r.height/2 - focusY * s
+    };
   }
-  if(!view||typeof view.scale!=='number')view=defaultView();
+
+  // If map size changed a lot (new walls discovered), reset if old view is nonsense
+  const mapSig = baseW + 'x' + baseH;
+  if(!view || typeof view.scale !== 'number' || view.mapSig !== mapSig){
+    view = defaultView();
+    view.mapSig = mapSig;
+  }
+
   const zlbl=document.getElementById('zoomLabel');
   function apply(){
-    svg.style.transformOrigin='0 0';
-    svg.style.transform='translate('+view.x+'px,'+view.y+'px) scale('+view.scale+')';
-    if(zlbl)zlbl.textContent=Math.round(view.scale*100)+'%';
-    try{localStorage.setItem(KEY,JSON.stringify(view));}catch(e){}
+    svg.style.transformOrigin = '0 0';
+    svg.style.transform = 'translate(' + view.x + 'px, ' + view.y + 'px) scale(' + view.scale + ')';
+    if(zlbl) zlbl.textContent = Math.round(view.scale * 100) + '%';
+    view.mapSig = mapSig;
+    try{ localStorage.setItem(KEY, JSON.stringify(view)); }catch(e){}
   }
-  function zoomAt(cx,cy,ns){
+
+  function zoomAt(clientX, clientY, nextScale){
     const r=stage.getBoundingClientRect();
-    const px=cx-r.left, py=cy-r.top;
-    const wx=(px-view.x)/view.scale, wy=(py-view.y)/view.scale;
-    view.scale=clamp(ns,0.2,5);
-    view.x=px-wx*view.scale; view.y=py-wy*view.scale;
+    const px = clientX - r.left;
+    const py = clientY - r.top;
+    const worldX = (px - view.x) / view.scale;
+    const worldY = (py - view.y) / view.scale;
+    view.scale = clamp(nextScale, 0.1, 6);
+    view.x = px - worldX * view.scale;
+    view.y = py - worldY * view.scale;
     apply();
   }
-  let drag=false, lx=0, ly=0;
-  stage.addEventListener('pointerdown',function(e){
-    if(e.button!==0)return; drag=true; lx=e.clientX; ly=e.clientY;
-    stage.setPointerCapture(e.pointerId); svg.classList.add('dragging');
+
+  let drag=false, moved=false, lx=0, ly=0;
+  stage.addEventListener('pointerdown', function(e){
+    if(e.button !== 0) return;
+    drag=true; moved=false; lx=e.clientX; ly=e.clientY;
+    stage.setPointerCapture(e.pointerId);
+    svg.classList.add('dragging');
   });
-  stage.addEventListener('pointermove',function(e){
-    if(!drag)return;
-    view.x+=e.clientX-lx; view.y+=e.clientY-ly; lx=e.clientX; ly=e.clientY; apply();
+  stage.addEventListener('pointermove', function(e){
+    if(!drag) return;
+    const dx=e.clientX-lx, dy=e.clientY-ly;
+    if(Math.abs(dx)+Math.abs(dy) > 2) moved=true;
+    view.x += dx; view.y += dy;
+    lx=e.clientX; ly=e.clientY;
+    apply();
   });
-  function endDrag(e){if(!drag)return; drag=false; svg.classList.remove('dragging');
-    try{stage.releasePointerCapture(e.pointerId);}catch(err){}}
-  stage.addEventListener('pointerup',endDrag); stage.addEventListener('pointercancel',endDrag);
-  stage.addEventListener('wheel',function(e){e.preventDefault();
-    zoomAt(e.clientX,e.clientY,view.scale*(e.deltaY<0?1.12:1/1.12));},{passive:false});
-  const zi=document.getElementById('zoomInBtn'), zo=document.getElementById('zoomOutBtn');
-  const rst=document.getElementById('resetViewBtn'), fc=document.getElementById('focusCoreBtn');
-  if(zi)zi.onclick=function(){const r=stage.getBoundingClientRect();zoomAt(r.left+r.width/2,r.top+r.height/2,view.scale*1.2);};
-  if(zo)zo.onclick=function(){const r=stage.getBoundingClientRect();zoomAt(r.left+r.width/2,r.top+r.height/2,view.scale/1.2);};
-  if(rst)rst.onclick=function(){view=defaultView();apply();};
-  if(fc)fc.onclick=function(){const r=stage.getBoundingClientRect();
-    view.x=r.width/2-focusX*view.scale; view.y=r.height/2-focusY*view.scale; apply();};
-  window.addEventListener('resize',function(){apply();});
+  function endDrag(e){
+    if(!drag) return;
+    drag=false;
+    svg.classList.remove('dragging');
+    try{ stage.releasePointerCapture(e.pointerId); }catch(err){}
+  }
+  stage.addEventListener('pointerup', endDrag);
+  stage.addEventListener('pointercancel', endDrag);
+  stage.addEventListener('pointerleave', function(e){ if(drag) endDrag(e); });
+
+  stage.addEventListener('wheel', function(e){
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.12 : (1/1.12);
+    zoomAt(e.clientX, e.clientY, view.scale * factor);
+  }, {passive:false});
+
+  // Touch pinch zoom (simple 2-finger)
+  let pinch=null;
+  stage.addEventListener('touchstart', function(e){
+    if(e.touches.length===2){
+      const a=e.touches[0], b=e.touches[1];
+      const dist=Math.hypot(a.clientX-b.clientX, a.clientY-b.clientY);
+      pinch={dist:dist, scale:view.scale, cx:(a.clientX+b.clientX)/2, cy:(a.clientY+b.clientY)/2};
+    }
+  }, {passive:true});
+  stage.addEventListener('touchmove', function(e){
+    if(e.touches.length===2 && pinch){
+      e.preventDefault();
+      const a=e.touches[0], b=e.touches[1];
+      const dist=Math.hypot(a.clientX-b.clientX, a.clientY-b.clientY);
+      const cx=(a.clientX+b.clientX)/2, cy=(a.clientY+b.clientY)/2;
+      zoomAt(cx, cy, pinch.scale * (dist / pinch.dist));
+    }
+  }, {passive:false});
+  stage.addEventListener('touchend', function(){ pinch=null; }, {passive:true});
+
+  const zi=document.getElementById('zoomInBtn');
+  const zo=document.getElementById('zoomOutBtn');
+  const rst=document.getElementById('resetViewBtn');
+  const fc=document.getElementById('focusCoreBtn');
+  if(zi) zi.onclick=function(){ const r=stage.getBoundingClientRect(); zoomAt(r.left+r.width/2, r.top+r.height/2, view.scale*1.2); };
+  if(zo) zo.onclick=function(){ const r=stage.getBoundingClientRect(); zoomAt(r.left+r.width/2, r.top+r.height/2, view.scale/1.2); };
+  if(rst) rst.onclick=function(){ view=defaultView(); view.mapSig=mapSig; apply(); };
+  if(fc) fc.onclick=function(){
+    const r=stage.getBoundingClientRect();
+    view.x = r.width/2 - focusX*view.scale;
+    view.y = r.height/2 - focusY*view.scale;
+    apply();
+  };
+
+  window.addEventListener('resize', function(){ apply(); });
   apply();
+
+  // Auto refresh keeps camera. Skip while dragging.
   setInterval(function(){
-    if(document.hidden||drag)return;
-    try{localStorage.setItem(KEY,JSON.stringify(view));}catch(e){}
+    if(document.hidden || drag) return;
+    try{ localStorage.setItem(KEY, JSON.stringify(view)); }catch(e){}
     location.reload();
-  },2000);
+  }, 2000);
 })();
 </script>
 """
