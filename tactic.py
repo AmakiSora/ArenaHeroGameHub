@@ -10,6 +10,7 @@ import json
 import math
 import os
 import time
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -79,6 +80,49 @@ def _line_blocked(
 
 # ── BFS pathfinding (multi-step lookahead) ────────────────────────────────────
 
+def _bfs_path(
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    obstacles: frozenset[tuple[int, int]],
+    max_steps: int = 800,
+) -> list[tuple[int, int]] | None:
+    """Return the shortest path including start and goal, or None."""
+    if start == goal:
+        return [start]
+    queue = deque([start])
+    parents: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+    steps = 0
+    while queue and steps < max_steps:
+        steps += 1
+        x, y = queue.popleft()
+        for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+            nx, ny = x + d.delta[0], y + d.delta[1]
+            next_pos = (nx, ny)
+            if next_pos in parents or next_pos in obstacles:
+                continue
+            parents[next_pos] = (x, y)
+            if next_pos == goal:
+                path = [goal]
+                cursor = parents[goal]
+                while cursor is not None:
+                    path.append(cursor)
+                    cursor = parents[cursor]
+                return list(reversed(path))
+            queue.append(next_pos)
+    return None
+
+
+def _direction_for_step(
+    start: tuple[int, int],
+    next_pos: tuple[int, int],
+) -> Direction | None:
+    delta = next_pos[0] - start[0], next_pos[1] - start[1]
+    for direction in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+        if direction.delta == delta:
+            return direction
+    return None
+
+
 def _bfs_direction(
     start: tuple[int, int],
     goal: tuple[int, int],
@@ -86,26 +130,34 @@ def _bfs_direction(
     max_steps: int = 800,
 ) -> Direction | None:
     """BFS shortest path, return first step direction or None if no path."""
-    from collections import deque
-    if start == goal:
-        return None
-    queue: deque[tuple[tuple[int, int], Direction | None]] = deque()
-    queue.append((start, None))
-    visited = {start}
-    steps = 0
-    while queue and steps < max_steps:
-        steps += 1
-        (x, y), first_dir = queue.popleft()
-        for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
-            nx, ny = x + d.delta[0], y + d.delta[1]
-            if (nx, ny) in visited or (nx, ny) in obstacles:
-                continue
-            visited.add((nx, ny))
-            action = first_dir if first_dir is not None else d
-            if (nx, ny) == goal:
-                return action
-            queue.append(((nx, ny), action))
-    return None
+    path = _bfs_path(start, goal, obstacles, max_steps)
+    return _direction_for_step(start, path[1]) if path and len(path) > 1 else None
+
+
+_object_names: dict[tuple[str, str], str] = {}
+_object_name_counters: defaultdict[str, int] = defaultdict(int)
+
+
+def _object_name(object_id: Any, prefix: str) -> str:
+    key = prefix, str(object_id)
+    if key not in _object_names:
+        _object_name_counters[prefix] += 1
+        _object_names[key] = f"{prefix}{_object_name_counters[prefix]}"
+    return _object_names[key]
+
+
+def _set_worker_route(
+    worker: Any,
+    target: tuple[int, int],
+    path: list[tuple[int, int]],
+    *,
+    complete: bool,
+) -> None:
+    turn_context.worker_routes[str(worker.id)[:8]] = {
+        "target": target,
+        "path": path,
+        "complete": complete,
+    }
 
 
 # ── decision logger ──────────────────────────────────────────────────────────
@@ -114,6 +166,7 @@ def _bfs_direction(
 class TickRecord:
     tick: int
     timestamp: str = ""
+    core_name: str = "C1"
     core_pos: list[int] | None = None
     core_hp: int = 0
     core_shield: int = 0
@@ -127,6 +180,7 @@ class TickRecord:
     workers: list[dict] = field(default_factory=list)
     vanguards: list[dict] = field(default_factory=list)
     rangers: list[dict] = field(default_factory=list)
+    enemies: list[dict] = field(default_factory=list)
     visible_enemies: int = 0
     resource_cells_visible: int = 0
     resource_cells: list[list[int]] = field(default_factory=list)
@@ -157,7 +211,7 @@ class TacticLogger:
         header = {
             "_meta": "arena-hero-tactic-log",
             "_started_at": datetime.now(timezone.utc).isoformat(),
-            "_version": 1,
+            "_version": 2,
         }
         self._file.write(json.dumps(header, ensure_ascii=False) + "\n")
         self._file.flush()
@@ -209,15 +263,22 @@ class TacticLogger:
         rec.latency_ms = round(latency_ms, 1)
 
         if core:
+            rec.core_name = _object_name(core.id, "C")
             rec.core_pos = list(core.position)
             rec.core_hp = core.hp
             rec.core_shield = core.shield
             rec.core_state = core.view.state.value if hasattr(core.view.state, "value") else str(core.view.state)
 
         for w in turn.workers:
+            wid = str(w.id)[:8]
+            route = turn_context.worker_routes.get(wid, {})
             rec.workers.append({
-                "id": str(w.id)[:8],
+                "id": wid,
+                "name": _object_name(w.id, "W"),
                 "pos": list(w.position),
+                "target": list(route["target"]) if route.get("target") else None,
+                "path": [list(position) for position in route.get("path", [])],
+                "path_complete": bool(route.get("complete", False)),
                 "cargo": w.cargo,
                 "hp": w.hp,
             })
@@ -225,6 +286,7 @@ class TacticLogger:
         for v in turn.vanguards:
             rec.vanguards.append({
                 "id": str(v.id)[:8],
+                "name": _object_name(v.id, "V"),
                 "pos": list(v.position),
                 "hp": v.hp,
             })
@@ -232,8 +294,21 @@ class TacticLogger:
         for r in turn.rangers:
             rec.rangers.append({
                 "id": str(r.id)[:8],
+                "name": _object_name(r.id, "R"),
                 "pos": list(r.position),
                 "hp": r.hp,
+            })
+
+        for enemy in turn.visible_enemies:
+            enemy_type = getattr(enemy, "unit_type", None)
+            if hasattr(enemy_type, "value"):
+                enemy_type = enemy_type.value
+            rec.enemies.append({
+                "id": str(enemy.id)[:8],
+                "name": _object_name(enemy.id, "E"),
+                "pos": list(enemy.position),
+                "hp": getattr(enemy, "hp", None),
+                "type": str(enemy_type) if enemy_type is not None else "ENEMY",
             })
 
         for event in turn.events:
@@ -270,10 +345,12 @@ def _plan_worker(
 
     if worker.cargo and pos == core.position and turn_context.resource_space > 0:
         worker.deposit()
+        _set_worker_route(worker, tuple(core.position), [tuple(pos)], complete=True)
         return ("DEPOSIT", f"at_core cargo={worker.cargo}")
 
     if pos in resource_cells and pos not in depleted and not worker.cargo:
         worker.harvest()
+        _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
         return ("HARVEST", f"on_resource {pos}")
 
     goal: tuple[int, int] | None = None
@@ -293,17 +370,19 @@ def _plan_worker(
 
     # Move toward goal (BFS multi-step pathfinding, avoids dead ends)
     if config["worker_bfs_enabled"] and goal is not None and goal != pos:
-        bfs_dir = _bfs_direction(
+        path = _bfs_path(
             pos,
             goal,
             obstacle_cells,
             max_steps=int(config["bfs_max_steps"]),
         )
+        bfs_dir = _direction_for_step(pos, path[1]) if path and len(path) > 1 else None
         if bfs_dir is not None:
             nx, ny = pos[0] + bfs_dir.delta[0], pos[1] + bfs_dir.delta[1]
             if (nx, ny) not in obstacle_cells:
                 worker.move(bfs_dir)
                 _worker_last_pos[str(worker.id)] = pos
+                _set_worker_route(worker, tuple(goal), path, complete=True)
                 return ("MOVE", f"{bfs_dir.name} -> {goal}")
         # BFS failed (trapped) - fall through to explore or greedy fallback
         goal = None
@@ -324,6 +403,12 @@ def _plan_worker(
             if (nx, ny) not in obstacle_cells:
                 worker.move(d)
                 _worker_last_pos[str(worker.id)] = pos
+                _set_worker_route(
+                    worker,
+                    tuple(core.position),
+                    [tuple(pos), (nx, ny)],
+                    complete=False,
+                )
                 return ("MOVE", f"{d.name} -> {core.position}")
 
     # No goal at all: fan out with backtracking avoidance
@@ -345,6 +430,7 @@ def _plan_worker(
             if (nx, ny) not in obstacle_cells:
                 worker.move(d)
                 _worker_last_pos[uid] = pos
+                _set_worker_route(worker, (nx, ny), [tuple(pos), (nx, ny)], complete=True)
                 return ("MOVE", f"{d.name} explore")
 
     if goal is not None and goal != pos:
@@ -354,9 +440,16 @@ def _plan_worker(
             ny = pos[1] + direction.delta[1]
             if (nx, ny) not in obstacle_cells:
                 worker.move(direction)
+                _set_worker_route(
+                    worker,
+                    tuple(goal),
+                    [tuple(pos), (nx, ny)],
+                    complete=False,
+                )
                 return ("MOVE", f"{direction.name} -> {goal}")
 
     worker.wait()
+    _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
     return ("WAIT", "no_action")
 
 
@@ -600,7 +693,11 @@ def _update_resource_memory(turn) -> None:
 
 
 # Context holder for the current turn's resource_space (set by choose_actions)
-turn_context = type("_Ctx", (), {"resource_space": 0, "config": {}})()
+turn_context = type(
+    "_Ctx",
+    (),
+    {"resource_space": 0, "config": {}, "worker_routes": {}},
+)()
 
 
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
@@ -609,6 +706,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     core_action_name = "WAIT"
     config = load_config()
     turn_context.config = config
+    turn_context.worker_routes = {}
 
     # ── Update permanent map memory ────────────────────────────────────
     known_obstacles = _update_obstacle_memory(turn)

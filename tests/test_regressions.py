@@ -42,7 +42,7 @@ class ConfiguredPlannerTests(unittest.TestCase):
         config["bfs_max_steps"] = 1250
         tactic._resource_assignments[str(worker.id)] = (2, 0)
         try:
-            with patch.object(tactic, "_bfs_direction", return_value=tactic.Direction.RIGHT) as bfs:
+            with patch.object(tactic, "_bfs_path", return_value=[(0, 0), (1, 0), (2, 0)]) as bfs:
                 action, _ = tactic._plan_worker(
                     worker,
                     Core(),
@@ -56,6 +56,30 @@ class ConfiguredPlannerTests(unittest.TestCase):
 
         self.assertEqual(action, "MOVE")
         self.assertEqual(bfs.call_args.kwargs["max_steps"], 1250)
+        self.assertEqual(tactic.turn_context.worker_routes["worker-1"]["target"], (2, 0))
+        self.assertEqual(len(tactic.turn_context.worker_routes["worker-1"]["path"]), 3)
+
+    def test_bfs_path_routes_around_obstacles(self) -> None:
+        path = tactic._bfs_path(
+            (0, 0),
+            (2, 0),
+            frozenset({(1, 0)}),
+            max_steps=100,
+        )
+
+        self.assertIsNotNone(path)
+        self.assertEqual(path[0], (0, 0))
+        self.assertEqual(path[-1], (2, 0))
+        self.assertNotIn((1, 0), path)
+
+    def test_object_names_are_stable_and_sequential(self) -> None:
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+
+        self.assertEqual(tactic._object_name("a", "W"), "W1")
+        self.assertEqual(tactic._object_name("b", "W"), "W2")
+        self.assertEqual(tactic._object_name("a", "W"), "W1")
+        self.assertEqual(tactic._object_name("enemy", "E"), "E1")
 
 
 class SummaryTests(unittest.TestCase):
@@ -91,6 +115,33 @@ class SummaryTests(unittest.TestCase):
 
 
 class DashboardLogTests(unittest.TestCase):
+    def test_svg_contains_worker_route_target_and_object_names(self) -> None:
+        rec = {
+            "core_pos": [0, 0],
+            "core_name": "C1",
+            "workers": [{
+                "id": "worker-1",
+                "name": "W1",
+                "pos": [0, 0],
+                "target": [2, 0],
+                "path": [[0, 0], [0, 1], [1, 1], [2, 1], [2, 0]],
+                "path_complete": True,
+                "cargo": 0,
+            }],
+            "vanguards": [{"name": "V1", "pos": [1, 2]}],
+            "rangers": [{"name": "R1", "pos": [2, 2]}],
+            "enemies": [{"name": "E1", "pos": [3, 2]}],
+            "resource_cells": [],
+        }
+        memory = {"obstacles": [], "resources": []}
+
+        svg = dashboard.render_svg(rec, memory)
+
+        self.assertIn('class="worker-route"', svg)
+        self.assertIn('class="worker-target"', svg)
+        for name in ("C1", "W1", "V1", "R1", "E1"):
+            self.assertIn(f">{name}</text>", svg)
+
     def test_reverse_reader_handles_small_chunk_boundaries(self) -> None:
         lines = ["first", "第二行", "third line is longer"]
         with tempfile.TemporaryDirectory() as temp_dir:
