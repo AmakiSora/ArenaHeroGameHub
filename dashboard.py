@@ -350,7 +350,7 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
       f'data-focus-y="{(core_cy if core_cy is not None else H/2):.1f}" '
       f'role="img" aria-label="known-map" style="width:{W}px;height:{H}px">')
     a('<defs>'
-      '<pattern id="gridPat" width="{c}" height="{c}" patternUnits="userSpaceOnUse">'
+      '<pattern id="gridPat" x="{p}" y="{p}" width="{c}" height="{c}" patternUnits="userSpaceOnUse">'
       '<rect width="{c}" height="{c}" fill="#10182c"/>'
       '<rect width="{c}" height="{c}" fill="#152038" opacity="0.35"/>'
       '<path d="M {c} 0 L 0 0 0 {c}" fill="none" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>'
@@ -363,7 +363,7 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
       '<feGaussianBlur stdDeviation="2.2" result="b"/>'
       '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>'
       '</filter>'
-      '</defs>'.format(c=cell))
+      '</defs>'.format(c=cell, p=pad))
     a(f'<rect x="0" y="0" width="{W}" height="{H}" fill="#0b1222"/>')
     a(f'<rect x="{pad}" y="{pad}" width="{cols*cell}" height="{rows*cell}" fill="url(#gridPat)" '
       f'stroke="rgba(255,255,255,0.06)" rx="8"/>')
