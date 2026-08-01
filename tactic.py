@@ -326,11 +326,9 @@ def _plan_ranger(
     obstacle_cells: frozenset[tuple[int, int]],
 ) -> tuple[str, str]:
     """Return (action_name, detail)."""
-    if not enemies:
-        ranger.wait()
-        return ("WAIT", "no_targets")
-
     pos = ranger.position
+
+    # 1. Shoot nearest in-range enemy with clear LOS
     best_dist = 10_000
     best_target = None
 
@@ -347,9 +345,33 @@ def _plan_ranger(
     if best_target is not None:
         ranger.shoot(best_target)
         return ("SHOOT", f"enemy at {best_target.position} dist={best_dist}")
-    else:
-        ranger.wait()
-        return ("WAIT", "no_los_target")
+
+    # 2. Enemies visible but out of range: move toward them
+    if enemies:
+        nearest = min(enemies, key=lambda e: _manhattan(pos, e.position))
+        direction = _step_towards(pos, nearest.position)
+        if direction is not None:
+            nx, ny = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
+            if (nx, ny) not in obstacle_cells:
+                ranger.move(direction)
+                return ("MOVE", f"{direction.name} -> enemy at {nearest.position}")
+
+    # 3. No enemies: scout in unique direction (based on UUID hash)
+    idx = hash(str(ranger.id)) % 4
+    dirs = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
+    preferred = dirs[idx]
+    nx, ny = pos[0] + preferred.delta[0], pos[1] + preferred.delta[1]
+    if (nx, ny) not in obstacle_cells:
+        ranger.move(preferred)
+        return ("MOVE", f"{preferred.name} scout")
+    for d in dirs:
+        nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+        if (nx, ny) not in obstacle_cells:
+            ranger.move(d)
+            return ("MOVE", f"{d.name} scout")
+
+    ranger.wait()
+    return ("WAIT", "no_way")
 
 
 # ── top-level tactic ─────────────────────────────────────────────────────────
