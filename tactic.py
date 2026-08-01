@@ -241,16 +241,24 @@ def _plan_worker(
     if goal is not None and goal != pos:
         direction = _step_towards(pos, goal)
         dirs_try = [direction] if direction else []
-        # Add remaining directions sorted by how much they reduce distance to goal
+        # Add remaining directions sorted by distance to goal, deprioritize backtrack
         remaining = [d for d in [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
                      if d not in dirs_try]
-        remaining.sort(key=lambda d: _manhattan((pos[0]+d.delta[0], pos[1]+d.delta[1]), goal))
+        prev = _worker_last_pos.get(str(worker.id))
+        def _sort_key(d):
+            nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+            dist = _manhattan((nx, ny), goal)
+            if prev and (nx, ny) == prev:
+                dist += 100  # deprioritize going back
+            return dist
+        remaining.sort(key=_sort_key)
         for d in dirs_try + remaining:
             if d is None:
                 continue
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
             if (nx, ny) not in obstacle_cells:
                 worker.move(d)
+                _worker_last_pos[str(worker.id)] = pos
                 return ("MOVE", f"{d.name} -> {goal}")
         # All blocked, fall through to explore
         goal = None
