@@ -200,6 +200,7 @@ TEAM_SETTING_FIELDS = (
     "home_patrol_radius",
     "attack_target_x",
     "attack_target_y",
+    "auto_attack_enabled",
     "ranger_attack_range",
 )
 
@@ -1456,6 +1457,7 @@ JS = r"""
       home_patrol_radius: settings.home_patrol_radius,
       attack_target_x: settings.attack_target_x,
       attack_target_y: settings.attack_target_y,
+      auto_attack_enabled: settings.auto_attack_enabled,
       ranger_attack_range: settings.ranger_attack_range
     };
   }
