@@ -147,6 +147,21 @@ def _object_name(object_id: Any, prefix: str) -> str:
     return _object_names[key]
 
 
+def _set_unit_route(
+    unit: Any,
+    target: tuple[int, int],
+    path: list[tuple[int, int]],
+    *,
+    complete: bool,
+) -> None:
+    """Record a planned route for any unit (worker, vanguard, ranger, core)."""
+    turn_context.unit_routes[str(unit.id)[:8]] = {
+        "target": target,
+        "path": path,
+        "complete": complete,
+    }
+
+
 def _set_worker_route(
     worker: Any,
     target: tuple[int, int],
@@ -154,6 +169,8 @@ def _set_worker_route(
     *,
     complete: bool,
 ) -> None:
+    _set_unit_route(worker, target, path, complete=complete)
+    # Backward compat: keep worker_routes populated
     turn_context.worker_routes[str(worker.id)[:8]] = {
         "target": target,
         "path": path,
@@ -285,18 +302,28 @@ class TacticLogger:
             })
 
         for v in turn.vanguards:
+            vid = str(v.id)[:8]
+            v_route = turn_context.unit_routes.get(vid, {})
             rec.vanguards.append({
-                "id": str(v.id)[:8],
+                "id": vid,
                 "name": _object_name(v.id, "V"),
                 "pos": list(v.position),
+                "target": list(v_route["target"]) if v_route.get("target") else None,
+                "path": [list(p) for p in v_route.get("path", [])],
+                "path_complete": bool(v_route.get("complete", False)),
                 "hp": v.hp,
             })
 
         for r in turn.rangers:
+            rid = str(r.id)[:8]
+            r_route = turn_context.unit_routes.get(rid, {})
             rec.rangers.append({
-                "id": str(r.id)[:8],
+                "id": rid,
                 "name": _object_name(r.id, "R"),
                 "pos": list(r.position),
+                "target": list(r_route["target"]) if r_route.get("target") else None,
+                "path": [list(p) for p in r_route.get("path", [])],
+                "path_complete": bool(r_route.get("complete", False)),
                 "hp": r.hp,
             })
 
@@ -606,6 +633,7 @@ def _move_towards(
     if direction is None:
         return None
     if _try_move(unit, direction, pos, obstacle_cells):
+        _set_unit_route(unit, goal, [pos, goal], complete=False)
         return ("MOVE", f"{direction.name} {detail_prefix} {goal}")
     # Prefer alternate axis when the primary step is blocked.
     dx = goal[0] - pos[0]
@@ -697,6 +725,8 @@ def _scout_cardinal(
     )
     for direction in rotated:
         if _try_move(unit, direction, pos, obstacle_cells):
+            npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+            _set_unit_route(unit, npos, [pos, npos], complete=False)
             return ("MOVE", f"{direction.name} {label}")
     unit.wait()
     return ("WAIT", "no_way")
@@ -1221,7 +1251,7 @@ def _update_enemy_sightings(turn) -> None:
 turn_context = type(
     "_Ctx",
     (),
-    {"resource_space": 0, "config": {}, "worker_routes": {}, "tick": 0},
+    {"resource_space": 0, "config": {}, "worker_routes": {}, "unit_routes": {}, "tick": 0},
 )()
 
 

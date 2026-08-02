@@ -396,7 +396,7 @@ class DashboardLogTests(unittest.TestCase):
 
         self.assertIn('<pattern id="gridPat" x="24" y="24"', svg)
         self.assertIn('class="worker-route"', svg)
-        self.assertIn('class="worker-target"', svg)
+        self.assertIn('class="worker-route-target"', svg)
         for name in ("C1", "W1", "V1", "R1", "E1"):
             self.assertIn(f">{name}</text>", svg)
 

@@ -601,19 +601,18 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
         "#63d8ff", "#57d6a3", "#ffc857", "#ff7aa9",
         "#b38cff", "#ff8a65", "#8fd14f", "#78a9ff",
     )
-    for index, worker in enumerate(rec.get("workers", []) or []):
-        path = [p for p in (worker.get("path") or []) if len(p) == 2]
-        target = worker.get("target") or []
-        color = route_colors[index % len(route_colors)]
-        name = worker.get("name") or f"W{index + 1}"
+
+    def _draw_route(unit_data, name, color, css_class=""):
+        path = [p for p in (unit_data.get("path") or []) if len(p) == 2]
+        target = unit_data.get("target") or []
         if len(path) > 1:
             route_points = []
             for px, py in path:
                 x, y = to_xy(int(px), int(py))
                 route_points.append(f"{x + cell / 2:.1f},{y + cell / 2:.1f}")
             points_attr = " ".join(route_points)
-            dash = "" if worker.get("path_complete") else ' stroke-dasharray="5 4"'
-            a(f'<polyline class="worker-route" data-worker="{name}" '
+            dash = "" if unit_data.get("path_complete") else ' stroke-dasharray="5 4"'
+            a(f'<polyline class="{css_class}" data-unit="{name}" '
               f'points="{points_attr}" fill="none" stroke="{color}" '
               f'stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" '
               f'opacity="0.82"{dash}/>')
@@ -622,9 +621,21 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
             if xmin <= tx <= xmax and ymin <= ty <= ymax:
                 x, y = to_xy(tx, ty)
                 cx, cy = x + cell / 2, y + cell / 2
-                a(f'<circle class="worker-target" data-worker="{name}" cx="{cx}" cy="{cy}" '
+                a(f'<circle class="{css_class}-target" data-unit="{name}" cx="{cx}" cy="{cy}" '
                   f'r="8" fill="none" stroke="{color}" stroke-width="1.8" opacity="0.9"/>')
                 a(f'<circle cx="{cx}" cy="{cy}" r="2" fill="{color}"/>')
+
+    for index, worker in enumerate(rec.get("workers", []) or []):
+        _draw_route(worker, worker.get("name") or f"W{index + 1}",
+                     route_colors[index % len(route_colors)], "worker-route")
+
+    # Vanguard routes (orange)
+    for index, v in enumerate(rec.get("vanguards", []) or []):
+        _draw_route(v, v.get("name") or f"V{index + 1}", "#ff8c42", "vanguard-route")
+
+    # Ranger routes (teal)
+    for index, r in enumerate(rec.get("rangers", []) or []):
+        _draw_route(r, r.get("name") or f"R{index + 1}", "#6ea8ff", "ranger-route")
 
     def unit(pos, color, label, glow=False, ring=None):
         if not pos or len(pos) != 2: return
