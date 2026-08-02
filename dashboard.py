@@ -824,6 +824,8 @@ body{margin:0;min-height:100vh;color:var(--text);
 .side-col{display:grid;gap:12px;min-width:0}
 .side-col .panel{padding:14px}
 .side-col .panel-title{font-size:14px;margin-bottom:10px}
+.enemy-clear-btn{appearance:none;border:1px solid rgba(255,100,100,.25);border-radius:6px;background:rgba(255,100,100,.08);color:#ffb6b6;font-size:10px;padding:2px 8px;cursor:pointer;transition:.12s}
+.enemy-clear-btn:hover{background:rgba(255,100,100,.22);border-color:rgba(255,100,100,.5);color:#fff}
 .center-col{display:grid;gap:12px;min-width:0}
 .map-panel{margin:0}
 .map-panel .map-toolbar{margin-bottom:8px}
@@ -2018,7 +2020,7 @@ def build_parts():
         f'<section class="panel"><div class="panel-title"><span>资源</span><span class="count">{pct}%</span></div>{left_res}</section>'
         f'<section class="panel"><div class="panel-title"><span>战场</span><span class="count">摘要</span></div>{left_fight}</section>'
         f'<section class="panel"><div class="panel-title"><span>异常</span><span class="count">{len(issues)}</span></div><div class="compact-list">{left_issues}</div></section>'
-        f'<section class="panel enemy-panel" id="leftEnemyPanel"><div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{len(ex_sightings)} 处</span></div><div class="enemy-actions"><button type="button" id="clearEnemyBtn" class="secondary" style="font-size:11px;padding:4px 10px">清除全部</button></div><div id="enemySection">{enemy_html}</div></section>'
+        f'<section class="panel enemy-panel" id="leftEnemyPanel"><div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{len(ex_sightings)} 处</span><button type="button" id="clearEnemyBtn" class="enemy-clear-btn">清除</button></div><div id="enemySection">{enemy_html}</div></section>'
     )
 
     return {

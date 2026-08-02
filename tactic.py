@@ -1237,13 +1237,49 @@ def _update_resource_memory(turn) -> None:
 
 
 def _update_enemy_sightings(turn) -> None:
-    """Record every position where enemies were seen."""
+    """Record every position where enemies were seen.  Remove stale sightings
+    when a friendly unit is looking at the cell and no enemy is there."""
     global _enemy_memory, _map_dirty
     before = len(_enemy_memory)
-    for enemy in turn.visible_enemies:
-        pos = tuple(enemy.position)
-        _enemy_memory.add(pos)
-    if len(_enemy_memory) > before:
+
+    # Collect all friendly positions for sight checking
+    friendly_positions: set[tuple[int, int]] = set()
+    if turn.core:
+        friendly_positions.add(tuple(turn.core.position))
+    for w in turn.workers:
+        friendly_positions.add(tuple(w.position))
+    for v in turn.vanguards:
+        friendly_positions.add(tuple(v.position))
+    for r in turn.rangers:
+        friendly_positions.add(tuple(r.position))
+
+    # Visible enemies this tick
+    visible_enemy_positions: set[tuple[int, int]] = {
+        tuple(enemy.position) for enemy in turn.visible_enemies
+    }
+
+    # Add new sightings
+    for pos in visible_enemy_positions:
+        if pos not in _enemy_memory:
+            _enemy_memory.add(pos)
+
+    # Remove stale sightings: friendly unit within range 5 of a sighting,
+    # but no visible enemy there
+    VISION_RANGE = 5
+    stale: set[tuple[int, int]] = set()
+    for sighting in _enemy_memory:
+        if sighting in visible_enemy_positions:
+            continue  # still there
+        # Check if any friendly unit is close enough to see this cell
+        for fpos in friendly_positions:
+            if _manhattan(fpos, sighting) <= VISION_RANGE:
+                stale.add(sighting)
+                break
+
+    if stale:
+        _enemy_memory -= stale
+
+    if len(_enemy_memory) != before:
         _map_dirty = True
 
 
