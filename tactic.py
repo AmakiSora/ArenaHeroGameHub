@@ -340,16 +340,18 @@ def _plan_worker(
     obstacle_cells: frozenset[tuple[int, int]],
     depleted: set[tuple[int, int]],
     config: dict[str, int | bool],
+    beacon_carried: bool = False,
 ) -> tuple[str, str]:
     """Return (action_name, detail)."""
     pos = worker.position
+    max_cargo = 2 if beacon_carried else 1
 
-    if worker.cargo and pos == core.position and turn_context.resource_space > 0:
+    if worker.cargo >= max_cargo and pos == core.position and turn_context.resource_space > 0:
         worker.deposit()
         _set_worker_route(worker, tuple(core.position), [tuple(pos)], complete=True)
         return ("DEPOSIT", f"at_core cargo={worker.cargo}")
 
-    if pos in resource_cells and pos not in depleted and not worker.cargo:
+    if pos in resource_cells and pos not in depleted and worker.cargo < max_cargo:
         worker.harvest()
         _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
         return ("HARVEST", f"on_resource {pos}")
@@ -364,7 +366,7 @@ def _plan_worker(
             goal = assigned
         # If no assignment, skip visible resources (they're assigned to other workers)
     # Fallback: use remembered resource coordinates (only if assigned)
-    if goal is None and not worker.cargo:
+    if goal is None and worker.cargo < max_cargo:
         assigned = _resource_assignments.get(str(worker.id))
         if assigned and assigned in _resource_memory:
             goal = assigned
@@ -372,7 +374,7 @@ def _plan_worker(
     # Reaching a remembered target without seeing a resource confirms that the
     # memory is stale. Forget it and explore immediately instead of waiting on
     # the empty cell forever.
-    if goal == pos and not worker.cargo and pos not in resource_cells:
+    if goal == pos and worker.cargo < max_cargo and pos not in resource_cells:
         _forget_resource(pos)
         _resource_assignments.pop(str(worker.id), None)
         goal = None
@@ -426,7 +428,7 @@ def _plan_worker(
                 return ("MOVE", f"{d.name} -> {core.position}")
 
     # No goal at all: fan out with backtracking avoidance
-    if goal is None and not worker.cargo:
+    if goal is None and worker.cargo < max_cargo:
         uid = str(worker.id)
         prev = _worker_last_pos.get(uid)
         recent = _worker_recent.get(uid, [])
@@ -1296,8 +1298,9 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 
     # Assign each resource to the closest worker (avoid stampede)
     _resource_assignments.clear()
-    # Only assign to workers without cargo (cargo workers are heading home)
-    idle_workers = [(str(w.id), tuple(w.position)) for w in turn.workers if not w.cargo]
+    # Workers at capacity head home; others can still be assigned targets.
+    max_w_cargo = 2 if beacon_carried_by_core else 1
+    idle_workers = [(str(w.id), tuple(w.position)) for w in turn.workers if w.cargo < max_w_cargo]
     all_resources = _merge_resource_cells(
         turn.resource_cells,
         _resource_memory,
@@ -1351,7 +1354,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     if not core_done and config["core_movement_enabled"]:
         # Stop if a cargo worker is close, otherwise move toward them
         close_cargo = any(
-            w.cargo > 0
+            w.cargo >= max_w_cargo
             and _manhattan(w.position, core_pos) <= int(config["cargo_wait_distance"])
             for w in turn.workers
         )
@@ -1415,6 +1418,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 obstacle_cells=obstacle_cells,
                 depleted=depleted,
                 config=config,
+                beacon_carried=beacon_carried_by_core,
             )
             unit_actions_detail[uid] = f"{action}:{detail}"
         elif unit.unit_type == UnitType.VANGUARD:
