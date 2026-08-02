@@ -1344,7 +1344,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             if enemies
             else int(config["peace_shield_target"])
         )
-        want_repair = core.shield < min(effective_cap, shield_target)
+        want_repair = core.shield < shield_target and core.shield < effective_cap
         if want_repair:
             core.repair_shield()
             core_action_name = "REPAIR_SHIELD"
