@@ -587,13 +587,37 @@ def _ensure_home_team_membership(
 
 
 def _auto_enlist_new_combat_units(turn: Any, config: dict[str, Any]) -> dict[str, Any]:
-    """Give every living Vanguard/Ranger a name and default them to home."""
+    """Give every living Vanguard/Ranger a name and default them to home.
+    Also remove dead units from all team rosters."""
     names: list[str] = []
     for vanguard in getattr(turn, "vanguards", ()) or ():
         names.append(_object_name(vanguard.id, "V"))
     for ranger in getattr(turn, "rangers", ()) or ():
         names.append(_object_name(ranger.id, "R"))
-    return _ensure_home_team_membership(config, names)
+
+    alive = {n.upper() for n in names}
+    config = _ensure_home_team_membership(config, names)
+
+    # Prune dead units from all team rosters
+    updated = dict(config)
+    changed = False
+    for team_key in ("home_team", "attack_team", "guerrilla_team"):
+        old = _parse_team_names(config.get(team_key, ""))
+        pruned = old & alive
+        if pruned != old:
+            updated[team_key] = _format_team_roster(pruned)
+            changed = True
+
+    if changed:
+        try:
+            saved = save_config(updated)
+            print(f"[team] pruned dead from rosters", flush=True)
+            return saved
+        except Exception as exc:
+            print(f"[team] roster prune failed: {exc}", flush=True)
+            return updated
+
+    return config
 
 
 def _cardinal_toward_delta(dx: int, dy: int) -> Direction | None:
