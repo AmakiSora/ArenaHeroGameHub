@@ -1359,28 +1359,37 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             for w in turn.workers
         )
         if not close_cargo:
-            # Move toward workers + resources center of mass
-            # Compute average worker position
-            wx = [w.position[0] for w in turn.workers]
-            wy = [w.position[1] for w in turn.workers]
-            if wx and wy:
-                avg_x = sum(wx) // len(wx)
-                avg_y = sum(wy) // len(wy)
+            # Determine movement target
+            core_target_enabled = config.get("core_target_enabled", False)
+            if core_target_enabled:
+                # Fixed coordinate target (overrides resource/worker heuristics)
+                target = (
+                    int(config.get("core_target_x", 0)),
+                    int(config.get("core_target_y", 0)),
+                )
             else:
-                avg_x, avg_y = core_pos
-            # Also consider nearest resource (visible or remembered)
-            res_target = None
-            if all_resources:
-                res_target = min(all_resources, key=lambda p: _manhattan(core_pos, p))
-            # Choose target: nearest resource or worker center, whichever is closer
-            if (
-                config["prefer_resources_for_core"]
-                and res_target
-                and _manhattan(core_pos, res_target) < _manhattan(core_pos, (avg_x, avg_y))
-            ):
-                target = res_target
-            else:
-                target = (avg_x, avg_y)
+                # Move toward workers + resources center of mass
+                # Compute average worker position
+                wx = [w.position[0] for w in turn.workers]
+                wy = [w.position[1] for w in turn.workers]
+                if wx and wy:
+                    avg_x = sum(wx) // len(wx)
+                    avg_y = sum(wy) // len(wy)
+                else:
+                    avg_x, avg_y = core_pos
+                # Also consider nearest resource (visible or remembered)
+                res_target = None
+                if all_resources:
+                    res_target = min(all_resources, key=lambda p: _manhattan(core_pos, p))
+                # Choose target: nearest resource or worker center, whichever is closer
+                if (
+                    config["prefer_resources_for_core"]
+                    and res_target
+                    and _manhattan(core_pos, res_target) < _manhattan(core_pos, (avg_x, avg_y))
+                ):
+                    target = res_target
+                else:
+                    target = (avg_x, avg_y)
             # Determine best direction
             dx = target[0] - core_pos[0]
             dy = target[1] - core_pos[1]
