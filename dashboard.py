@@ -645,7 +645,7 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
         name = w.get("name") or f"W{index + 1}"
         unit(w.get("pos"), "#57d6a3" if c else "#8aa4ff", name, glow=c, ring="#9ef0c8" if c else None)
     for index, v in enumerate(rec.get("vanguards", [])):
-        unit(v.get("pos"), "#ff6b9d", v.get("name") or f"V{index + 1}", glow=True)
+        unit(v.get("pos"), "#ff8c42", v.get("name") or f"V{index + 1}", glow=True)
     for index, r in enumerate(rec.get("rangers", [])):
         unit(r.get("pos"), "#b38cff", r.get("name") or f"R{index + 1}", glow=True)
     for index, enemy in enumerate(rec.get("enemies", [])):
@@ -698,7 +698,7 @@ CSS = r"""
 :root{
  --bg0:#070b16;--bg1:#10182b;--card:rgba(255,255,255,.045);
  --line:rgba(255,255,255,.08);--text:#eef3ff;--muted:#93a0bf;
- --accent:#6ea8ff;--pink:#ff6b9d;--green:#57d6a3;--amber:#ffc857;
+ --accent:#6ea8ff;--pink:#ff6b9d;--orange:#ff8c42;--green:#57d6a3;--amber:#ffc857;
  --red:#ff6b6b;--purple:#b38cff;--shadow:0 18px 50px rgba(0,0,0,.35);
 }
 *{box-sizing:border-box}
@@ -799,7 +799,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .map-legend .dot.core{background:#6ea8ff;color:#6ea8ff;border-radius:2px}
 .map-legend .dot.cargo{background:#57d6a3;color:#57d6a3}
 .map-legend .dot.worker{background:#8aa4ff;color:#8aa4ff}
-.map-legend .dot.vg{background:#ff6b9d;color:#ff6b9d}
+.map-legend .dot.vg{background:#ff8c42;color:#ff8c42}
 .map-legend .dot.rg{background:#b38cff;color:#b38cff}
 .map-legend .dot.enemy{background:#ff6464;color:#ff6464}
 .map-legend .dot.wall{background:#3a455f;color:#7f8eab;border-radius:2px;box-shadow:none;border:1px solid #7f8eab;width:9px;height:9px}
@@ -863,7 +863,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-chip:active{cursor:grabbing}
 .team-chip.dragging{opacity:.45}
 .team-chip .glyph{width:28px;height:28px;border-radius:10px;display:grid;place-items:center;font:800 12px Consolas,monospace;color:#081018}
-.team-chip.kind-VANGUARD .glyph{background:#ff6b9d}
+.team-chip.kind-VANGUARD .glyph{background:#ff8c42}
 .team-chip.kind-RANGER .glyph{background:#b38cff}
 .team-chip.kind-COMBAT .glyph{background:#6ea8ff}
 .team-chip .meta{min-width:0;flex:1}
