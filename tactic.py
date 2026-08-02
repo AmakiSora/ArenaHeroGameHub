@@ -379,10 +379,15 @@ def _plan_worker(
 
     # Move toward goal (BFS multi-step pathfinding, avoids dead ends)
     if config["worker_bfs_enabled"] and goal is not None and goal != pos:
+        # Workers can walk onto the core cell; the game may report it as an
+        # obstacle so temporarily exclude it from the pathfinding obstacle set.
+        bfs_obs = obstacle_cells
+        if goal == tuple(core.position):
+            bfs_obs = obstacle_cells - {goal}
         path = _bfs_path(
             pos,
             goal,
-            obstacle_cells,
+            bfs_obs,
             max_steps=int(config["bfs_max_steps"]),
         )
         bfs_dir = _direction_for_step(pos, path[1]) if path and len(path) > 1 else None
@@ -424,12 +429,16 @@ def _plan_worker(
     if goal is None and not worker.cargo:
         uid = str(worker.id)
         prev = _worker_last_pos.get(uid)
+        recent = _worker_recent.get(uid, [])
         idx = hash(uid) % 4
         base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
         rotated = base[idx:] + base[:idx]
-        # Sort: deprioritize direction that goes back to previous position
+        # Sort: deprioritize backtracking and recently visited cells
+        recent_set = set(recent)
         def _sort_key(d):
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+            if (nx, ny) in recent_set:
+                return 2  # recently visited = worst
             if config["avoid_backtracking"] and prev and (nx, ny) == prev:
                 return 1  # backtracking = bad
             return 0
@@ -439,6 +448,10 @@ def _plan_worker(
             if (nx, ny) not in obstacle_cells:
                 worker.move(d)
                 _worker_last_pos[uid] = pos
+                recent.append(pos)
+                if len(recent) > 4:
+                    recent.pop(0)
+                _worker_recent[uid] = recent
                 _set_worker_route(worker, (nx, ny), [tuple(pos), (nx, ny)], complete=True)
                 return ("MOVE", f"{d.name} explore")
 
@@ -1047,6 +1060,7 @@ _resource_tombstones: set[tuple[int, int]] = set()
 _obstacle_memory: set[tuple[int, int]] = set()
 # Track each worker's previous position to avoid backtracking
 _worker_last_pos: dict[str, tuple[int, int]] = {}
+_worker_recent: dict[str, list[tuple[int, int]]] = {}  # last 4 positions, anti-oscillation
 # Resource assignment: each resource assigned to closest worker only
 _resource_assignments: dict[str, tuple[int, int]] = {}
 _map_dirty: bool = False
