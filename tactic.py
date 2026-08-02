@@ -1344,7 +1344,25 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     config = load_config()
     turn_context.config = config
     turn_context.worker_routes = {}
+    turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
+
+    # ── Cleanup dead-unit bookkeeping ──────────────────────────────────
+    alive_ids: set[str] = set()
+    for w in turn.workers:
+        alive_ids.add(str(w.id)[:8])
+    for v in getattr(turn, "vanguards", ()) or ():
+        alive_ids.add(str(v.id)[:8])
+    for r in getattr(turn, "rangers", ()) or ():
+        alive_ids.add(str(r.id)[:8])
+    # Prune dead workers from position/assignment tracking
+    for dead_id in list(_worker_last_pos) - alive_ids:
+        _worker_last_pos.pop(dead_id, None)
+    for dead_id in list(_worker_recent) - alive_ids:
+        _worker_recent.pop(dead_id, None)
+    for dead_id in list(_resource_assignments) - alive_ids:
+        _resource_assignments.pop(dead_id, None)
+
     _sync_production_queue(turn)
 
     # ── Update permanent map memory ────────────────────────────────────
