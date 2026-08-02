@@ -1982,6 +1982,7 @@ def build_parts():
         f'<section class="panel"><div class="panel-title"><span>资源</span><span class="count">{pct}%</span></div>{left_res}</section>'
         f'<section class="panel"><div class="panel-title"><span>战场</span><span class="count">摘要</span></div>{left_fight}</section>'
         f'<section class="panel"><div class="panel-title"><span>异常</span><span class="count">{len(issues)}</span></div><div class="compact-list">{left_issues}</div></section>'
+        f'<section class="panel enemy-panel" id="leftEnemyPanel"><div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{len(ex_sightings)} 处</span></div><div id="enemySection">{enemy_html}</div></section>'
     )
 
     return {
@@ -2091,10 +2092,6 @@ def generate_html() -> str:
           <button type="button" class="add-ore-btn" id="resAddToggle" title="录入矿点">+</button>
         </div>
         <div id="resSection">{parts['resHtml']}</div>
-      </section>
-      <section class="panel enemy-panel" id="enemyPanel">
-        <div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{parts['enemyCount']}</span></div>
-        <div id="enemySection">{parts['enemyHtml']}</div>
       </section>
       <section class="panel">
         <div class="panel-title"><span>事件</span><span class="count" id="eventsCount">{parts['eventsCount']}</span></div>
