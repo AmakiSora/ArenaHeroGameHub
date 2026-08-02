@@ -63,12 +63,17 @@ class QueuedSpawnPlannerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = default_config()
 
+    @staticmethod
+    def _turn(tick, units=(), events=(), population=18):
+        return SimpleNamespace(tick=tick, units=units, events=events,
+                               state=SimpleNamespace(population=population))
+
     def test_affordable_head_is_spawned_and_success_removes_it(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "queue.db"
             with patch.object(production_queue, "QUEUE_PATH", path):
                 production_queue.enqueue("RANGER")
-                turn = SimpleNamespace(tick=10, units=(), events=())
+                turn = self._turn(tick=10)
                 core = self.Core()
 
                 self.assertIsNone(tactic._plan_queued_spawn(turn, core, resources=11, config=self.config))
@@ -80,9 +85,8 @@ class QueuedSpawnPlannerTests(unittest.TestCase):
                 self.assertEqual(core.spawned, UnitType.RANGER)
                 self.assertEqual(production_queue.head_request()["status"], "inflight")
 
-                success_turn = SimpleNamespace(
+                success_turn = self._turn(
                     tick=11,
-                    units=(),
                     events=(SimpleNamespace(event_type="CORE_SPAWN_SUCCEEDED"),),
                 )
                 tactic._sync_production_queue(success_turn)
@@ -95,7 +99,7 @@ class QueuedSpawnPlannerTests(unittest.TestCase):
             with patch.object(production_queue, "QUEUE_PATH", path):
                 production_queue.enqueue("WORKER")
                 occupying_unit = SimpleNamespace(position=(0, 0))
-                turn = SimpleNamespace(tick=20, units=(occupying_unit,), events=())
+                turn = self._turn(tick=20, units=(occupying_unit,))
 
                 action = tactic._plan_queued_spawn(turn, self.Core(), resources=20, config=self.config)
 
@@ -107,7 +111,7 @@ class QueuedSpawnPlannerTests(unittest.TestCase):
             path = Path(temp_dir) / "queue.db"
             with patch.object(production_queue, "QUEUE_PATH", path):
                 production_queue.enqueue("WORKER")
-                turn = SimpleNamespace(tick=30, units=(), events=())
+                turn = self._turn(tick=30)
                 core = self.Core()
                 config = dict(self.config)
                 config["resource_reserve"] = 20
@@ -127,7 +131,7 @@ class QueuedSpawnPlannerTests(unittest.TestCase):
             path = Path(temp_dir) / "queue.db"
             with patch.object(production_queue, "QUEUE_PATH", path):
                 production_queue.enqueue("WORKER")
-                turn = SimpleNamespace(tick=40, units=(), events=())
+                turn = self._turn(tick=40)
                 core = self.Core()
                 config = dict(self.config)
                 config["resource_reserve"] = 0

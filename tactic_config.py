@@ -42,6 +42,7 @@ CONFIG_FIELDS = (
     ConfigField("peace_shield_target", "和平修盾目标", "core", "integer", 10, 0, 10, 1),
     ConfigField("combat_shield_target", "战斗修盾目标", "core", "integer", 3, 0, 10, 1),
     ConfigField("resource_reserve", "生产保留金币", "core", "integer", 0, 0, 100, 1),
+    ConfigField("population_cap", "人口上限暂停生产", "core", "integer", 20, 0, 20, 1),
     ConfigField(
         "home_team",
         "守家队名单",

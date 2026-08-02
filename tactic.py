@@ -1226,7 +1226,10 @@ def _plan_queued_spawn(turn: Any, core: Any, resources: int, config: dict[str, A
         return None
     cost = int(request["cost"])
     reserve = int(config.get("resource_reserve", 0))
+    pop_cap = int(config.get("population_cap", 20))
     if resources < cost + reserve:
+        return None
+    if turn.state.population >= pop_cap:
         return None
     if any(tuple(unit.position) == tuple(core.position) for unit in turn.units):
         return None
