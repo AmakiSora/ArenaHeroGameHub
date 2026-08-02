@@ -155,6 +155,88 @@ class ConfiguredPlannerTests(unittest.TestCase):
         self.assertEqual(path[-1], (2, 0))
         self.assertNotIn((1, 0), path)
 
+    def test_dead_end_cells_detect_cul_de_sac(self) -> None:
+        # Convex pocket: free cell (0, 0) has walls on UP/LEFT/RIGHT, open DOWN.
+        obstacles = frozenset({
+            (0, -1),  # UP
+            (-1, 0),  # LEFT
+            (1, 0),   # RIGHT
+        })
+        dead = tactic._dead_end_cells(obstacles)
+        self.assertIn((0, 0), dead)
+
+    def test_dead_end_cells_collapse_corridor_into_cul_de_sac(self) -> None:
+        # Corridor (0,0)->(0,1) ends in a three-sided pocket at (0,0).
+        # Only one free exit from (0,1) after (0,0) is marked dead.
+        obstacles = frozenset({
+            (-1, 0), (1, 0), (0, -1),  # pocket walls around (0,0)
+            (-1, 1), (1, 1),           # corridor side walls around (0,1)
+        })
+        dead = tactic._dead_end_cells(obstacles)
+        self.assertIn((0, 0), dead)
+        self.assertIn((0, 1), dead)
+
+    def test_bfs_avoids_dead_end_unless_goal_requires_it(self) -> None:
+        # Open path around a cul-de-sac entrance.
+        # Layout: start (0,2) -> goal (2,2); pocket entrance (0,1) leads to (0,0).
+        obstacles = frozenset({
+            (-1, 0), (1, 0), (0, -1),  # pocket walls for (0,0)
+            (-1, 1), (1, 1),           # corridor sides for (0,1)
+        })
+        path = tactic._bfs_path((0, 2), (2, 2), obstacles, max_steps=200)
+        self.assertIsNotNone(path)
+        assert path is not None
+        self.assertNotIn((0, 0), path)
+        self.assertNotIn((0, 1), path)
+
+        # Goal inside the pocket must still be reachable.
+        into_pocket = tactic._bfs_path((0, 2), (0, 0), obstacles, max_steps=200)
+        self.assertIsNotNone(into_pocket)
+        assert into_pocket is not None
+        self.assertEqual(into_pocket[-1], (0, 0))
+        self.assertIn((0, 1), into_pocket)
+
+    def test_worker_explore_skips_dead_end(self) -> None:
+        class Worker:
+            id = "worker-deadend"
+            position = (0, 1)
+            cargo = 0
+            direction = None
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+        class Core:
+            position = (5, 5)
+
+        # At (0,1): UP is the cul-de-sac (0,0); RIGHT/LEFT blocked; DOWN is open.
+        obstacles = frozenset({
+            (-1, 0), (1, 0), (0, -1),  # walls around (0,0)
+            (-1, 1), (1, 1),           # side walls at current row
+        })
+        worker = Worker()
+        config = default_config()
+        tactic._worker_last_pos.clear()
+        tactic._worker_recent.clear()
+        tactic._resource_assignments.clear()
+        action, detail = tactic._plan_worker(
+            worker,
+            Core(),
+            resource_cells=frozenset(),
+            obstacle_cells=obstacles,
+            depleted=set(),
+            config=config,
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("explore", detail)
+        self.assertIsNotNone(worker.direction)
+        # Must not step UP into the dead end when DOWN is free.
+        self.assertNotEqual(worker.direction, tactic.Direction.UP)
+        self.assertEqual(worker.direction, tactic.Direction.DOWN)
+
     def test_object_names_are_stable_and_sequential(self) -> None:
         tactic._object_names.clear()
         tactic._object_name_counters.clear()
@@ -163,6 +245,60 @@ class ConfiguredPlannerTests(unittest.TestCase):
         self.assertEqual(tactic._object_name("b", "W"), "W2")
         self.assertEqual(tactic._object_name("a", "W"), "W1")
         self.assertEqual(tactic._object_name("enemy", "E"), "E1")
+
+    def test_astar_reaches_distant_goal_within_budget(self) -> None:
+        # Plain BFS needed ~900 expansions on open maps; A* should be far lower.
+        path = tactic._bfs_path(
+            (0, 0),
+            (40, 0),
+            frozenset({(20, y) for y in range(-5, 6)} - {(20, 3)}),
+            max_steps=2500,
+        )
+        self.assertIsNotNone(path)
+        assert path is not None
+        self.assertEqual(path[0], (0, 0))
+        self.assertEqual(path[-1], (40, 0))
+        self.assertNotIn((20, 0), path)
+
+    def test_worker_backtrack_memory_survives_full_id_keys(self) -> None:
+        class Worker:
+            id = "abcdef12-ffff-ffff-ffff-ffffffffffff"
+            position = (1, 0)
+            cargo = 0
+            direction = None
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        config = default_config()
+        # Simulate prior tick memory written with the full id (as planners do).
+        tactic._worker_last_pos[str(worker.id)] = (0, 0)
+        tactic._worker_recent[str(worker.id)] = [(0, 0)]
+        tactic._resource_assignments.clear()
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                Core(),
+                resource_cells=frozenset(),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+            )
+        finally:
+            tactic._worker_last_pos.pop(str(worker.id), None)
+            tactic._worker_recent.pop(str(worker.id), None)
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("explore", detail)
+        # Must not immediately reverse into the previous cell (0,0) = LEFT.
+        self.assertNotEqual(worker.direction, tactic.Direction.LEFT)
 
 
 class CombatTeamPlannerTests(unittest.TestCase):
@@ -263,6 +399,23 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(action, "MOVE")
         self.assertIn("home-return", detail)
         self.assertEqual(unit.action, "MOVE")
+
+    def test_home_team_hysteresis_avoids_radius_edge_flip(self) -> None:
+        # Exactly at radius+1 should patrol/hold, not flip into home-return.
+        unit = self.CombatUnit("v-edge", (4, 0))
+        self.config["home_patrol_radius"] = 3
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="home",
+        )
+
+        self.assertNotIn("home-return", detail)
+        self.assertIn(action, {"MOVE", "WAIT"})
 
     def test_attack_team_marches_to_configured_target(self) -> None:
         unit = self.CombatUnit("v-attack", (0, 0))

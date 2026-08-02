@@ -19,7 +19,7 @@ class TacticConfigTests(unittest.TestCase):
     def test_defaults_preserve_existing_strategy(self) -> None:
         config = default_config()
 
-        self.assertEqual(config["bfs_max_steps"], 800)
+        self.assertEqual(config["bfs_max_steps"], 2500)
         self.assertEqual(config["cargo_wait_distance"], 5)
         self.assertEqual(config["combat_shield_target"], 3)
         self.assertTrue(config["core_movement_enabled"])

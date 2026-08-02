@@ -7,7 +7,15 @@ import os
 import time
 from collections import defaultdict
 
-LOG_FILE = "tactic_log.jsonl"
+def _data_path(name: str) -> str:
+    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
+    if raw:
+        from pathlib import Path
+        return str(Path(raw).resolve() / name)
+    return name
+
+
+LOG_FILE = _data_path("tactic_log.jsonl")
 
 def read_latest():
     """Read the latest complete tick record from the log."""

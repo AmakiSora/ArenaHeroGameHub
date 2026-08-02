@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -9,7 +10,12 @@ from pathlib import Path
 from typing import Any
 
 
-QUEUE_PATH = Path(__file__).with_name("production_queue.db")
+def _data_dir() -> Path:
+    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
+    return Path(raw).resolve() if raw else Path(__file__).resolve().parent
+
+
+QUEUE_PATH = _data_dir() / "production_queue.db"
 MAX_QUEUE_SIZE = 20
 UNIT_COSTS = {
     "WORKER": 5,

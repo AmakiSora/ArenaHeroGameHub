@@ -1,0 +1,34 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "4399"
+      ARENA_DATA_DIR: /app/runtime
+      ARENA_HERO_API_KEY: ${ARENA_HERO_API_KEY:?Set ARENA_HERO_API_KEY in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "4399:4399"
+    volumes:
+      - arena-game-runtime:/app/runtime
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4399/api/state', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  arena-game-runtime:
+    name: arena-game-runtime

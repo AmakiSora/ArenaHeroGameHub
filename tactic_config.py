@@ -6,8 +6,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+# ARENA_DATA_DIR lets Docker keep mutable state on a volume.
 
-CONFIG_PATH = Path(__file__).with_name("tactic_config.json")
+
+def _data_dir() -> Path:
+    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
+    return Path(raw).resolve() if raw else Path(__file__).resolve().parent
+
+
+CONFIG_PATH = _data_dir() / "tactic_config.json"
 
 
 @dataclass(frozen=True)
@@ -32,7 +39,7 @@ CONFIG_GROUPS = (
 
 CONFIG_FIELDS = (
     ConfigField("worker_bfs_enabled", "启用工人 BFS", "worker", "boolean", True),
-    ConfigField("bfs_max_steps", "BFS 搜索节点", "worker", "integer", 800, 50, 5000, 50),
+    ConfigField("bfs_max_steps", "BFS 搜索节点", "worker", "integer", 2500, 50, 8000, 50),
     ConfigField("avoid_backtracking", "避免立即回头", "worker", "boolean", True),
     ConfigField("backtrack_penalty", "载矿回头惩罚", "worker", "integer", 10, 0, 100, 1),
     ConfigField("core_movement_enabled", "允许核心移动", "core", "boolean", True),

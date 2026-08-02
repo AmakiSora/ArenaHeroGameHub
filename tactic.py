@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from getpass import getpass
+from heapq import heappop, heappush
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,13 @@ from tactic_config import load_config, save_config
 
 apply_sdk_compat()
 
-MAP_MEMORY_PATH = Path("map_memory.json")
+def _data_dir() -> Path:
+    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
+    return Path(raw).resolve() if raw else Path.cwd()
+
+
+MAP_MEMORY_PATH = _data_dir() / "map_memory.json"
+DEFAULT_LOG_PATH = str(_data_dir() / "tactic_log.jsonl")
 
 
 # ── geometry helpers ─────────────────────────────────────────────────────────
@@ -83,37 +90,189 @@ def _line_blocked(
     return False
 
 
-# ── BFS pathfinding (multi-step lookahead) ────────────────────────────────────
+# ── Dead-end map recognition ──────────────────────────────────────────────────
+# A free cell with only one open cardinal neighbor is a 凸-shaped cul-de-sac
+# (three sides walled). One-wide corridors that only lead into such pockets are
+# expanded iteratively so explorers do not walk into obvious dead ends.
+
+_CARDINAL_DELTAS: tuple[tuple[int, int], ...] = ((0, -1), (1, 0), (0, 1), (-1, 0))
+_dead_end_cache_key: frozenset[tuple[int, int]] | None = None
+_dead_end_cache: frozenset[tuple[int, int]] = frozenset()
+
+
+def _neighbor_cells(pos: tuple[int, int]) -> tuple[tuple[int, int], ...]:
+    x, y = pos
+    return tuple((x + dx, y + dy) for dx, dy in _CARDINAL_DELTAS)
+
+
+def _open_degree(
+    pos: tuple[int, int],
+    blocked: frozenset[tuple[int, int]] | set[tuple[int, int]],
+) -> int:
+    """Count free cardinal neighbors of pos (cells not in blocked)."""
+    return sum(1 for n in _neighbor_cells(pos) if n not in blocked)
+
+
+def _dead_end_cells(
+    obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]],
+) -> frozenset[tuple[int, int]]:
+    """Return free cells that are obvious dead ends given known walls.
+
+    Seed candidates are free cells adjacent to any known obstacle. A candidate
+    is a dead end when it has at most one free neighbor. Marked dead ends are
+    then treated as blocked so one-wide corridors collapse inward.
+    """
+    if not obstacles:
+        return frozenset()
+    obs = frozenset(obstacles)
+    candidates: set[tuple[int, int]] = set()
+    for cell in obs:
+        for n in _neighbor_cells(cell):
+            if n not in obs:
+                candidates.add(n)
+
+    dead: set[tuple[int, int]] = set()
+    changed = True
+    while changed:
+        changed = False
+        blocked = obs | dead
+        for cell in candidates:
+            if cell in dead:
+                continue
+            if _open_degree(cell, blocked) <= 1:
+                dead.add(cell)
+                changed = True
+    return frozenset(dead)
+
+
+def _get_dead_ends(
+    obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]],
+) -> frozenset[tuple[int, int]]:
+    """Cached dead-end set for the current known obstacle map."""
+    global _dead_end_cache_key, _dead_end_cache
+    key = frozenset(obstacles)
+    if _dead_end_cache_key == key:
+        return _dead_end_cache
+    _dead_end_cache = _dead_end_cells(key)
+    _dead_end_cache_key = key
+    return _dead_end_cache
+
+
+def _dead_component(
+    start: tuple[int, int],
+    dead: frozenset[tuple[int, int]] | set[tuple[int, int]],
+) -> frozenset[tuple[int, int]]:
+    """4-connected component of start inside the dead-end set."""
+    if start not in dead:
+        return frozenset()
+    seen: set[tuple[int, int]] = {start}
+    queue: deque[tuple[int, int]] = deque([start])
+    while queue:
+        cell = queue.popleft()
+        for n in _neighbor_cells(cell):
+            if n in dead and n not in seen:
+                seen.add(n)
+                queue.append(n)
+    return frozenset(seen)
+
+
+def _path_blockers(
+    obstacles: frozenset[tuple[int, int]],
+    *,
+    start: tuple[int, int] | None = None,
+    goal: tuple[int, int] | None = None,
+    avoid_dead_ends: bool = True,
+) -> frozenset[tuple[int, int]]:
+    """Obstacles plus dead ends, keeping corridors that contain start/goal."""
+    if not avoid_dead_ends:
+        return obstacles
+    dead = _get_dead_ends(obstacles)
+    if not dead:
+        return obstacles
+    allowed: set[tuple[int, int]] = set()
+    if start is not None and start in dead:
+        allowed |= _dead_component(start, dead)
+    if goal is not None and goal in dead:
+        allowed |= _dead_component(goal, dead)
+    return obstacles | (dead - allowed)
+
+
+def _is_dead_end_step(
+    pos: tuple[int, int],
+    obstacles: frozenset[tuple[int, int]],
+    *,
+    allow: Iterable[tuple[int, int]] = (),
+) -> bool:
+    """True if stepping onto pos would enter a recognized dead end."""
+    if pos in allow:
+        return False
+    return pos in _get_dead_ends(obstacles)
+
+
+# ── Pathfinding (A* multi-step lookahead; kept as _bfs_path for callers) ──────
 
 def _bfs_path(
     start: tuple[int, int],
     goal: tuple[int, int],
     obstacles: frozenset[tuple[int, int]],
-    max_steps: int = 800,
+    max_steps: int = 2500,
+    *,
+    avoid_dead_ends: bool = True,
 ) -> list[tuple[int, int]] | None:
-    """Return the shortest path including start and goal, or None."""
+    """Return a short grid path including start and goal, or None.
+
+    Uses A* (Manhattan heuristic) so long routes across open maps need far
+    fewer expansions than plain BFS. max_steps still caps node expansions.
+
+    When avoid_dead_ends is True, 凸-shaped cul-de-sacs and one-wide corridors
+    that only lead into them are treated as blocked, unless start or goal lies
+    inside such a pocket (so units can still exit or reach a resource there).
+    """
     if start == goal:
         return [start]
-    queue = deque([start])
+    blocked = _path_blockers(
+        obstacles,
+        start=start,
+        goal=goal,
+        avoid_dead_ends=avoid_dead_ends,
+    )
+    # Goal itself must remain enterable even if classified as a dead end.
+    if goal in blocked and goal not in obstacles:
+        blocked = blocked - {goal}
+
+    # A*: f = g + h. tie-break on h so we bias toward the goal.
+    # Heap entries: (f, h, counter, g, cell). counter breaks remaining ties.
+    open_heap: list[tuple[int, int, int, int, tuple[int, int]]] = []
+    g_score: dict[tuple[int, int], int] = {start: 0}
     parents: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
-    steps = 0
-    while queue and steps < max_steps:
-        steps += 1
-        x, y = queue.popleft()
+    heappush(open_heap, (_manhattan(start, goal), _manhattan(start, goal), 0, 0, start))
+    expansions = 0
+    counter = 0
+    while open_heap and expansions < max_steps:
+        _f, _h, _c, g_current, current = heappop(open_heap)
+        if g_current > g_score.get(current, 1 << 30):
+            continue  # stale heap entry
+        if current == goal:
+            path = [goal]
+            cursor = parents[goal]
+            while cursor is not None:
+                path.append(cursor)
+                cursor = parents[cursor]
+            return list(reversed(path))
+        expansions += 1
+        x, y = current
         for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
-            nx, ny = x + d.delta[0], y + d.delta[1]
-            next_pos = (nx, ny)
-            if next_pos in parents or next_pos in obstacles:
+            next_pos = (x + d.delta[0], y + d.delta[1])
+            if next_pos in blocked:
                 continue
-            parents[next_pos] = (x, y)
-            if next_pos == goal:
-                path = [goal]
-                cursor = parents[goal]
-                while cursor is not None:
-                    path.append(cursor)
-                    cursor = parents[cursor]
-                return list(reversed(path))
-            queue.append(next_pos)
+            tentative = g_current + 1
+            if tentative >= g_score.get(next_pos, 1 << 30):
+                continue
+            parents[next_pos] = current
+            g_score[next_pos] = tentative
+            h = _manhattan(next_pos, goal)
+            counter += 1
+            heappush(open_heap, (tentative + h, h, counter, tentative, next_pos))
     return None
 
 
@@ -132,10 +291,18 @@ def _bfs_direction(
     start: tuple[int, int],
     goal: tuple[int, int],
     obstacles: frozenset[tuple[int, int]],
-    max_steps: int = 800,
+    max_steps: int = 2500,
+    *,
+    avoid_dead_ends: bool = True,
 ) -> Direction | None:
     """BFS shortest path, return first step direction or None if no path."""
-    path = _bfs_path(start, goal, obstacles, max_steps)
+    path = _bfs_path(
+        start,
+        goal,
+        obstacles,
+        max_steps,
+        avoid_dead_ends=avoid_dead_ends,
+    )
     return _direction_for_step(start, path[1]) if path and len(path) > 1 else None
 
 
@@ -428,37 +595,59 @@ def _plan_worker(
             nx, ny = pos[0] + bfs_dir.delta[0], pos[1] + bfs_dir.delta[1]
             if (nx, ny) not in obstacle_cells:
                 worker.move(bfs_dir)
-                _worker_last_pos[str(worker.id)] = pos
+                uid = str(worker.id)
+                _worker_last_pos[uid] = pos
+                recent = _worker_recent.get(uid, [])
+                recent.append(pos)
+                if len(recent) > 6:
+                    recent.pop(0)
+                _worker_recent[uid] = recent
                 _set_worker_route(worker, tuple(goal), path, complete=True)
                 return ("MOVE", f"{bfs_dir.name} -> {goal}")
-        # BFS failed (trapped) - fall through to explore or greedy fallback
-        goal = None
+        # Path search failed this tick. Keep the goal so cargo/resource greedy
+        # fallbacks still march the same way instead of flipping into explore.
 
-    # Cargo worker with BFS failed: greedy move toward core
-    if worker.cargo and goal is None:
+    # Cargo worker greedy fallback toward core (also used when BFS misses)
+    if worker.cargo and goal is not None:
+        # Re-bind goal to core for the cargo march detail string.
+        goal = tuple(core.position)
+    if worker.cargo:
         prev = _worker_last_pos.get(str(worker.id))
-        def _cargo_sort(d):
+        recent = _worker_recent.get(str(worker.id), [])
+        recent_set = set(recent)
+        cargo_candidates: list[tuple[int, Direction, tuple[int, int]]] = []
+        for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
-            dist = _manhattan((nx, ny), core.position)
-            if prev and (nx, ny) == prev:
+            npos = (nx, ny)
+            if npos in obstacle_cells:
+                continue
+            dist = _manhattan(npos, core.position)
+            if prev and npos == prev:
                 dist += int(config["backtrack_penalty"])
-            return dist
-        all_dirs = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
-        all_dirs.sort(key=_cargo_sort)
-        for d in all_dirs:
-            nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
-            if (nx, ny) not in obstacle_cells:
-                worker.move(d)
-                _worker_last_pos[str(worker.id)] = pos
-                _set_worker_route(
-                    worker,
-                    tuple(core.position),
-                    [tuple(pos), (nx, ny)],
-                    complete=False,
-                )
-                return ("MOVE", f"{d.name} -> {core.position}")
+            if npos in recent_set:
+                dist += 3
+            if _is_dead_end_step(npos, obstacle_cells):
+                dist += 50
+            cargo_candidates.append((dist, d, npos))
+        cargo_candidates.sort(key=lambda item: item[0])
+        for _dist, d, npos in cargo_candidates:
+            worker.move(d)
+            uid = str(worker.id)
+            _worker_last_pos[uid] = pos
+            recent = _worker_recent.get(uid, [])
+            recent.append(pos)
+            if len(recent) > 6:
+                recent.pop(0)
+            _worker_recent[uid] = recent
+            _set_worker_route(
+                worker,
+                tuple(core.position),
+                [tuple(pos), npos],
+                complete=False,
+            )
+            return ("MOVE", f"{d.name} -> {core.position}")
 
-    # No goal at all: fan out with backtracking avoidance
+    # No goal at all: fan out with backtracking + dead-end avoidance
     if goal is None and worker.cargo < max_cargo:
         uid = str(worker.id)
         prev = _worker_last_pos.get(uid)
@@ -466,34 +655,55 @@ def _plan_worker(
         idx = hash(uid) % 4
         base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
         rotated = base[idx:] + base[:idx]
-        # Sort: deprioritize backtracking and recently visited cells
+        # Sort: deprioritize dead ends, backtracking and recently visited cells
         recent_set = set(recent)
         def _sort_key(d):
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+            score = 0
+            if _is_dead_end_step((nx, ny), obstacle_cells):
+                score += 3  # obvious dead end = avoid first
             if (nx, ny) in recent_set:
-                return 2  # recently visited = worst
+                score += 2  # recently visited
             if config["avoid_backtracking"] and prev and (nx, ny) == prev:
-                return 1  # backtracking = bad
-            return 0
+                score += 1  # backtracking
+            return score
         rotated.sort(key=_sort_key)
         for d in rotated:
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
-            if (nx, ny) not in obstacle_cells:
-                worker.move(d)
-                _worker_last_pos[uid] = pos
-                recent.append(pos)
-                if len(recent) > 4:
-                    recent.pop(0)
-                _worker_recent[uid] = recent
-                _set_worker_route(worker, (nx, ny), [tuple(pos), (nx, ny)], complete=True)
-                return ("MOVE", f"{d.name} explore")
+            if (nx, ny) in obstacle_cells:
+                continue
+            # Never explore into a recognized dead end when any open alternative exists.
+            if _is_dead_end_step((nx, ny), obstacle_cells):
+                # Only take it if every remaining free neighbor is also a dead end
+                # or blocked (unit is already trapped / must exit).
+                free = [
+                    (pos[0] + od.delta[0], pos[1] + od.delta[1])
+                    for od in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT)
+                    if (pos[0] + od.delta[0], pos[1] + od.delta[1]) not in obstacle_cells
+                ]
+                open_free = [
+                    cell for cell in free
+                    if not _is_dead_end_step(cell, obstacle_cells)
+                ]
+                if open_free:
+                    continue
+            worker.move(d)
+            _worker_last_pos[uid] = pos
+            recent.append(pos)
+            if len(recent) > 4:
+                recent.pop(0)
+            _worker_recent[uid] = recent
+            _set_worker_route(worker, (nx, ny), [tuple(pos), (nx, ny)], complete=True)
+            return ("MOVE", f"{d.name} explore")
 
     if goal is not None and goal != pos:
         direction = _step_towards(pos, goal)
         if direction is not None:
             nx = pos[0] + direction.delta[0]
             ny = pos[1] + direction.delta[1]
-            if (nx, ny) not in obstacle_cells:
+            if (nx, ny) not in obstacle_cells and not (
+                _is_dead_end_step((nx, ny), obstacle_cells, allow=(goal,))
+            ):
                 worker.move(direction)
                 _set_worker_route(
                     worker,
@@ -638,9 +848,14 @@ def _try_move(
     direction: Direction,
     pos: tuple[int, int],
     obstacle_cells: frozenset[tuple[int, int]],
+    *,
+    avoid_dead_ends: bool = False,
+    allow: Iterable[tuple[int, int]] = (),
 ) -> bool:
     nx, ny = pos[0] + direction.delta[0], pos[1] + direction.delta[1]
     if (nx, ny) in obstacle_cells:
+        return False
+    if avoid_dead_ends and _is_dead_end_step((nx, ny), obstacle_cells, allow=allow):
         return False
     unit.move(direction)
     _worker_last_pos[str(unit.id)] = pos
@@ -660,7 +875,16 @@ def _move_towards(
     direction = _step_towards(pos, goal)
     if direction is None:
         return None
-    if _try_move(unit, direction, pos, obstacle_cells):
+    # Skip 凸-shaped cul-de-sacs unless the goal itself is inside one.
+    allow = (goal,)
+    if _try_move(
+        unit,
+        direction,
+        pos,
+        obstacle_cells,
+        avoid_dead_ends=True,
+        allow=allow,
+    ):
         _set_unit_route(unit, goal, [pos, goal], complete=False)
         return ("MOVE", f"{direction.name} {detail_prefix} {goal}")
     # Prefer alternate axis when the primary step is blocked.
@@ -685,6 +909,22 @@ def _move_towards(
             alternates.append(Direction.DOWN)
         elif dy < 0:
             alternates.append(Direction.UP)
+    for alt in alternates:
+        if alt == direction:
+            continue
+        if _try_move(
+            unit,
+            alt,
+            pos,
+            obstacle_cells,
+            avoid_dead_ends=True,
+            allow=allow,
+        ):
+            return ("MOVE", f"{alt.name} {detail_prefix} {goal}")
+    # Last resort: ignore dead-end filter if goal requires it.
+    if _try_move(unit, direction, pos, obstacle_cells):
+        _set_unit_route(unit, goal, [pos, goal], complete=False)
+        return ("MOVE", f"{direction.name} {detail_prefix} {goal}")
     for alt in alternates:
         if alt == direction:
             continue
@@ -744,13 +984,33 @@ def _scout_cardinal(
     idx = hash(str(unit.id)) % 4
     base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
     rotated = base[idx:] + base[:idx]
-    rotated.sort(
-        key=lambda d: 1
-        if config.get("avoid_backtracking")
-        and prev
-        and (pos[0] + d.delta[0], pos[1] + d.delta[1]) == prev
-        else 0
-    )
+
+    def _scout_key(d: Direction) -> int:
+        npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+        score = 0
+        if _is_dead_end_step(npos, obstacle_cells):
+            score += 2
+        if (
+            config.get("avoid_backtracking")
+            and prev
+            and npos == prev
+        ):
+            score += 1
+        return score
+
+    rotated.sort(key=_scout_key)
+    for direction in rotated:
+        if _try_move(
+            unit,
+            direction,
+            pos,
+            obstacle_cells,
+            avoid_dead_ends=True,
+        ):
+            npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+            _set_unit_route(unit, npos, [pos, npos], complete=False)
+            return ("MOVE", f"{direction.name} {label}")
+    # If every open neighbor is a dead end, take the least-bad exit rather than wait.
     for direction in rotated:
         if _try_move(unit, direction, pos, obstacle_cells):
             npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
@@ -794,6 +1054,9 @@ def _plan_home_combat(
     """Defend near the Core: engage nearby threats, otherwise patrol the ring."""
     pos = tuple(unit.position)
     radius = int(config["home_patrol_radius"])
+    # Hysteresis: only force a return when clearly outside the ring. A one-cell
+    # band stops home-return / home-patrol A-B-A flipping on the perimeter.
+    return_radius = radius + 1
 
     if unit_kind == "vanguard":
         sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
@@ -813,7 +1076,7 @@ def _plan_home_combat(
     # Only chase enemies that are already inside the home perimeter.
     local_enemies = [
         enemy for enemy in enemies
-        if _manhattan(core_pos, enemy.position) <= radius + 1
+        if _manhattan(core_pos, enemy.position) <= return_radius
     ]
     if local_enemies:
         nearest = min(local_enemies, key=lambda e: _manhattan(pos, e.position))
@@ -827,7 +1090,8 @@ def _plan_home_combat(
         if moved is not None:
             return moved
 
-    if _manhattan(pos, core_pos) > radius:
+    dist_home = _manhattan(pos, core_pos)
+    if dist_home > return_radius:
         moved = _move_towards(
             unit, pos, core_pos, obstacle_cells, detail_prefix="home-return",
         )
@@ -835,6 +1099,11 @@ def _plan_home_combat(
             return moved
 
     goal = _home_patrol_goal(str(unit.id), core_pos, radius)
+    # Already on/near the assigned slot: hold instead of micro-stepping.
+    if _manhattan(pos, goal) <= 1 and dist_home <= return_radius:
+        unit.wait()
+        _set_unit_route(unit, goal, [pos], complete=True)
+        return ("WAIT", f"home-hold {goal}")
     if pos != goal:
         moved = _move_towards(
             unit, pos, goal, obstacle_cells, detail_prefix="home-patrol",
@@ -1011,10 +1280,19 @@ def _plan_guerrilla_combat(
             else (Direction.RIGHT if dx > 0 else Direction.LEFT)
         )
         for direction in (primary, secondary):
+            if _try_move(
+                unit, direction, pos, obstacle_cells, avoid_dead_ends=True,
+            ):
+                return ("MOVE", f"{direction.name} guerrilla-roam {label}")
+        for direction in (primary, secondary):
             if _try_move(unit, direction, pos, obstacle_cells):
                 return ("MOVE", f"{direction.name} guerrilla-roam {label}")
     else:
         direction = _cardinal_toward_delta(dx, dy)
+        if direction is not None and _try_move(
+            unit, direction, pos, obstacle_cells, avoid_dead_ends=True,
+        ):
+            return ("MOVE", f"{direction.name} guerrilla-roam {label}")
         if direction is not None and _try_move(unit, direction, pos, obstacle_cells):
             return ("MOVE", f"{direction.name} guerrilla-roam {label}")
 
@@ -1376,14 +1654,16 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
 
     # ── Cleanup dead-unit bookkeeping ──────────────────────────────────
+    # Keys in _worker_last_pos / _worker_recent / _resource_assignments use the
+    # full str(unit.id). Previously cleanup used id[:8], which wiped every
+    # entry each tick and disabled backtrack avoidance → A-B-A oscillation.
     alive_ids: set[str] = set()
     for w in turn.workers:
-        alive_ids.add(str(w.id)[:8])
+        alive_ids.add(str(w.id))
     for v in getattr(turn, "vanguards", ()) or ():
-        alive_ids.add(str(v.id)[:8])
+        alive_ids.add(str(v.id))
     for r in getattr(turn, "rangers", ()) or ():
-        alive_ids.add(str(r.id)[:8])
-    # Prune dead workers from position/assignment tracking
+        alive_ids.add(str(r.id))
     for dead_id in set(_worker_last_pos) - alive_ids:
         _worker_last_pos.pop(dead_id, None)
     for dead_id in set(_worker_recent) - alive_ids:
@@ -1434,25 +1714,41 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         ):
             depleted.add(event.position)
 
-    # Assign each resource to the closest worker (avoid stampede)
-    _resource_assignments.clear()
-    # Workers at capacity head home; others can still be assigned targets.
+    # Assign each resource to one worker (avoid stampede).
+    # Keep sticky assignments across ticks so two nearby workers do not swap the
+    # same mine every tick (that produced goal/explore A-B-A flipping).
     max_w_cargo = 2 if beacon_carried_by_core else 1
     idle_workers = [(str(w.id), tuple(w.position)) for w in turn.workers if w.cargo < max_w_cargo]
+    idle_ids = {wid for wid, _ in idle_workers}
     all_resources = _merge_resource_cells(
         turn.resource_cells,
         _resource_memory,
         depleted,
     )
-    # Sort resources by distance to nearest idle worker, assign each to closest
-    available = list(idle_workers)  # copy, will remove assigned workers
-    for res in sorted(all_resources, key=lambda p: min(_manhattan(p, w[1]) for w in available) if available else 0):
+    resource_set = set(all_resources)
+
+    sticky: dict[str, tuple[int, int]] = {}
+    claimed_resources: set[tuple[int, int]] = set()
+    for wid, res in list(_resource_assignments.items()):
+        res_t = tuple(res)
+        if wid in idle_ids and res_t in resource_set and res_t not in claimed_resources:
+            sticky[wid] = res_t
+            claimed_resources.add(res_t)
+    _resource_assignments.clear()
+    _resource_assignments.update(sticky)
+
+    available = [w for w in idle_workers if w[0] not in sticky]
+    open_resources = [r for r in all_resources if r not in claimed_resources]
+    for res in sorted(
+        open_resources,
+        key=lambda p: min(_manhattan(p, w[1]) for w in available) if available else 0,
+    ):
         if not available:
             break
         closest = min(available, key=lambda w: _manhattan(res, w[1]))
         wid = closest[0]
         _resource_assignments[wid] = res
-        available.remove(closest)  # remove assigned worker from pool
+        available.remove(closest)
     for event in turn.events:
         if (
             event.event_type == "HARVEST_FAILED"
@@ -1542,14 +1838,17 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 elif dy < 0: dirs.append(Direction.UP)
                 if dx > 0: dirs.append(Direction.RIGHT)
                 elif dx < 0: dirs.append(Direction.LEFT)
-            # Try each direction (obstacle-aware)
+            # Try each direction (obstacle + dead-end aware)
             for d in dirs:
                 nx, ny = core_pos[0] + d.delta[0], core_pos[1] + d.delta[1]
-                if (nx, ny) not in obstacle_cells:
-                    core.start_move(d)
-                    core_action_name = f"MOVE_{d.name}"
-                    core_done = True
-                    break
+                if (nx, ny) in obstacle_cells:
+                    continue
+                if _is_dead_end_step((nx, ny), obstacle_cells, allow=(target,)):
+                    continue
+                core.start_move(d)
+                core_action_name = f"MOVE_{d.name}"
+                core_done = True
+                break
 
     if not core_done:
         core.wait()
@@ -1598,7 +1897,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 
 # ── live loop ────────────────────────────────────────────────────────────────
 
-def play(api_key: str, log_path: str = "tactic_log.jsonl") -> None:
+def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
     """Run forever with automatic reconnect on protocol/transport failures."""
     _load_map_memory()
     logger = TacticLogger(log_path)

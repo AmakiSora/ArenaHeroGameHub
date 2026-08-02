@@ -8,6 +8,7 @@ import os
 import time
 from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 
 import production_queue
@@ -20,8 +21,13 @@ from tactic_config import (
     save_config,
 )
 
-LOG_FILE = "tactic_log.jsonl"
-MAP_FILE = "map_memory.json"
+def _data_path(name: str) -> str:
+    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
+    return str(Path(raw).resolve() / name) if raw else name
+
+
+LOG_FILE = _data_path("tactic_log.jsonl")
+MAP_FILE = _data_path("map_memory.json")
 HOST = "0.0.0.0"
 PORT = 4399
 
