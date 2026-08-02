@@ -797,9 +797,20 @@ def _plan_attack_combat(
     obstacle_cells: frozenset[tuple[int, int]],
     config: dict[str, Any],
 ) -> tuple[str, str]:
-    """March as a group toward the configured coordinate; engage en route."""
+    """March as a group toward the configured coordinate; engage en route.
+
+    When auto_attack_enabled is true, the nearest enemy sighting from memory
+    replaces the static target coordinate, so the attack team hunts enemies
+    even when none are currently visible.
+    """
     pos = tuple(unit.position)
-    target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
+
+    # Determine target: auto-attack uses nearest enemy sighting, else static config
+    auto_attack = bool(config.get("auto_attack_enabled", False))
+    if auto_attack and _enemy_memory:
+        target = min(_enemy_memory, key=lambda p: _manhattan(pos, p))
+    else:
+        target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
 
     if unit_kind == "vanguard":
         sweep = _vanguard_adjacent_sweep(unit, pos, enemies)

@@ -73,6 +73,7 @@ CONFIG_FIELDS = (
     ConfigField("home_patrol_radius", "守家巡逻半径", "combat", "integer", 5, 1, 30, 1),
     ConfigField("attack_target_x", "进攻目标 X", "combat", "integer", 0, -500, 500, 1),
     ConfigField("attack_target_y", "进攻目标 Y", "combat", "integer", 0, -500, 500, 1),
+    ConfigField("auto_attack_enabled", "自动进攻", "combat", "boolean", False),
     ConfigField("ranger_attack_range", "游侠开火距离", "combat", "integer", 3, 1, 3, 1),
     ConfigField("map_save_interval_ticks", "地图保存间隔 Tick", "runtime", "integer", 10, 1, 200, 1),
 )
