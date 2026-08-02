@@ -1135,6 +1135,7 @@ JS = r"""
       if(data.vgHtml) setHtml('#vgGrid', data.vgHtml);
       if(data.rgHtml) setHtml('#rgGrid', data.rgHtml);
       if(data.resHtml){ setHtml('#resSection', data.resHtml); bindOreForm(); }
+      if(data.enemyHtml){ setHtml('#enemySection', data.enemyHtml); }
       if(data.eventsHtml) setHtml('#eventsSection', data.eventsHtml);
       if(data.mapTitle) setHtml('#mapTitleCount', data.mapTitle);
       if(data.footerHtml) setHtml('#footerSection', data.footerHtml);
@@ -1142,6 +1143,7 @@ JS = r"""
       if(data.vgCount !== undefined) setText('#vgCount', String(data.vgCount));
       if(data.rgCount !== undefined) setText('#rgCount', String(data.rgCount));
       if(data.resCount !== undefined) setText('#resCount', data.resCount + ' 可见');
+      if(data.enemyCount !== undefined) setText('#enemyCount', data.enemyCount);
       if(data.eventsCount !== undefined) setText('#eventsCount', String(data.eventsCount));
       if(data.combatUnits && !teamsDirty && !teamsBusy){
         teamsUnits = data.combatUnits;
@@ -1850,12 +1852,6 @@ def build_parts():
         res_html += f'<h4>手动录入 <span class="manual-tag">{len(mem_manual)}</span></h4><div class="chip-row">{manual_chips}</div>'
     if not mem_resources:
         res_html += '<h4>记忆矿点</h4><div class="muted">暂无记忆矿点</div>'
-
-    # Enemy sightings
-    ex_sightings = mm.get("enemy_sightings", [])
-    if ex_sightings:
-        ex_chips = "".join(f'<span class="chip enemy-chip">{fmt_pos(p)}</span>' for p in ex_sightings[:30])
-        res_html += f'<h4>敌人踪迹 <span class="manual-tag">{len(ex_sightings)}</span></h4><div class="chip-row">{ex_chips}</div>'
     res_html += (
         '<div class="res-add-form" id="resAddForm">'
         '<div class="row">'
@@ -1870,6 +1866,14 @@ def build_parts():
         '</div>'
         '</div>'
     )
+
+    # Enemy sightings — separate card below ore panel
+    ex_sightings = mm.get("enemy_sightings", [])
+    if ex_sightings:
+        ex_chips = "".join(f'<span class="chip enemy-chip">{fmt_pos(p)}</span>' for p in ex_sightings[:30])
+        enemy_html = f'<div class="res-section"><h4>敌人踪迹</h4><div class="chip-row">{ex_chips}</div></div>'
+    else:
+        enemy_html = '<div class="muted">暂无敌人踪迹</div>'
 
     if events:
         rows = ""
@@ -1993,6 +1997,7 @@ def build_parts():
         "vgHtml": vg_html,
         "rgHtml": rg_html,
         "resHtml": res_html,
+        "enemyHtml": enemy_html,
         "eventsHtml": events_html,
         "mapSvg": svg,
         "mapTitle": map_title,
@@ -2001,6 +2006,7 @@ def build_parts():
         "vgCount": len(vgs),
         "rgCount": len(rgs),
         "resCount": len(rcells),
+        "enemyCount": f"{len(ex_sightings)} 处",
         "eventsCount": len(events),
         "combatUnits": combat_units,
     }
@@ -2085,6 +2091,10 @@ def generate_html() -> str:
           <button type="button" class="add-ore-btn" id="resAddToggle" title="录入矿点">+</button>
         </div>
         <div id="resSection">{parts['resHtml']}</div>
+      </section>
+      <section class="panel enemy-panel" id="enemyPanel">
+        <div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{parts['enemyCount']}</span></div>
+        <div id="enemySection">{parts['enemyHtml']}</div>
       </section>
       <section class="panel">
         <div class="panel-title"><span>事件</span><span class="count" id="eventsCount">{parts['eventsCount']}</span></div>
