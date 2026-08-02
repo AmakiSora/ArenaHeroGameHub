@@ -485,6 +485,8 @@ def _collect_points(rec, mm):
         if len(p) == 2: pts.append((int(p[0]), int(p[1])))
     for p in mm.get("obstacles", []): pts.append((int(p[0]), int(p[1])))
     for p in mm.get("resources", []): pts.append((int(p[0]), int(p[1])))
+    bp = rec.get("beacon_pos")
+    if bp and len(bp) == 2: pts.append((int(bp[0]), int(bp[1])))
     return pts
 
 
@@ -642,6 +644,21 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
         a(f'<text x="{core_cx}" y="{core_cy+3}" text-anchor="middle" font-size="8" '
           f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#081018">'
           f'{rec.get("core_name") or "C1"}</text>')
+
+    # Beacon
+    bp = rec.get("beacon_pos")
+    if bp and len(bp) == 2:
+        bx, by = to_xy(int(bp[0]), int(bp[1]))
+        bcx, bcy = bx + cell / 2, by + cell / 2
+        # Glow
+        a(f'<circle cx="{bcx}" cy="{bcy}" r="14" fill="#ffc857" opacity="0.18"/>')
+        # Diamond shape
+        r = 7.5
+        a(f'<polygon points="{bcx},{bcy-r} {bcx+r},{bcy} {bcx},{bcy+r} {bcx-r},{bcy}" '
+          f'fill="#ffc857" stroke="#ffe08a" stroke-width="1.5" filter="url(#glow)"/>')
+        # Inner star
+        a(f'<text x="{bcx}" y="{bcy+3.5}" text-anchor="middle" font-size="9" '
+          f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#5c4300">★</text>')
 
     for x in range(xmin, xmax + 1):
         if x % step == 0:
