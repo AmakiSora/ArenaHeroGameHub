@@ -1060,6 +1060,8 @@ _resource_memory: set[tuple[int, int]] = set()
 _resource_tombstones: set[tuple[int, int]] = set()
 # Permanent obstacles: once seen, always blocked
 _obstacle_memory: set[tuple[int, int]] = set()
+# Enemy sightings: remember every position where enemies were seen
+_enemy_memory: set[tuple[int, int]] = set()
 # Track each worker's previous position to avoid backtracking
 _worker_last_pos: dict[str, tuple[int, int]] = {}
 _worker_recent: dict[str, list[tuple[int, int]]] = {}  # last 4 positions, anti-oscillation
@@ -1070,20 +1072,20 @@ _last_map_save_tick: int = -1
 
 
 def _load_map_memory() -> None:
-    """Load permanent obstacle/resource memory from disk."""
-    global _resource_memory, _obstacle_memory
+    """Load permanent obstacle/resource/enemy memory from disk."""
+    global _resource_memory, _obstacle_memory, _enemy_memory
     if not MAP_MEMORY_PATH.exists():
         return
     try:
         data = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
         _obstacle_memory = {tuple(p) for p in data.get("obstacles", []) if len(p) == 2}
         resources = {tuple(p) for p in data.get("resources", []) if len(p) == 2}
-        # manual resources are sticky and must survive auto-cleanup
         manual = {tuple(p) for p in data.get("manual_resources", []) if len(p) == 2}
         _resource_memory = resources | manual
+        _enemy_memory = {tuple(p) for p in data.get("enemy_sightings", []) if len(p) == 2}
         print(
             f"[map] loaded obstacles={len(_obstacle_memory)} resources={len(_resource_memory)} "
-            f"manual={len(manual)} from {MAP_MEMORY_PATH}",
+            f"manual={len(manual)} enemies={len(_enemy_memory)} from {MAP_MEMORY_PATH}",
             flush=True,
         )
     except Exception as e:
@@ -1130,9 +1132,11 @@ def _save_map_memory(
         "obstacles": sorted([list(p) for p in _obstacle_memory]),
         "resources": sorted([list(p) for p in resources]),
         "manual_resources": sorted([list(p) for p in manual]),
+        "enemy_sightings": sorted([list(p) for p in _enemy_memory]),
         "obstacle_count": len(_obstacle_memory),
         "resource_count": len(resources),
         "manual_count": len(manual),
+        "enemy_sighting_count": len(_enemy_memory),
     }
     tmp = MAP_MEMORY_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -1190,6 +1194,16 @@ def _update_resource_memory(turn) -> None:
     if _resource_memory != before:
         _map_dirty = True
 
+
+def _update_enemy_sightings(turn) -> None:
+    """Record every position where enemies were seen."""
+    global _enemy_memory, _map_dirty
+    before = len(_enemy_memory)
+    for enemy in turn.visible_enemies:
+        pos = tuple(enemy.position)
+        _enemy_memory.add(pos)
+    if len(_enemy_memory) > before:
+        _map_dirty = True
 
 
 # Context holder for the current turn's resource_space (set by choose_actions)
@@ -1259,6 +1273,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     # ── Update permanent map memory ────────────────────────────────────
     known_obstacles = _update_obstacle_memory(turn)
     _update_resource_memory(turn)
+    _update_enemy_sightings(turn)
     _save_map_memory(
         tick=getattr(turn, "tick", None),
         save_interval_ticks=int(config["map_save_interval_ticks"]),
