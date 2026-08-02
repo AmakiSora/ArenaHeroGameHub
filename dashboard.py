@@ -1187,6 +1187,19 @@ JS = r"""
   
   function bindOreForm(){
     // Bind the right-column ore add form + chip delete buttons; idempotent.
+    // Also bind enemy clear button.
+    const clearEnemyBtn = document.getElementById('clearEnemyBtn');
+    if(clearEnemyBtn && !clearEnemyBtn._bound){
+      clearEnemyBtn._bound = true;
+      clearEnemyBtn.addEventListener('click', async function(){
+        if(!confirm('确定清除所有敌人踪迹？')) return;
+        try{
+          const res = await fetch('/api/enemy/clear', {method:'POST'});
+          const data = await res.json();
+          if(data.ok) refresh();
+        }catch(e){}
+      });
+    }
     const toggle = document.getElementById('resAddToggle');
     const form = document.getElementById('resAddForm');
     const msg = document.getElementById('oreMsg');
@@ -2005,7 +2018,7 @@ def build_parts():
         f'<section class="panel"><div class="panel-title"><span>资源</span><span class="count">{pct}%</span></div>{left_res}</section>'
         f'<section class="panel"><div class="panel-title"><span>战场</span><span class="count">摘要</span></div>{left_fight}</section>'
         f'<section class="panel"><div class="panel-title"><span>异常</span><span class="count">{len(issues)}</span></div><div class="compact-list">{left_issues}</div></section>'
-        f'<section class="panel enemy-panel" id="leftEnemyPanel"><div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{len(ex_sightings)} 处</span></div><div id="enemySection">{enemy_html}</div></section>'
+        f'<section class="panel enemy-panel" id="leftEnemyPanel"><div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{len(ex_sightings)} 处</span></div><div class="enemy-actions"><button type="button" id="clearEnemyBtn" class="secondary" style="font-size:11px;padding:4px 10px">清除全部</button></div><div id="enemySection">{enemy_html}</div></section>'
     )
 
     return {
@@ -2274,6 +2287,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/production-queue/clear":
             production_queue.clear_requests()
             self._send_json(200, production_queue.queue_payload())
+            return
+        if path == "/api/enemy/clear":
+            try:
+                with open(MAP_FILE, "r+", encoding="utf-8") as f:
+                    d = json.load(f)
+                    d["enemy_sightings"] = []
+                    d["enemy_sighting_count"] = 0
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(d, f, ensure_ascii=False, indent=2)
+                self._send_json(200, {"ok": True, "cleared": True})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
             return
 
         try:
