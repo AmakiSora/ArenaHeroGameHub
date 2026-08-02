@@ -23,8 +23,12 @@ from arena_hero import (
     Direction,
     UnitType,
 )
+from arena_hero.errors import ProtocolError, TransportError
 import production_queue
+from sdk_compat import apply_sdk_compat
 from tactic_config import load_config, save_config
+
+apply_sdk_compat()
 
 MAP_MEMORY_PATH = Path("map_memory.json")
 
@@ -1595,6 +1599,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 # ── live loop ────────────────────────────────────────────────────────────────
 
 def play(api_key: str, log_path: str = "tactic_log.jsonl") -> None:
+    """Run forever with automatic reconnect on protocol/transport failures."""
     _load_map_memory()
     logger = TacticLogger(log_path)
     logger.open()
@@ -1605,38 +1610,71 @@ def play(api_key: str, log_path: str = "tactic_log.jsonl") -> None:
         flush=True,
     )
 
+    reconnect_delay = 1.0
+    max_reconnect_delay = 30.0
+    session = 0
+
     try:
-        with ArenaHeroClient(api_key=api_key) as game:
-            for turn in game.turns():
-                tick_start = time.monotonic()
-                core_action, unit_actions = choose_actions(turn)
-                try:
-                    accepted = turn.submit()
-                    latency = (time.monotonic() - tick_start) * 1000
-                    plan_actions: dict[str, str] = {}
-                    for uid, detail in unit_actions.items():
-                        plan_actions[uid] = detail
-                    logger.record_tick(
-                        turn,
-                        core_action=core_action,
-                        unit_actions=plan_actions,
-                        accepted=accepted.accepted,
-                        latency_ms=latency,
-                    )
-                    print(
-                        f"tick={accepted.tick} "
-                        f"core={core_action} "
-                        f"res={turn.resources}/{turn.resource_capacity} "
-                        f"pop={turn.state.population} "
-                        f"workers={len(turn.workers)} "
-                        f"enemies={len(turn.visible_enemies)} "
-                        f"resources_visible={len(turn.resource_cells)} "
-                        f"memory={len(_resource_memory)} "
-                        f"walls={len(_obstacle_memory)}",
-                        flush=True,
-                    )
-                except Exception as e:
-                    print(f"tick={turn.tick} submit_error={e}", flush=True)
+        while True:
+            session += 1
+            try:
+                print(f"[tactic] connecting session={session}", flush=True)
+                with ArenaHeroClient(api_key=api_key) as game:
+                    for turn in game.turns():
+                        reconnect_delay = 1.0  # healthy stream → reset backoff
+                        tick_start = time.monotonic()
+                        try:
+                            core_action, unit_actions = choose_actions(turn)
+                        except Exception as e:
+                            print(f"tick={getattr(turn, 'tick', '?')} plan_error={e}", flush=True)
+                            continue
+                        try:
+                            accepted = turn.submit()
+                            latency = (time.monotonic() - tick_start) * 1000
+                            plan_actions: dict[str, str] = {}
+                            for uid, detail in unit_actions.items():
+                                plan_actions[uid] = detail
+                            logger.record_tick(
+                                turn,
+                                core_action=core_action,
+                                unit_actions=plan_actions,
+                                accepted=accepted.accepted,
+                                latency_ms=latency,
+                            )
+                            print(
+                                f"tick={accepted.tick} "
+                                f"core={core_action} "
+                                f"res={turn.resources}/{turn.resource_capacity} "
+                                f"pop={turn.state.population} "
+                                f"workers={len(turn.workers)} "
+                                f"enemies={len(turn.visible_enemies)} "
+                                f"resources_visible={len(turn.resource_cells)} "
+                                f"memory={len(_resource_memory)} "
+                                f"walls={len(_obstacle_memory)}",
+                                flush=True,
+                            )
+                        except Exception as e:
+                            print(f"tick={turn.tick} submit_error={e}", flush=True)
+            except KeyboardInterrupt:
+                raise
+            except (ProtocolError, TransportError, OSError, ConnectionError, TimeoutError) as e:
+                print(
+                    f"[tactic] stream error session={session}: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+            except Exception as e:
+                # Catch-all so one unexpected crash doesn't kill the process.
+                print(
+                    f"[tactic] unexpected error session={session}: {type(e).__name__}: {e}",
+                    flush=True,
+                )
+            _save_map_memory(force=True)
+            print(
+                f"[tactic] reconnecting in {reconnect_delay:.1f}s…",
+                flush=True,
+            )
+            time.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, max_reconnect_delay)
     except KeyboardInterrupt:
         print("\n[tactic] stopped by user", flush=True)
     finally:
