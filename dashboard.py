@@ -391,6 +391,9 @@ def render_teams_panel() -> str:
         '<label>进攻 Y'
         f'<input id="teamAttackY" name="attack_target_y" type="number" min="-500" max="500" '
         f'step="1" value="{config["attack_target_y"]}"></label>'
+        '<label class="team-switch">自动进攻'
+        f'<input id="teamAutoAttack" name="auto_attack_enabled" type="checkbox" '
+        f'data-kind="boolean"{" checked" if config.get("auto_attack_enabled") else ""}></label>'
         '<label>游侠射程'
         f'<input id="teamRangerRange" name="ranger_attack_range" type="number" min="1" max="3" '
         f'step="1" value="{config["ranger_attack_range"]}"></label>'
@@ -872,6 +875,8 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}
 .team-settings label{display:grid;gap:6px;padding:10px 12px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);color:var(--muted);font-size:11px}
 .team-settings input{width:100%;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
+.team-settings label.team-switch{display:flex;align-items:center;gap:8px;justify-content:space-between}
+.team-settings label.team-switch input{width:16px;height:16px;accent-color:#57d6a3;cursor:pointer}
 .team-settings input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
 .teams-message{min-height:18px;margin-top:10px;color:var(--muted);font-size:12px}
 .teams-message.ok{color:#8ef0c4}.teams-message.err{color:#ff9b9b}
@@ -1406,6 +1411,7 @@ JS = r"""
       home_patrol_radius: Number((document.getElementById('teamHomeRadius') || {}).value || 5),
       attack_target_x: Number((document.getElementById('teamAttackX') || {}).value || 0),
       attack_target_y: Number((document.getElementById('teamAttackY') || {}).value || 0),
+      auto_attack_enabled: (document.getElementById('teamAutoAttack') || {}).checked || false,
       ranger_attack_range: Number((document.getElementById('teamRangerRange') || {}).value || 3)
     };
   }
@@ -1416,11 +1422,15 @@ JS = r"""
       home_patrol_radius: 'teamHomeRadius',
       attack_target_x: 'teamAttackX',
       attack_target_y: 'teamAttackY',
+      auto_attack_enabled: 'teamAutoAttack',
       ranger_attack_range: 'teamRangerRange'
     };
     Object.keys(map).forEach(function(key){
       const el = document.getElementById(map[key]);
-      if(el && key in config) el.value = String(config[key]);
+      if(el && key in config) {
+        if (el.type === 'checkbox') el.checked = !!config[key];
+        else el.value = String(config[key]);
+      }
     });
   }
 
