@@ -1356,11 +1356,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     for r in getattr(turn, "rangers", ()) or ():
         alive_ids.add(str(r.id)[:8])
     # Prune dead workers from position/assignment tracking
-    for dead_id in list(_worker_last_pos) - alive_ids:
+    for dead_id in set(_worker_last_pos) - alive_ids:
         _worker_last_pos.pop(dead_id, None)
-    for dead_id in list(_worker_recent) - alive_ids:
+    for dead_id in set(_worker_recent) - alive_ids:
         _worker_recent.pop(dead_id, None)
-    for dead_id in list(_resource_assignments) - alive_ids:
+    for dead_id in set(_resource_assignments) - alive_ids:
         _resource_assignments.pop(dead_id, None)
 
     _sync_production_queue(turn)
