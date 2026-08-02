@@ -1481,7 +1481,8 @@ def play(api_key: str, log_path: str = "tactic_log.jsonl") -> None:
     logger.open()
     print(f"[tactic] logging to {log_path}", flush=True)
     print(
-        f"[map] obstacles={len(_obstacle_memory)} resources={len(_resource_memory)}",
+        f"[map] obstacles={len(_obstacle_memory)} resources={len(_resource_memory)}"
+        f" enemies={len(_enemy_memory)}",
         flush=True,
     )
 
