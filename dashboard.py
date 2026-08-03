@@ -11,7 +11,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-import production_queue
 from tactic_config import (
     CONFIG_PATH,
     ConfigValidationError,
@@ -307,13 +306,14 @@ def collect_combat_units(rec: dict | None = None, config: dict | None = None) ->
     return sorted(by_name.values(), key=sort_key)
 
 
-def render_config_panel() -> str:
+def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) -> str:
     config = load_config(CONFIG_PATH)
     schema = config_schema()
     fields_by_group: dict[str, list[dict]] = defaultdict(list)
     for field in schema["fields"]:
-        # Combat rosters + team settings live on the dedicated teams card.
-        if field["group"] == "combat":
+        # Combat rosters + team settings live on the dedicated teams card;
+        # production targets live in the dedicated section below.
+        if field["group"] in {"combat", "production"}:
             continue
         fields_by_group[field["group"]].append(field)
 
@@ -351,18 +351,23 @@ def render_config_panel() -> str:
         '<section class="panel config-panel">'
         '<div class="panel-title"><span>策略配置</span>'
         '<span class="count" id="configState">当前值</span></div>'
-        '<section class="production-section" aria-labelledby="productionQueueTitle">'
-        '<div class="production-title"><div><b id="productionQueueTitle">生产需求队列</b>'
-        '<span class="count" id="productionQueueCount">0 / 20</span></div>'
-        '<button type="button" class="queue-clear" id="productionQueueClear">清空</button></div>'
-        '<div class="production-add">'
-        '<button type="button" data-queue-unit="WORKER"><span>W</span>工人<small>5</small></button>'
-        '<button type="button" data-queue-unit="VANGUARD"><span>V</span>先锋<small>10</small></button>'
-        '<button type="button" data-queue-unit="RANGER"><span>R</span>游侠<small>12</small></button>'
-        '</div>'
-        '<div class="production-list" id="productionQueueList"></div>'
-        '<div class="production-status" id="productionQueueStatus" aria-live="polite"></div>'
-        '</section>'
+        '<section class="production-section" aria-labelledby="productionTargetsTitle">'
+        '<div class="production-title"><div><b id="productionTargetsTitle">生产需求目标</b>'
+        '<span class="count">低于目标自动补兵 · 超出自动自裁 · 阵亡自动补充</span></div></div>'
+        '<div class="production-targets" id="productionTargets">'
+        '<div class="production-target"><label for="cfg-target_workers">工人目标</label>'
+        f'<input id="cfg-target_workers" name="target_workers" type="number" data-kind="integer" '
+        f'min="0" max="19" step="1" value="{config["target_workers"]}" required>'
+        f'<span class="current">当前 <b id="prodCurrentWorkers">{workers}</b></span></div>'
+        '<div class="production-target"><label for="cfg-target_vanguards">先锋目标</label>'
+        f'<input id="cfg-target_vanguards" name="target_vanguards" type="number" data-kind="integer" '
+        f'min="0" max="19" step="1" value="{config["target_vanguards"]}" required>'
+        f'<span class="current">当前 <b id="prodCurrentVanguards">{vanguards}</b></span></div>'
+        '<div class="production-target"><label for="cfg-target_rangers">游侠目标</label>'
+        f'<input id="cfg-target_rangers" name="target_rangers" type="number" data-kind="integer" '
+        f'min="0" max="19" step="1" value="{config["target_rangers"]}" required>'
+        f'<span class="current">当前 <b id="prodCurrentRangers">{rangers}</b></span></div>'
+        '</div></section>'
         '<form id="tacticConfigForm">'
         f'<div class="config-groups">{"".join(groups)}</div>'
         '<div class="config-actions">'
@@ -937,20 +942,16 @@ body{margin:0;min-height:100vh;color:var(--text);
 .config-message.ok{color:#8ef0c4}.config-message.err{color:#ff9b9b}
 .production-section{margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid var(--line)}
 .production-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
-.production-title>div{display:flex;align-items:baseline;gap:10px}.production-title b{font-size:13px;color:#c7dbff}
-.production-add{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:10px}
-.production-add button,.queue-clear{appearance:none;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:#162238;color:#eef3ff;cursor:pointer}
-.production-add button{display:flex;align-items:center;justify-content:center;gap:7px;min-height:38px;padding:7px 10px;font-size:12px}
-.production-add button>span{display:grid;place-items:center;width:20px;height:20px;border-radius:4px;background:#285b8f;color:#fff;font:700 11px Consolas,monospace}
-.production-add button small{color:#ffc857;font:11px Consolas,monospace}.production-add button:hover{border-color:rgba(110,168,255,.5);background:#1b2b47}
-.production-add button:disabled,.queue-clear:disabled{opacity:.45;cursor:not-allowed}
-.queue-clear{padding:5px 9px;background:transparent;color:var(--muted);font-size:11px}
-.production-list{display:flex;align-items:center;gap:6px;min-height:34px;overflow-x:auto;padding:2px 0 5px}
-.production-item{flex:0 0 auto;display:flex;align-items:center;gap:6px;min-height:29px;padding:5px 7px;border:1px solid rgba(255,255,255,.09);border-radius:6px;background:rgba(255,255,255,.035);color:#e5edff;cursor:pointer}
-.production-item .order{display:grid;place-items:center;width:17px;height:17px;border-radius:3px;background:#25334d;color:#a9c8ff;font:10px Consolas,monospace}
-.production-item b{font-size:11px}.production-item small{color:#ffc857;font:10px Consolas,monospace}.production-item .remove{color:#7f8eab;font-size:14px;line-height:1}
-.production-item.inflight{border-color:rgba(87,214,163,.38);background:rgba(87,214,163,.08)}
-.production-empty,.production-status{color:var(--muted);font-size:11px}.production-status{min-height:15px;margin-top:3px}.production-status.err{color:#ff9b9b}
+.production-title>div{display:flex;flex-direction:column;gap:2px}
+.production-title b{font-size:13px;color:#c7dbff}
+.production-title .count{font-size:11px;color:var(--muted)}
+.production-targets{display:grid;gap:8px}
+.production-target{display:grid;grid-template-columns:64px 96px 1fr;gap:10px;align-items:center;min-height:36px}
+.production-target>label{color:var(--muted);font-size:12px}
+.production-target>input[type=number]{width:96px;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
+.production-target>input[type=number]:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
+.production-target .current{color:var(--muted);font-size:11px;font-family:Consolas,monospace}
+.production-target .current b{color:#8ef0c4;font-size:13px}
 .hero{display:none}
 .metrics{display:none}
 .layout{display:none}
@@ -971,7 +972,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 @media (max-width:680px){
   .config-groups{grid-template-columns:1fr}
   .config-message{width:100%;margin-left:0}
-  .production-add{grid-template-columns:1fr}
+  .production-targets{grid-template-columns:1fr}
   .team-board{grid-template-columns:1fr}
   .team-settings{grid-template-columns:1fr}
   .teams-hero{flex-direction:column}
@@ -990,7 +991,6 @@ JS = r"""
   let lastTick = null;
   let refreshing = false;
   let configDirty = false;
-  let productionQueueBusy = false;
   let teamsDirty = false;
   let teamsBusy = false;
   let teamsUnits = [];
@@ -1189,6 +1189,9 @@ JS = r"""
       if(data.workersCount !== undefined) setText('#workersCount', data.workersCount + ' 个');
       if(data.vgCount !== undefined) setText('#vgCount', String(data.vgCount));
       if(data.rgCount !== undefined) setText('#rgCount', String(data.rgCount));
+      if(data.workersCount !== undefined || data.vgCount !== undefined || data.rgCount !== undefined){
+        updateProductionCounts(data.workersCount, data.vgCount, data.rgCount);
+      }
       if(data.resCount !== undefined) setText('#resCount', data.resCount + ' 可见');
       if(data.enemyCount !== undefined) setText('#enemyCount', data.enemyCount);
       if(data.eventsCount !== undefined) setText('#eventsCount', String(data.eventsCount));
@@ -1320,105 +1323,14 @@ JS = r"""
     }
   }
 
-  function setProductionQueueStatus(text, isError){
-    const status = document.getElementById('productionQueueStatus');
-    if(!status) return;
-    status.textContent = text || '';
-    status.className = 'production-status' + (isError ? ' err' : '');
-  }
-
-  function renderProductionQueue(data){
-    if(!data || !Array.isArray(data.items)) return;
-    const list = document.getElementById('productionQueueList');
-    const count = document.getElementById('productionQueueCount');
-    const clear = document.getElementById('productionQueueClear');
-    const full = data.count >= data.limit;
-    if(count) count.textContent = data.count + ' / ' + data.limit;
-    document.querySelectorAll('[data-queue-unit]').forEach(function(button){
-      button.disabled = full || productionQueueBusy;
-    });
-    if(clear) clear.disabled = data.count === 0 || productionQueueBusy;
-    if(list){
-      list.replaceChildren();
-      if(data.items.length === 0){
-        const empty = document.createElement('span');
-        empty.className = 'production-empty';
-        empty.textContent = '暂无生产需求';
-        list.appendChild(empty);
-      }else{
-        data.items.forEach(function(item, index){
-          const button = document.createElement('button');
-          button.type = 'button';
-          button.className = 'production-item' + (item.status === 'inflight' ? ' inflight' : '');
-          button.title = '移除 ' + item.label;
-          const order = document.createElement('span');
-          order.className = 'order'; order.textContent = String(index + 1);
-          const label = document.createElement('b'); label.textContent = item.label;
-          const cost = document.createElement('small'); cost.textContent = String(item.cost);
-          const remove = document.createElement('span');
-          remove.className = 'remove'; remove.textContent = '×'; remove.setAttribute('aria-hidden', 'true');
-          button.append(order, label, cost, remove);
-          button.onclick = function(){ mutateProductionQueue('/api/production-queue/remove', {id:item.id}); };
-          list.appendChild(button);
-        });
-      }
-    }
-    const head = data.items[0];
-    if(head){
-      setProductionQueueStatus(
-        head.status === 'inflight'
-          ? '正在生产：' + head.label
-          : '队首：' + head.label + ' · ' + head.cost + ' 资源',
-        false
-      );
-    }else{
-      setProductionQueueStatus('', false);
-    }
-  }
-
-  async function loadProductionQueue(){
-    if(productionQueueBusy || document.hidden) return;
-    try{
-      const res = await fetch('/api/production-queue?ts=' + Date.now(), {cache:'no-store'});
-      const data = await res.json();
-      if(res.ok && data.ok) renderProductionQueue(data);
-    }catch(e){}
-  }
-
-  async function mutateProductionQueue(path, payload){
-    if(productionQueueBusy) return;
-    productionQueueBusy = true;
-    document.querySelectorAll('[data-queue-unit]').forEach(function(button){ button.disabled = true; });
-    const clear = document.getElementById('productionQueueClear');
-    if(clear) clear.disabled = true;
-    setProductionQueueStatus('同步中…', false);
-    let nextData = null;
-    try{
-      const res = await fetch(path, {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(payload || {})
-      });
-      const data = await res.json();
-      if(!res.ok || !data.ok) throw new Error(data.error || '队列操作失败');
-      nextData = data;
-    }catch(err){
-      setProductionQueueStatus(err.message || '网络错误', true);
-    }finally{
-      productionQueueBusy = false;
-      if(nextData) renderProductionQueue(nextData);
-      else loadProductionQueue();
-    }
-  }
-
-  function bindProductionQueue(){
-    document.querySelectorAll('[data-queue-unit]').forEach(function(button){
-      button.onclick = function(){
-        mutateProductionQueue('/api/production-queue/add', {unit_type:button.dataset.queueUnit});
-      };
-    });
-    const clear = document.getElementById('productionQueueClear');
-    if(clear) clear.onclick = function(){ mutateProductionQueue('/api/production-queue/clear', {}); };
+  function updateProductionCounts(workers, vanguards, rangers){
+    const set = function(id, value){
+      const el = document.getElementById(id);
+      if(el) el.textContent = String(value == null ? '-' : value);
+    };
+    set('prodCurrentWorkers', workers);
+    set('prodCurrentVanguards', vanguards);
+    set('prodCurrentRangers', rangers);
   }
 
   function applyConfigValues(config){
@@ -1777,8 +1689,6 @@ JS = r"""
   }
 
   bindOreForm();
-  bindProductionQueue();
-  loadProductionQueue();
   bindConfigForm();
   bindTeamsBoard();
   loadTeams(true);
@@ -1794,7 +1704,6 @@ JS = r"""
     }, {passive:false});
   }
   setInterval(softRefresh, 2000);
-  setInterval(loadProductionQueue, 2000);
   setInterval(function(){ loadConfig(false); }, 10000);
   setInterval(function(){ loadTeams(false); }, 5000);
 })();
@@ -2157,7 +2066,7 @@ def generate_html() -> str:
        </div>
       </section>
       {render_teams_panel()}
-      {render_config_panel()}
+      {render_config_panel(parts['workersCount'], parts['vgCount'], parts['rgCount'])}
       <div id="issuesSection" style="display:none">{parts['issuesHtml']}</div>
     </section>
 
@@ -2251,12 +2160,6 @@ class Handler(BaseHTTPRequestHandler):
                 "combat_units": collect_combat_units(rec, config),
             })
             return
-        if path == "/api/production-queue":
-            try:
-                self._send_json(200, production_queue.queue_payload())
-            except Exception as exc:
-                self._send_json(500, {"ok": False, "error": f"读取队列失败: {exc}"})
-            return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
@@ -2316,30 +2219,6 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
-        if path == "/api/production-queue/add":
-            try:
-                production_queue.enqueue(str(data.get("unit_type", "")))
-                self._send_json(200, production_queue.queue_payload())
-            except production_queue.InvalidUnitTypeError:
-                self._send_json(400, {"ok": False, "error": "未知单位类型"})
-            except production_queue.QueueFullError:
-                self._send_json(409, {"ok": False, "error": "需求队列已达到 20 个"})
-            except Exception as exc:
-                self._send_json(500, {"ok": False, "error": f"加入队列失败: {exc}"})
-            return
-        if path == "/api/production-queue/remove":
-            try:
-                request_id = int(data.get("id"))
-            except (TypeError, ValueError):
-                self._send_json(400, {"ok": False, "error": "无效的队列编号"})
-                return
-            production_queue.remove_request(request_id)
-            self._send_json(200, production_queue.queue_payload())
-            return
-        if path == "/api/production-queue/clear":
-            production_queue.clear_requests()
-            self._send_json(200, production_queue.queue_payload())
-            return
         if path == "/api/enemy/clear":
             try:
                 with open(MAP_FILE, "r+", encoding="utf-8") as f:

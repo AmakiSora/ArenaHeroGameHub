@@ -94,7 +94,6 @@ EXCLUDE_PATTERNS = [
     # Runtime state is uploaded separately into the Docker volume.
     r"^map_memory\.json$",
     r"^tactic_config\.json$",
-    r"^production_queue\.db",
     r"^tactic_log\.jsonl$",
     r"^tactic_play\.log$",
     r"^_.*\.py$",
@@ -109,7 +108,6 @@ EXCLUDE_PATTERNS = [
 RUNTIME_SEED_FILES = (
     "map_memory.json",
     "tactic_config.json",
-    "production_queue.db",
     "tactic_log.jsonl",
     "tactic_play.log",
 )
@@ -236,14 +234,12 @@ docker run --rm \
   alpine:3.21 sh -c '
     set -e
     mkdir -p /data
-    for f in map_memory.json tactic_config.json production_queue.db tactic_log.jsonl tactic_play.log; do
+    for f in map_memory.json tactic_config.json tactic_log.jsonl tactic_play.log; do
       if [ -f "/seed/$f" ]; then
         cp -f "/seed/$f" "/data/$f"
         echo "seeded $f"
       fi
     done
-    # Drop sqlite sidecars so a replaced db starts cleanly.
-    rm -f /data/production_queue.db-wal /data/production_queue.db-shm
     # Container runs as uid 10001 (arena).
     chown -R 10001:10001 /data
     chmod -R u+rwX,go+rX /data

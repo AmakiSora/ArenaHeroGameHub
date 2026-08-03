@@ -6,7 +6,7 @@ This release runs ArenaGame as one Python container:
 - `tactic.py` Arena Hero client (same container, background process)
 
 It is intentionally a single replica. Runtime files (`map_memory.json`,
-`tactic_config.json`, `production_queue.db`, logs) live on a Docker volume.
+`tactic_config.json`, logs) live on a Docker volume.
 
 ## Security Notice
 
@@ -135,7 +135,7 @@ After every deployment:
 
 1. `http://SERVER_IP:4399/` loads the Chinese dashboard
 2. `/api/state` returns JSON
-3. `/api/config` and production-queue endpoints respond
+3. `/api/config` responds (production targets live in the config form)
 4. `docker compose logs app` shows tactic connecting when API key is set
 5. New ticks appear in the dashboard after the tactic joins a game
 

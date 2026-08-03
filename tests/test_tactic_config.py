@@ -100,12 +100,18 @@ class TacticConfigTests(unittest.TestCase):
         page = dashboard.generate_html()
 
         for field in CONFIG_FIELDS:
-            if field.group == "combat":
+            if field.group in ("combat", "production"):
                 continue
             self.assertIn(f'name="{field.key}"', panel)
-        for unit_type in ("WORKER", "VANGUARD", "RANGER"):
-            self.assertIn(f'data-queue-unit="{unit_type}"', panel)
-        self.assertIn('id="productionQueueList"', panel)
+        for key, current_id in (
+            ("target_workers", "prodCurrentWorkers"),
+            ("target_vanguards", "prodCurrentVanguards"),
+            ("target_rangers", "prodCurrentRangers"),
+        ):
+            self.assertIn(f'name="{key}"', panel)
+            self.assertIn(f'id="{current_id}"', panel)
+        self.assertNotIn("productionQueueList", panel)
+        self.assertNotIn("productionQueueClear", panel)
         self.assertNotIn('name="home_team"', panel)
         self.assertNotIn('name="attack_team"', panel)
         self.assertNotIn('name="guerrilla_team"', panel)

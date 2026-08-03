@@ -26,7 +26,6 @@ from arena_hero import (
     UnitType,
 )
 from arena_hero.errors import ProtocolError, TransportError
-import production_queue
 from sdk_compat import apply_sdk_compat
 from tactic_config import load_config, save_config
 
@@ -45,6 +44,26 @@ LOG_MAX_BYTES = int(os.environ.get("ARENA_LOG_MAX_MB", "20")) * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 # Shutdown summary only reads this many of the newest tick records.
 _SUMMARY_TAIL_RECORDS = 10000
+
+# Resource cost of each spawnable unit type (demand-based production).
+UNIT_SPAWN_COSTS = {
+    "WORKER": 5,
+    "VANGUARD": 10,
+    "RANGER": 12,
+}
+# Spawn priority when several types are below their target (economy first).
+_SPAWN_PRIORITY = (UnitType.WORKER, UnitType.VANGUARD, UnitType.RANGER)
+# Config key for each unit type's target, and its fallback when unset.
+_TARGET_KEYS = {
+    UnitType.WORKER: "target_workers",
+    UnitType.VANGUARD: "target_vanguards",
+    UnitType.RANGER: "target_rangers",
+}
+_TARGET_DEFAULTS = {
+    UnitType.WORKER: 10,
+    UnitType.VANGUARD: 2,
+    UnitType.RANGER: 2,
+}
 
 
 # ── geometry helpers ─────────────────────────────────────────────────────────
@@ -1832,50 +1851,87 @@ turn_context = type(
 )()
 
 
-def _sync_production_queue(turn: Any) -> None:
-    """Resolve the one spawn request issued on a previous Tick."""
-    inflight = production_queue.inflight_request()
-    if inflight is None:
-        return
+def _plan_demand_spawn(turn: Any, core: Any, resources: int, config: dict[str, Any]) -> str | None:
+    """Spawn the highest-priority type whose current count is below its target.
 
-    event_types = {str(event.event_type) for event in turn.events}
-    if "CORE_SPAWN_SUCCEEDED" in event_types:
-        production_queue.finish_inflight(inflight["id"], succeeded=True)
-    elif "CORE_SPAWN_FAILED" in event_types:
-        production_queue.finish_inflight(inflight["id"], succeeded=False)
-    else:
-        production_queue.reset_stale_inflight(int(turn.tick))
+    Demand-based production: counts are recomputed every Tick, so a successful
+    spawn naturally stops further production (count +1) and a failed one is
+    retried on the next Tick — no inflight bookkeeping is needed because the
+    Core takes exactly one action per Tick.
 
-
-def _plan_queued_spawn(turn: Any, core: Any, resources: int, config: dict[str, Any]) -> str | None:
-    """Queue the affordable FIFO production request when the Core cell is free.
-
-    Ensures at least `resource_reserve` resources remain after spending.
+    Spawn only when:
+    - the Core cell is free (a unit standing on it blocks the spawn),
+    - population is below `population_cap`,
+    - resources cover `cost + resource_reserve`.
     """
-    if production_queue.inflight_request() is not None:
-        return None
-
-    request = production_queue.head_request()
-    if request is None:
-        return None
-    cost = int(request["cost"])
-    reserve = int(config.get("resource_reserve", 0))
-    pop_cap = int(config.get("population_cap", 20))
-    if resources < cost + reserve:
-        return None
-    if turn.state.population >= pop_cap:
-        return None
     if any(tuple(unit.position) == tuple(core.position) for unit in turn.units):
         return None
-    if not production_queue.claim_request(request["id"], int(turn.tick)):
+    pop_cap = int(config.get("population_cap", 20))
+    if getattr(turn.state, "population", 0) >= pop_cap:
         return None
 
-    try:
-        core.spawn(UnitType(request["unit_type"]))
-    except Exception:
-        production_queue.finish_inflight(request["id"], succeeded=False)
-        return None
-    return f'SPAWN_{request["unit_type"]}'
+    reserve = int(config.get("resource_reserve", 0))
+    for unit_type in _SPAWN_PRIORITY:
+        count = _unit_type_count(turn, unit_type)
+        target = int(config.get(_TARGET_KEYS[unit_type], _TARGET_DEFAULTS[unit_type]))
+        if count >= target:
+            continue
+        cost = UNIT_SPAWN_COSTS[unit_type.name]
+        if resources < cost + reserve:
+            continue
+        try:
+            core.spawn(unit_type)
+        except Exception:
+            return None
+        return f"SPAWN_{unit_type.name}"
+    return None
+
+
+def _unit_type_count(turn: Any, unit_type: UnitType) -> int:
+    attr = {
+        UnitType.WORKER: "workers",
+        UnitType.VANGUARD: "vanguards",
+        UnitType.RANGER: "rangers",
+    }[unit_type]
+    return len(getattr(turn, attr, ()) or ())
+
+
+def _plan_over_target_self_destruct(
+    turn: Any, core: Any, config: dict[str, Any],
+) -> list[tuple[Any, str]]:
+    """Pick one unit per over-target type to self-destruct this Tick.
+
+    When a type's current count exceeds its target (e.g. the target was lowered),
+    shed the least-useful unit: empty workers first, and among candidates the one
+    furthest from the Core. At most one unit per type per Tick so a big overrun is
+    trimmed gradually instead of wiping a whole corps at once. The Champion Beacon
+    carrier is never selected.
+    """
+    result: list[tuple[Any, str]] = []
+    core_pos = tuple(core.position)
+    beacon = getattr(turn, "beacon", None)
+    carrier_id = str(getattr(beacon, "carrier_id", None) or "")
+
+    for unit_type in _SPAWN_PRIORITY:
+        count = _unit_type_count(turn, unit_type)
+        target = int(config.get(_TARGET_KEYS[unit_type], _TARGET_DEFAULTS[unit_type]))
+        if count <= target:
+            continue
+        pool = [
+            unit for unit in turn.units
+            if unit.unit_type == unit_type and str(unit.id) != carrier_id
+        ]
+        if not pool:
+            continue
+
+        def key(unit: Any) -> tuple[int, int]:
+            # Farthest from Core first; for workers prefer an empty one.
+            empty = 1 if unit_type == UnitType.WORKER and getattr(unit, "cargo", 0) == 0 else 0
+            return (_manhattan(unit.position, core_pos), empty)
+
+        chosen = max(pool, key=key)
+        result.append((chosen, f"{count}>{target}"))
+    return result
 
 
 def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
@@ -1923,8 +1979,6 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     for r in getattr(turn, "rangers", ()) or ():
         alive_ids.add(str(r.id))
     _prune_dead_unit_bookkeeping(alive_ids)
-
-    _sync_production_queue(turn)
 
     # ── Update permanent map memory ────────────────────────────────────
     known_obstacles = _update_obstacle_memory(turn)
@@ -2015,9 +2069,9 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         core_done = True
 
     if not core_done:
-        queued_spawn = _plan_queued_spawn(turn, core, resources, config)
-        if queued_spawn is not None:
-            core_action_name = queued_spawn
+        demand_spawn = _plan_demand_spawn(turn, core, resources, config)
+        if demand_spawn is not None:
+            core_action_name = demand_spawn
             core_done = True
 
     if not core_done and config["repair_enabled"] and resources >= 1:
@@ -2116,7 +2170,14 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     )
 
     # ── Unit actions ────────────────────────────────────────────────────
+    # Shed over-target units first so their self-destruct (not a normal action)
+    # is issued this Tick, and the per-unit planner skips them below.
+    self_destructs = _plan_over_target_self_destruct(turn, core, config)
+    sd_ids = {str(unit.id) for unit, _ in self_destructs}
+
     for unit in turn.units:
+        if str(unit.id) in sd_ids:
+            continue
         uid = str(unit.id)[:8]
         if unit.unit_type == UnitType.WORKER:
             action, detail = _plan_worker(
@@ -2153,6 +2214,10 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 team=team,
             )
             unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
+
+    for unit, detail in self_destructs:
+        unit.self_destruct()
+        unit_actions_detail[str(unit.id)[:8]] = f"SELF_DESTRUCT:{detail}"
 
     return core_action_name, unit_actions_detail
 

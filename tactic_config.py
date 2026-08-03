@@ -36,6 +36,7 @@ CONFIG_GROUPS = (
     ("core", "核心"),
     ("combat", "战斗分队"),
     ("runtime", "运行"),
+    ("production", "生产"),
 )
 
 CONFIG_FIELDS = (
@@ -91,6 +92,9 @@ CONFIG_FIELDS = (
     ),
     ConfigField("ranger_attack_range", "游侠开火距离", "combat", "integer", 3, 1, 3, 1),
     ConfigField("map_save_interval_ticks", "地图保存间隔 Tick", "runtime", "integer", 10, 1, 200, 1),
+    ConfigField("target_workers", "工人目标", "production", "integer", 10, 0, 19, 1),
+    ConfigField("target_vanguards", "先锋目标", "production", "integer", 2, 0, 19, 1),
+    ConfigField("target_rangers", "游侠目标", "production", "integer", 2, 0, 19, 1),
 )
 
 _FIELDS_BY_KEY = {field.key: field for field in CONFIG_FIELDS}
