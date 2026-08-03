@@ -12,6 +12,7 @@ from unittest.mock import patch
 from arena_hero import UnitType
 
 import dashboard
+import game_stats
 import status
 import tactic
 from tactic_config import default_config
@@ -1355,6 +1356,154 @@ class SelfDestructTests(unittest.TestCase):
         result = tactic._plan_over_target_self_destruct(turn, self.Core(), self.config)
 
         self.assertEqual(result[0][0].id, "w-far")
+
+
+class GameStatsTests(unittest.TestCase):
+    """Cumulative battle-report aggregation (economy / combat / production)."""
+
+    @staticmethod
+    def _ev(event_type, actor=None, values=None):
+        return SimpleNamespace(
+            event_type=event_type,
+            reason_code=None,
+            actor_id=actor,
+            values=values,
+            position=None,
+        )
+
+    @staticmethod
+    def _unit(name, unit_type):
+        return SimpleNamespace(id=name, unit_type=unit_type)
+
+    @staticmethod
+    def _turn(units=(), events=()):
+        return SimpleNamespace(units=units, events=events)
+
+    def test_per_worker_harvest_and_deposit_amounts(self) -> None:
+        stats = game_stats.new_stats()
+        worker = self._unit("worker-11111111", UnitType.WORKER)
+        game_stats.sync_units(stats, self._turn(units=(worker,)), tick=10)
+        game_stats.record_events(stats, self._turn(events=(
+            self._ev("HARVEST_SUCCEEDED", "worker-11111111", {"amount": 2}),
+            self._ev("HARVEST_SUCCEEDED", "worker-11111111", {"amount": 2}),
+            self._ev("DEPOSIT_SUCCEEDED", "worker-11111111", {"amount": 4}),
+        )), tick=11)
+
+        self.assertEqual(stats["economy"]["harvested_total"], 4)
+        self.assertEqual(stats["economy"]["harvest_count"], 2)
+        self.assertEqual(stats["economy"]["deposited_total"], 4)
+        rec = stats["per_worker"]["worker-1"]
+        self.assertEqual(rec["harvested"], 4)
+        self.assertEqual(rec["harvest_count"], 2)
+        self.assertEqual(rec["deposited"], 4)
+
+    def test_combat_shots_classified_by_type(self) -> None:
+        stats = game_stats.new_stats()
+        vanguard = self._unit("vg-22222222", UnitType.VANGUARD)
+        ranger = self._unit("rg-33333333", UnitType.RANGER)
+        game_stats.sync_units(stats, self._turn(units=(vanguard, ranger)), tick=10)
+        game_stats.record_events(stats, self._turn(events=(
+            self._ev("SHOT_HIT", "vg-22222222"),
+            self._ev("SHOT_MISSED", "vg-22222222"),
+            self._ev("SHOT_HIT", "rg-33333333"),
+            self._ev("SHOT_MISSED", "rg-33333333"),
+            self._ev("SHOT_MISSED", "rg-33333333"),
+        )), tick=11)
+
+        comb = stats["combat"]
+        self.assertEqual(comb["vanguard_shots"], 2)
+        self.assertEqual(comb["vanguard_hits"], 1)
+        self.assertEqual(comb["ranger_shots"], 3)
+        self.assertEqual(comb["ranger_hits"], 1)
+        self.assertEqual(stats["per_combat"]["vg-22222"]["hits"], 1)
+        self.assertEqual(stats["per_combat"]["rg-33333"]["shots"], 3)
+
+    def test_birth_baseline_and_spawned_by_type(self) -> None:
+        stats = game_stats.new_stats()
+        worker = self._unit("worker-44444444", UnitType.WORKER)
+        # First tick is a baseline: existing units are NOT counted as spawned.
+        game_stats.sync_units(stats, self._turn(units=(worker,)), tick=100)
+        self.assertEqual(stats["production"]["spawned"]["WORKER"], 0)
+
+        vanguard = self._unit("vg-55555555", UnitType.VANGUARD)
+        game_stats.sync_units(stats, self._turn(units=(worker, vanguard)), tick=101)
+        self.assertEqual(stats["production"]["spawned"]["WORKER"], 0)
+        self.assertEqual(stats["production"]["spawned"]["VANGUARD"], 1)
+        self.assertEqual(stats["deaths"]["WORKER"], 0)
+
+    def test_death_detected_on_snapshot_gone(self) -> None:
+        stats = game_stats.new_stats()
+        worker = self._unit("worker-66666666", UnitType.WORKER)
+        game_stats.sync_units(stats, self._turn(units=(worker,)), tick=10)
+        # Worker disappears on the next tick.
+        game_stats.sync_units(stats, self._turn(units=()), tick=11)
+
+        self.assertEqual(stats["deaths"]["WORKER"], 1)
+        self.assertEqual(stats["per_worker"]["worker-6"]["died_tick"], 11)
+
+    def test_self_destruct_and_global_combat_events(self) -> None:
+        stats = game_stats.new_stats()
+        ranger = self._unit("rg-77777777", UnitType.RANGER)
+        game_stats.sync_units(stats, self._turn(units=(ranger,)), tick=10)
+        game_stats.record_events(stats, self._turn(events=(
+            self._ev("UNIT_SELF_DESTRUCTED", "rg-77777777"),
+            self._ev("DESTRUCTION_PARTICIPATION"),
+            self._ev("UNIT_DAMAGED"),
+            self._ev("UNIT_MOVE_SUCCEEDED"),
+            self._ev("UNIT_MOVE_FAILED"),
+            self._ev("CORE_SPAWN_FAILED"),
+        )), tick=11)
+
+        self.assertEqual(stats["production"]["self_destructed"]["RANGER"], 1)
+        self.assertEqual(stats["combat"]["kill_participations"], 1)
+        self.assertEqual(stats["combat"]["damage_taken"], 1)
+        self.assertEqual(stats["economy"]["moves_succeeded"], 1)
+        self.assertEqual(stats["economy"]["moves_failed"], 1)
+        self.assertEqual(stats["production"]["spawn_failed"], 1)
+
+    def test_derive_metrics(self) -> None:
+        stats = game_stats.new_stats()
+        stats["start_tick"] = 100
+        stats["current_tick"] = 300
+        stats["economy"]["harvested_total"] = 400
+        stats["economy"]["deposited_total"] = 200
+        stats["combat"]["vanguard_shots"] = 10
+        stats["combat"]["vanguard_hits"] = 3
+        stats["samples"] = [
+            {"tick": 100, "harvested_total": 0},
+            {"tick": 300, "harvested_total": 400},
+        ]
+
+        derived = game_stats.derive(stats, alive_workers=8)
+
+        self.assertEqual(derived["ticks"], 200)
+        self.assertEqual(derived["harvest_per_tick"], 2.0)
+        self.assertEqual(derived["harvest_per_worker"], 50.0)
+        self.assertEqual(derived["vanguard_hit_rate"], 30.0)
+        self.assertEqual(derived["window_harvest_per_tick"], 2.0)
+
+    def test_save_load_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "stats.json"
+            stats = game_stats.new_stats()
+            stats["current_tick"] = 42
+            stats["economy"]["harvested_total"] = 123
+            game_stats.save(stats, path)
+
+            loaded = game_stats.load(path)
+
+        self.assertEqual(loaded["current_tick"], 42)
+        self.assertEqual(loaded["economy"]["harvested_total"], 123)
+
+    def test_maybe_save_respects_interval(self) -> None:
+        stats = game_stats.new_stats()
+        stats["start_tick"] = 10
+        with patch.object(game_stats, "save", return_value=None) as save_mock:
+            self.assertFalse(game_stats.maybe_save(stats, tick=20, interval=20))
+            self.assertTrue(game_stats.maybe_save(stats, tick=30, interval=20))
+            self.assertFalse(game_stats.maybe_save(stats, tick=35, interval=20))
+            self.assertTrue(game_stats.maybe_save(stats, tick=50, interval=20))
+        self.assertEqual(save_mock.call_count, 2)
 
 
 if __name__ == "__main__":

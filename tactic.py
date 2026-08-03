@@ -26,6 +26,7 @@ from arena_hero import (
     UnitType,
 )
 from arena_hero.errors import ProtocolError, TransportError
+import game_stats
 from sdk_compat import apply_sdk_compat
 from tactic_config import load_config, save_config
 
@@ -1665,6 +1666,10 @@ _STUCK_THRESHOLD = 8
 _map_dirty: bool = False
 _last_map_save_tick: int = -1
 
+# Cumulative battle-report statistics (economy / combat / production + per-unit
+# details), persisted to game_stats.json so they survive process restarts.
+_game_stats: dict[str, Any] = game_stats.load()
+
 
 def _load_map_memory() -> None:
     """Load permanent obstacle/resource/enemy memory from disk."""
@@ -1979,6 +1984,12 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     for r in getattr(turn, "rangers", ()) or ():
         alive_ids.add(str(r.id))
     _prune_dead_unit_bookkeeping(alive_ids)
+
+    # ── Aggregate battle-report statistics ─────────────────────────────
+    game_stats.sync_units(_game_stats, turn, turn_context.tick)
+    game_stats.record_events(_game_stats, turn, turn_context.tick)
+    game_stats.sampled(_game_stats, turn_context.tick)
+    game_stats.maybe_save(_game_stats, turn_context.tick)
 
     # ── Update permanent map memory ────────────────────────────────────
     known_obstacles = _update_obstacle_memory(turn)

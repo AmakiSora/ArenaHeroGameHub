@@ -108,6 +108,7 @@ EXCLUDE_PATTERNS = [
 RUNTIME_SEED_FILES = (
     "map_memory.json",
     "tactic_config.json",
+    "game_stats.json",
     "tactic_log.jsonl",
     "tactic_play.log",
 )
@@ -234,7 +235,7 @@ docker run --rm \
   alpine:3.21 sh -c '
     set -e
     mkdir -p /data
-    for f in map_memory.json tactic_config.json tactic_log.jsonl tactic_play.log; do
+    for f in map_memory.json tactic_config.json game_stats.json tactic_log.jsonl tactic_play.log; do
       if [ -f "/seed/$f" ]; then
         cp -f "/seed/$f" "/data/$f"
         echo "seeded $f"

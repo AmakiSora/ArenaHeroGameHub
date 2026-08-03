@@ -13,6 +13,7 @@ map_memory.json
 map_memory.tmp
 tactic_config.json
 tactic_config.tmp
+game_stats.json
 
 # Python cache
 __pycache__/

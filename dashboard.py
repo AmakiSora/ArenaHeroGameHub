@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+import game_stats
 from tactic_config import (
     CONFIG_PATH,
     ConfigValidationError,
@@ -865,7 +866,8 @@ body{margin:0;min-height:100vh;color:var(--text);
 .kv span{color:var(--muted)}
 .stat-chips{display:flex;flex-wrap:wrap;gap:6px}
 .mini-bar{height:6px;border-radius:99px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:8px}
-.mini-bar>span{display:block;height:100%;background:linear-gradient(90deg,#57d6a3,#6ea8ff)}.res-add-form{display:none;gap:8px;margin-top:10px;padding:10px;border-radius:12px;background:rgba(0,0,0,.2);border:1px solid rgba(110,168,255,.22)}.res-add-form.open{display:grid}.res-add-form .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.res-add-form label{display:grid;gap:4px;font-size:11px;color:var(--muted)}.res-add-form input{width:100%;padding:7px 9px;border-radius:8px;border:1px solid rgba(255,255,255,.10);background:#0b1222;color:#eef3ff;font-family:Consolas,monospace;font-size:12px;outline:none}.res-add-form input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}.res-add-form .actions{display:flex;gap:6px;flex-wrap:wrap}.res-add-form button{appearance:none;border:1px solid rgba(110,168,255,.35);background:#285b8f;color:#fff;border-radius:999px;padding:6px 11px;font-size:11px;font-weight:700;cursor:pointer}.res-add-form button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}.res-add-form button:hover{border-color:rgba(110,168,255,.55)}.res-add-form .msg{min-height:14px;font-size:11px;color:var(--muted)}.res-add-form .msg.ok{color:#8ef0c4}.res-add-form .msg.err{color:#ff9b9b}.chip.removable{position:relative;display:inline-flex;align-items:center;gap:6px;padding-right:4px}
+.mini-bar>span{display:block;height:100%;background:linear-gradient(90deg,#57d6a3,#6ea8ff)}
+.mini-label{font-size:10px;color:#8ef0c4;font-family:Consolas,monospace;margin-top:3px;text-align:right}.res-add-form{display:none;gap:8px;margin-top:10px;padding:10px;border-radius:12px;background:rgba(0,0,0,.2);border:1px solid rgba(110,168,255,.22)}.res-add-form.open{display:grid}.res-add-form .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.res-add-form label{display:grid;gap:4px;font-size:11px;color:var(--muted)}.res-add-form input{width:100%;padding:7px 9px;border-radius:8px;border:1px solid rgba(255,255,255,.10);background:#0b1222;color:#eef3ff;font-family:Consolas,monospace;font-size:12px;outline:none}.res-add-form input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}.res-add-form .actions{display:flex;gap:6px;flex-wrap:wrap}.res-add-form button{appearance:none;border:1px solid rgba(110,168,255,.35);background:#285b8f;color:#fff;border-radius:999px;padding:6px 11px;font-size:11px;font-weight:700;cursor:pointer}.res-add-form button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}.res-add-form button:hover{border-color:rgba(110,168,255,.55)}.res-add-form .msg{min-height:14px;font-size:11px;color:var(--muted)}.res-add-form .msg.ok{color:#8ef0c4}.res-add-form .msg.err{color:#ff9b9b}.chip.removable{position:relative;display:inline-flex;align-items:center;gap:6px;padding-right:4px}
 .chip.mem.manual{background:rgba(255,200,87,.18);border-color:rgba(255,200,87,.35);color:#ffe4a8}
 .chip.mem{background:rgba(255,200,87,.10);border-color:rgba(255,200,87,.18);color:#ffe0a0}.chip.enemy-chip{background:rgba(255,100,100,.10);border-color:rgba(255,100,100,.18);color:#ffa8a8}.chip .chip-x{opacity:0;display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;background:rgba(255,100,100,.2);color:#ffb6b6;margin-left:4px;cursor:pointer;font-size:10px;line-height:1;border:none;padding:0;transition:opacity .12s,background .12s}.chip .chip-x:hover{background:rgba(255,100,100,.45);color:#fff}.chip.removable:hover .chip-x{opacity:1}.res-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}.res-head .title{display:flex;align-items:baseline;gap:8px}.res-head .add-ore-btn{appearance:none;border:1px solid rgba(110,168,255,.3);width:22px;height:22px;border-radius:50%;background:rgba(110,168,255,.12);color:#c7dbff;cursor:pointer;font-size:14px;line-height:1;padding:0;display:grid;place-items:center;transition:.12s}.res-head .add-ore-btn:hover{background:rgba(110,168,255,.28);border-color:rgba(110,168,255,.6);color:#fff}.res-section{display:grid;gap:8px}.res-section h4{margin:0;font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.8px}.manual-tag{color:#ffd98a;font-size:10px;margin-left:6px}
 .config-panel{margin-top:0}
@@ -1746,6 +1748,12 @@ def build_parts():
         act = actions.get(wid) or actions.get(w.get("id", ""), "")
         stats[action_kind(act, w.get("cargo", 0))] += 1
 
+    # Battle-report statistics (economy / combat / production + per-unit).
+    game_stat = game_stats.load()
+    derived = game_stats.derive(game_stat, alive_workers=len(workers))
+    per_worker = game_stat.get("per_worker", {}) or {}
+    per_combat = game_stat.get("per_combat", {}) or {}
+
     def wcard(w):
         wid = w.get("id", "")
         sid = short_id(wid)
@@ -1762,6 +1770,12 @@ def build_parts():
             f'<span class="pill">矿 {cargo}</span>'
             if cargo else f'<span class="pill">HP {w.get("hp","?")}</span>'
         )
+        pw = per_worker.get(sid)
+        if pw is not None:
+            extra += (
+                f'<span class="pill" title="累计采矿 / 卸货">采 {pw.get("harvested", 0)}'
+                f' · 卸 {pw.get("deposited", 0)}</span>'
+            )
         return (
             f'<div class="unit {kind}"><div class="unit-top">'
             f'<div class="unit-id">{name}<span class="count">{sid}</span></div>'
@@ -1783,18 +1797,32 @@ def build_parts():
             return "未编队"
         return "作战"
 
+    def combat_stat_line(sid: str) -> str:
+        """Per-combat-unit stats: shots / hits / hit-rate, or '已阵亡'."""
+        rec = per_combat.get(sid)
+        if not rec:
+            return ""
+        shots = int(rec.get("shots", 0) or 0)
+        hits = int(rec.get("hits", 0) or 0)
+        rate = (hits * 100 / shots) if shots else 0.0
+        alive = rec.get("died_tick") is None
+        if alive:
+            return f'<span class="pill" title="攻击次数 / 命中次数">攻 {shots} · 中 {hits} ({rate:.0f}%)</span>'
+        return f'<span class="pill" title="生前攻击 / 命中">已阵亡 · 生前攻 {shots} · 中 {hits}</span>'
+
     def ucard(u, color_cls):
         uid = u.get("id", "")
         sid = short_id(uid)
         name = u.get("name") or sid
         act = actions.get(sid) or actions.get(uid, "")
         label = team_label(act)
+        stat_line = combat_stat_line(sid)
         return (
             f'<div class="unit {color_cls}"><div class="unit-top">'
             f'<div class="unit-id">{name}<span class="count">{sid}</span></div>'
             f'<span class="badge {color_cls}">{label}</span></div>'
             f'<div class="unit-meta"><span>{fmt_pos(u.get("pos"))}</span>'
-            f'<span class="pill">HP {u.get("hp","?")}</span></div>'
+            f'<span class="pill">HP {u.get("hp","?")}</span>{stat_line}</div>'
             f'<div class="unit-action">{act}</div></div>'
         )
 
@@ -1974,12 +2002,67 @@ def build_parts():
     else:
         left_issues = '<div class="muted">暂无异常</div>'
 
+    # ── Battle-report panel ─────────────────────────────────────────────
+    def _bar(rate: float) -> str:
+        pct = min(100, int(rate))
+        return (
+            f'<div class="mini-bar"><span style="width:{pct}%"></span></div>'
+            f'<div class="mini-label">{rate:.0f}%</div>'
+        )
+
+    eco = game_stat.get("economy", {}) or {}
+    prod = game_stat.get("production", {}) or {}
+    comb = game_stat.get("combat", {}) or {}
+    death = game_stat.get("deaths", {}) or {}
+    spawned = prod.get("spawned", {}) or {}
+    self_destructed = prod.get("self_destructed", {}) or {}
+    label = {"WORKER": "工人", "VANGUARD": "先锋", "RANGER": "游侠"}
+
+    def unit_counts_map(counter: dict) -> str:
+        return " · ".join(
+            f"{label[t]} {int(counter.get(t, 0) or 0)}" for t in ("WORKER", "VANGUARD", "RANGER")
+        )
+
+    def kv_row(k: str, v: str) -> str:
+        return f'<div class="kv"><span>{k}</span><b>{v}</b></div>'
+
+    vg_rate = derived["vanguard_hit_rate"]
+    rg_rate = derived["ranger_hit_rate"]
+    report_html = (
+        '<section class="panel"><div class="panel-title"><span>战报统计</span>'
+        f'<span class="count">累计 {derived["ticks"]} tick</span></div>'
+        '<div class="kv"><span>总采集</span>'
+        f'<b>{eco.get("harvested_total", 0)} <small>({eco.get("harvest_count", 0)} 次)</small></b></div>'
+        '<div class="kv"><span>总卸货</span>'
+        f'<b>{eco.get("deposited_total", 0)} <small>({eco.get("deposit_count", 0)} 次)</small></b></div>'
+        f'<div class="kv"><span>采集效率</span><b>{derived["harvest_per_tick"]}/tick · 每工人 {derived["harvest_per_worker"]}</b></div>'
+        f'<div class="kv"><span>近窗效率</span><b>{derived["window_harvest_per_tick"]}/tick</b></div>'
+        f'<div class="kv"><span>采集失败</span><b>{eco.get("harvest_failed", 0)}</b></div>'
+        '<div class="stat-chips" style="margin-top:8px">'
+        f'<span class="pill">生产 {unit_counts_map(spawned)}</span>'
+        f'<span class="pill">自裁 {unit_counts_map(self_destructed)}</span>'
+        f'<span class="pill">阵亡 {unit_counts_map(death)}</span>'
+        f'<span class="pill">生产失败 {int(prod.get("spawn_failed", 0) or 0)}</span></div>'
+        '<div style="margin-top:8px"><div class="kv"><span>先锋</span>'
+        f'<b>{comb.get("vanguard_shots", 0)} 攻 / {comb.get("vanguard_hits", 0)} 中</b></div>{_bar(vg_rate)}</div>'
+        '<div style="margin-top:8px"><div class="kv"><span>游侠</span>'
+        f'<b>{comb.get("ranger_shots", 0)} 攻 / {comb.get("ranger_hits", 0)} 中</b></div>{_bar(rg_rate)}</div>'
+        '<div class="stat-chips" style="margin-top:8px">'
+        f'<span class="pill">参与击杀 {int(comb.get("kill_participations", 0) or 0)}</span>'
+        f'<span class="pill">承伤 {int(comb.get("damage_taken", 0) or 0)}</span>'
+        f'<span class="pill">扫描 {int(comb.get("sweeps_resolved", 0) or 0)}</span></div>'
+        '<div class="kv" style="margin-top:8px"><span>移动</span>'
+        f'<b>成功 {eco.get("moves_succeeded", 0)} · 失败 {eco.get("moves_failed", 0)}</b></div>'
+        '</section>'
+    )
+
     left_html = (
         f'<section class="panel"><div class="panel-title"><span>核心</span><span class="count">状态</span></div>{left_core}</section>'
         f'<section class="panel"><div class="panel-title"><span>资源</span><span class="count">{pct}%</span></div>{left_res}</section>'
         f'<section class="panel"><div class="panel-title"><span>战场</span><span class="count">摘要</span></div>{left_fight}</section>'
         f'<section class="panel"><div class="panel-title"><span>异常</span><span class="count">{len(issues)}</span></div><div class="compact-list">{left_issues}</div></section>'
-        f'<section class="panel enemy-panel" id="leftEnemyPanel"><div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{len(ex_sightings)} 处</span><button type="button" id="clearEnemyBtn" class="enemy-clear-btn">清除</button></div><div id="enemySection">{enemy_html}</div></section>'
+        + report_html
+        + f'<section class="panel enemy-panel" id="leftEnemyPanel"><div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{len(ex_sightings)} 处</span><button type="button" id="clearEnemyBtn" class="enemy-clear-btn">清除</button></div><div id="enemySection">{enemy_html}</div></section>'
     )
 
     return {
