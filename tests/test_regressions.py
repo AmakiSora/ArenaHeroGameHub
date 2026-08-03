@@ -15,6 +15,7 @@ import dashboard
 import game_stats
 import status
 import tactic
+import tactic_config
 from tactic_config import default_config
 
 
@@ -374,7 +375,8 @@ class CombatTeamPlannerTests(unittest.TestCase):
                 ),
                 rangers=(SimpleNamespace(id="rang-1"),),
             )
-            with patch.object(tactic, "save_config", side_effect=lambda values: save_config(values, path)):
+            with patch.object(tactic, "save_config", side_effect=lambda values: save_config(values, path)), \
+                 patch.object(tactic, "CONFIG_PATH", path):
                 updated = tactic._auto_enlist_new_combat_units(turn, load_config(path))
 
             loaded = load_config(path)
@@ -1356,6 +1358,44 @@ class SelfDestructTests(unittest.TestCase):
         result = tactic._plan_over_target_self_destruct(turn, self.Core(), self.config)
 
         self.assertEqual(result[0][0].id, "w-far")
+
+
+class ConfigClobberProtectionTests(unittest.TestCase):
+    """Auto-enlist must never overwrite newer dashboard edits (e.g. targets)."""
+
+    def test_freshest_config_overrides_cached_with_newer_disk(self) -> None:
+        full = tactic_config.default_config()
+        full["target_vanguards"] = 4
+        full["target_rangers"] = 5
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tactic_config.json"
+            path.write_text(json.dumps(full, ensure_ascii=False), encoding="utf-8")
+            with patch.object(tactic, "CONFIG_PATH", path):
+                fresh = tactic._freshest_config()
+
+        self.assertEqual(fresh["target_vanguards"], 4)
+        self.assertEqual(fresh["target_rangers"], 5)
+        # All fields survive, not just the edited ones.
+        for key in ("target_workers", "population_cap", "home_team"):
+            self.assertIn(key, fresh)
+
+    def test_auto_enlist_preserves_newer_disk_targets(self) -> None:
+        # The on-disk config has targets the tactic's in-memory copy doesn't.
+        full = tactic_config.default_config()
+        full["target_vanguards"] = 4
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tactic_config.json"
+            path.write_text(json.dumps(full, ensure_ascii=False), encoding="utf-8")
+            stale = tactic_config.default_config()  # still target 2
+            with patch.object(tactic, "CONFIG_PATH", path), \
+                 patch.object(tactic, "save_config", wraps=tactic_config.save_config) as save_mock:
+                result = tactic._ensure_home_team_membership(stale, ["V9"])
+
+        self.assertEqual(result["target_vanguards"], 4)  # preserved from disk
+        self.assertIn("V9", result["home_team"])
+        self.assertEqual(save_mock.call_count, 1)
+        saved = save_mock.call_args[0][0]
+        self.assertEqual(saved["target_vanguards"], 4)
 
 
 class GameStatsTests(unittest.TestCase):

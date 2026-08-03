@@ -110,6 +110,11 @@ class TacticConfigTests(unittest.TestCase):
         ):
             self.assertIn(f'name="{key}"', panel)
             self.assertIn(f'id="{current_id}"', panel)
+        # Live target/current display + per-row production state.
+        for state_id in ("prodStateWorkers", "prodStateVanguards", "prodStateRangers"):
+            self.assertIn(f'id="{state_id}"', panel)
+        self.assertIn("/ 需求", panel)
+        self.assertIn("prod-state", panel)
         self.assertNotIn("productionQueueList", panel)
         self.assertNotIn("productionQueueClear", panel)
         self.assertNotIn('name="home_team"', panel)

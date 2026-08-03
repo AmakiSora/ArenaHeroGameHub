@@ -348,27 +348,41 @@ def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) 
             f'<legend>{group["label"]}</legend>{"".join(rows)}</fieldset>'
         )
 
+    def target_row(key: str, label: str, target: int, current: int) -> str:
+        diff = target - current
+        if diff > 0:
+            state_cls, state_text = "producing", f"缺 {diff} · 生产中"
+        elif diff < 0:
+            state_cls, state_text = "culling", f"超编 {-diff} · 将自裁"
+        else:
+            state_cls, state_text = "ok", "已达标"
+        suffix = key.replace("target_", "").capitalize()  # Workers / Vanguards / Rangers
+        return (
+            f'<div class="production-target">'
+            f'<label for="cfg-{key}">{label}</label>'
+            f'<input id="cfg-{key}" name="{key}" type="number" data-kind="integer" '
+            f'min="0" max="19" step="1" value="{target}" required>'
+            f'<span class="production-current">'
+            f'当前 <b id="prodCurrent{suffix}">{current}</b>'
+            f' / 需求 <b id="prodTarget{suffix}">{target}</b>'
+            f'<em id="prodState{suffix}" class="prod-state {state_cls}">{state_text}</em>'
+            f'</span></div>'
+        )
+
+    target_rows = "".join([
+        target_row("target_workers", "工人目标", int(config["target_workers"]), workers),
+        target_row("target_vanguards", "先锋目标", int(config["target_vanguards"]), vanguards),
+        target_row("target_rangers", "游侠目标", int(config["target_rangers"]), rangers),
+    ])
+
     return (
         '<section class="panel config-panel">'
         '<div class="panel-title"><span>策略配置</span>'
         '<span class="count" id="configState">当前值</span></div>'
         '<section class="production-section" aria-labelledby="productionTargetsTitle">'
         '<div class="production-title"><div><b id="productionTargetsTitle">生产需求目标</b>'
-        '<span class="count">低于目标自动补兵 · 超出自动自裁 · 阵亡自动补充</span></div></div>'
-        '<div class="production-targets" id="productionTargets">'
-        '<div class="production-target"><label for="cfg-target_workers">工人目标</label>'
-        f'<input id="cfg-target_workers" name="target_workers" type="number" data-kind="integer" '
-        f'min="0" max="19" step="1" value="{config["target_workers"]}" required>'
-        f'<span class="current">当前 <b id="prodCurrentWorkers">{workers}</b></span></div>'
-        '<div class="production-target"><label for="cfg-target_vanguards">先锋目标</label>'
-        f'<input id="cfg-target_vanguards" name="target_vanguards" type="number" data-kind="integer" '
-        f'min="0" max="19" step="1" value="{config["target_vanguards"]}" required>'
-        f'<span class="current">当前 <b id="prodCurrentVanguards">{vanguards}</b></span></div>'
-        '<div class="production-target"><label for="cfg-target_rangers">游侠目标</label>'
-        f'<input id="cfg-target_rangers" name="target_rangers" type="number" data-kind="integer" '
-        f'min="0" max="19" step="1" value="{config["target_rangers"]}" required>'
-        f'<span class="current">当前 <b id="prodCurrentRangers">{rangers}</b></span></div>'
-        '</div></section>'
+        '<span class="count">低于目标自动补兵 · 超出自动自裁 · 阵亡自动补充 · 改后点保存生效</span></div></div>'
+        f'<div class="production-targets" id="productionTargets">{target_rows}</div></section>'
         '<form id="tacticConfigForm">'
         f'<div class="config-groups">{"".join(groups)}</div>'
         '<div class="config-actions">'
@@ -948,12 +962,17 @@ body{margin:0;min-height:100vh;color:var(--text);
 .production-title b{font-size:13px;color:#c7dbff}
 .production-title .count{font-size:11px;color:var(--muted)}
 .production-targets{display:grid;gap:8px}
-.production-target{display:grid;grid-template-columns:64px 96px 1fr;gap:10px;align-items:center;min-height:36px}
+.production-target{display:grid;grid-template-columns:64px 96px minmax(0,1fr);gap:10px;align-items:center;min-height:36px}
 .production-target>label{color:var(--muted);font-size:12px}
 .production-target>input[type=number]{width:96px;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
 .production-target>input[type=number]:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
-.production-target .current{color:var(--muted);font-size:11px;font-family:Consolas,monospace}
-.production-target .current b{color:#8ef0c4;font-size:13px}
+.production-current{display:flex;align-items:center;gap:6px;flex-wrap:wrap;color:var(--muted);font-size:11px;font-family:Consolas,monospace}
+.production-current b{color:#8ef0c4;font-size:13px}
+.production-current #prodTargetWorkers,.production-current #prodTargetVanguards,.production-current #prodTargetRangers{color:#ffe08a}
+.prod-state{padding:2px 8px;border-radius:999px;font-size:10px;font-style:normal;font-family:"Segoe UI","Microsoft YaHei",sans-serif}
+.prod-state.producing{background:rgba(87,214,163,.15);color:#8ef0c4}
+.prod-state.ok{background:rgba(110,168,255,.12);color:#a9c8ff}
+.prod-state.culling{background:rgba(255,107,107,.15);color:#ff9b9b}
 .hero{display:none}
 .metrics{display:none}
 .layout{display:none}
@@ -1325,7 +1344,51 @@ JS = r"""
     }
   }
 
+  let productionCounts = {workers: null, vanguards: null, rangers: null};
+
+  function productionTargetValues(){
+    const out = {};
+    document.querySelectorAll('#productionTargets input[name^="target_"]').forEach(function(inp){
+      out[inp.name] = Number(inp.value);
+    });
+    return out;
+  }
+
+  function updateProductionStates(){
+    const targets = productionTargetValues();
+    const set = function(id, value){
+      const el = document.getElementById(id);
+      if(el) el.textContent = String(value == null ? '-' : value);
+    };
+    set('prodTargetWorkers', targets.target_workers);
+    set('prodTargetVanguards', targets.target_vanguards);
+    set('prodTargetRangers', targets.target_rangers);
+    const known = productionCounts.workers != null
+      || productionCounts.vanguards != null
+      || productionCounts.rangers != null;
+    if(!known) return;
+    const rows = [
+      ['prodStateWorkers', 'target_workers', productionCounts.workers],
+      ['prodStateVanguards', 'target_vanguards', productionCounts.vanguards],
+      ['prodStateRangers', 'target_rangers', productionCounts.rangers],
+    ];
+    rows.forEach(function(row){
+      const el = document.getElementById(row[0]);
+      if(!el) return;
+      const target = Number(targets[row[1]]);
+      const current = Number(row[2] == null ? 0 : row[2]);
+      const diff = target - current;
+      let text, cls;
+      if(diff > 0){ text = '缺 ' + diff + ' · 生产中'; cls = 'producing'; }
+      else if(diff < 0){ text = '超编 ' + (-diff) + ' · 将自裁'; cls = 'culling'; }
+      else { text = '已达标'; cls = 'ok'; }
+      el.textContent = text;
+      el.className = 'prod-state ' + cls;
+    });
+  }
+
   function updateProductionCounts(workers, vanguards, rangers){
+    productionCounts = {workers: workers, vanguards: vanguards, rangers: rangers};
     const set = function(id, value){
       const el = document.getElementById(id);
       if(el) el.textContent = String(value == null ? '-' : value);
@@ -1333,6 +1396,7 @@ JS = r"""
     set('prodCurrentWorkers', workers);
     set('prodCurrentVanguards', vanguards);
     set('prodCurrentRangers', rangers);
+    updateProductionStates();
   }
 
   function applyConfigValues(config){
@@ -1343,6 +1407,7 @@ JS = r"""
       if(input.dataset.kind === 'boolean') input.checked = Boolean(config[input.name]);
       else input.value = String(config[input.name]);
     });
+    updateProductionStates();
   }
 
   function teamKindLabel(kind){
@@ -1633,6 +1698,7 @@ JS = r"""
     form.addEventListener('input', function(){
       configDirty = true;
       setConfigMessage('有未保存修改', '');
+      updateProductionStates();
     });
     form.onsubmit = async function(e){
       e.preventDefault();

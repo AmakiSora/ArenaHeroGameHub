@@ -28,7 +28,7 @@ from arena_hero import (
 from arena_hero.errors import ProtocolError, TransportError
 import game_stats
 from sdk_compat import apply_sdk_compat
-from tactic_config import load_config, save_config
+from tactic_config import CONFIG_PATH, load_config, save_config
 
 apply_sdk_compat()
 
@@ -1003,6 +1003,25 @@ def _format_team_roster(names: set[str]) -> str:
     return ", ".join(sorted((name.upper() for name in names), key=sort_key))
 
 
+def _freshest_config() -> dict[str, Any]:
+    """Return a full-field config with the newest on-disk values.
+
+    Bypasses tactic_config's signature cache so team auto-enlist never
+    overwrites a concurrent dashboard save (e.g. production targets) with a
+    stale in-memory copy — the dashboard and tactic are separate processes
+    sharing tactic_config.json, and last-writer-wins must be the newest file.
+    """
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    base = load_config(CONFIG_PATH)  # full field set (defaults + cached file)
+    for key, value in raw.items():
+        if key in base:
+            base[key] = value
+    return base
+
+
 def _ensure_home_team_membership(
     config: dict[str, Any],
     unit_names: Iterable[str],
@@ -1021,7 +1040,7 @@ def _ensure_home_team_membership(
     if not added:
         return config
 
-    updated = dict(config)
+    updated = dict(_freshest_config())
     updated["home_team"] = _format_team_roster(home)
     try:
         saved = save_config(updated)
@@ -1048,7 +1067,7 @@ def _auto_enlist_new_combat_units(turn: Any, config: dict[str, Any]) -> dict[str
     config = _ensure_home_team_membership(config, names)
 
     # Prune dead units from all team rosters
-    updated = dict(config)
+    updated = dict(_freshest_config())
     changed = False
     for team_key in ("home_team", "attack_team", "guerrilla_team"):
         old = _parse_team_names(config.get(team_key, ""))
