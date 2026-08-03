@@ -993,5 +993,174 @@ class WorkerPathCacheTests(unittest.TestCase):
         self.assertIn(("E", "enemy-1"), tactic._object_names)
 
 
+class WorkerCongestionTests(unittest.TestCase):
+    """Core-cell congestion coordination + un-stick recovery."""
+
+    class Worker:
+        def __init__(self, worker_id: str, position: tuple[int, int]) -> None:
+            self.id = worker_id
+            self.position = position
+            self.cargo = 0
+            self.direction = None
+
+        def move(self, direction) -> None:
+            self.direction = direction
+            self.position = (
+                self.position[0] + direction.delta[0],
+                self.position[1] + direction.delta[1],
+            )
+
+        def wait(self) -> None:
+            self.direction = None
+
+    class Core:
+        def __init__(self, position: tuple[int, int] = (28, -20)) -> None:
+            self.position = position
+
+    def setUp(self) -> None:
+        self._last_pos = dict(tactic._worker_last_pos)
+        self._recent = {k: list(v) for k, v in tactic._worker_recent.items()}
+        self._assignments = dict(tactic._resource_assignments)
+        self._memory = set(tactic._resource_memory)
+        self._stuck = dict(tactic._worker_stuck_ticks)
+        self._stuck_pos = dict(tactic._worker_stuck_pos)
+        tactic._worker_last_pos.clear()
+        tactic._worker_recent.clear()
+        tactic._resource_assignments.clear()
+        tactic._worker_path_cache.clear()
+        tactic._worker_stuck_ticks.clear()
+        tactic._worker_stuck_pos.clear()
+        tactic._resource_memory.clear()
+
+    def tearDown(self) -> None:
+        tactic._worker_path_cache.clear()
+        tactic._worker_stuck_ticks.clear()
+        tactic._worker_stuck_pos.clear()
+        tactic._worker_last_pos.clear()
+        tactic._worker_last_pos.update(self._last_pos)
+        tactic._worker_recent.clear()
+        tactic._worker_recent.update(self._recent)
+        tactic._resource_assignments.clear()
+        tactic._resource_assignments.update(self._assignments)
+        tactic._resource_memory.clear()
+        tactic._resource_memory.update(self._memory)
+        tactic._worker_stuck_ticks.update(self._stuck)
+        tactic._worker_stuck_pos.update(self._stuck_pos)
+
+    def _plan(self, worker, core=None, *, obstacle_cells=frozenset(),
+              resource_cells=frozenset(), occupied=frozenset(), config=None):
+        return tactic._plan_worker(
+            worker,
+            core or self.Core(),
+            resource_cells=resource_cells,
+            obstacle_cells=obstacle_cells,
+            depleted=set(),
+            config=config or default_config(),
+            occupied=occupied,
+        )
+
+    def test_full_worker_retreats_when_core_occupied(self) -> None:
+        worker = self.Worker("w-full", (27, -20))
+        worker.cargo = 2
+        # Core cell is taken by another worker; (27,-19) also occupied.
+        occupied = frozenset({(28, -20), (27, -19)})
+
+        action, detail = self._plan(worker, occupied=occupied)
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("core-retreat", detail)
+        # Must move away from the core, never into the occupied core cell.
+        self.assertGreater(
+            tactic._manhattan(worker.position, (28, -20)),
+            tactic._manhattan((27, -20), (28, -20)),
+        )
+
+    def test_full_worker_waits_when_core_occupied_and_no_retreat(self) -> None:
+        worker = self.Worker("w-full2", (27, -20))
+        worker.cargo = 2
+        # All four neighbours of (27,-20) are occupied -> nowhere to retreat.
+        occupied = frozenset({(28, -20), (27, -19), (27, -21), (26, -20)})
+
+        action, detail = self._plan(worker, occupied=occupied)
+
+        self.assertEqual(action, "WAIT")
+        self.assertIn("core-congested", detail)
+        self.assertEqual(worker.position, (27, -20))
+
+    def test_empty_worker_vacates_core_when_goal_blocked(self) -> None:
+        worker = self.Worker("w-core", (28, -20))
+        worker.cargo = 0
+        # A remembered resource to the west is walled off, and three of the core's
+        # neighbours are occupied — BFS fails, so the worker must leave the chute.
+        tactic._resource_assignments["w-core"] = (25, -23)
+        tactic._resource_memory.add((25, -23))
+        obstacles = frozenset({
+            (25, -24), (26, -24), (26, -23), (26, -22), (25, -22), (24, -22), (24, -23),
+        })
+        occupied = frozenset({(27, -20), (29, -20), (28, -19)})
+
+        action, detail = self._plan(
+            worker, obstacle_cells=obstacles, occupied=occupied,
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("vacate-core", detail)
+        self.assertNotEqual(worker.position, (28, -20))
+
+    def test_worker_avoids_occupied_cell_in_bfs(self) -> None:
+        worker = self.Worker("w-bfs", (0, 0))
+        worker.cargo = 0
+        tactic._resource_assignments["w-bfs"] = (0, 2)
+        tactic._resource_memory.add((0, 2))
+        # The direct UP neighbour (0,1) is taken by another unit.
+        occupied = frozenset({(0, 1)})
+
+        action, detail = self._plan(
+            worker, resource_cells=frozenset({(0, 2)}), occupied=occupied,
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIsNotNone(worker.direction)
+        self.assertNotEqual(worker.direction, tactic.Direction.UP)
+
+    def test_unstick_forgets_stale_goal_and_explores(self) -> None:
+        worker = self.Worker("w-stuck", (44, 6))
+        worker.cargo = 0
+        tactic._resource_assignments["w-stuck"] = (44, 5)
+        tactic._resource_memory.add((44, 5))
+        tactic._worker_stuck_pos["w-stuck"] = (44, 6)
+        tactic._worker_stuck_ticks["w-stuck"] = tactic._STUCK_THRESHOLD - 1
+        # The remembered resource cell is occupied (e.g. by an enemy).
+        occupied = frozenset({(44, 5)})
+
+        action, detail = self._plan(worker, occupied=occupied)
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("explore", detail)
+        self.assertNotIn("w-stuck", tactic._resource_assignments)
+        self.assertNotIn((44, 5), tactic._resource_memory)
+
+    def test_unstick_counts_frozen_worker_without_move_history(self) -> None:
+        # A worker that has never moved (no _worker_last_pos entry) must still
+        # accumulate stuck ticks — the old detection only counted moves, so a
+        # worker frozen from the start was never unstuck.
+        worker = self.Worker("w-frozen", (44, 6))
+        worker.cargo = 0
+        tactic._resource_assignments["w-frozen"] = (44, 5)
+        tactic._resource_memory.add((44, 5))
+        occupied = frozenset({(44, 5)})
+
+        action1, _ = self._plan(worker, occupied=occupied)
+        self.assertEqual(action1, "WAIT")  # blocked, no movement
+        # Second tick: still stuck at the same position, count must advance.
+        tactic._worker_stuck_pos["w-frozen"] = (44, 6)
+        tactic._worker_stuck_ticks["w-frozen"] = tactic._STUCK_THRESHOLD - 1
+        action2, detail2 = self._plan(worker, occupied=occupied)
+
+        self.assertEqual(action2, "MOVE")
+        self.assertIn("explore", detail2)
+        self.assertNotIn("w-frozen", tactic._resource_assignments)
+
+
 if __name__ == "__main__":
     unittest.main()

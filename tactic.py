@@ -571,20 +571,48 @@ class TacticLogger:
 
 # ── unit planners ────────────────────────────────────────────────────────────
 
+def _retreat_from(
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    others: frozenset[tuple[int, int]],
+) -> Direction | None:
+    """Pick a direction that moves away from core_pos, if any is free.
+
+    Used to back a full worker out of the core's immediate ring so the core cell
+    can free up for unloading. Prefers the direction that increases distance to
+    the core the most; skips obstacles, occupied cells and dead ends.
+    """
+    best: Direction | None = None
+    best_dist = -1
+    for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+        npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+        if npos in obstacle_cells or npos in others:
+            continue
+        if _is_dead_end_step(npos, obstacle_cells):
+            continue
+        dist = _manhattan(npos, core_pos)
+        if dist > best_dist:
+            best_dist = dist
+            best = d
+    return best
+
+
 def _worker_cached_path_step(
     worker,
     uid: str,
     pos: tuple[int, int],
     goal: tuple[int, int],
     obstacle_cells: frozenset[tuple[int, int]],
+    others: frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[str, str] | None:
     """Advance one step along a cached A* path, or None to force a replan.
 
     Obstacles only ever grow (never shrink), so a cached path can never become
     shorter or suboptimal — it can only become blocked ahead. Local next-cell
-    validation (traversable + not a dead end) is therefore enough to keep
-    reusing it across ticks; comparing whole obstacle sets would change every
-    tick during exploration and defeat the cache.
+    validation (traversable + not a dead end + not occupied) is therefore enough
+    to keep reusing it across ticks; comparing whole obstacle sets would change
+    every tick during exploration and defeat the cache.
     """
     cached = _worker_path_cache.get(uid)
     if cached is None or cached["goal"] != goal:
@@ -602,6 +630,10 @@ def _worker_cached_path_step(
         _worker_path_cache.pop(uid, None)
         return None
     next_cell = path[k + 1]
+    # The goal cell may be stepped on only while it is actually free; any other
+    # occupied cell invalidates the cached step (server rejects the move).
+    if next_cell in others:
+        return None
     valid = next_cell == goal or (
         next_cell not in obstacle_cells
         and not _is_dead_end_step(next_cell, obstacle_cells, allow=(goal,))
@@ -631,10 +663,18 @@ def _plan_worker(
     depleted: set[tuple[int, int]],
     config: dict[str, int | bool],
     beacon_carried: bool = False,
+    occupied: frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[str, str]:
     """Return (action_name, detail)."""
     pos = worker.position
     max_cargo = 2 if beacon_carried else 1
+    uid = str(worker.id)
+    # Cells taken by other units this tick. Workers cannot move into them, so
+    # pathfinding treats them as temporary obstacles. The worker's own cell is
+    # excluded; the core cell is not in `occupied` at all (the core may be
+    # stepped on to unload), so it only blocks when another unit stands there.
+    core_pos = tuple(core.position)
+    others = occupied - {pos}
 
     if worker.cargo >= max_cargo and pos == core.position and turn_context.resource_space > 0:
         worker.deposit()
@@ -647,17 +687,21 @@ def _plan_worker(
         return ("HARVEST", f"on_resource {pos}")
 
     goal: tuple[int, int] | None = None
-    if worker.cargo:
+    if worker.cargo >= max_cargo:
+        # Only FULL workers target the core. A partially-loaded worker (e.g. a
+        # second haul while the beacon is carried) must keep harvesting — sending
+        # it to the core just parks it on the unloading cell where it can't
+        # deposit, wedging the full workers behind it.
         goal = core.position
     elif resource_cells:
         # Only go to assigned resource, not the nearest one
-        assigned = _resource_assignments.get(str(worker.id))
+        assigned = _resource_assignments.get(uid)
         if assigned and assigned in resource_cells:
             goal = assigned
         # If no assignment, skip visible resources (they're assigned to other workers)
     # Fallback: use remembered resource coordinates (only if assigned)
     if goal is None and worker.cargo < max_cargo:
-        assigned = _resource_assignments.get(str(worker.id))
+        assigned = _resource_assignments.get(uid)
         if assigned and assigned in _resource_memory:
             goal = assigned
 
@@ -666,21 +710,50 @@ def _plan_worker(
     # the empty cell forever.
     if goal == pos and worker.cargo < max_cargo and pos not in resource_cells:
         _forget_resource(pos)
-        _resource_assignments.pop(str(worker.id), None)
+        _resource_assignments.pop(uid, None)
         goal = None
+
+    # ── Un-stick recovery ────────────────────────────────────────────────
+    # A worker frozen in place for _STUCK_THRESHOLD ticks is almost always
+    # chasing a remembered resource that has been depleted or is occupied by an
+    # enemy (server keeps rejecting the move). Drop the stale goal and force a
+    # re-plan/explore instead of hammering the same blocked cell forever.
+    if _worker_stuck_pos.get(uid) == pos:
+        stuck = _worker_stuck_ticks.get(uid, 0) + 1
+    else:
+        stuck = 0
+    _worker_stuck_pos[uid] = pos
+    _worker_stuck_ticks[uid] = stuck
+    if stuck >= _STUCK_THRESHOLD:
+        _worker_path_cache.pop(uid, None)
+        if worker.cargo < max_cargo:
+            if goal is not None:
+                _forget_resource(goal)
+            _resource_assignments.pop(uid, None)
+            _worker_stuck_ticks[uid] = 0
+            goal = None
+
+    # ── Core-cell congestion coordination ────────────────────────────────
+    # With a fixed core, every full worker funnels to the same cell, which holds
+    # one unit at a time. Blindly moving into an occupied core cell is rejected
+    # by the server, so the ring of full workers wedges in place. Rules:
+    #   - a worker standing on the core cell leaves first (frees the chute);
+    #   - a full worker only approaches the core when the cell is actually free,
+    #     otherwise it backs out of the immediate ring or waits.
+    # (core_pos is already defined above for `others`.)
 
     # Move toward goal (BFS multi-step pathfinding, avoids dead ends)
     if config["worker_bfs_enabled"] and goal is not None and goal != pos:
-        uid = str(worker.id)
-        cached_move = _worker_cached_path_step(worker, uid, pos, goal, obstacle_cells)
+        cached_move = _worker_cached_path_step(worker, uid, pos, goal, obstacle_cells, others)
         if cached_move is not None:
             return cached_move
 
         # Workers can walk onto the core cell; the game may report it as an
         # obstacle so temporarily exclude it from the pathfinding obstacle set.
-        bfs_obs = obstacle_cells
-        if goal == tuple(core.position):
-            bfs_obs = obstacle_cells - {goal}
+        # Other units are real blockers and stay in the obstacle set.
+        bfs_obs = obstacle_cells | others
+        if goal == core_pos:
+            bfs_obs = bfs_obs - {goal}
         path = _bfs_path(
             pos,
             goal,
@@ -699,7 +772,9 @@ def _plan_worker(
         bfs_dir = _direction_for_step(pos, path[1]) if path and len(path) > 1 else None
         if bfs_dir is not None:
             nx, ny = pos[0] + bfs_dir.delta[0], pos[1] + bfs_dir.delta[1]
-            if (nx, ny) == goal or (nx, ny) not in obstacle_cells:
+            npos = (nx, ny)
+            # Step only into a free cell (the goal cell itself counts only when free).
+            if (npos not in obstacle_cells or npos == goal) and npos not in others:
                 worker.move(bfs_dir)
                 _worker_last_pos[uid] = pos
                 recent = _worker_recent.get(uid, [])
@@ -709,6 +784,42 @@ def _plan_worker(
                 _worker_recent[uid] = recent
                 _set_worker_route(worker, tuple(goal), path, complete=True)
                 return ("MOVE", f"{bfs_dir.name} -> {goal}")
+        # BFS failed (goal blocked/unreachable this tick) — coordinate congestion.
+        # A worker standing on the core frees the unloading chute; a full worker
+        # wedged into the core ring backs out or waits instead of hammering the
+        # occupied core cell every tick.
+        if pos == core_pos and worker.cargo < max_cargo:
+            for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+                npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+                if npos in obstacle_cells or npos in others:
+                    continue
+                if _is_dead_end_step(npos, obstacle_cells):
+                    continue
+                worker.move(d)
+                _worker_last_pos[uid] = pos
+                recent = _worker_recent.get(uid, [])
+                recent.append(pos)
+                if len(recent) > 6:
+                    recent.pop(0)
+                _worker_recent[uid] = recent
+                _set_worker_route(worker, npos, [tuple(pos), npos], complete=False)
+                return ("MOVE", f"{d.name} vacate-core")
+        if worker.cargo >= max_cargo and goal == core_pos and core_pos in others:
+            if pos != core_pos and _manhattan(pos, core_pos) <= 1:
+                retreat = _retreat_from(pos, core_pos, obstacle_cells, others)
+                if retreat is not None:
+                    worker.move(retreat)
+                    _worker_last_pos[uid] = pos
+                    recent = _worker_recent.get(uid, [])
+                    recent.append(pos)
+                    if len(recent) > 6:
+                        recent.pop(0)
+                    _worker_recent[uid] = recent
+                    _set_worker_route(worker, core_pos, [tuple(pos)], complete=False)
+                    return ("MOVE", f"{retreat.name} core-retreat")
+            worker.wait()
+            _set_worker_route(worker, core_pos, [tuple(pos)], complete=True)
+            return ("WAIT", "core-congested")
         # Path search failed this tick. Keep the goal so cargo/resource greedy
         # fallbacks still march the same way instead of flipping into explore.
 
@@ -717,14 +828,14 @@ def _plan_worker(
         # Re-bind goal to core for the cargo march detail string.
         goal = tuple(core.position)
     if worker.cargo:
-        prev = _worker_last_pos.get(str(worker.id))
-        recent = _worker_recent.get(str(worker.id), [])
+        prev = _worker_last_pos.get(uid)
+        recent = _worker_recent.get(uid, [])
         recent_set = set(recent)
         cargo_candidates: list[tuple[int, Direction, tuple[int, int]]] = []
         for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
             npos = (nx, ny)
-            if npos in obstacle_cells:
+            if npos in obstacle_cells or npos in others:
                 continue
             dist = _manhattan(npos, core.position)
             if prev and npos == prev:
@@ -737,7 +848,6 @@ def _plan_worker(
         cargo_candidates.sort(key=lambda item: item[0])
         for _dist, d, npos in cargo_candidates:
             worker.move(d)
-            uid = str(worker.id)
             _worker_last_pos[uid] = pos
             recent = _worker_recent.get(uid, [])
             recent.append(pos)
@@ -775,7 +885,7 @@ def _plan_worker(
         rotated.sort(key=_sort_key)
         for d in rotated:
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
-            if (nx, ny) in obstacle_cells:
+            if (nx, ny) in obstacle_cells or (nx, ny) in others:
                 continue
             # Never explore into a recognized dead end when any open alternative exists.
             if _is_dead_end_step((nx, ny), obstacle_cells):
@@ -806,7 +916,7 @@ def _plan_worker(
         if direction is not None:
             nx = pos[0] + direction.delta[0]
             ny = pos[1] + direction.delta[1]
-            if (nx, ny) not in obstacle_cells and not (
+            if (nx, ny) not in obstacle_cells and (nx, ny) not in others and not (
                 _is_dead_end_step((nx, ny), obstacle_cells, allow=(goal,))
             ):
                 worker.move(direction)
@@ -1526,6 +1636,13 @@ _resource_assignments: dict[str, tuple[int, int]] = {}
 # Worker A* path cache: reuse a computed path across ticks instead of recomputing
 # from scratch every tick. Keyed by full str(worker.id); entry {goal, path}.
 _worker_path_cache: dict[str, dict] = {}
+# Consecutive ticks a worker has not moved — triggers un-stick recovery.
+# _worker_stuck_ticks counts consecutive same-position ticks; _worker_stuck_pos
+# remembers the position those ticks were counted at (independent of last-pos,
+# which only tracks moves and would miss a worker frozen from the start).
+_worker_stuck_ticks: dict[str, int] = {}
+_worker_stuck_pos: dict[str, tuple[int, int]] = {}
+_STUCK_THRESHOLD = 8
 _map_dirty: bool = False
 _last_map_save_tick: int = -1
 
@@ -1779,6 +1896,10 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _resource_assignments.pop(dead_id, None)
     for dead_id in set(_worker_path_cache) - alive_ids:
         _worker_path_cache.pop(dead_id, None)
+    for dead_id in set(_worker_stuck_ticks) - alive_ids:
+        _worker_stuck_ticks.pop(dead_id, None)
+    for dead_id in set(_worker_stuck_pos) - alive_ids:
+        _worker_stuck_pos.pop(dead_id, None)
     for (prefix, obj_id), name in list(_object_names.items()):
         if prefix in ("W", "V", "R") and str(obj_id) not in alive_ids:
             _object_names.pop((prefix, obj_id), None)
@@ -1982,6 +2103,18 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         core.wait()
         core_action_name = "WAIT"
 
+    # Occupied cells this tick (every friendly unit + visible enemies). Workers
+    # use this to avoid hammering blocked cells — the main cause of the core-ring
+    # deadlock where full workers wedge in place and the economy stalls. The core
+    # cell itself is deliberately NOT included: a worker may step onto it to
+    # unload, so it only counts as occupied when another unit is standing there.
+    occupied: frozenset[tuple[int, int]] = frozenset(
+        {tuple(w.position) for w in turn.workers}
+        | {tuple(v.position) for v in getattr(turn, "vanguards", ()) or ()}
+        | {tuple(r.position) for r in getattr(turn, "rangers", ()) or ()}
+        | {tuple(e.position) for e in enemies}
+    )
+
     # ── Unit actions ────────────────────────────────────────────────────
     for unit in turn.units:
         uid = str(unit.id)[:8]
@@ -1993,6 +2126,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 depleted=depleted,
                 config=config,
                 beacon_carried=beacon_carried_by_core,
+                occupied=occupied,
             )
             unit_actions_detail[uid] = f"{action}:{detail}"
         elif unit.unit_type == UnitType.VANGUARD:

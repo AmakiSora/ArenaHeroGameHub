@@ -15,8 +15,13 @@ from pydantic import Field, TypeAdapter
 
 def apply_sdk_compat() -> None:
     """Install protocol compatibility patches. Safe to call more than once."""
+    import json
+    from datetime import datetime, timezone
+
     import arena_hero.actions as actions
     import arena_hero._protocol as protocol
+    import arena_hero.client as client
+    from arena_hero.enums import CommandSource
     from arena_hero.errors import ProtocolError
     from arena_hero.models import Received, Tick
 
@@ -88,62 +93,100 @@ def apply_sdk_compat() -> None:
         "PICKUP_BEACON", "DROP_BEACON", "SELF_DESTRUCT", "HEAL",
     }
 
+    last_tick = 0
+
     def tolerant_parse_stream_message(raw: str | bytes):
+        nonlocal last_tick
         try:
-            return original_parse(raw)
+            result = original_parse(raw)
         except ProtocolError:
             if isinstance(raw, bytes):
                 raise ProtocolError("the server sent a binary WebSocket message")
             try:
                 envelope = loose_adapter.validate_json(raw)
             except Exception as exc:
-                raise ProtocolError("invalid Arena Hero WebSocket message") from exc
-
-            if isinstance(envelope, _TickEnv):
-                return Tick(tick=envelope.data)
-            if isinstance(envelope, _StateEnv):
-                # State must stay strict — re-raise original failure path. Chain
-                # the envelope validation detail (from `loose_adapter.validate_json`
-                # at the top of the except block) so it isn't lost when debugging.
-                raise ProtocolError("invalid Arena Hero WebSocket message") from exc
-
-            data = envelope.data
-            cleaned: dict[UUID, Any] = {}
-            for key, value in (data.plan.unit_actions or {}).items():
+                # The server may send an envelope type we don't know about yet
+                # (e.g. an acknowledgement/ping). One stray message must not drop
+                # the whole stream — that forces a reconnect and a tick gap.
+                # Identify the type and, when unknown, skip the message instead.
+                saved_exc = exc  # keep for the state re-raise below (except var is del'd)
                 try:
-                    uid = key if isinstance(key, UUID) else UUID(str(key))
+                    obj = json.loads(raw)
+                    msg_type = obj.get("type") if isinstance(obj, dict) else None
                 except Exception:
-                    continue
-                if not isinstance(value, dict):
-                    continue
-                action_type = value.get("type")
-                if action_type == "HEAL":
-                    # Normalize unknown heal echoes to WAIT so the stream continues.
-                    cleaned[uid] = {"type": "WAIT"}
-                elif action_type in known_unit_types:
-                    cleaned[uid] = value
+                    msg_type = None
+                if msg_type not in ("tick", "state", "received"):
+                    print(
+                        f"[compat] skip unknown stream message type={msg_type!r}",
+                        flush=True,
+                    )
+                    if last_tick >= 1:
+                        plan = actions.CommandPlan(
+                            tick=last_tick, unit_actions={}, core_action=None,
+                        )
+                        return Received(
+                            tick=last_tick,
+                            source=CommandSource.AGENT,
+                            received_at=datetime.now(timezone.utc),
+                            plan=plan,
+                        )
+                raise ProtocolError("invalid Arena Hero WebSocket message") from exc
+        else:
+            if isinstance(result, Tick):
+                last_tick = result.tick
+            return result
+
+        if isinstance(envelope, _TickEnv):
+            last_tick = envelope.data
+            return Tick(tick=envelope.data)
+        if isinstance(envelope, _StateEnv):
+            # State must stay strict — re-raise the original failure path. Chain
+            # the envelope validation detail when there was a validation error,
+            # otherwise suppress the chained cause.
+            cause = saved_exc if "saved_exc" in locals() else None
+            raise ProtocolError("invalid Arena Hero WebSocket message") from cause
+
+        data = envelope.data
+        cleaned: dict[UUID, Any] = {}
+        for key, value in (data.plan.unit_actions or {}).items():
             try:
-                plan = actions.CommandPlan.model_validate(
-                    {
-                        "tick": data.plan.tick,
-                        "unit_actions": cleaned,
-                        "core_action": data.plan.core_action,
-                    }
-                )
+                uid = key if isinstance(key, UUID) else UUID(str(key))
             except Exception:
-                plan = actions.CommandPlan(
-                    tick=int(data.plan.tick),
-                    unit_actions={},
-                    core_action=None,
-                )
-            return Received(
-                tick=int(data.tick),
-                source=data.source,
-                received_at=data.received_at,
-                plan=plan,
+                continue
+            if not isinstance(value, dict):
+                continue
+            action_type = value.get("type")
+            if action_type == "HEAL":
+                # Normalize unknown heal echoes to WAIT so the stream continues.
+                cleaned[uid] = {"type": "WAIT"}
+            elif action_type in known_unit_types:
+                cleaned[uid] = value
+        try:
+            plan = actions.CommandPlan.model_validate(
+                {
+                    "tick": data.plan.tick,
+                    "unit_actions": cleaned,
+                    "core_action": data.plan.core_action,
+                }
             )
+        except Exception:
+            plan = actions.CommandPlan(
+                tick=int(data.plan.tick),
+                unit_actions={},
+                core_action=None,
+            )
+        return Received(
+            tick=int(data.tick),
+            source=data.source,
+            received_at=data.received_at,
+            plan=plan,
+        )
 
     protocol.parse_stream_message = tolerant_parse_stream_message
+    # client.py does `from ._protocol import parse_stream_message` at module load,
+    # so patching only `protocol.parse_stream_message` would NOT affect the
+    # reference client.events() calls. Patch the client's module-level binding too.
+    client.parse_stream_message = tolerant_parse_stream_message
     actions._arena_compat_applied = True
     print(
         "[compat] arena_hero protocol patch applied "
