@@ -7,6 +7,11 @@ import os
 import time
 from collections import defaultdict
 
+# Streaming reverse-tail JSONL reader shared with the dashboard. This avoids
+# slurping the whole (potentially many-MB) tactic_log.jsonl on every call.
+from dashboard import _iter_log_lines_reverse
+
+
 def _data_path(name: str) -> str:
     raw = os.environ.get("ARENA_DATA_DIR", "").strip()
     if raw:
@@ -17,52 +22,43 @@ def _data_path(name: str) -> str:
 
 LOG_FILE = _data_path("tactic_log.jsonl")
 
+
+def _is_tick_record(rec) -> bool:
+    return isinstance(rec, dict) and "tick" in rec and "plan_unit_actions" in rec
+
+
 def read_latest():
     """Read the latest complete tick record from the log."""
     if not os.path.exists(LOG_FILE):
         print("[ERROR] tactic_log.jsonl not found")
         return None
-    
-    with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-        lines = [l.strip() for l in f if l.strip()]
-    
-    if not lines:
-        print("[INFO] Log is empty")
-        return None
-    
-    # Find the latest tick record
-    latest = None
-    for line in reversed(lines):
+
+    for line in _iter_log_lines_reverse(LOG_FILE):
         try:
             rec = json.loads(line)
-            if rec.get("tick") and "plan_unit_actions" in rec:
-                latest = rec
-                break
-        except:
+        except json.JSONDecodeError:
             continue
-    
-    return latest
+        if _is_tick_record(rec):
+            return rec
+    print("[INFO] Log is empty")
+    return None
 
 
 def read_history(ticks=20):
-    """Read the last N tick records."""
+    """Read the last N tick records (newest first)."""
     if not os.path.exists(LOG_FILE):
         return []
-    
-    with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
-        lines = [l.strip() for l in f if l.strip()]
-    
+
     history = []
-    for line in reversed(lines):
+    for line in _iter_log_lines_reverse(LOG_FILE):
         try:
             rec = json.loads(line)
-            if rec.get("tick") and "plan_unit_actions" in rec:
-                history.append(rec)
-                if len(history) >= ticks:
-                    break
-        except:
+        except json.JSONDecodeError:
             continue
-    
+        if _is_tick_record(rec):
+            history.append(rec)
+            if len(history) >= ticks:
+                break
     return history
 
 

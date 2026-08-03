@@ -28,7 +28,7 @@ def apply_sdk_compat() -> None:
 
         type: Literal["HEAL"] = "HEAL"
 
-    # Accept HEAL in unit action unions used by CommandPlan / Received.
+    # Accept HEAL in the unit action union used by Received envelopes.
     actions.HealAction = HealAction
     actions.UnitAction = Annotated[
         actions.WaitAction
@@ -43,12 +43,6 @@ def apply_sdk_compat() -> None:
         | HealAction,
         Field(discriminator="type"),
     ]
-
-    # Rebuild CommandPlan so its unit_actions field uses the expanded union.
-    class CommandPlan(actions._StrictModel):
-        tick: int = Field(ge=1)
-        unit_actions: dict[UUID, Any] = Field(default_factory=dict)
-        core_action: Any | None = None
 
     # Keep outgoing submits on the original CommandPlan (strict, no HEAL needed).
     # Only loosen inbound stream parsing.
@@ -108,8 +102,10 @@ def apply_sdk_compat() -> None:
             if isinstance(envelope, _TickEnv):
                 return Tick(tick=envelope.data)
             if isinstance(envelope, _StateEnv):
-                # State must stay strict — re-raise original failure path.
-                raise ProtocolError("invalid Arena Hero WebSocket message")
+                # State must stay strict — re-raise original failure path. Chain
+                # the envelope validation detail (from `loose_adapter.validate_json`
+                # at the top of the except block) so it isn't lost when debugging.
+                raise ProtocolError("invalid Arena Hero WebSocket message") from exc
 
             data = envelope.data
             cleaned: dict[UUID, Any] = {}

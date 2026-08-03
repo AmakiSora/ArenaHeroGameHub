@@ -73,7 +73,7 @@ def read_history(ticks: int = 40):
             rec = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(rec, dict) and rec.get("tick") and "plan_unit_actions" in rec:
+        if isinstance(rec, dict) and "tick" in rec and "plan_unit_actions" in rec:
             out.append(rec)
             if len(out) >= ticks:
                 break
@@ -206,7 +206,7 @@ TEAM_SETTING_FIELDS = (
     "home_patrol_radius",
     "attack_target_x",
     "attack_target_y",
-    "auto_attack_enabled",
+    "attack_mode",
     "ranger_attack_range",
 )
 
@@ -387,6 +387,15 @@ def render_teams_panel() -> str:
             f'<div class="team-empty">拖到这里</div></div></div>'
         )
 
+    attack_mode = str(config.get("attack_mode", "coords"))
+    mode_checked = {
+        "coords": " checked" if attack_mode == "coords" else "",
+        "auto": " checked" if attack_mode == "auto" else "",
+        "beacon": " checked" if attack_mode == "beacon" else "",
+    }
+    # Attack coordinates only matter in coords mode; beacon / auto ignore them.
+    coords_locked = "" if attack_mode == "coords" else " disabled"
+
     settings = (
         '<div class="team-settings">'
         '<label>守家半径'
@@ -394,16 +403,23 @@ def render_teams_panel() -> str:
         f'step="1" value="{config["home_patrol_radius"]}"></label>'
         '<label>进攻 X'
         f'<input id="teamAttackX" name="attack_target_x" type="number" min="-500" max="500" '
-        f'step="1" value="{config["attack_target_x"]}"></label>'
+        f'step="1" value="{config["attack_target_x"]}"{coords_locked}></label>'
         '<label>进攻 Y'
         f'<input id="teamAttackY" name="attack_target_y" type="number" min="-500" max="500" '
-        f'step="1" value="{config["attack_target_y"]}"></label>'
-        '<label class="team-switch">自动进攻'
-        f'<input id="teamAutoAttack" name="auto_attack_enabled" type="checkbox" '
-        f'data-kind="boolean"{" checked" if config.get("auto_attack_enabled") else ""}></label>'
+        f'step="1" value="{config["attack_target_y"]}"{coords_locked}></label>'
         '<label>游侠射程'
         f'<input id="teamRangerRange" name="ranger_attack_range" type="number" min="1" max="3" '
         f'step="1" value="{config["ranger_attack_range"]}"></label>'
+        '<div class="team-mode">'
+        '<span class="team-mode-title">进攻方式</span>'
+        '<div class="team-mode-opts">'
+        '<label class="team-radio"><input type="radio" name="attack_mode" value="coords"'
+        f'{mode_checked["coords"]}>进攻坐标</label>'
+        '<label class="team-radio"><input type="radio" name="attack_mode" value="auto"'
+        f'{mode_checked["auto"]}>自动进攻</label>'
+        '<label class="team-radio"><input type="radio" name="attack_mode" value="beacon"'
+        f'{mode_checked["beacon"]}>进攻冠军信标</label>'
+        '</div></div>'
         '</div>'
     )
 
@@ -898,6 +914,12 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-settings label.team-switch{display:flex;align-items:center;gap:8px;justify-content:space-between}
 .team-settings label.team-switch input{width:16px;height:16px;accent-color:#57d6a3;cursor:pointer}
 .team-settings input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
+.team-settings input:disabled{opacity:.4;cursor:not-allowed}
+.team-mode{grid-column:1/-1;display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06)}
+.team-mode-title{color:var(--muted);font-size:11px}
+.team-mode-opts{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.team-radio{display:flex;align-items:center;gap:6px;color:#d7e8ff;font-size:12px;cursor:pointer}
+.team-radio input{width:14px;height:14px;accent-color:#57d6a3;margin:0;cursor:pointer}
 .teams-message{min-height:18px;margin-top:10px;color:var(--muted);font-size:12px}
 .teams-message.ok{color:#8ef0c4}.teams-message.err{color:#ff9b9b}
 .config-switch{justify-self:end;position:relative;width:38px;height:22px}
@@ -1440,13 +1462,23 @@ JS = r"""
   }
 
   function currentTeamSettings(){
+    const modeEl = document.querySelector('input[name="attack_mode"]:checked');
     return {
       home_patrol_radius: Number((document.getElementById('teamHomeRadius') || {}).value || 5),
       attack_target_x: Number((document.getElementById('teamAttackX') || {}).value || 0),
       attack_target_y: Number((document.getElementById('teamAttackY') || {}).value || 0),
-      auto_attack_enabled: (document.getElementById('teamAutoAttack') || {}).checked || false,
+      attack_mode: (modeEl && modeEl.value) || 'coords',
       ranger_attack_range: Number((document.getElementById('teamRangerRange') || {}).value || 3)
     };
+  }
+
+  function syncTeamModeDisabled(){
+    const modeEl = document.querySelector('input[name="attack_mode"]:checked');
+    const mode = (modeEl && modeEl.value) || 'coords';
+    ['teamAttackX','teamAttackY'].forEach(function(id){
+      const el = document.getElementById(id);
+      if(el) el.disabled = (mode !== 'coords');
+    });
   }
 
   function applyTeamSettings(config){
@@ -1455,7 +1487,6 @@ JS = r"""
       home_patrol_radius: 'teamHomeRadius',
       attack_target_x: 'teamAttackX',
       attack_target_y: 'teamAttackY',
-      auto_attack_enabled: 'teamAutoAttack',
       ranger_attack_range: 'teamRangerRange'
     };
     Object.keys(map).forEach(function(key){
@@ -1465,6 +1496,11 @@ JS = r"""
         else el.value = String(config[key]);
       }
     });
+    const mode = config.attack_mode || 'coords';
+    document.querySelectorAll('input[name="attack_mode"]').forEach(function(el){
+      el.checked = (el.value === mode);
+    });
+    syncTeamModeDisabled();
   }
 
   function rosterFromUnits(team){
@@ -1489,7 +1525,7 @@ JS = r"""
       home_patrol_radius: settings.home_patrol_radius,
       attack_target_x: settings.attack_target_x,
       attack_target_y: settings.attack_target_y,
-      auto_attack_enabled: settings.auto_attack_enabled,
+      attack_mode: settings.attack_mode,
       ranger_attack_range: settings.ranger_attack_range
     };
   }
@@ -1636,6 +1672,14 @@ JS = r"""
       const el = document.getElementById(id);
       if(!el) return;
       el.addEventListener('change', function(){
+        teamsDirty = true;
+        setTeamsMessage('参数已修改，保存中…', '');
+        saveTeams(true);
+      });
+    });
+    document.querySelectorAll('input[name="attack_mode"]').forEach(function(el){
+      el.addEventListener('change', function(){
+        syncTeamModeDisabled();
         teamsDirty = true;
         setTeamsMessage('参数已修改，保存中…', '');
         saveTeams(true);

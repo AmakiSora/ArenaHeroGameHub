@@ -10,6 +10,7 @@ import json
 import math
 import os
 import time
+import traceback
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, asdict
@@ -38,6 +39,12 @@ def _data_dir() -> Path:
 
 MAP_MEMORY_PATH = _data_dir() / "map_memory.json"
 DEFAULT_LOG_PATH = str(_data_dir() / "tactic_log.jsonl")
+
+# Rotate tactic_log.jsonl when it exceeds this size and keep at most N backups.
+LOG_MAX_BYTES = int(os.environ.get("ARENA_LOG_MAX_MB", "20")) * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+# Shutdown summary only reads this many of the newest tick records.
+_SUMMARY_TAIL_RECORDS = 10000
 
 
 # ── geometry helpers ─────────────────────────────────────────────────────────
@@ -150,11 +157,18 @@ def _get_dead_ends(
 ) -> frozenset[tuple[int, int]]:
     """Cached dead-end set for the current known obstacle map."""
     global _dead_end_cache_key, _dead_end_cache
-    key = frozenset(obstacles)
-    if _dead_end_cache_key == key:
+    # Callers always pass a frozenset (and share one object across a tick), so
+    # use it directly as the cache key instead of rebuilding frozenset(obstacles)
+    # — an O(n) copy on every _is_dead_end_step call. frozenset == short-circuits
+    # on length, so a growing obstacle set is an O(1) miss during exploration.
+    if obstacles is _dead_end_cache_key:
         return _dead_end_cache
-    _dead_end_cache = _dead_end_cells(key)
-    _dead_end_cache_key = key
+    if isinstance(obstacles, frozenset) and obstacles == _dead_end_cache_key:
+        return _dead_end_cache
+    if not isinstance(obstacles, frozenset):
+        obstacles = frozenset(obstacles)
+    _dead_end_cache = _dead_end_cells(obstacles)
+    _dead_end_cache_key = obstacles
     return _dead_end_cache
 
 
@@ -287,25 +301,6 @@ def _direction_for_step(
     return None
 
 
-def _bfs_direction(
-    start: tuple[int, int],
-    goal: tuple[int, int],
-    obstacles: frozenset[tuple[int, int]],
-    max_steps: int = 2500,
-    *,
-    avoid_dead_ends: bool = True,
-) -> Direction | None:
-    """BFS shortest path, return first step direction or None if no path."""
-    path = _bfs_path(
-        start,
-        goal,
-        obstacles,
-        max_steps,
-        avoid_dead_ends=avoid_dead_ends,
-    )
-    return _direction_for_step(start, path[1]) if path and len(path) > 1 else None
-
-
 _object_names: dict[tuple[str, str], str] = {}
 _object_name_counters: defaultdict[str, int] = defaultdict(int)
 
@@ -397,6 +392,9 @@ class TacticLogger:
 
     def open(self) -> None:
         self._file = open(self.path, "a", encoding="utf-8")
+        self._write_header()
+
+    def _write_header(self) -> None:
         header = {
             "_meta": "arena-hero-tactic-log",
             "_started_at": datetime.now(timezone.utc).isoformat(),
@@ -404,6 +402,48 @@ class TacticLogger:
         }
         self._file.write(json.dumps(header, ensure_ascii=False) + "\n")
         self._file.flush()
+
+    def _maybe_rotate(self) -> None:
+        """Rotate the log by size so it never grows without bound.
+
+        Readers (dashboard/status/summary) open the current path fresh on every
+        call, so after a rotate they transparently read the newest segment.
+        Rotation must never crash a Tick: any failure is swallowed and a writable
+        handle to the current file is restored.
+        """
+        try:
+            if not self._file or self._file.closed:
+                return
+            if os.fstat(self._file.fileno()).st_size < LOG_MAX_BYTES:
+                return
+            # Close before renaming — an open handle blocks rename on Windows.
+            self._file.flush()
+            self._file.close()
+            log_path = Path(self.path)
+            # Shift backups newest -> oldest; unlink the destination first
+            # (Path.rename fails if the destination already exists on Windows).
+            for i in range(LOG_BACKUP_COUNT - 1, 0, -1):
+                src = log_path.with_name(f"{log_path.name}.{i}")
+                dst = log_path.with_name(f"{log_path.name}.{i + 1}")
+                if dst.exists():
+                    dst.unlink()
+                if src.exists():
+                    src.rename(dst)
+            backup = log_path.with_name(f"{log_path.name}.1")
+            if log_path.exists():
+                if backup.exists():
+                    backup.unlink()
+                log_path.rename(backup)
+            self._file = open(self.path, "a", encoding="utf-8")
+            self._write_header()
+            print(f"[log] rotated {self.path} -> {backup.name}", flush=True)
+        except Exception as exc:
+            if not self._file or self._file.closed:
+                try:
+                    self._file = open(self.path, "a", encoding="utf-8")
+                except Exception:
+                    self._file = None
+            print(f"[log] rotation failed: {exc}", flush=True)
 
     def close(self) -> None:
         if self._file and not self._file.closed:
@@ -519,6 +559,7 @@ class TacticLogger:
                 "amount": event.resource_amount,
             })
 
+        self._maybe_rotate()
         if self._file and not self._file.closed:
             self._file.write(json.dumps(asdict(rec), ensure_ascii=False) + "\n")
             self._file.flush()
@@ -529,6 +570,57 @@ class TacticLogger:
 
 
 # ── unit planners ────────────────────────────────────────────────────────────
+
+def _worker_cached_path_step(
+    worker,
+    uid: str,
+    pos: tuple[int, int],
+    goal: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+) -> tuple[str, str] | None:
+    """Advance one step along a cached A* path, or None to force a replan.
+
+    Obstacles only ever grow (never shrink), so a cached path can never become
+    shorter or suboptimal — it can only become blocked ahead. Local next-cell
+    validation (traversable + not a dead end) is therefore enough to keep
+    reusing it across ticks; comparing whole obstacle sets would change every
+    tick during exploration and defeat the cache.
+    """
+    cached = _worker_path_cache.get(uid)
+    if cached is None or cached["goal"] != goal:
+        return None
+    path = cached["path"]
+    if pos == goal:
+        _worker_path_cache.pop(uid, None)
+        return None
+    try:
+        k = path.index(pos)
+    except ValueError:
+        # Unit is not on the cached path (blocked or diverted last tick).
+        return None
+    if k + 1 >= len(path):
+        _worker_path_cache.pop(uid, None)
+        return None
+    next_cell = path[k + 1]
+    valid = next_cell == goal or (
+        next_cell not in obstacle_cells
+        and not _is_dead_end_step(next_cell, obstacle_cells, allow=(goal,))
+    )
+    if not valid:
+        return None
+    bfs_dir = _direction_for_step(pos, next_cell)
+    if bfs_dir is None:
+        return None
+    worker.move(bfs_dir)
+    _worker_last_pos[uid] = pos
+    recent = _worker_recent.get(uid, [])
+    recent.append(pos)
+    if len(recent) > 6:
+        recent.pop(0)
+    _worker_recent[uid] = recent
+    _set_worker_route(worker, tuple(goal), path, complete=True)
+    return ("MOVE", f"{bfs_dir.name} -> {goal}")
+
 
 def _plan_worker(
     worker,
@@ -579,6 +671,11 @@ def _plan_worker(
 
     # Move toward goal (BFS multi-step pathfinding, avoids dead ends)
     if config["worker_bfs_enabled"] and goal is not None and goal != pos:
+        uid = str(worker.id)
+        cached_move = _worker_cached_path_step(worker, uid, pos, goal, obstacle_cells)
+        if cached_move is not None:
+            return cached_move
+
         # Workers can walk onto the core cell; the game may report it as an
         # obstacle so temporarily exclude it from the pathfinding obstacle set.
         bfs_obs = obstacle_cells
@@ -590,12 +687,20 @@ def _plan_worker(
             bfs_obs,
             max_steps=int(config["bfs_max_steps"]),
         )
+        if path and len(path) > 1:
+            _worker_path_cache[uid] = {
+                "goal": tuple(goal),
+                "path": path,
+                # Debug only — never compared for cache validity.
+                "obstacles_used": bfs_obs,
+            }
+        else:
+            _worker_path_cache.pop(uid, None)
         bfs_dir = _direction_for_step(pos, path[1]) if path and len(path) > 1 else None
         if bfs_dir is not None:
             nx, ny = pos[0] + bfs_dir.delta[0], pos[1] + bfs_dir.delta[1]
-            if (nx, ny) not in obstacle_cells:
+            if (nx, ny) == goal or (nx, ny) not in obstacle_cells:
                 worker.move(bfs_dir)
-                uid = str(worker.id)
                 _worker_last_pos[uid] = pos
                 recent = _worker_recent.get(uid, [])
                 recent.append(pos)
@@ -1124,17 +1229,21 @@ def _plan_attack_combat(
     obstacle_cells: frozenset[tuple[int, int]],
     config: dict[str, Any],
 ) -> tuple[str, str]:
-    """March as a group toward the configured coordinate; engage en route.
+    """March as a group toward the configured destination; engage en route.
 
-    When auto_attack_enabled is true, the nearest enemy sighting from memory
-    replaces the static target coordinate, so the attack team hunts enemies
-    even when none are currently visible.
+    attack_mode (三选一) picks the destination:
+      - coords -> static attack_target_x / attack_target_y
+      - auto   -> nearest enemy sighting from memory
+      - beacon -> the champion beacon's always-public position; the static
+                  coordinate and auto-attack settings are ignored in this mode
     """
     pos = tuple(unit.position)
 
-    # Determine target: auto-attack uses nearest enemy sighting, else static config
-    auto_attack = bool(config.get("auto_attack_enabled", False))
-    if auto_attack and _enemy_memory:
+    mode = str(config.get("attack_mode", "coords"))
+    if mode == "beacon":
+        beacon_pos = getattr(turn_context, "beacon_pos", None)
+        target = beacon_pos or (int(config["attack_target_x"]), int(config["attack_target_y"]))
+    elif mode == "auto" and _enemy_memory:
         target = min(_enemy_memory, key=lambda p: _manhattan(pos, p))
     else:
         target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
@@ -1168,16 +1277,16 @@ def _plan_attack_combat(
 
     if pos == target:
         unit.wait()
-        return ("WAIT", f"attack-hold {target}")
+        return ("WAIT", f"attack-hold-{mode} {target}")
 
     moved = _move_towards(
-        unit, pos, target, obstacle_cells, detail_prefix="attack-march",
+        unit, pos, target, obstacle_cells, detail_prefix=f"attack-march-{mode}",
     )
     if moved is not None:
         return moved
 
     unit.wait()
-    return ("WAIT", f"attack-blocked {target}")
+    return ("WAIT", f"attack-blocked-{mode} {target}")
 
 
 def _plan_guerrilla_combat(
@@ -1414,6 +1523,9 @@ _worker_last_pos: dict[str, tuple[int, int]] = {}
 _worker_recent: dict[str, list[tuple[int, int]]] = {}  # last 4 positions, anti-oscillation
 # Resource assignment: each resource assigned to closest worker only
 _resource_assignments: dict[str, tuple[int, int]] = {}
+# Worker A* path cache: reuse a computed path across ticks instead of recomputing
+# from scratch every tick. Keyed by full str(worker.id); entry {goal, path}.
+_worker_path_cache: dict[str, dict] = {}
 _map_dirty: bool = False
 _last_map_save_tick: int = -1
 
@@ -1593,7 +1705,13 @@ def _update_enemy_sightings(turn) -> None:
 turn_context = type(
     "_Ctx",
     (),
-    {"resource_space": 0, "config": {}, "worker_routes": {}, "unit_routes": {}, "tick": 0},
+    {
+        "resource_space": 0,
+        "worker_routes": {},
+        "unit_routes": {},
+        "tick": 0,
+        "beacon_pos": None,
+    },
 )()
 
 
@@ -1643,20 +1761,39 @@ def _plan_queued_spawn(turn: Any, core: Any, resources: int, config: dict[str, A
     return f'SPAWN_{request["unit_type"]}'
 
 
+def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
+    """Drop per-unit bookkeeping for units that no longer exist.
+
+    Keys in _worker_last_pos / _worker_recent / _resource_assignments use the
+    full str(unit.id). Previously cleanup used id[:8], which wiped every entry
+    each tick and disabled backtrack avoidance → A-B-A oscillation. Also prunes
+    the A* path cache and _object_names so a long-lived process does not grow
+    without bound. Core (C) and enemy (E) names are kept — enemy visibility is
+    intermittent, so pruning those would churn their names.
+    """
+    for dead_id in set(_worker_last_pos) - alive_ids:
+        _worker_last_pos.pop(dead_id, None)
+    for dead_id in set(_worker_recent) - alive_ids:
+        _worker_recent.pop(dead_id, None)
+    for dead_id in set(_resource_assignments) - alive_ids:
+        _resource_assignments.pop(dead_id, None)
+    for dead_id in set(_worker_path_cache) - alive_ids:
+        _worker_path_cache.pop(dead_id, None)
+    for (prefix, obj_id), name in list(_object_names.items()):
+        if prefix in ("W", "V", "R") and str(obj_id) not in alive_ids:
+            _object_names.pop((prefix, obj_id), None)
+
+
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
     """Queue actions, return (core_action_name, {unit_id: action_detail})."""
     unit_actions_detail: dict[str, str] = {}
     core_action_name = "WAIT"
     config = load_config()
-    turn_context.config = config
     turn_context.worker_routes = {}
     turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
 
     # ── Cleanup dead-unit bookkeeping ──────────────────────────────────
-    # Keys in _worker_last_pos / _worker_recent / _resource_assignments use the
-    # full str(unit.id). Previously cleanup used id[:8], which wiped every
-    # entry each tick and disabled backtrack avoidance → A-B-A oscillation.
     alive_ids: set[str] = set()
     for w in turn.workers:
         alive_ids.add(str(w.id))
@@ -1664,12 +1801,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         alive_ids.add(str(v.id))
     for r in getattr(turn, "rangers", ()) or ():
         alive_ids.add(str(r.id))
-    for dead_id in set(_worker_last_pos) - alive_ids:
-        _worker_last_pos.pop(dead_id, None)
-    for dead_id in set(_worker_recent) - alive_ids:
-        _worker_recent.pop(dead_id, None)
-    for dead_id in set(_resource_assignments) - alive_ids:
-        _resource_assignments.pop(dead_id, None)
+    _prune_dead_unit_bookkeeping(alive_ids)
 
     _sync_production_queue(turn)
 
@@ -1688,7 +1820,6 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 
     # Newly produced (or previously unassigned) combat units join 守家队.
     config = _auto_enlist_new_combat_units(turn, config)
-    turn_context.config = config
 
     core = turn.core
     core_pos = core.position
@@ -1700,6 +1831,10 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     obstacle_cells: frozenset[tuple[int, int]] = known_obstacles
     enemies = turn.visible_enemies
     beacon = turn.beacon
+    # Beacon position is always public; keep it for the attack teams.
+    turn_context.beacon_pos = (
+        tuple(beacon.position) if getattr(beacon, "position", None) else None
+    )
 
     beacon_on_ground_here = beacon.status == "GROUND" and beacon.position == core_pos
     beacon_carried_by_core = beacon.status == "CARRIED" and beacon.carrier_id == core.id
@@ -1749,13 +1884,6 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         wid = closest[0]
         _resource_assignments[wid] = res
         available.remove(closest)
-    for event in turn.events:
-        if (
-            event.event_type == "HARVEST_FAILED"
-            and event.reason_code == "RESOURCE_DEPLETED"
-            and event.position
-        ):
-            depleted.add(event.position)
 
     # ── Core action ─────────────────────────────────────────────────────
     core_done = False
@@ -1925,7 +2053,11 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                         try:
                             core_action, unit_actions = choose_actions(turn)
                         except Exception as e:
-                            print(f"tick={getattr(turn, 'tick', '?')} plan_error={e}", flush=True)
+                            print(
+                                f"tick={getattr(turn, 'tick', '?')} plan_error={e}\n"
+                                f"{traceback.format_exc()}",
+                                flush=True,
+                            )
                             continue
                         try:
                             accepted = turn.submit()
@@ -1953,7 +2085,11 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                                 flush=True,
                             )
                         except Exception as e:
-                            print(f"tick={turn.tick} submit_error={e}", flush=True)
+                            print(
+                                f"tick={turn.tick} submit_error={e}\n"
+                                f"{traceback.format_exc()}",
+                                flush=True,
+                            )
             except KeyboardInterrupt:
                 raise
             except (ProtocolError, TransportError, OSError, ConnectionError, TimeoutError) as e:
@@ -1983,21 +2119,29 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
 
 
 def _print_summary(log_path: str) -> None:
-    """Quick summary from the log file."""
+    """Quick summary from the tail of the log file.
+
+    Reads only the newest _SUMMARY_TAIL_RECORDS ticks (the current segment after
+    log rotation) instead of slurping the whole — possibly tens-of-MB — file.
+    """
     try:
+        # Import lazily so the running bot never loads dashboard code until
+        # shutdown.
+        from dashboard import _iter_log_lines_reverse
+
         ticks = []
-        with open(log_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(record, dict) and "tick" in record:
-                    ticks.append(record)
+        for line in _iter_log_lines_reverse(log_path):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and "tick" in record:
+                ticks.append(record)
+                if len(ticks) >= _SUMMARY_TAIL_RECORDS:
+                    break
         if not ticks:
             return
+        ticks.reverse()  # reader yields newest-first; summary wants oldest-first
 
         total_ticks = len(ticks)
         first_tick = ticks[0]["tick"]
@@ -2034,8 +2178,8 @@ def _print_summary(log_path: str) -> None:
         print(f"  Log file:         {log_path}")
         print("=" * 60)
         print()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[summary] could not read {log_path}: {exc}", flush=True)
 
 
 if __name__ == "__main__":

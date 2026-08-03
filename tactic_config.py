@@ -28,6 +28,7 @@ class ConfigField:
     maximum: int | None = None
     step: int | None = None
     placeholder: str | None = None
+    options: tuple[str, ...] | None = None
 
 
 CONFIG_GROUPS = (
@@ -80,7 +81,14 @@ CONFIG_FIELDS = (
     ConfigField("home_patrol_radius", "守家巡逻半径", "combat", "integer", 5, 1, 30, 1),
     ConfigField("attack_target_x", "进攻目标 X", "combat", "integer", 0, -500, 500, 1),
     ConfigField("attack_target_y", "进攻目标 Y", "combat", "integer", 0, -500, 500, 1),
-    ConfigField("auto_attack_enabled", "自动进攻", "combat", "boolean", False),
+    ConfigField(
+        "attack_mode",
+        "进攻方式",
+        "combat",
+        "select",
+        "coords",
+        options=("coords", "auto", "beacon"),
+    ),
     ConfigField("ranger_attack_range", "游侠开火距离", "combat", "integer", 3, 1, 3, 1),
     ConfigField("map_save_interval_ticks", "地图保存间隔 Tick", "runtime", "integer", 10, 1, 200, 1),
 )
@@ -94,6 +102,8 @@ _cache_value: dict[str, int | bool | str] | None = None
 _LEGACY_KEYS = frozenset({
     "vanguard_engage_enabled",
     "ranger_engage_enabled",
+    # Replaced by the attack_mode 三选一 (coords / auto / beacon).
+    "auto_attack_enabled",
 })
 
 
@@ -137,6 +147,13 @@ def validate_config(
         if field.kind == "boolean":
             if not isinstance(raw_value, bool):
                 errors[key] = "必须是开关值"
+                continue
+            config[key] = raw_value
+            continue
+
+        if field.kind == "select":
+            if not isinstance(raw_value, str) or raw_value not in (field.options or ()):
+                errors[key] = "不是合法的选项"
                 continue
             config[key] = raw_value
             continue
@@ -187,6 +204,12 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, int | bool | str]:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
+                # Migrate the legacy auto_attack checkbox to attack_mode.
+                if "attack_mode" not in raw and "auto_attack_enabled" in raw:
+                    raw = {
+                        **raw,
+                        "attack_mode": "auto" if raw.get("auto_attack_enabled") else "coords",
+                    }
                 config = validate_config(raw)
         except (OSError, json.JSONDecodeError, ConfigValidationError):
             config = default_config()

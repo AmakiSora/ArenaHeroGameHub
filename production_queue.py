@@ -71,8 +71,10 @@ def _as_request(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": int(row["id"]),
         "unit_type": unit_type,
-        "label": UNIT_LABELS[unit_type],
-        "cost": UNIT_COSTS[unit_type],
+        # Fall back gracefully for rows with an unknown unit type (old schema or
+        # a manual DB edit) so one bad row can't break the whole dashboard queue.
+        "label": UNIT_LABELS.get(unit_type, unit_type),
+        "cost": UNIT_COSTS.get(unit_type, 0),
         "status": str(row["status"]),
         "issued_tick": row["issued_tick"],
         "created_at": str(row["created_at"]),

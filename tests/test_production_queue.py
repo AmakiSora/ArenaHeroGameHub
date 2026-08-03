@@ -53,6 +53,29 @@ class ProductionQueueTests(unittest.TestCase):
             self.assertIsNone(production_queue.head_request(path))
 
 
+    def test_unknown_unit_type_row_does_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "queue.db"
+            connection = production_queue._connect(path)
+            try:
+                connection.execute(
+                    "INSERT INTO production_queue (unit_type, status, created_at) "
+                    "VALUES ('TANK', 'pending', '2026-01-01T00:00:00+00:00')"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            items = production_queue.list_requests(path)
+            payload = production_queue.queue_payload(path)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["unit_type"], "TANK")
+        self.assertEqual(items[0]["label"], "TANK")
+        self.assertEqual(items[0]["cost"], 0)
+        self.assertEqual(payload["count"], 1)
+
+
 class QueuedSpawnPlannerTests(unittest.TestCase):
     class Core:
         position = (0, 0)

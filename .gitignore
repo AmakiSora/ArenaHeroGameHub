@@ -1,6 +1,7 @@
 # Logs
 tactic_play.log
 tactic_log.jsonl
+tactic_log.jsonl.*
 dashboard.log
 direct_play.log
 direct_debug.json

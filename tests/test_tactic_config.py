@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,24 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(config["home_patrol_radius"], 5)
         self.assertEqual(config["attack_target_x"], 0)
         self.assertEqual(config["attack_target_y"], 0)
+        self.assertEqual(config["attack_mode"], "coords")
+
+    def test_attack_mode_rejects_unknown_values(self) -> None:
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"attack_mode": "nuke"})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"attack_mode": True})
+
+    def test_legacy_auto_attack_checkbox_migrates_to_attack_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tactic_config.json"
+            raw = {**default_config()}
+            raw.pop("attack_mode")
+            raw["auto_attack_enabled"] = True
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            loaded = load_config(path)
+
+        self.assertEqual(loaded["attack_mode"], "auto")
 
     def test_save_and_hot_reload_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -97,6 +116,10 @@ class TacticConfigTests(unittest.TestCase):
         self.assertIn("进攻队", teams)
         self.assertIn("游击队", teams)
         self.assertIn("待命池", teams)
+        self.assertIn('name="attack_mode"', teams)
+        self.assertIn("进攻冠军信标", teams)
+        self.assertIn("自动进攻", teams)
+        self.assertNotIn('name="auto_attack_enabled"', teams)
         self.assertIn("resAddToggle", page)
         self.assertIn("resAddForm", page)
         self.assertIn("chip-x", page)
