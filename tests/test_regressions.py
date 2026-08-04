@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from arena_hero import UnitType
+from arena_hero import Direction, UnitType
 
 import dashboard
 import game_stats
@@ -146,6 +146,105 @@ class ConfiguredPlannerTests(unittest.TestCase):
         self.assertEqual(bfs.call_args.kwargs["max_steps"], 1250)
         self.assertEqual(tactic.turn_context.worker_routes["worker-1"]["target"], (2, 0))
         self.assertEqual(len(tactic.turn_context.worker_routes["worker-1"]["path"]), 3)
+
+    def test_partial_cargo_worker_on_resource_returns_home_not_harvest(self) -> None:
+        # Harvest fills the worker in one action (2 while the beacon is carried),
+        # so a worker at cargo=1 can never top up — the server answers with
+        # CARGO_FULL and the worker would wedge on the mine forever. It must
+        # return home to deposit instead.
+        class Worker:
+            id = "worker-1"
+            position = (5, 0)
+            cargo = 1
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def harvest(self) -> None:
+                self.harvested = True
+
+            def deposit(self) -> None:
+                self.deposited = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        config = default_config()
+        config["worker_bfs_enabled"] = False  # exercise the greedy fallback
+        try:
+            action, _ = tactic._plan_worker(
+                worker,
+                Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+            )
+        finally:
+            tactic.turn_context.worker_routes = {}
+
+        self.assertNotEqual(action, "HARVEST")
+        self.assertIsNone(getattr(worker, "harvested", None))
+        self.assertEqual(action, "MOVE")  # heading home with the partial load
+        self.assertEqual(worker.direction, Direction.LEFT)
+
+    def test_partial_cargo_worker_at_core_deposits(self) -> None:
+        class Worker:
+            id = "worker-1"
+            position = (0, 0)
+            cargo = 1
+
+            def deposit(self) -> None:
+                self.deposited = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        tactic.turn_context.resource_space = 5
+        try:
+            action, _ = tactic._plan_worker(
+                worker,
+                Core(),
+                resource_cells=frozenset(),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=default_config(),
+            )
+        finally:
+            tactic.turn_context.worker_routes = {}
+
+        self.assertEqual(action, "DEPOSIT")
+        self.assertTrue(worker.deposited)
+
+    def test_empty_worker_on_resource_harvests(self) -> None:
+        class Worker:
+            id = "worker-1"
+            position = (5, 0)
+            cargo = 0
+
+            def harvest(self) -> None:
+                self.harvested = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        try:
+            action, _ = tactic._plan_worker(
+                worker,
+                Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=default_config(),
+            )
+        finally:
+            tactic.turn_context.worker_routes = {}
+
+        self.assertEqual(action, "HARVEST")
+        self.assertTrue(worker.harvested)
 
     def test_bfs_path_routes_around_obstacles(self) -> None:
         path = tactic._bfs_path(
