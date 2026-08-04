@@ -22,6 +22,7 @@ from typing import Any
 
 from arena_hero import (
     ArenaHeroClient,
+    CoreState,
     Direction,
     UnitType,
 )
@@ -99,18 +100,26 @@ def _line_blocked(
     b: tuple[int, int],
     obstacles: frozenset[tuple[int, int]],
 ) -> bool:
+    """True when an intermediate cell on the straight a→b line is blocked.
+
+    Supports horizontal, vertical, and exact 45° diagonals (rules v0.8). Only
+    the cells actually crossed are checked; obstacles beside the line never
+    block. A non-aligned line (not a legal shot) returns True.
+    """
     x1, y1 = a
     x2, y2 = b
-    if x1 == x2:
-        step = 1 if y2 > y1 else -1
-        for y in range(y1 + step, y2, step):
-            if (x1, y) in obstacles:
-                return True
-    elif y1 == y2:
-        step = 1 if x2 > x1 else -1
-        for x in range(x1 + step, x2, step):
-            if (x, y1) in obstacles:
-                return True
+    dx = x2 - x1
+    dy = y2 - y1
+    if not (dx == 0 or dy == 0 or abs(dx) == abs(dy)):
+        return True
+    sx = (dx > 0) - (dx < 0)
+    sy = (dy > 0) - (dy < 0)
+    x, y = x1 + sx, y1 + sy
+    while (x, y) != (x2, y2):
+        if (x, y) in obstacles:
+            return True
+        x += sx
+        y += sy
     return False
 
 
@@ -1210,13 +1219,21 @@ def _ranger_best_shot(
     obstacle_cells: frozenset[tuple[int, int]],
     attack_range: int,
 ) -> tuple[str, str] | None:
+    """Pick the closest enemy in legal 8-way range (rules v0.8/v0.13).
+
+    Distance is Chebyshev — horizontal, vertical, or exact-diagonal offsets
+    where max(|dx|, |dy|) is within 1..attack_range. Diagonal shots are legal
+    and only intermediate crossed cells can block the line.
+    """
     best_dist = 10_000
     best_target = None
     for enemy in enemies:
-        dist = _manhattan(pos, enemy.position)
+        dx = int(enemy.position[0]) - pos[0]
+        dy = int(enemy.position[1]) - pos[1]
+        dist = max(abs(dx), abs(dy))
         if not (1 <= dist <= attack_range):
             continue
-        if _line_blocked(pos, enemy.position, obstacle_cells):
+        if _line_blocked(pos, tuple(enemy.position), obstacle_cells):
             continue
         if dist < best_dist:
             best_dist = dist
@@ -1990,6 +2007,56 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
             _object_names.pop((prefix, obj_id), None)
 
 
+# ── post-combat healing (rules v0.10) ─────────────────────────────────────────
+# A Unit may spend its whole action to recover HP only while sharing a cell with
+# its own stationary Core; the Core may heal as its action. 1 resource = 1 HP,
+# resolved after combat (Unit heals before the Core action). A heal that is
+# still impossible at resolution fails privately and spends nothing.
+
+_UNIT_MAX_HP = {UnitType.WORKER: 2, UnitType.VANGUARD: 4, UnitType.RANGER: 2}
+_CORE_MAX_HP = 5
+
+
+def _unit_max_hp(unit: Any) -> int:
+    return _UNIT_MAX_HP.get(getattr(unit, "unit_type", None), 2)
+
+
+def _unit_needs_heal(
+    unit: Any,
+    *,
+    core_pos: tuple[int, int],
+    core_moving: bool,
+    heal_budget: int,
+    heal_enabled: bool,
+) -> bool:
+    """True when a Unit should spend its whole action on HEAL this Tick."""
+    if not heal_enabled or core_moving:
+        return False
+    if heal_budget < 1:
+        return False
+    if tuple(unit.position) != tuple(core_pos):
+        return False
+    if getattr(unit, "hp", 0) >= _unit_max_hp(unit):
+        return False
+    # A loaded Worker at the Core must deposit first — unloading funds the
+    # whole economy; it can heal next Tick.
+    if (
+        getattr(unit, "unit_type", None) == UnitType.WORKER
+        and getattr(unit, "cargo", 0) > 0
+    ):
+        return False
+    return True
+
+
+def _core_should_heal(core: Any, resources: int, config: dict) -> bool:
+    """True when the Core should spend its action recovering HP (HP first)."""
+    return (
+        bool(config.get("heal_enabled", True))
+        and resources >= 1
+        and int(getattr(core, "hp", 0)) < _CORE_MAX_HP
+    )
+
+
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
     """Queue actions, return (core_action_name, {unit_id: action_detail})."""
     unit_actions_detail: dict[str, str] = {}
@@ -2110,6 +2177,12 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             core_action_name = demand_spawn
             core_done = True
 
+    # Recover Core HP before repairing shield — HP is permanent damage.
+    if not core_done and _core_should_heal(core, resources, config):
+        core.heal()
+        core_action_name = "HEAL_CORE"
+        core_done = True
+
     if not core_done and config["repair_enabled"] and resources >= 1:
         effective_cap = 10 if beacon_carried_by_core else 5
         shield_target = (
@@ -2212,10 +2285,33 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     self_destructs = _plan_over_target_self_destruct(turn, core, config)
     sd_ids = {str(unit.id) for unit, _ in self_destructs}
 
+    # Healing budget: leftover resources after reserve + this Tick's spawn cost,
+    # so healing never starves production. Unit heals resolve before the Core
+    # action (spawn), so the spawn's cost is reserved first.
+    core_moving = (
+        getattr(getattr(core, "view", None), "state", None) == CoreState.MOVING
+    )
+    heal_enabled = bool(config.get("heal_enabled", True))
+    heal_budget = resources - int(config.get("resource_reserve", 0))
+    if core_action_name.startswith("SPAWN_"):
+        heal_budget -= UNIT_SPAWN_COSTS.get(core_action_name.split("_", 1)[1], 0)
+
     for unit in turn.units:
         if str(unit.id) in sd_ids:
             continue
         uid = str(unit.id)[:8]
+        # Post-combat healing: a damaged Unit on the Core cell with a stationary
+        # Core spends its whole action recovering HP (1 resource / 1 HP).
+        if _unit_needs_heal(
+            unit,
+            core_pos=core_pos,
+            core_moving=core_moving,
+            heal_budget=heal_budget,
+            heal_enabled=heal_enabled,
+        ):
+            unit.heal()
+            unit_actions_detail[uid] = "HEAL"
+            continue
         if unit.unit_type == UnitType.WORKER:
             action, detail = _plan_worker(
                 unit, core,

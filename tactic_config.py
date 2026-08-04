@@ -51,6 +51,7 @@ CONFIG_FIELDS = (
     ConfigField("core_target_y", "核心目标 Y", "core", "integer", 0, -500, 500, 1),
     ConfigField("cargo_wait_distance", "等待载矿工人距离", "core", "integer", 5, 0, 20, 1),
     ConfigField("repair_enabled", "允许修盾", "core", "boolean", True),
+    ConfigField("heal_enabled", "允许战后回血", "core", "boolean", True),
     ConfigField("peace_shield_target", "和平修盾目标", "core", "integer", 10, 0, 10, 1),
     ConfigField("combat_shield_target", "战斗修盾目标", "core", "integer", 3, 0, 10, 1),
     ConfigField("resource_reserve", "生产保留金币", "core", "integer", 0, 0, 100, 1),

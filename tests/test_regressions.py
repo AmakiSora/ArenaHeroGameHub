@@ -1645,5 +1645,148 @@ class GameStatsTests(unittest.TestCase):
         self.assertEqual(save_mock.call_count, 2)
 
 
+class RangerShootingTests(unittest.TestCase):
+    """8-way (diagonal) Ranger fire — rules v0.8/v0.13."""
+
+    class Ranger:
+        def __init__(self, position: tuple[int, int]) -> None:
+            self.position = position
+            self.action = None
+            self.arg = None
+
+        def shoot(self, target) -> None:
+            self.action = "SHOOT"
+            self.arg = target
+
+    class Enemy:
+        def __init__(self, position: tuple[int, int]) -> None:
+            self.position = position
+
+    def _shoot(
+        self,
+        enemy_positions,
+        obstacles=(),
+        attack_range: int = 3,
+        ranger_pos: tuple[int, int] = (0, 0),
+    ):
+        ranger = self.Ranger(ranger_pos)
+        enemies = tuple(self.Enemy(p) for p in enemy_positions)
+        result = tactic._ranger_best_shot(
+            ranger,
+            tuple(ranger_pos),
+            enemies,
+            frozenset(obstacles),
+            attack_range,
+        )
+        return result, ranger, enemies
+
+    def test_diagonal_shot_within_range(self) -> None:
+        result, ranger, enemies = self._shoot([(3, 3)])
+        self.assertEqual(ranger.action, "SHOOT")
+        self.assertIs(ranger.arg, enemies[0])
+        self.assertEqual(result[0], "SHOOT")
+
+    def test_diagonal_shot_out_of_range(self) -> None:
+        result, ranger, _ = self._shoot([(4, 4)])
+        self.assertIsNone(result)
+        self.assertIsNone(ranger.action)
+
+    def test_diagonal_blocked_by_intermediate_cell(self) -> None:
+        result, ranger, _ = self._shoot([(3, 3)], obstacles=[(1, 1)])
+        self.assertIsNone(result)
+        self.assertIsNone(ranger.action)
+
+    def test_side_obstacle_does_not_block_diagonal(self) -> None:
+        # Obstacles beside the diagonal line never block (rules v0.8).
+        result, ranger, _ = self._shoot([(2, 2)], obstacles=[(0, 2), (2, 0)])
+        self.assertEqual(ranger.action, "SHOOT")
+        self.assertEqual(result[0], "SHOOT")
+
+    def test_non_aligned_cell_never_shots(self) -> None:
+        result, ranger, _ = self._shoot([(2, 1)])
+        self.assertIsNone(result)
+        self.assertIsNone(ranger.action)
+
+    def test_cardinal_shot_still_works(self) -> None:
+        result, ranger, enemies = self._shoot([(0, 3)])
+        self.assertEqual(ranger.action, "SHOOT")
+        self.assertIs(ranger.arg, enemies[0])
+
+    def test_picks_closest_enemy(self) -> None:
+        result, ranger, enemies = self._shoot([(2, 2), (1, 0)])
+        self.assertEqual(ranger.action, "SHOOT")
+        self.assertIs(ranger.arg, enemies[1])  # (1,0) is Chebyshev 1
+
+    def test_line_blocked_supports_diagonal(self) -> None:
+        self.assertTrue(tactic._line_blocked((0, 0), (3, 3), frozenset({(1, 1)})))
+        self.assertFalse(tactic._line_blocked((0, 0), (3, 3), frozenset()))
+        # Non-aligned line is not a legal shot line.
+        self.assertTrue(tactic._line_blocked((0, 0), (2, 1), frozenset()))
+        # Cardinal still works.
+        self.assertTrue(tactic._line_blocked((0, 0), (0, 3), frozenset({(0, 2)})))
+
+
+class HealingPlannerTests(unittest.TestCase):
+    """Post-combat healing decisions — rules v0.10."""
+
+    @staticmethod
+    def _unit(*, pos=(0, 0), hp, unit_type=UnitType.VANGUARD, cargo=0):
+        return SimpleNamespace(position=pos, hp=hp, unit_type=unit_type, cargo=cargo)
+
+    @staticmethod
+    def _core(hp=5):
+        return SimpleNamespace(hp=hp)
+
+    def _needs_heal(self, unit, **overrides) -> bool:
+        kwargs = dict(
+            core_pos=(0, 0), core_moving=False, heal_budget=3, heal_enabled=True
+        )
+        kwargs.update(overrides)
+        return tactic._unit_needs_heal(unit, **kwargs)
+
+    def test_damaged_unit_at_core_heals(self) -> None:
+        self.assertTrue(self._needs_heal(self._unit(hp=2)))
+
+    def test_full_hp_does_not_heal(self) -> None:
+        self.assertFalse(self._needs_heal(self._unit(hp=4)))
+
+    def test_off_core_does_not_heal(self) -> None:
+        self.assertFalse(self._needs_heal(self._unit(pos=(1, 1), hp=2)))
+
+    def test_moving_core_does_not_heal(self) -> None:
+        self.assertFalse(self._needs_heal(self._unit(hp=2), core_moving=True))
+
+    def test_low_budget_does_not_heal(self) -> None:
+        self.assertFalse(self._needs_heal(self._unit(hp=2), heal_budget=0))
+
+    def test_disabled_does_not_heal(self) -> None:
+        self.assertFalse(self._needs_heal(self._unit(hp=2), heal_enabled=False))
+
+    def test_loaded_worker_deposits_not_heal(self) -> None:
+        self.assertFalse(
+            self._needs_heal(
+                self._unit(hp=1, unit_type=UnitType.WORKER, cargo=1)
+            )
+        )
+
+    def test_worker_heals_when_empty(self) -> None:
+        self.assertTrue(
+            self._needs_heal(
+                self._unit(hp=1, unit_type=UnitType.WORKER, cargo=0)
+            )
+        )
+
+    def test_core_heals_when_damaged(self) -> None:
+        self.assertTrue(tactic._core_should_heal(self._core(hp=3), 2, default_config()))
+
+    def test_core_full_hp_no_heal(self) -> None:
+        self.assertFalse(tactic._core_should_heal(self._core(hp=5), 2, default_config()))
+
+    def test_core_heal_respects_config(self) -> None:
+        config = default_config()
+        config["heal_enabled"] = False
+        self.assertFalse(tactic._core_should_heal(self._core(hp=3), 2, config))
+
+
 if __name__ == "__main__":
     unittest.main()
