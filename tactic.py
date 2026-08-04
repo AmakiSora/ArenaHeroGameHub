@@ -27,10 +27,7 @@ from arena_hero import (
 )
 from arena_hero.errors import ProtocolError, TransportError
 import game_stats
-from sdk_compat import apply_sdk_compat
 from tactic_config import CONFIG_PATH, load_config, save_config
-
-apply_sdk_compat()
 
 def _data_dir() -> Path:
     raw = os.environ.get("ARENA_DATA_DIR", "").strip()

@@ -14,7 +14,6 @@ COPY dashboard.py \
      tactic.py \
      game_stats.py \
      tactic_config.py \
-     sdk_compat.py \
      status.py \
      docker-entrypoint.py \
      ./
