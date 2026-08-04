@@ -37,6 +37,15 @@ def _data_dir() -> Path:
 
 MAP_MEMORY_PATH = _data_dir() / "map_memory.json"
 DEFAULT_LOG_PATH = str(_data_dir() / "tactic_log.jsonl")
+# Manual per-unit target coordinates set from the dashboard (display-name keyed).
+WAYPOINTS_PATH = _data_dir() / "waypoints.json"
+
+# Display-name prefix per unit type (W / V / R), shared with the dashboard.
+_UNIT_NAME_PREFIX = {
+    UnitType.WORKER: "W",
+    UnitType.VANGUARD: "V",
+    UnitType.RANGER: "R",
+}
 
 # Rotate tactic_log.jsonl when it exceeds this size and keep at most N backups.
 LOG_MAX_BYTES = int(os.environ.get("ARENA_LOG_MAX_MB", "20")) * 1024 * 1024
@@ -680,6 +689,44 @@ def _worker_cached_path_step(
     return ("MOVE", f"{bfs_dir.name} -> {goal}")
 
 
+def _enemy_unit_type_name(enemy: Any) -> str | None:
+    """Return WORKER/VANGUARD/RANGER/CORE/None for a visible enemy object."""
+    kind = getattr(enemy, "kind", None)
+    if kind is not None:
+        value = kind.value if hasattr(kind, "value") else str(kind)
+        upper = value.upper()
+        if upper == "CORE":
+            return "CORE"
+        if upper in {"WORKER", "VANGUARD", "RANGER"}:
+            return upper
+    unit_type = getattr(enemy, "unit_type", None)
+    if unit_type is None:
+        return None
+    if hasattr(unit_type, "value"):
+        return str(unit_type.value).upper()
+    return str(unit_type).upper()
+
+
+def _is_combat_threat(enemy: Any) -> bool:
+    """True when the visible enemy can deal combat damage.
+
+    Workers have no attack. Only Vanguard melee, Ranger shots, and enemy Cores
+    can hurt a stationary friendly unit. Unknown stubs (tests / bare objects)
+    stay treated as threats so missing type data fails safe.
+    """
+    name = _enemy_unit_type_name(enemy)
+    if name == "WORKER":
+        return False
+    if name in {"VANGUARD", "RANGER", "CORE"}:
+        return True
+    return True
+
+
+def _combat_threats(enemies: tuple | list) -> tuple:
+    """Filter visible enemies down to units/cores that can actually attack."""
+    return tuple(e for e in enemies if _is_combat_threat(e))
+
+
 def _worker_flee(
     worker,
     uid: str,
@@ -698,45 +745,145 @@ def _worker_flee(
     cell that maximizes distance from the enemy; fall back to any free cell;
     only WAIT when every neighbor is blocked. `others` includes the enemy cells
     themselves, so the worker can never step onto an enemy.
+
+    Cargo workers bias hard toward the Core so they do not ping-pong on the
+    same two cells next to a stationary attacker while carrying resources home.
     """
     prev = _worker_last_pos.get(uid)
     recent = _worker_recent.get(uid, [])
     recent_set = set(recent)
+    # Detect 2-cell oscillation: A->B->A. Break it by banning the reverse
+    # step when any other free neighbor exists.
+    oscillating = (
+        len(recent) >= 2
+        and recent[-1] == pos
+        and prev == recent[-2]
+        and prev is not None
+    )
     candidates: list[tuple[float, int, Direction, tuple[int, int]]] = []
     for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
         nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
         npos = (nx, ny)
         if npos in obstacle_cells or npos in others:
             continue
-        score = -_manhattan(npos, enemy_pos) * 10.0
+        dist_enemy = _manhattan(npos, enemy_pos)
+        score = dist_enemy * 10.0
+        if carrying:
+            closer_home = _manhattan(pos, core_pos) - _manhattan(npos, core_pos)
+            score += closer_home * 8.0
+            if closer_home > 0:
+                score += 4.0
         if _is_dead_end_step(npos, obstacle_cells):
             score -= 5.0
         else:
             score += 5.0
         if prev and npos == prev:
-            score -= 3.0  # avoid backtracking when an alternative exists
+            # Strong anti-backtrack. Oscillating cargo couriers must not keep
+            # flipping LEFT/RIGHT next to the same enemy.
+            score -= 12.0 if carrying else 6.0
+            if oscillating:
+                score -= 20.0
         if npos in recent_set:
-            score -= 2.0
-        if carrying and _manhattan(npos, core_pos) < _manhattan(pos, core_pos):
-            score += 0.5  # nudge cargo workers homeward while escaping
+            score -= 4.0 if carrying else 2.0
         candidates.append((score, d.delta[0] * 4 + d.delta[1], d, npos))
     candidates.sort(reverse=True)
-    for allow_dead_end in (False, True):
+
+    def _try_pick(allow_reverse: bool, allow_dead_end: bool) -> tuple[str, str] | None:
         for _score, _tie, d, npos in candidates:
             if not allow_dead_end and _is_dead_end_step(npos, obstacle_cells):
                 continue
+            if not allow_reverse and prev and npos == prev and oscillating:
+                continue
             worker.move(d)
             _worker_last_pos[uid] = pos
-            recent = _worker_recent.get(uid, [])
-            recent.append(pos)
-            if len(recent) > 6:
-                recent.pop(0)
-            _worker_recent[uid] = recent
+            hist = _worker_recent.get(uid, [])
+            hist.append(pos)
+            if len(hist) > 6:
+                hist.pop(0)
+            _worker_recent[uid] = hist
             _set_worker_route(worker, tuple(npos), [tuple(pos), npos], complete=False)
             return ("MOVE", f"{d.name} flee-enemy@{enemy_pos}")
+        return None
+
+    for allow_dead_end in (False, True):
+        picked = _try_pick(allow_reverse=False, allow_dead_end=allow_dead_end)
+        if picked is not None:
+            return picked
+    for allow_dead_end in (False, True):
+        picked = _try_pick(allow_reverse=True, allow_dead_end=allow_dead_end)
+        if picked is not None:
+            return picked
     worker.wait()
     _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
     return ("WAIT", "flee-boxed")
+
+
+def _plan_waypoint(
+    unit,
+    name: str,
+    waypoint: tuple[int, int],
+    *,
+    config: dict[str, Any],
+    obstacle_cells: frozenset[tuple[int, int]],
+    occupied: frozenset[tuple[int, int]],
+    enemies: tuple,
+    core_pos: tuple[int, int],
+) -> tuple[str, str]:
+    """March one unit to a manually set target; resume normal planning on arrival.
+
+    Dashboard per-unit ⌖ targets are display-name keyed (W3/V2/R1). While under
+    a manual waypoint the unit only walks — no mining / depositing / firing —
+    except workers keep the enemy-evasion rule so a manual trip cannot get them
+    killed. Reaching the target deletes the waypoint; the next Tick the unit
+    falls back to its normal program behavior.
+    """
+    pos = tuple(unit.position)
+    target = (int(waypoint[0]), int(waypoint[1]))
+    is_worker = getattr(unit, "unit_type", None) == UnitType.WORKER
+
+    def _record(path: list[tuple[int, int]], complete: bool) -> None:
+        if is_worker:
+            _set_worker_route(unit, target, path, complete=complete)
+        else:
+            _set_unit_route(unit, target, path, complete=complete)
+
+    if pos == target:
+        _remove_waypoint(name)
+        _record([tuple(pos)], complete=True)
+        return ("WAIT", f"waypoint-reached {target}")
+
+    blocked = frozenset(obstacle_cells) | frozenset(occupied)
+
+    # Workers keep the survival rule while marching: never stop next to an
+    # attacking enemy.
+    if is_worker:
+        threat_radius = int(config.get("enemy_threat_radius", 3))
+        combat_enemies = _combat_threats(enemies)
+        if combat_enemies and threat_radius > 0:
+            nearest = min(
+                combat_enemies, key=lambda e: _manhattan(pos, tuple(e.position))
+            )
+            if _manhattan(pos, tuple(nearest.position)) <= threat_radius:
+                flee_blocked = blocked | {tuple(e.position) for e in enemies}
+                return _worker_flee(
+                    unit,
+                    str(unit.id),
+                    pos,
+                    tuple(nearest.position),
+                    tuple(core_pos),
+                    obstacle_cells,
+                    flee_blocked,
+                    carrying=(getattr(unit, "cargo", 0) > 0),
+                )
+
+    moved = _move_towards(unit, pos, target, blocked, detail_prefix="waypoint")
+    if moved is not None:
+        _record([tuple(pos), target], complete=False)
+        return moved
+
+    unit.wait()
+    _record([tuple(pos), target], complete=True)
+    return ("WAIT", f"waypoint-blocked {target}")
 
 
 def _plan_worker(
@@ -774,14 +921,19 @@ def _plan_worker(
     # never HARVEST / DEPOSIT / WAIT. Evasion outranks everything: a dead
     # worker mines nothing. Radius 0 (dashboard knob) disables the safety.
     threat_radius = int(config.get("enemy_threat_radius", 3))
-    if enemies and threat_radius > 0:
+    # Only combat-capable enemies force evasion. Hostile Workers cannot attack,
+    # so dancing away from them only wastes cargo trips and creates LEFT/RIGHT
+    # oscillation next to a harmless unit.
+    combat_enemies = _combat_threats(enemies)
+    if combat_enemies and threat_radius > 0:
         nearest_enemy = min(
-            enemies, key=lambda e: _manhattan(pos, tuple(e.position))
+            combat_enemies, key=lambda e: _manhattan(pos, tuple(e.position))
         )
         if _manhattan(pos, tuple(nearest_enemy.position)) <= threat_radius:
             # `others` already carries the enemy cells in production (occupied
             # includes them); union them again so a fleeing worker can never
-            # step onto an enemy even if `occupied` was not passed.
+            # step onto an enemy even if `occupied` was not passed. Block all
+            # visible enemy cells (including non-combat Workers) as geometry.
             flee_blocked = others | {tuple(e.position) for e in enemies}
             return _worker_flee(
                 worker,
@@ -1772,6 +1924,10 @@ _resource_tombstones: set[tuple[int, int]] = set()
 _obstacle_memory: set[tuple[int, int]] = set()
 # Enemy sightings: remember every position where enemies were seen
 _enemy_memory: set[tuple[int, int]] = set()
+# Last applied dashboard enemy-clear sequence from map_memory.json.
+_enemy_clear_seq: int = 0
+# Signature of the last dashboard map edits we absorbed (avoid re-applying every tick).
+_last_dashboard_map_sig: tuple | None = None
 # Track each worker's previous position to avoid backtracking
 _worker_last_pos: dict[str, tuple[int, int]] = {}
 _worker_recent: dict[str, list[tuple[int, int]]] = {}  # last 4 positions, anti-oscillation
@@ -1795,26 +1951,114 @@ _last_map_save_tick: int = -1
 _game_stats: dict[str, Any] = game_stats.load()
 
 
+def _coords_from_payload(raw) -> set[tuple[int, int]]:
+    """Parse [[x,y], ...] payloads into coordinate tuples."""
+    out: set[tuple[int, int]] = set()
+    for item in raw or []:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out.add((int(item[0]), int(item[1])))
+    return out
+
+
 def _load_map_memory() -> None:
     """Load permanent obstacle/resource/enemy memory from disk."""
-    global _resource_memory, _obstacle_memory, _enemy_memory
+    global _resource_memory, _obstacle_memory, _enemy_memory, _enemy_clear_seq, _last_dashboard_map_sig
     if not MAP_MEMORY_PATH.exists():
         return
     try:
         data = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
-        _obstacle_memory = {tuple(p) for p in data.get("obstacles", []) if len(p) == 2}
-        resources = {tuple(p) for p in data.get("resources", []) if len(p) == 2}
-        manual = {tuple(p) for p in data.get("manual_resources", []) if len(p) == 2}
-        _resource_memory = resources | manual
-        _enemy_memory = {tuple(p) for p in data.get("enemy_sightings", []) if len(p) == 2}
+        forgotten = _coords_from_payload(data.get("forgotten_resources"))
+        _obstacle_memory = _coords_from_payload(data.get("obstacles"))
+        resources = _coords_from_payload(data.get("resources"))
+        manual = _coords_from_payload(data.get("manual_resources"))
+        _resource_memory = (resources | manual) - forgotten
+        _resource_tombstones.clear()
+        _resource_tombstones.update(forgotten)
+        _enemy_memory = _coords_from_payload(data.get("enemy_sightings"))
+        _enemy_clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
+        _last_dashboard_map_sig = _dashboard_map_sig(data)
         print(
             f"[map] loaded obstacles={len(_obstacle_memory)} resources={len(_resource_memory)} "
-            f"manual={len(manual)} enemies={len(_enemy_memory)} from {MAP_MEMORY_PATH}",
+            f"manual={len(manual - forgotten)} forgotten={len(forgotten)} "
+            f"enemies={len(_enemy_memory)} from {MAP_MEMORY_PATH}",
             flush=True,
         )
     except Exception as e:
         print(f"[map] load failed: {e}", flush=True)
 
+
+
+def _dashboard_map_sig(data: dict) -> tuple:
+    """Stable signature of dashboard-owned map fields."""
+    forgotten = tuple(sorted(_coords_from_payload(data.get("forgotten_resources"))))
+    manual = tuple(sorted(_coords_from_payload(data.get("manual_resources"))))
+    resources = tuple(sorted(_coords_from_payload(data.get("resources"))))
+    enemies = tuple(sorted(_coords_from_payload(data.get("enemy_sightings"))))
+    clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
+    return (forgotten, manual, resources, enemies, clear_seq)
+
+
+def _apply_dashboard_map_edits() -> None:
+    """Pull dashboard deletions/additions into process memory before planning/saving.
+
+    The dashboard and tactic are separate processes. Without this sync, a
+    dashboard clear only edits map_memory.json, and the next tactic save would
+    rewrite the old in-memory resources or enemy sightings back onto disk.
+
+    Edits are applied only when the dashboard-owned signature changes, so a
+    live re-discovery after a clear is not immediately re-forgotten from a
+    stale on-disk forget list.
+    """
+    global _resource_memory, _enemy_memory, _enemy_clear_seq, _map_dirty, _last_dashboard_map_sig
+    if not MAP_MEMORY_PATH.exists():
+        return
+    try:
+        data = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    sig = _dashboard_map_sig(data)
+    if sig == _last_dashboard_map_sig:
+        return
+    _last_dashboard_map_sig = sig
+
+    forgotten = _coords_from_payload(data.get("forgotten_resources"))
+    manual = _coords_from_payload(data.get("manual_resources"))
+    disk_resources = _coords_from_payload(data.get("resources"))
+
+    if forgotten:
+        before = set(_resource_memory)
+        for pos in forgotten:
+            _resource_memory.discard(pos)
+            _resource_tombstones.add(pos)
+        if _resource_memory != before:
+            _map_dirty = True
+        for wid, goal in list(_resource_assignments.items()):
+            if tuple(goal) in forgotten:
+                _resource_assignments.pop(wid, None)
+
+    # Absorb dashboard manual adds only. Auto resources are owned by this
+    # process; rehydrating them here would undo a local _forget_resource()
+    # that has not been flushed to disk yet.
+    #
+    # Local tombstones also win over a still-stale on-disk manual entry until
+    # the next save flushes the forget list.
+    for pos in manual - forgotten - set(_resource_tombstones):
+        if pos not in _resource_memory:
+            _resource_memory.add(pos)
+            _map_dirty = True
+        _resource_tombstones.discard(pos)
+    # disk_resources is intentionally unused for rehydration.
+    _ = disk_resources
+
+    clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
+    if clear_seq > _enemy_clear_seq:
+        _enemy_clear_seq = clear_seq
+        disk_enemies = _coords_from_payload(data.get("enemy_sightings"))
+        if _enemy_memory != disk_enemies:
+            _enemy_memory.clear()
+            _enemy_memory.update(disk_enemies)
+            _map_dirty = True
 
 
 def _save_map_memory(
@@ -1824,9 +2068,12 @@ def _save_map_memory(
 ) -> None:
     """Persist permanent map memory. Obstacles never shrink.
 
-    Manual resources entered from the dashboard are preserved across saves.
+    Manual resources entered from the dashboard are preserved across saves,
+    except coordinates listed in forgotten_resources / local tombstones.
     """
-    global _map_dirty, _last_map_save_tick
+    global _map_dirty, _last_map_save_tick, _enemy_clear_seq, _last_dashboard_map_sig
+    # Always honor dashboard deletions, even on a non-dirty no-op path.
+    _apply_dashboard_map_edits()
     if not force and not _map_dirty:
         return
     if (
@@ -1838,17 +2085,29 @@ def _save_map_memory(
         return
 
     manual: set[tuple[int, int]] = set()
+    disk_forgotten: set[tuple[int, int]] = set()
+    disk_enemy_clear_seq = _enemy_clear_seq
     if MAP_MEMORY_PATH.exists():
         try:
             prev = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
-            manual = {tuple(p) for p in prev.get("manual_resources", []) if len(p) == 2}
+            manual = _coords_from_payload(prev.get("manual_resources"))
+            disk_forgotten = _coords_from_payload(prev.get("forgotten_resources"))
+            disk_enemy_clear_seq = int(prev.get("enemy_clear_seq", _enemy_clear_seq) or 0)
         except Exception:
             manual = set()
+            disk_forgotten = set()
 
-    manual -= _resource_tombstones
-    resources = (set(_resource_memory) | manual) - _resource_tombstones
+    # Sticky forget list: dashboard clears + runtime depletion confirmations.
+    # Anything currently known again (re-seen live, or revived in RAM) leaves
+    # the forget list so workers can relearn after a manual clear.
+    forgotten = (set(_resource_tombstones) | disk_forgotten) - set(_resource_memory)
+    manual -= forgotten
+    resources = (set(_resource_memory) | manual) - forgotten
     _resource_memory.clear()
     _resource_memory.update(resources)
+    _resource_tombstones.clear()
+    _resource_tombstones.update(forgotten)
+    _enemy_clear_seq = max(_enemy_clear_seq, disk_enemy_clear_seq)
 
     payload = {
         "updated_tick": tick,
@@ -1856,19 +2115,82 @@ def _save_map_memory(
         "obstacles": sorted([list(p) for p in _obstacle_memory]),
         "resources": sorted([list(p) for p in resources]),
         "manual_resources": sorted([list(p) for p in manual]),
+        "forgotten_resources": sorted([list(p) for p in forgotten]),
         "enemy_sightings": sorted([list(p) for p in _enemy_memory]),
         "obstacle_count": len(_obstacle_memory),
         "resource_count": len(resources),
         "manual_count": len(manual),
         "enemy_sighting_count": len(_enemy_memory),
+        "enemy_clear_seq": _enemy_clear_seq,
     }
     tmp = MAP_MEMORY_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(MAP_MEMORY_PATH)
-    _resource_tombstones.clear()
     _map_dirty = False
+    _last_dashboard_map_sig = _dashboard_map_sig(payload)
     if tick is not None:
         _last_map_save_tick = tick
+
+
+# ── manual per-unit waypoints (dashboard ⌖) ─────────────────────────────────
+# The dashboard and tactic are separate processes sharing waypoints.json. All
+# writes are read-modify-write on the latest file so one side's change never
+# clobbers the other's (same discipline as map_memory.json).
+
+def _load_waypoints() -> dict[str, tuple[int, int]]:
+    """Read manual per-unit targets as {display_name: (x, y)}."""
+    if not WAYPOINTS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(WAYPOINTS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    targets = data.get("targets") if isinstance(data, dict) else None
+    out: dict[str, tuple[int, int]] = {}
+    if isinstance(targets, dict):
+        for name, pos in targets.items():
+            if (
+                isinstance(name, str)
+                and isinstance(pos, (list, tuple))
+                and len(pos) == 2
+            ):
+                try:
+                    out[name] = (int(pos[0]), int(pos[1]))
+                except (TypeError, ValueError):
+                    continue
+    return out
+
+
+def _write_waypoints(targets: dict[str, tuple[int, int]]) -> None:
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "targets": {name: [int(x), int(y)] for name, (x, y) in targets.items()},
+    }
+    tmp = WAYPOINTS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(WAYPOINTS_PATH)
+
+
+def _remove_waypoint(name: str) -> None:
+    """Delete one manual target, preserving any concurrent dashboard writes."""
+    try:
+        targets = _load_waypoints()
+        if name in targets:
+            del targets[name]
+            _write_waypoints(targets)
+    except Exception:
+        pass
+
+
+def _prune_waypoint_targets(
+    targets: dict[str, tuple[int, int]],
+    alive_names: set[str],
+) -> bool:
+    """Remove waypoints whose unit is gone; return True when anything changed."""
+    stale = [name for name in targets if name not in alive_names]
+    for name in stale:
+        targets.pop(name, None)
+    return bool(stale)
 
 
 
@@ -2153,6 +2475,18 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
 
+    # Manual per-unit targets set from the dashboard (display-name keyed).
+    # Prune targets whose unit no longer exists — names are computed BEFORE the
+    # dead-unit cleanup below so a just-died unit's name is never re-issued.
+    waypoints = _load_waypoints()
+    if waypoints:
+        alive_names = {
+            _object_name(u.id, _UNIT_NAME_PREFIX.get(u.unit_type, "U"))
+            for u in turn.units
+        }
+        if _prune_waypoint_targets(waypoints, alive_names):
+            _write_waypoints(waypoints)
+
     # ── Cleanup dead-unit bookkeeping ──────────────────────────────────
     alive_ids: set[str] = set()
     for w in turn.workers:
@@ -2170,6 +2504,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     game_stats.maybe_save(_game_stats, turn_context.tick)
 
     # ── Update permanent map memory ────────────────────────────────────
+    # Honor dashboard clears before we re-accumulate or plan against memory.
+    _apply_dashboard_map_edits()
     known_obstacles = _update_obstacle_memory(turn)
     _update_resource_memory(turn)
     _update_enemy_sightings(turn)
@@ -2398,6 +2734,23 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         ):
             unit.heal()
             unit_actions_detail[uid] = "HEAL"
+            continue
+        # Manual per-unit waypoint: march to the configured coordinate, then
+        # resume the normal planner once it is reached.
+        name = _object_name(unit.id, _UNIT_NAME_PREFIX.get(unit.unit_type, "U"))
+        wp = waypoints.get(name)
+        if wp is not None:
+            action, detail = _plan_waypoint(
+                unit,
+                name,
+                wp,
+                config=config,
+                obstacle_cells=obstacle_cells,
+                occupied=occupied,
+                enemies=enemies,
+                core_pos=core_pos,
+            )
+            unit_actions_detail[uid] = f"{action}:{detail}[waypoint]"
             continue
         if unit.unit_type == UnitType.WORKER:
             action, detail = _plan_worker(

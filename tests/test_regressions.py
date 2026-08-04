@@ -35,6 +35,7 @@ class ResourceMergeTests(unittest.TestCase):
         original_memory = set(tactic._resource_memory)
         original_tombstones = set(tactic._resource_tombstones)
         original_dirty = tactic._map_dirty
+        original_sig = tactic._last_dashboard_map_sig
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 memory_path = Path(temp_dir) / "map_memory.json"
@@ -46,6 +47,7 @@ class ResourceMergeTests(unittest.TestCase):
                 tactic._resource_memory.clear()
                 tactic._resource_memory.update({stale_resource, active_resource})
                 tactic._resource_tombstones.clear()
+                tactic._last_dashboard_map_sig = None
 
                 with patch.object(tactic, "MAP_MEMORY_PATH", memory_path):
                     tactic._forget_resource(stale_resource)
@@ -58,9 +60,140 @@ class ResourceMergeTests(unittest.TestCase):
             tactic._resource_tombstones.clear()
             tactic._resource_tombstones.update(original_tombstones)
             tactic._map_dirty = original_dirty
+            tactic._last_dashboard_map_sig = original_sig
 
         self.assertEqual(saved["resources"], [list(active_resource)])
         self.assertEqual(saved["manual_resources"], [])
+        self.assertEqual(saved["forgotten_resources"], [list(stale_resource)])
+
+
+class DashboardMapMemoryTests(unittest.TestCase):
+    def test_remove_resource_writes_sticky_forgotten_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_path = Path(temp_dir) / "map_memory.json"
+            memory_path.write_text(json.dumps({
+                "obstacles": [],
+                "resources": [[10, 10], [20, 20]],
+                "manual_resources": [[10, 10]],
+                "enemy_sightings": [],
+            }), encoding="utf-8")
+            with patch.object(dashboard, "MAP_FILE", str(memory_path)):
+                result = dashboard.remove_manual_resource(10, 10)
+                loaded = dashboard.load_map_memory()
+                raw = json.loads(memory_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(loaded["resources"], [(20, 20)])
+        self.assertEqual(raw["forgotten_resources"], [[10, 10]])
+        self.assertEqual(raw["manual_resources"], [])
+
+    def test_clear_remembered_resources_tombstones_everything(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            memory_path = Path(temp_dir) / "map_memory.json"
+            memory_path.write_text(json.dumps({
+                "obstacles": [[1, 1]],
+                "resources": [[3, 3], [4, 4]],
+                "manual_resources": [[4, 4]],
+                "enemy_sightings": [[9, 9]],
+            }), encoding="utf-8")
+            with patch.object(dashboard, "MAP_FILE", str(memory_path)):
+                result = dashboard.clear_remembered_resources()
+                loaded = dashboard.load_map_memory()
+                raw = json.loads(memory_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["resource_count"], 0)
+        self.assertEqual(loaded["resources"], [])
+        self.assertEqual(sorted(raw["forgotten_resources"]), [[3, 3], [4, 4]])
+        self.assertEqual(raw["enemy_sightings"], [[9, 9]])
+        self.assertEqual(raw["obstacles"], [[1, 1]])
+
+    def test_dashboard_clear_is_not_restored_by_tactic_save(self) -> None:
+        stale_resource = (7, 7)
+        keep_resource = (8, 8)
+        original_memory = set(tactic._resource_memory)
+        original_tombstones = set(tactic._resource_tombstones)
+        original_dirty = tactic._map_dirty
+        original_sig = tactic._last_dashboard_map_sig
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                memory_path = Path(temp_dir) / "map_memory.json"
+                memory_path.write_text(json.dumps({
+                    "obstacles": [],
+                    "resources": [list(stale_resource), list(keep_resource)],
+                    "manual_resources": [],
+                    "enemy_sightings": [],
+                }), encoding="utf-8")
+
+                tactic._resource_memory.clear()
+                tactic._resource_memory.update({stale_resource, keep_resource})
+                tactic._resource_tombstones.clear()
+                tactic._last_dashboard_map_sig = None
+                tactic._map_dirty = True
+
+                with patch.object(dashboard, "MAP_FILE", str(memory_path)), \
+                     patch.object(tactic, "MAP_MEMORY_PATH", memory_path):
+                    # Simulate the user clicking clear on the dashboard while
+                    # the tactic process still holds the old RAM memory.
+                    dashboard.clear_remembered_resources()
+                    tactic._save_map_memory(force=True)
+                    saved = json.loads(memory_path.read_text(encoding="utf-8"))
+                    in_memory = set(tactic._resource_memory)
+        finally:
+            tactic._resource_memory.clear()
+            tactic._resource_memory.update(original_memory)
+            tactic._resource_tombstones.clear()
+            tactic._resource_tombstones.update(original_tombstones)
+            tactic._map_dirty = original_dirty
+            tactic._last_dashboard_map_sig = original_sig
+
+        self.assertEqual(saved["resources"], [])
+        self.assertEqual(in_memory, set())
+        self.assertIn(list(stale_resource), saved["forgotten_resources"])
+        self.assertIn(list(keep_resource), saved["forgotten_resources"])
+
+    def test_live_rediscovery_clears_forgotten_entry(self) -> None:
+        pos = (5, 5)
+        original_memory = set(tactic._resource_memory)
+        original_tombstones = set(tactic._resource_tombstones)
+        original_dirty = tactic._map_dirty
+        original_sig = tactic._last_dashboard_map_sig
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                memory_path = Path(temp_dir) / "map_memory.json"
+                memory_path.write_text(json.dumps({
+                    "obstacles": [],
+                    "resources": [],
+                    "manual_resources": [],
+                    "forgotten_resources": [list(pos)],
+                    "enemy_sightings": [],
+                }), encoding="utf-8")
+                tactic._resource_memory.clear()
+                tactic._resource_tombstones.clear()
+                tactic._resource_tombstones.add(pos)
+                tactic._last_dashboard_map_sig = None
+
+                turn = SimpleNamespace(
+                    resource_cells=frozenset({pos}),
+                    events=(),
+                )
+                with patch.object(tactic, "MAP_MEMORY_PATH", memory_path):
+                    tactic._apply_dashboard_map_edits()
+                    # After absorbing the clear, a live sighting relearns it.
+                    tactic._update_resource_memory(turn)
+                    tactic._map_dirty = True
+                    tactic._save_map_memory(force=True)
+                    saved = json.loads(memory_path.read_text(encoding="utf-8"))
+        finally:
+            tactic._resource_memory.clear()
+            tactic._resource_memory.update(original_memory)
+            tactic._resource_tombstones.clear()
+            tactic._resource_tombstones.update(original_tombstones)
+            tactic._map_dirty = original_dirty
+            tactic._last_dashboard_map_sig = original_sig
+
+        self.assertEqual(saved["resources"], [list(pos)])
+        self.assertEqual(saved["forgotten_resources"], [])
 
 
 class ConfiguredPlannerTests(unittest.TestCase):
@@ -432,8 +565,9 @@ class WorkerEnemyEvasionTests(unittest.TestCase):
             self.harvested = True
 
     class Enemy:
-        def __init__(self, position: tuple[int, int]) -> None:
+        def __init__(self, position: tuple[int, int], unit_type: str = "VANGUARD") -> None:
             self.position = position
+            self.unit_type = unit_type
 
     class Core:
         position = (0, 0)
@@ -559,6 +693,62 @@ class WorkerEnemyEvasionTests(unittest.TestCase):
         dx, dy = worker.direction.delta
         npos = (dx, dy)
         self.assertNotIn(npos, {obstacle, enemy})
+
+    def test_hostile_worker_does_not_force_flee(self) -> None:
+        """Enemy Workers cannot attack — cargo should still walk home."""
+        worker = self.Worker((2, 0), cargo=1)
+        config = default_config()
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                self.Core(),
+                resource_cells=frozenset(),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+                enemies=(self.Enemy((3, 0), unit_type="WORKER"),),
+            )
+        finally:
+            self._clear_worker_state()
+
+        self.assertEqual(action, "MOVE")
+        self.assertNotIn("flee", detail)
+        self.assertIn("-> (0, 0)", detail)
+
+    def test_carrying_flee_prefers_homeward_breakout(self) -> None:
+        """A cargo courier next to a Vanguard should not reverse into oscillation."""
+        worker = self.Worker((-221, 336), cargo=1)
+        config = default_config()
+        # Seed A<->B oscillation history: ... left cell, current right-ish cell.
+        uid = str(worker.id)
+        tactic._worker_last_pos[uid] = (-222, 336)
+        tactic._worker_recent[uid] = [(-222, 336), (-221, 336)]
+        core = self.Core()
+        core.position = (-250, 363)
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                core,
+                resource_cells=frozenset(),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+                enemies=(self.Enemy((-220, 336), unit_type="VANGUARD"),),
+            )
+        finally:
+            self._clear_worker_state()
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("flee", detail)
+        dx, dy = worker.direction.delta
+        npos = (-221 + dx, 336 + dy)
+        # Must not reverse back onto the previous cell.
+        self.assertNotEqual(npos, (-222, 336))
+        # Should not get closer to the attacker at (-220,336).
+        self.assertGreaterEqual(
+            tactic._manhattan(npos, (-220, 336)),
+            tactic._manhattan((-221, 336), (-220, 336)),
+        )
 
 
 class CombatTeamPlannerTests(unittest.TestCase):
@@ -1942,6 +2132,167 @@ class HealingPlannerTests(unittest.TestCase):
         config = default_config()
         config["heal_enabled"] = False
         self.assertFalse(tactic._core_should_heal(self._core(hp=3), 2, config))
+
+
+class ManualWaypointTests(unittest.TestCase):
+    """Per-unit manual target coordinates (dashboard ⌖) — march, then resume."""
+
+    class Unit:
+        def __init__(self, name, pos, unit_type, cargo=0):
+            self.id = name
+            self.position = pos
+            self.unit_type = unit_type
+            self.cargo = cargo
+            self.action = None
+            self.arg = None
+
+        def move(self, direction):
+            self.action = "MOVE"
+            self.arg = direction
+
+        def wait(self):
+            self.action = "WAIT"
+
+    class Enemy:
+        def __init__(self, position, unit_type="VANGUARD"):
+            self.position = position
+            self.unit_type = unit_type
+
+    def setUp(self) -> None:
+        self._wp_path = tactic.WAYPOINTS_PATH
+        self._names = dict(tactic._object_names)
+        self._counters = dict(tactic._object_name_counters)
+        self._last_pos = dict(tactic._worker_last_pos)
+        self._recent = {k: list(v) for k, v in tactic._worker_recent.items()}
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        tactic._worker_last_pos.clear()
+        tactic._worker_recent.clear()
+        tactic.turn_context.worker_routes = {}
+        tactic.turn_context.unit_routes = {}
+
+    def tearDown(self) -> None:
+        tactic.WAYPOINTS_PATH = self._wp_path
+        tactic._object_names.clear()
+        tactic._object_names.update(self._names)
+        tactic._object_name_counters.clear()
+        tactic._object_name_counters.update(self._counters)
+        tactic._worker_last_pos.clear()
+        tactic._worker_last_pos.update(self._last_pos)
+        tactic._worker_recent.clear()
+        tactic._worker_recent.update(self._recent)
+        tactic.turn_context.worker_routes = {}
+        tactic.turn_context.unit_routes = {}
+
+    def _plan(self, unit, name, wp, **overrides):
+        kwargs = dict(
+            config=default_config(),
+            obstacle_cells=frozenset(),
+            occupied=frozenset(),
+            enemies=(),
+            core_pos=(0, 0),
+        )
+        kwargs.update(overrides)
+        return tactic._plan_waypoint(unit, name, wp, **kwargs)
+
+    def test_march_toward_target(self) -> None:
+        unit = self.Unit("w1", (0, 0), UnitType.WORKER)
+        action, detail = self._plan(unit, "W1", (5, 0))
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(unit.arg.name, "RIGHT")
+        self.assertIn("waypoint", detail)
+
+    def test_reach_clears_waypoint_only_for_that_unit(self) -> None:
+        unit = self.Unit("w1", (5, 0), UnitType.WORKER)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "waypoints.json"
+            with patch.object(tactic, "WAYPOINTS_PATH", path):
+                tactic._write_waypoints({"W1": (5, 0), "V2": (1, 1)})
+                action, detail = self._plan(unit, "W1", (5, 0))
+                remaining = tactic._load_waypoints()
+        self.assertEqual(action, "WAIT")
+        self.assertIn("waypoint-reached", detail)
+        self.assertNotIn("W1", remaining)
+        self.assertIn("V2", remaining)
+
+    def test_worker_evades_enemy_while_marching(self) -> None:
+        unit = self.Unit("w1", (0, 0), UnitType.WORKER)
+        enemy = self.Enemy((1, 0))
+        action, detail = self._plan(unit, "W1", (9, 0), enemies=(enemy,))
+        self.assertEqual(action, "MOVE")
+        self.assertIn("flee", detail)
+
+    def test_vanguard_marches_without_firing(self) -> None:
+        unit = self.Unit("v1", (0, 0), UnitType.VANGUARD)
+        enemy = self.Enemy((1, 1))
+        action, detail = self._plan(unit, "V1", (4, 4), enemies=(enemy,))
+        self.assertEqual(action, "MOVE")
+        self.assertIn("waypoint", detail)
+
+    def test_blocked_waits_and_keeps_target(self) -> None:
+        unit = self.Unit("r1", (0, 0), UnitType.RANGER)
+        obstacles = frozenset({(1, 0), (-1, 0), (0, 1), (0, -1)})
+        action, detail = self._plan(
+            unit, "R1", (5, 0), obstacle_cells=obstacles,
+        )
+        self.assertEqual(action, "WAIT")
+        self.assertIn("waypoint-blocked", detail)
+
+    def test_prune_removes_dead_unit_targets(self) -> None:
+        targets = {"W1": (1, 1), "V2": (2, 2), "R3": (3, 3)}
+        changed = tactic._prune_waypoint_targets(targets, {"W1", "V2"})
+        self.assertTrue(changed)
+        self.assertEqual(targets, {"W1": (1, 1), "V2": (2, 2)})
+        self.assertFalse(tactic._prune_waypoint_targets(targets, {"W1", "V2"}))
+
+    def test_load_write_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "waypoints.json"
+            with patch.object(tactic, "WAYPOINTS_PATH", path):
+                tactic._write_waypoints({"W1": (10, -20), "R3": (-5, 8)})
+                loaded = tactic._load_waypoints()
+        self.assertEqual(loaded, {"W1": (10, -20), "R3": (-5, 8)})
+
+
+class DashboardWaypointTests(unittest.TestCase):
+    def test_set_remove_clear_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wp_file = Path(temp_dir) / "waypoints.json"
+            with patch.object(dashboard, "WAYPOINTS_FILE", str(wp_file)):
+                self.assertTrue(dashboard.set_waypoint("W3", 10, 20)["ok"])
+                self.assertEqual(dashboard.load_waypoints(), {"W3": [10, 20]})
+                self.assertTrue(dashboard.remove_waypoint("W3")["ok"])
+                self.assertEqual(dashboard.load_waypoints(), {})
+                self.assertFalse(dashboard.remove_waypoint("W3")["ok"])
+                self.assertTrue(dashboard.set_waypoint("V2", -5, 8)["ok"])
+                self.assertTrue(dashboard.clear_waypoints()["ok"])
+                self.assertEqual(dashboard.load_waypoints(), {})
+
+    def test_render_waypoints_panel_controls(self) -> None:
+        html = dashboard.render_waypoints_panel(
+            {"W3": [10, 20]}, workers=["W3"], vanguards=["V2"], rangers=[],
+        )
+        self.assertIn('id="waypointPanel"', html)
+        self.assertIn('id="wpName"', html)
+        self.assertIn('<option value="W3">W3（工人）</option>', html)
+        self.assertIn('<option value="V2">V2（先锋）</option>', html)
+        self.assertIn('id="wpX"', html)
+        self.assertIn('id="wpY"', html)
+        self.assertIn('id="pickWpBtn"', html)
+        self.assertIn('id="wpSetBtn"', html)
+        self.assertIn('id="wpClearBtn"', html)
+        self.assertIn("W3 → (10, 20)", html)
+        self.assertIn('data-wp-remove="W3"', html)
+
+    def test_svg_draws_waypoint_marker(self) -> None:
+        rec = {
+            "core_pos": [0, 0],
+            "workers": [], "vanguards": [], "rangers": [], "enemies": [],
+            "resource_cells": [],
+        }
+        memory = {"obstacles": [], "resources": []}
+        svg = dashboard.render_svg(rec, memory, waypoints={"W3": [0, 0]})
+        self.assertIn("W3→(0,0)", svg)
 
 
 if __name__ == "__main__":

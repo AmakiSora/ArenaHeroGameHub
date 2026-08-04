@@ -28,6 +28,7 @@ def _data_path(name: str) -> str:
 
 LOG_FILE = _data_path("tactic_log.jsonl")
 MAP_FILE = _data_path("map_memory.json")
+WAYPOINTS_FILE = _data_path("waypoints.json")
 HOST = "0.0.0.0"
 PORT = 4399
 
@@ -81,62 +82,79 @@ def read_history(ticks: int = 40):
 
 
 
-def load_map_memory():
+def _read_map_file() -> dict:
+    """Load raw map_memory.json, or an empty structure when missing/invalid."""
     empty = {
         "obstacles": [],
         "resources": [],
         "manual_resources": [],
+        "forgotten_resources": [],
         "enemy_sightings": [],
         "obstacle_count": 0,
         "resource_count": 0,
         "manual_count": 0,
+        "enemy_sighting_count": 0,
+        "enemy_clear_seq": 0,
     }
     if not os.path.exists(MAP_FILE):
         return empty
     try:
         with open(MAP_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        resources = [tuple(p) for p in d.get("resources", []) if len(p) == 2]
-        manual = [tuple(p) for p in d.get("manual_resources", []) if len(p) == 2]
-        all_res = sorted(set(resources) | set(manual))
-        return {
-            "obstacles": [tuple(p) for p in d.get("obstacles", []) if len(p) == 2],
-            "resources": all_res,
-            "manual_resources": manual,
-            "enemy_sightings": [tuple(p) for p in d.get("enemy_sightings", []) if len(p) == 2],
-            "obstacle_count": d.get("obstacle_count", len(d.get("obstacles", []))),
-            "resource_count": len(all_res),
-            "manual_count": len(manual),
-            "updated_tick": d.get("updated_tick"),
-        }
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            empty.update(loaded)
+        return empty
     except Exception:
         return empty
 
 
+def _write_map_file(payload: dict) -> None:
+    """Atomically replace map_memory.json."""
+    tmp = MAP_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp, MAP_FILE)
+
+
+def _coord_set(raw) -> set[tuple[int, int]]:
+    out: set[tuple[int, int]] = set()
+    for item in raw or []:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            out.add((int(item[0]), int(item[1])))
+    return out
+
+
+def load_map_memory():
+    d = _read_map_file()
+    forgotten = _coord_set(d.get("forgotten_resources"))
+    resources = _coord_set(d.get("resources")) - forgotten
+    manual = _coord_set(d.get("manual_resources")) - forgotten
+    all_res = sorted(resources | manual)
+    return {
+        "obstacles": sorted(_coord_set(d.get("obstacles"))),
+        "resources": all_res,
+        "manual_resources": sorted(manual),
+        "forgotten_resources": sorted(forgotten),
+        "enemy_sightings": sorted(_coord_set(d.get("enemy_sightings"))),
+        "obstacle_count": d.get("obstacle_count", len(d.get("obstacles", []) or [])),
+        "resource_count": len(all_res),
+        "manual_count": len(manual),
+        "enemy_clear_seq": int(d.get("enemy_clear_seq", 0) or 0),
+        "updated_tick": d.get("updated_tick"),
+    }
+
+
 def save_manual_resource(x: int, y: int) -> dict:
     """Add a manually entered resource into map_memory.json."""
-    data: dict = {
-        "obstacles": [],
-        "resources": [],
-        "manual_resources": [],
-        "obstacle_count": 0,
-        "resource_count": 0,
-        "manual_count": 0,
-    }
-    if os.path.exists(MAP_FILE):
-        try:
-            with open(MAP_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    data.update(loaded)
-        except Exception:
-            pass
-
+    data = _read_map_file()
     pos = (int(x), int(y))
-    resources = {tuple(p) for p in data.get("resources", []) if len(p) == 2}
-    manual = {tuple(p) for p in data.get("manual_resources", []) if len(p) == 2}
+    resources = _coord_set(data.get("resources"))
+    manual = _coord_set(data.get("manual_resources"))
+    forgotten = _coord_set(data.get("forgotten_resources"))
     resources.add(pos)
     manual.add(pos)
+    # Re-adding from the dashboard revives a previously cleared coordinate.
+    forgotten.discard(pos)
 
     payload = {
         "updated_tick": data.get("updated_tick"),
@@ -144,15 +162,18 @@ def save_manual_resource(x: int, y: int) -> dict:
         "obstacles": data.get("obstacles", []),
         "resources": [list(p) for p in sorted(resources)],
         "manual_resources": [list(p) for p in sorted(manual)],
-        "obstacle_count": data.get("obstacle_count", len(data.get("obstacles", []))),
+        "forgotten_resources": [list(p) for p in sorted(forgotten)],
+        "enemy_sightings": data.get("enemy_sightings", []),
+        "obstacle_count": data.get("obstacle_count", len(data.get("obstacles", []) or [])),
         "resource_count": len(resources),
         "manual_count": len(manual),
+        "enemy_sighting_count": data.get(
+            "enemy_sighting_count", len(data.get("enemy_sightings", []) or [])
+        ),
+        "enemy_clear_seq": int(data.get("enemy_clear_seq", 0) or 0),
         "source": "dashboard-manual",
     }
-    tmp = MAP_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-    os.replace(tmp, MAP_FILE)
+    _write_map_file(payload)
     return {
         "ok": True,
         "pos": [pos[0], pos[1]],
@@ -162,36 +183,169 @@ def save_manual_resource(x: int, y: int) -> dict:
 
 
 def remove_manual_resource(x: int, y: int) -> dict:
+    """Forget one remembered resource and sticky-tombstone it for the tactic process."""
+    data = _read_map_file()
     pos = (int(x), int(y))
-    if not os.path.exists(MAP_FILE):
-        return {"ok": False, "error": "no map file"}
-    with open(MAP_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    resources = {tuple(p) for p in data.get("resources", []) if len(p) == 2}
-    manual = {tuple(p) for p in data.get("manual_resources", []) if len(p) == 2}
+    resources = _coord_set(data.get("resources"))
+    manual = _coord_set(data.get("manual_resources"))
+    forgotten = _coord_set(data.get("forgotten_resources"))
     resources.discard(pos)
     manual.discard(pos)
+    forgotten.add(pos)
     payload = {
         "updated_tick": data.get("updated_tick"),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "obstacles": data.get("obstacles", []),
         "resources": [list(p) for p in sorted(resources)],
         "manual_resources": [list(p) for p in sorted(manual)],
-        "obstacle_count": data.get("obstacle_count", len(data.get("obstacles", []))),
+        "forgotten_resources": [list(p) for p in sorted(forgotten)],
+        "enemy_sightings": data.get("enemy_sightings", []),
+        "obstacle_count": data.get("obstacle_count", len(data.get("obstacles", []) or [])),
         "resource_count": len(resources),
         "manual_count": len(manual),
+        "enemy_sighting_count": data.get(
+            "enemy_sighting_count", len(data.get("enemy_sightings", []) or [])
+        ),
+        "enemy_clear_seq": int(data.get("enemy_clear_seq", 0) or 0),
         "source": "dashboard-manual",
     }
-    tmp = MAP_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-    os.replace(tmp, MAP_FILE)
+    _write_map_file(payload)
     return {
         "ok": True,
         "pos": [pos[0], pos[1]],
         "resource_count": len(resources),
         "manual_count": len(manual),
+        "forgotten_count": len(forgotten),
     }
+
+
+def clear_remembered_resources() -> dict:
+    """Clear all auto + manual resource memory and tombstone every former point."""
+    data = _read_map_file()
+    resources = _coord_set(data.get("resources"))
+    manual = _coord_set(data.get("manual_resources"))
+    forgotten = _coord_set(data.get("forgotten_resources"))
+    forgotten |= resources | manual
+    payload = {
+        "updated_tick": data.get("updated_tick"),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "obstacles": data.get("obstacles", []),
+        "resources": [],
+        "manual_resources": [],
+        "forgotten_resources": [list(p) for p in sorted(forgotten)],
+        "enemy_sightings": data.get("enemy_sightings", []),
+        "obstacle_count": data.get("obstacle_count", len(data.get("obstacles", []) or [])),
+        "resource_count": 0,
+        "manual_count": 0,
+        "enemy_sighting_count": data.get(
+            "enemy_sighting_count", len(data.get("enemy_sightings", []) or [])
+        ),
+        "enemy_clear_seq": int(data.get("enemy_clear_seq", 0) or 0),
+        "source": "dashboard-clear-resources",
+    }
+    _write_map_file(payload)
+    return {
+        "ok": True,
+        "cleared": True,
+        "resource_count": 0,
+        "forgotten_count": len(forgotten),
+    }
+
+
+def clear_enemy_sightings() -> dict:
+    """Clear enemy sightings and bump a seq so the tactic process drops its RAM copy."""
+    data = _read_map_file()
+    seq = int(data.get("enemy_clear_seq", 0) or 0) + 1
+    payload = {
+        "updated_tick": data.get("updated_tick"),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "obstacles": data.get("obstacles", []),
+        "resources": data.get("resources", []),
+        "manual_resources": data.get("manual_resources", []),
+        "forgotten_resources": data.get("forgotten_resources", []),
+        "enemy_sightings": [],
+        "obstacle_count": data.get("obstacle_count", len(data.get("obstacles", []) or [])),
+        "resource_count": data.get("resource_count", len(data.get("resources", []) or [])),
+        "manual_count": data.get("manual_count", len(data.get("manual_resources", []) or [])),
+        "enemy_sighting_count": 0,
+        "enemy_clear_seq": seq,
+        "source": "dashboard-clear-enemies",
+    }
+    _write_map_file(payload)
+    return {"ok": True, "cleared": True, "enemy_clear_seq": seq}
+
+
+# ── manual per-unit waypoints (⌖ map pick) ──────────────────────────────────
+
+def _read_waypoints_file() -> dict:
+    try:
+        with open(WAYPOINTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_waypoints_file(payload: dict) -> None:
+    tmp = WAYPOINTS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+    os.replace(tmp, WAYPOINTS_FILE)
+
+
+def load_waypoints() -> dict[str, list[int]]:
+    """Load manual per-unit targets as {display_name: [x, y]}."""
+    data = _read_waypoints_file()
+    targets = data.get("targets") if isinstance(data, dict) else None
+    out: dict[str, list[int]] = {}
+    if isinstance(targets, dict):
+        for name, pos in targets.items():
+            if (
+                isinstance(name, str)
+                and isinstance(pos, (list, tuple))
+                and len(pos) == 2
+            ):
+                try:
+                    out[name] = [int(pos[0]), int(pos[1])]
+                except (TypeError, ValueError):
+                    continue
+    return out
+
+
+def set_waypoint(name: str, x: int, y: int) -> dict:
+    """Set a manual target for one unit (display-name keyed)."""
+    targets = load_waypoints()
+    targets[name] = [int(x), int(y)]
+    _write_waypoints_file({
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "targets": targets,
+    })
+    return {
+        "ok": True,
+        "name": name,
+        "pos": [int(x), int(y)],
+        "waypoint_count": len(targets),
+    }
+
+
+def remove_waypoint(name: str) -> dict:
+    targets = load_waypoints()
+    if name not in targets:
+        return {"ok": False, "error": "目标不存在"}
+    del targets[name]
+    _write_waypoints_file({
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "targets": targets,
+    })
+    return {"ok": True, "name": name, "waypoint_count": len(targets)}
+
+
+def clear_waypoints() -> dict:
+    _write_waypoints_file({
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "targets": {},
+    })
+    return {"ok": True, "cleared": True, "waypoint_count": 0}
 
 
 TEAM_BOARD_KEYS = ("unassigned", "home", "attack", "guerrilla")
@@ -307,6 +461,13 @@ def collect_combat_units(rec: dict | None = None, config: dict | None = None) ->
     return sorted(by_name.values(), key=sort_key)
 
 
+# Coordinate fields the user can fill by clicking the map. Maps the X field to
+# its paired Y field and the DOM id of the map-pick button (rendered on the X row).
+COORD_PICKER_ROWS = {
+    "core_target_x": ("core_target_y", "pickCoreBtn"),
+}
+
+
 def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) -> str:
     config = load_config(CONFIG_PATH)
     schema = config_schema()
@@ -337,6 +498,11 @@ def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) 
                     f'data-kind="integer" value="{value}" min="{field["minimum"]}" '
                     f'max="{field["maximum"]}" step="{field["step"]}" required>'
                 )
+                if key in COORD_PICKER_ROWS:
+                    control += (
+                        f'<button type="button" class="pick-btn" id="{COORD_PICKER_ROWS[key][1]}" '
+                        f'title="点击地图选择坐标（X 与 Y 一起填入）">⌖</button>'
+                    )
             rows.append(
                 '<div class="config-row">'
                 f'<label for="cfg-{key}">{field["label"]}</label>{control}</div>'
@@ -426,8 +592,10 @@ def render_teams_panel() -> str:
         f'<input id="teamHomeRadius" name="home_patrol_radius" type="number" min="1" max="30" '
         f'step="1" value="{config["home_patrol_radius"]}"></label>'
         '<label>进攻 X'
-        f'<input id="teamAttackX" name="attack_target_x" type="number" min="-500" max="500" '
-        f'step="1" value="{config["attack_target_x"]}"{coords_locked}></label>'
+        f'<span class="coord-input"><input id="teamAttackX" name="attack_target_x" type="number" min="-500" max="500" '
+        f'step="1" value="{config["attack_target_x"]}"{coords_locked}>'
+        '<button type="button" class="pick-btn" id="pickAttackBtn" '
+        'title="点击地图选择进攻坐标（X 与 Y 一起填入）">⌖</button></span></label>'
         '<label>进攻 Y'
         f'<input id="teamAttackY" name="attack_target_y" type="number" min="-500" max="500" '
         f'step="1" value="{config["attack_target_y"]}"{coords_locked}></label>'
@@ -462,6 +630,52 @@ def render_teams_panel() -> str:
         f'{settings}'
         '<div class="teams-message" id="teamsMessage" aria-live="polite">'
         '拖拽单位后自动保存，下个 Tick 生效</div>'
+        '</section>'
+    )
+
+
+def render_waypoints_panel(
+    waypoints: dict[str, list[int]],
+    workers: list[str],
+    vanguards: list[str],
+    rangers: list[str],
+) -> str:
+    """Manual per-unit target panel: list current, add one for a live unit."""
+    def _opts(label: str, names: list[str]) -> str:
+        return "".join(
+            f'<option value="{n}">{n}（{label}）</option>' for n in names
+        )
+
+    options = _opts("工人", workers) + _opts("先锋", vanguards) + _opts("游侠", rangers)
+    if not options:
+        options = '<option value="" disabled>暂无存活单位</option>'
+
+    if waypoints:
+        chips = "".join(
+            f'<span class="chip removable wp-chip">{name} → ({x}, {y})'
+            f'<button type="button" class="chip-x" data-wp-remove="{name}" '
+            f'aria-label="删除 {name}" title="删除">×</button></span>'
+            for name, (x, y) in sorted(waypoints.items())
+        )
+        list_html = f'<div class="wp-list">{chips}</div>'
+    else:
+        list_html = '<div class="muted">暂无手动目标 · 单位到达后自动清除</div>'
+
+    return (
+        '<section class="panel waypoint-panel" id="waypointPanel">'
+        '<div class="panel-title"><span>手动目标</span>'
+        f'<span class="count" id="waypointCount">{len(waypoints)} 个</span></div>'
+        f'{list_html}'
+        '<div class="wp-add">'
+        f'<select id="wpName" title="选择单位"><option value="">选择单位…</option>{options}</select>'
+        '<input id="wpX" type="number" step="1" min="-500" max="500" placeholder="X" required>'
+        '<input id="wpY" type="number" step="1" min="-500" max="500" placeholder="Y" required>'
+        '<button type="button" class="pick-btn" id="pickWpBtn" '
+        'title="点击地图选择坐标（X 与 Y 一起填入）">⌖</button>'
+        '<button type="button" id="wpSetBtn">设置目标</button>'
+        '<button type="button" class="secondary" id="wpClearBtn">清空</button>'
+        '</div>'
+        '<div class="wp-msg" id="wpMsg">到达目标后自动恢复程序行动</div>'
         '</section>'
     )
 
@@ -543,7 +757,12 @@ def _collect_points(rec, mm):
     return pts
 
 
-def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
+def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
+               config: dict | None = None, waypoints: dict | None = None):
+    if config is None:
+        config = load_config(CONFIG_PATH)
+    if waypoints is None:
+        waypoints = load_waypoints()
     pts = _collect_points(rec, mm)
     core = rec.get("core_pos")
     if not pts:
@@ -733,6 +952,47 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4):
         a(f'<text x="{bcx}" y="{bcy+3.5}" text-anchor="middle" font-size="9" '
           f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#5c4300">★</text>')
 
+    # Configured strategy points — the same coordinates the map-pick buttons
+    # fill. Drawing them makes the map double as a coordinate reference.
+    def _config_marker(x, y, color, prefix):
+        if not (xmin <= x <= xmax and ymin <= y <= ymax):
+            return
+        px, py = to_xy(x, y)
+        cx, cy = px + cell / 2, py + cell / 2
+        label = f"{prefix}({x},{y})"
+        w = 6.5 * len(label) + 12
+        a(f'<circle cx="{cx}" cy="{cy}" r="9" fill="none" stroke="{color}" '
+          f'stroke-width="1.6" stroke-dasharray="4 3" opacity="0.9"/>')
+        a(f'<circle cx="{cx}" cy="{cy}" r="2.4" fill="{color}"/>')
+        a(f'<rect x="{cx + 8}" y="{cy - 12}" width="{w:.0f}" height="16" rx="8" '
+          f'fill="#0b1222" stroke="{color}" stroke-opacity="0.55" stroke-width="1"/>')
+        a(f'<text x="{cx + 8 + w / 2:.0f}" y="{cy + 0.5}" text-anchor="middle" '
+          f'font-size="10" fill="{color}" font-family="Consolas, monospace">{label}</text>')
+
+    if str(config.get("attack_mode", "coords")) == "coords":
+        _config_marker(int(config.get("attack_target_x", 0)),
+                       int(config.get("attack_target_y", 0)), "#ff8c42", "攻")
+    if bool(config.get("core_target_enabled", False)):
+        _config_marker(int(config.get("core_target_x", 0)),
+                       int(config.get("core_target_y", 0)), "#6ea8ff", "核")
+
+    # Manual per-unit targets (dashboard ⌖). One marker per targeted unit.
+    for name, wp in sorted(waypoints.items()):
+        x, y = int(wp[0]), int(wp[1])
+        if not (xmin <= x <= xmax and ymin <= y <= ymax):
+            continue
+        px, py = to_xy(x, y)
+        cx, cy = px + cell / 2, py + cell / 2
+        label = f"{name}→({x},{y})"
+        w = 6.5 * len(label) + 12
+        a(f'<circle cx="{cx}" cy="{cy}" r="9" fill="none" stroke="#3dd6c9" '
+          f'stroke-width="1.6" stroke-dasharray="4 3" opacity="0.9"/>')
+        a(f'<circle cx="{cx}" cy="{cy}" r="2.4" fill="#3dd6c9"/>')
+        a(f'<rect x="{cx + 8}" y="{cy - 12}" width="{w:.0f}" height="16" rx="8" '
+          f'fill="#0b1222" stroke="#3dd6c9" stroke-opacity="0.55" stroke-width="1"/>')
+        a(f'<text x="{cx + 8 + w / 2:.0f}" y="{cy + 0.5}" text-anchor="middle" '
+          f'font-size="10" fill="#3dd6c9" font-family="Consolas, monospace">{label}</text>')
+
     for x in range(xmin, xmax + 1):
         if x % step == 0:
             px, _ = to_xy(x, ymin)
@@ -850,6 +1110,9 @@ body{margin:0;min-height:100vh;color:var(--text);
 .map-toolbar button:hover{background:rgba(110,168,255,.16);border-color:rgba(110,168,255,.28)}
 .map-toolbar .hint{color:var(--muted);font-size:12px}
 .map-toolbar #zoomLabel{min-width:52px;color:#c7dbff;font-family:Consolas,monospace;font-size:12px}
+.map-toolbar .coord-readout{min-width:92px;color:#8ef0c4;font:12px Consolas,monospace;padding:4px 10px;border-radius:999px;background:rgba(87,214,163,.10);border:1px solid rgba(87,214,163,.22)}
+.map-stage.picking{cursor:crosshair}
+.map-stage.picking .game-map{cursor:crosshair}
 .map-legend{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .map-legend span{font-size:11px;color:var(--muted);padding:4px 8px;border-radius:999px;
  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);display:inline-flex;align-items:center;gap:6px}
@@ -865,6 +1128,9 @@ body{margin:0;min-height:100vh;color:var(--text);
 .map-legend .dot.ore-mem{background:#c9a227;color:#c9a227;opacity:.8}
 .map-legend .route-line{width:18px;height:0;border-top:2px solid #63d8ff;box-shadow:none;border-radius:0}
 .map-legend .target-ring{width:10px;height:10px;border:2px solid #63d8ff;background:transparent;box-shadow:none}
+.map-legend .dot.attack-target{width:10px;height:10px;border:2px dashed #ff8c42;background:transparent;box-shadow:none;border-radius:0}
+.map-legend .dot.core-target{width:10px;height:10px;border:2px dashed #6ea8ff;background:transparent;box-shadow:none;border-radius:0}
+.map-legend .dot.wp{width:10px;height:10px;border:2px dashed #3dd6c9;background:transparent;box-shadow:none;border-radius:0}
 
 .main-grid{display:grid;grid-template-columns:280px minmax(0,1fr) 320px;gap:14px;align-items:start}
 .side-col{display:grid;gap:12px;min-width:0}
@@ -896,6 +1162,24 @@ body{margin:0;min-height:100vh;color:var(--text);
 .config-row>label{color:var(--muted);font-size:12px;line-height:1.35}
 .config-row>input[type=number]{width:112px;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:6px;background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
 .config-row>input[type=number]:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
+.pick-btn{appearance:none;border:1px solid rgba(110,168,255,.35);border-radius:8px;background:rgba(110,168,255,.10);color:#a9c8ff;width:26px;height:26px;font-size:13px;line-height:1;cursor:pointer;display:grid;place-items:center;padding:0;transition:.12s;flex:0 0 auto}
+.pick-btn:hover{background:rgba(110,168,255,.28);border-color:rgba(110,168,255,.6);color:#fff}
+.pick-btn.active{background:#285b8f;border-color:#6ea8ff;color:#fff;box-shadow:0 0 0 2px rgba(110,168,255,.25)}
+.pick-btn:disabled{opacity:.4;cursor:not-allowed}
+.team-settings .coord-input{display:flex;gap:6px;align-items:center;min-width:0}
+.team-settings .coord-input input{flex:1;min-width:0;width:auto}
+.res-add-form button.ore-pick-btn{grid-column:1/-1;justify-self:start;width:auto;height:28px;padding:0 12px;font-size:11px;font-family:inherit;display:inline-flex;align-items:center;gap:4px;background:rgba(110,168,255,.10);border-color:rgba(110,168,255,.35);color:#a9c8ff}
+.res-add-form button.ore-pick-btn:hover{background:rgba(110,168,255,.28);border-color:rgba(110,168,255,.6);color:#fff}
+.wp-list{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+.wp-chip{background:rgba(61,214,201,.10);border-color:rgba(61,214,201,.22);color:#7fe8dd}
+.wp-add{display:grid;grid-template-columns:1fr 56px 56px 28px auto auto;gap:8px;align-items:center;margin-top:4px}
+.wp-add select,.wp-add input{width:100%;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#0b1222;color:var(--text);font:12px Consolas,monospace;outline:none;min-width:0}
+.wp-add select:focus,.wp-add input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
+.wp-add button:not(.pick-btn){border:1px solid rgba(61,214,201,.35);border-radius:999px;padding:7px 11px;background:rgba(61,214,201,.12);color:#bff5ec;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap}
+.wp-add button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}
+.wp-add button:not(.pick-btn):hover{border-color:rgba(61,214,201,.6);color:#fff}
+.wp-msg{min-height:15px;margin-top:8px;color:var(--muted);font-size:11px}
+.wp-msg.ok{color:#8ef0c4}
 .teams-panel{margin-top:0;overflow:hidden}
 .teams-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px;padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:
   radial-gradient(circle at 12% 20%, rgba(87,214,163,.18), transparent 42%),
@@ -1021,6 +1305,24 @@ JS = r"""
   let teamsUnits = [];
   let teamsConfig = null;
   let dragUnitName = null;
+  let pickMode = null;
+  let downX = 0, downY = 0, moved = false;
+
+  const PICK_TARGETS = {
+    attack: {xId: 'teamAttackX', yId: 'teamAttackY'},
+    core:   {xId: 'cfg-core_target_x', yId: 'cfg-core_target_y'},
+    ore:    {xId: 'oreX', yId: 'oreY'},
+    wp:     {xId: 'wpX', yId: 'wpY'},
+  };
+  const PICK_BUTTONS = {
+    pickAttackBtn: 'attack',
+    pickCoreBtn:   'core',
+    pickOreBtn:    'ore',
+    pickWpBtn:     'wp',
+  };
+  const PICK_LABELS = {
+    attack: '进攻目标', core: '核心目标', ore: '矿点', wp: '手动目标',
+  };
 
   function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
 
@@ -1111,6 +1413,106 @@ JS = r"""
     return svgToWorld(meta, px, py);
   }
 
+  function pixelToSvgLocal(clientX, clientY){
+    const r = stage.getBoundingClientRect();
+    return [
+      (clientX - r.left - (view._x || 0)) / view.scale,
+      (clientY - r.top - (view._y || 0)) / view.scale,
+    ];
+  }
+
+  function setCoordLabel(text){
+    const label = document.getElementById('mapCoordLabel');
+    if(label) label.textContent = text;
+  }
+
+  function updateCoordReadout(clientX, clientY){
+    if(!svg || !view || !stage) return;
+    const meta = readSvgMeta(svg);
+    const p = pixelToSvgLocal(clientX, clientY);
+    if(p[0] < 0 || p[1] < 0 || p[0] > meta.width || p[1] > meta.height){
+      setCoordLabel(pickMode ? '拾取：移入地图点选' : '坐标 —');
+      return;
+    }
+    const w = svgToWorld(meta, p[0], p[1]);
+    const x = Math.round(w[0]), y = Math.round(w[1]);
+    setCoordLabel((pickMode ? '拾取 (' : '坐标 (') + x + ', ' + y + ')');
+  }
+
+  function resetCoordReadout(){
+    if(pickMode) setCoordLabel('拾取：点击地图选择「' + PICK_LABELS[pickMode] + '」，Esc 取消');
+    else setCoordLabel('坐标 —');
+  }
+
+  function setPickMode(mode){
+    pickMode = mode;
+    const stageEl = document.getElementById('mapStage');
+    if(stageEl) stageEl.classList.toggle('picking', !!mode);
+    Object.keys(PICK_BUTTONS).forEach(function(id){
+      const btn = document.getElementById(id);
+      if(btn) btn.classList.toggle('active', !!mode && PICK_BUTTONS[id] === mode);
+    });
+    if(mode) setCoordLabel('拾取：点击地图选择「' + PICK_LABELS[mode] + '」，Esc 取消');
+    else resetCoordReadout();
+  }
+
+  function applyPick(world){
+    if(!pickMode) return;
+    const t = PICK_TARGETS[pickMode];
+    const xEl = document.getElementById(t.xId);
+    const yEl = document.getElementById(t.yId);
+    if(!xEl || !yEl) return;
+    const fit = function(el, v){
+      const lo = el.min === '' ? -Infinity : Number(el.min);
+      const hi = el.max === '' ? Infinity : Number(el.max);
+      return clamp(Math.round(v), lo, hi);
+    };
+    xEl.value = String(fit(xEl, world[0]));
+    yEl.value = String(fit(yEl, world[1]));
+    const picked = xEl.value + ', ' + yEl.value;
+    setPickMode(null);
+    setCoordLabel('已拾取 (' + picked + ')');
+    // One bubbled event pair marks the owning form dirty / triggers auto-save.
+    xEl.dispatchEvent(new Event('input', {bubbles:true}));
+    xEl.dispatchEvent(new Event('change', {bubbles:true}));
+    setTimeout(function(){
+      if(!pickMode) setCoordLabel('坐标 —');
+    }, 1800);
+  }
+
+  function handleStageClick(clientX, clientY){
+    if(!pickMode || !svg) return;
+    const meta = readSvgMeta(svg);
+    const p = pixelToSvgLocal(clientX, clientY);
+    if(p[0] < 0 || p[1] < 0 || p[0] > meta.width || p[1] > meta.height){
+      setCoordLabel('拾取：请在地图范围内点击');
+      return;
+    }
+    applyPick(svgToWorld(meta, p[0], p[1]));
+  }
+
+  function bindPickButton(id){
+    const btn = document.getElementById(id);
+    if(!btn || btn._bound) return;
+    btn._bound = true;
+    btn.onclick = function(e){
+      e.preventDefault();
+      e.stopPropagation();
+      const mode = PICK_BUTTONS[id];
+      setPickMode(pickMode === mode ? null : mode);
+    };
+  }
+
+  function bindPickButtons(){
+    Object.keys(PICK_BUTTONS).forEach(bindPickButton);
+  }
+
+  function syncPickButtonsDisabled(){
+    const modeEl = document.querySelector('input[name="attack_mode"]:checked');
+    const btn = document.getElementById('pickAttackBtn');
+    if(btn) btn.disabled = !!(modeEl && modeEl.value !== 'coords');
+  }
+
   function zoomAt(clientX, clientY, nextScale){
     const before = pixelToWorldUnder(clientX, clientY);
     view.scale = clamp(nextScale, 0.1, 6);
@@ -1129,12 +1531,16 @@ JS = r"""
 
     stage.onpointerdown = function(e){
       if(e.button !== 0) return;
-      drag = true; lx = e.clientX; ly = e.clientY;
+      drag = true; moved = false;
+      downX = e.clientX; downY = e.clientY;
+      lx = e.clientX; ly = e.clientY;
       try { stage.setPointerCapture(e.pointerId); } catch(err){}
       svg.classList.add('dragging');
     };
     stage.onpointermove = function(e){
+      updateCoordReadout(e.clientX, e.clientY);
       if(!drag) return;
+      if(Math.hypot(e.clientX - downX, e.clientY - downY) > 5) moved = true;
       const dx = e.clientX - lx, dy = e.clientY - ly;
       lx = e.clientX; ly = e.clientY;
       const meta = readSvgMeta(svg);
@@ -1142,14 +1548,22 @@ JS = r"""
       view.worldY -= dy / (view.scale * meta.cell);
       apply();
     };
-    function endDrag(e){
+    stage.onpointerup = function(e){
       if(!drag) return;
       drag = false;
       if(svg) svg.classList.remove('dragging');
       try { stage.releasePointerCapture(e.pointerId); } catch(err){}
-    }
-    stage.onpointerup = endDrag;
-    stage.onpointercancel = endDrag;
+      if(!moved) handleStageClick(e.clientX, e.clientY);
+    };
+    stage.onpointercancel = function(e){
+      if(!drag) return;
+      drag = false;
+      if(svg) svg.classList.remove('dragging');
+      try { stage.releasePointerCapture(e.pointerId); } catch(err){}
+    };
+    stage.onpointerleave = function(){
+      if(!drag) resetCoordReadout();
+    };
 
     const zi = document.getElementById('zoomInBtn');
     const zo = document.getElementById('zoomOutBtn');
@@ -1207,6 +1621,7 @@ JS = r"""
       if(data.vgHtml) setHtml('#vgGrid', data.vgHtml);
       if(data.rgHtml) setHtml('#rgGrid', data.rgHtml);
       if(data.resHtml){ setHtml('#resSection', data.resHtml); bindOreForm(); }
+      if(data.waypointHtml){ setHtml('#waypointSection', data.waypointHtml); bindWaypointPanel(); }
       if(data.enemyHtml){ setHtml('#enemySection', data.enemyHtml); }
       if(data.eventsHtml) setHtml('#eventsSection', data.eventsHtml);
       if(data.mapTitle) setHtml('#mapTitleCount', data.mapTitle);
@@ -1255,6 +1670,21 @@ JS = r"""
           const res = await fetch('/api/enemy/clear', {method:'POST'});
           const data = await res.json();
           if(data.ok) refresh();
+        }catch(e){}
+      });
+    }
+    const clearResourceBtn = document.getElementById('clearResourceBtn');
+    if(clearResourceBtn && !clearResourceBtn._bound){
+      clearResourceBtn._bound = true;
+      clearResourceBtn.addEventListener('click', async function(){
+        if(!confirm('确定清除全部记忆矿点？旧坐标会被屏蔽，直到重新看见或手动录入。')) return;
+        try{
+          const res = await fetch('/api/resource/clear', {method:'POST'});
+          const data = await res.json();
+          if(data.ok){
+            lastTick = null;
+            softRefresh();
+          }
         }catch(e){}
       });
     }
@@ -1343,6 +1773,96 @@ JS = r"""
           const x = Number(btn.dataset.removeX);
           const y = Number(btn.dataset.removeY);
           postOre('/api/resource/remove', x, y);
+        };
+      });
+    }
+    const orePickBtn = document.getElementById('pickOreBtn');
+    if(orePickBtn) bindPickButton('pickOreBtn');
+  }
+
+  function bindWaypointPanel(){
+    // Manual per-unit targets: add / remove / clear + ⌖ map pick. Idempotent;
+    // re-called after each soft refresh re-renders the panel.
+    const panel = document.getElementById('waypointPanel');
+    if(!panel) return;
+    bindPickButton('pickWpBtn');
+
+    function msg(text, kind){
+      const m = document.getElementById('wpMsg');
+      if(m){ m.textContent = text || ''; m.className = 'wp-msg' + (kind ? ' ' + kind : ''); }
+    }
+
+    const setBtn = document.getElementById('wpSetBtn');
+    if(setBtn && !setBtn._bound){
+      setBtn._bound = true;
+      setBtn.onclick = async function(){
+        const nameEl = document.getElementById('wpName');
+        const xEl = document.getElementById('wpX');
+        const yEl = document.getElementById('wpY');
+        const name = ((nameEl && nameEl.value) || '').trim();
+        const x = Number(xEl && xEl.value);
+        const y = Number(yEl && yEl.value);
+        if(!name){ msg('请先选择单位', 'err'); return; }
+        if(!Number.isFinite(x) || !Number.isFinite(y)){
+          msg('请输入有效整数坐标', 'err');
+          return;
+        }
+        try{
+          const res = await fetch('/api/waypoint/set', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({name:name, x:Math.trunc(x), y:Math.trunc(y)})
+          });
+          const data = await res.json();
+          if(!res.ok || !data.ok){
+            msg((data && data.error) || '设置失败', 'err');
+            return;
+          }
+          msg(name + ' → (' + data.pos[0] + ', ' + data.pos[1] + ') 已设置', 'ok');
+          if(xEl) xEl.value = '';
+          if(yEl) yEl.value = '';
+          lastTick = null;
+          softRefresh();
+        }catch(e){ msg('网络错误', 'err'); }
+      };
+    }
+
+    const clearBtn = document.getElementById('wpClearBtn');
+    if(clearBtn && !clearBtn._bound){
+      clearBtn._bound = true;
+      clearBtn.onclick = async function(){
+        if(!confirm('确定清空全部手动目标？')) return;
+        try{
+          const res = await fetch('/api/waypoint/clear', {method:'POST'});
+          const data = await res.json();
+          if(data.ok){
+            msg('已清空全部手动目标', 'ok');
+            lastTick = null;
+            softRefresh();
+          }
+        }catch(e){}
+      };
+    }
+
+    if(panel){
+      panel.querySelectorAll('button[data-wp-remove]').forEach(function(btn){
+        if(btn.dataset.bound === '1') return;
+        btn.dataset.bound = '1';
+        btn.onclick = async function(){
+          const name = btn.dataset.wpRemove;
+          try{
+            const res = await fetch('/api/waypoint/remove', {
+              method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body: JSON.stringify({name:name})
+            });
+            const data = await res.json();
+            if(data.ok){
+              msg(name + ' 已清除', 'ok');
+              lastTick = null;
+              softRefresh();
+            }
+          }catch(e){}
         };
       });
     }
@@ -1462,6 +1982,8 @@ JS = r"""
       const el = document.getElementById(id);
       if(el) el.disabled = (mode !== 'coords');
     });
+    syncPickButtonsDisabled();
+    if(mode !== 'coords' && pickMode === 'attack') setPickMode(null);
   }
 
   function applyTeamSettings(config){
@@ -1763,11 +2285,17 @@ JS = r"""
   bindOreForm();
   bindConfigForm();
   bindTeamsBoard();
+  bindWaypointPanel();
   loadTeams(true);
   ensureView();
   bindStage();
+  bindPickButtons();
+  syncPickButtonsDisabled();
   apply();
   window.addEventListener('resize', function(){ apply(); });
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape' && pickMode) setPickMode(null);
+  });
   if(stage){
     stage.addEventListener('wheel', function(e){
       e.preventDefault();
@@ -1806,7 +2334,8 @@ def build_parts():
     enemies = rec.get("visible_enemies", 0)
     rcells = rec.get("resource_cells", [])
     mm = load_map_memory()
-    svg = render_svg(rec, mm)
+    waypoints = load_waypoints()
+    svg = render_svg(rec, mm, waypoints=waypoints)
     events = (rec.get("events", []) or [])[:8]
     running = age < 30
     status_cls = "ok" if running else "down"
@@ -1900,6 +2429,10 @@ def build_parts():
     vg_html = "".join(ucard(v, "combat") for v in vgs) or '<div class="empty">暂无先锋</div>'
     rg_html = "".join(ucard(r, "combat") for r in rgs) or '<div class="empty">暂无游侠</div>'
     combat_units = collect_combat_units(rec, load_config(CONFIG_PATH))
+    wp_workers = [w.get("name") for w in workers if w.get("name")]
+    wp_vgs = [v.get("name") for v in vgs if v.get("name")]
+    wp_rgs = [r.get("name") for r in rgs if r.get("name")]
+    waypoint_html = render_waypoints_panel(waypoints, wp_workers, wp_vgs, wp_rgs)
 
     if issues:
         items = "".join(
@@ -1947,11 +2480,19 @@ def build_parts():
         res_html += f'<h4>手动录入 <span class="manual-tag">{len(mem_manual)}</span></h4><div class="chip-row">{manual_chips}</div>'
     if not mem_resources:
         res_html += '<h4>记忆矿点</h4><div class="muted">暂无记忆矿点</div>'
+    if mem_resources:
+        res_html += (
+            '<div class="actions" style="margin-top:4px">'
+            '<button type="button" id="clearResourceBtn" class="enemy-clear-btn">清除记忆矿点</button>'
+            '</div>'
+        )
     res_html += (
         '<div class="res-add-form" id="resAddForm">'
         '<div class="row">'
         '<label>X<input id="oreX" name="x" type="number" step="1" placeholder="-30" required></label>'
         '<label>Y<input id="oreY" name="y" type="number" step="1" placeholder="65" required></label>'
+        '<button type="button" class="pick-btn ore-pick-btn" id="pickOreBtn" '
+        'title="点击地图选择矿点坐标（X 与 Y 一起填入）">⌖ 地图点选</button>'
         '</div>'
         '<div class="actions">'
         '<button type="button" id="oreAddBtn">加入记忆</button>'
@@ -2150,6 +2691,7 @@ def build_parts():
         "resHtml": res_html,
         "enemyHtml": enemy_html,
         "eventsHtml": events_html,
+        "waypointHtml": waypoint_html,
         "mapSvg": svg,
         "mapTitle": map_title,
         "footerHtml": footer_html,
@@ -2159,6 +2701,7 @@ def build_parts():
         "resCount": len(rcells),
         "enemyCount": f"{len(ex_sightings)} 处",
         "eventsCount": len(events),
+        "waypointCount": len(waypoints),
         "combatUnits": combat_units,
     }
 
@@ -2201,7 +2744,8 @@ def generate_html() -> str:
         <button type="button" id="resetViewBtn">重置视角</button>
         <button type="button" id="focusCoreBtn">定位核心</button>
         <span id="zoomLabel">100%</span>
-        <span class="hint">拖动 · 滚轮 · 软刷新</span>
+        <span class="coord-readout" id="mapCoordLabel">坐标 —</span>
+        <span class="hint">拖动 · 滚轮 · ⌖点选坐标 · 软刷新</span>
        </div>
        <div class="map-stage" id="mapStage">{parts['mapSvg']}</div>
        <div class="map-legend">
@@ -2216,6 +2760,9 @@ def generate_html() -> str:
         <span><i class="dot ore-mem"></i>记忆矿</span>
         <span><i class="dot route-line"></i>工人路径</span>
         <span><i class="dot target-ring"></i>目标</span>
+        <span><i class="dot attack-target"></i>进攻目标</span>
+        <span><i class="dot core-target"></i>核心目标</span>
+        <span><i class="dot wp"></i>手动目标</span>
        </div>
       </section>
       {render_teams_panel()}
@@ -2236,6 +2783,7 @@ def generate_html() -> str:
         <div class="panel-title"><span>游侠</span><span class="count" id="rgCount">{parts['rgCount']}</span></div>
         <div class="unit-grid" id="rgGrid">{parts['rgHtml']}</div>
       </section>
+      <div id="waypointSection">{parts['waypointHtml']}</div>
       <section class="panel res-panel" id="resPanel">
         <div class="res-head">
           <div class="panel-title" style="margin-bottom:0"><span>矿点</span><span class="count" id="resCount">{parts['resCount']} 可见</span></div>
@@ -2313,6 +2861,9 @@ class Handler(BaseHTTPRequestHandler):
                 "combat_units": collect_combat_units(rec, config),
             })
             return
+        if path == "/api/waypoints":
+            self._send_json(200, {"ok": True, "waypoints": load_waypoints()})
+            return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
@@ -2374,16 +2925,47 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/enemy/clear":
             try:
-                with open(MAP_FILE, "r+", encoding="utf-8") as f:
-                    d = json.load(f)
-                    d["enemy_sightings"] = []
-                    d["enemy_sighting_count"] = 0
-                    f.seek(0)
-                    f.truncate()
-                    json.dump(d, f, ensure_ascii=False, indent=2)
-                self._send_json(200, {"ok": True, "cleared": True})
+                result = clear_enemy_sightings()
+                self._send_json(200, result)
             except Exception as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+
+        if path == "/api/resource/clear":
+            try:
+                result = clear_remembered_resources()
+                self._send_json(200, result)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+
+        if path == "/api/waypoint/set":
+            name = str(data.get("name", "") or "").strip()
+            try:
+                x = int(data.get("x"))
+                y = int(data.get("y"))
+            except Exception:
+                self._send_json(400, {"ok": False, "error": "x/y 必须是整数"})
+                return
+            if not name:
+                self._send_json(400, {"ok": False, "error": "name 不能为空"})
+                return
+            x = max(-500, min(500, x))
+            y = max(-500, min(500, y))
+            self._send_json(200, set_waypoint(name, x, y))
+            return
+
+        if path == "/api/waypoint/remove":
+            name = str(data.get("name", "") or "").strip()
+            if not name:
+                self._send_json(400, {"ok": False, "error": "name 不能为空"})
+                return
+            result = remove_waypoint(name)
+            self._send_json(200 if result.get("ok") else 400, result)
+            return
+
+        if path == "/api/waypoint/clear":
+            self._send_json(200, clear_waypoints())
             return
 
         try:
