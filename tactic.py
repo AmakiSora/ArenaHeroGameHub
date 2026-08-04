@@ -46,6 +46,7 @@ _UNIT_NAME_PREFIX = {
     UnitType.VANGUARD: "V",
     UnitType.RANGER: "R",
 }
+_DIRECTION_BY_NAME = {d.name: d for d in Direction}
 
 # Rotate tactic_log.jsonl when it exceeds this size and keep at most N backups.
 LOG_MAX_BYTES = int(os.environ.get("ARENA_LOG_MAX_MB", "20")) * 1024 * 1024
@@ -836,10 +837,17 @@ def _plan_waypoint(
     except workers keep the enemy-evasion rule so a manual trip cannot get them
     killed. Reaching the target deletes the waypoint; the next Tick the unit
     falls back to its normal program behavior.
+
+    A target that is an obstacle can never be entered; standing in the cell
+    adjacent to it counts as arrival. A target that cannot be reached at all
+    (sealed off / permanently occupied) auto-clears after
+    _WAYPOINT_STUCK_THRESHOLD ticks of no progress, so the unit does not stand
+    or circle there forever.
     """
     pos = tuple(unit.position)
     target = (int(waypoint[0]), int(waypoint[1]))
     is_worker = getattr(unit, "unit_type", None) == UnitType.WORKER
+    uid = str(unit.id)
 
     def _record(path: list[tuple[int, int]], complete: bool) -> None:
         if is_worker:
@@ -847,15 +855,30 @@ def _plan_waypoint(
         else:
             _set_unit_route(unit, target, path, complete=complete)
 
-    if pos == target:
+    def _finish(detail_prefix: str) -> tuple[str, str]:
+        _waypoint_stuck.pop(uid, None)
         _remove_waypoint(name)
-        _record([tuple(pos)], complete=True)
-        return ("WAIT", f"waypoint-reached {target}")
+        _record([tuple(pos), target], complete=True)
+        return ("WAIT", f"{detail_prefix} {target}")
+
+    if pos == target:
+        return _finish("waypoint-reached")
+
+    # Obstacle target: the closest reachable success is the adjacent cell.
+    if target in obstacle_cells and _manhattan(pos, target) <= 1:
+        return _finish("waypoint-reached-adjacent")
 
     blocked = frozenset(obstacle_cells) | frozenset(occupied)
 
+    def _count_stuck() -> bool:
+        """Return True when the unit should give up on this waypoint."""
+        ticks, last_target = _waypoint_stuck.get(uid, (0, target))
+        new_ticks = ticks + 1 if last_target == target else 1
+        _waypoint_stuck[uid] = (new_ticks, target)
+        return new_ticks >= _WAYPOINT_STUCK_THRESHOLD
+
     # Workers keep the survival rule while marching: never stop next to an
-    # attacking enemy.
+    # attacking enemy. Fleeing is survival, not stagnation — reset the counter.
     if is_worker:
         threat_radius = int(config.get("enemy_threat_radius", 3))
         combat_enemies = _combat_threats(enemies)
@@ -864,10 +887,11 @@ def _plan_waypoint(
                 combat_enemies, key=lambda e: _manhattan(pos, tuple(e.position))
             )
             if _manhattan(pos, tuple(nearest.position)) <= threat_radius:
+                _waypoint_stuck.pop(uid, None)
                 flee_blocked = blocked | {tuple(e.position) for e in enemies}
                 return _worker_flee(
                     unit,
-                    str(unit.id),
+                    uid,
                     pos,
                     tuple(nearest.position),
                     tuple(core_pos),
@@ -876,12 +900,33 @@ def _plan_waypoint(
                     carrying=(getattr(unit, "cargo", 0) > 0),
                 )
 
+    # Adjacent but the target cell itself is blocked this tick (e.g. a unit is
+    # standing on it). Hold instead of wandering beside it; a transient occupant
+    # frees up, otherwise the stuck counter clears the waypoint.
+    if _manhattan(pos, target) == 1 and target in blocked:
+        if _count_stuck():
+            return _finish("waypoint-unreachable")
+        unit.wait()
+        _record([tuple(pos), target], complete=True)
+        return ("WAIT", f"waypoint-blocked {target}")
+
     moved = _move_towards(unit, pos, target, blocked, detail_prefix="waypoint")
     if moved is not None:
+        moved_dir = _DIRECTION_BY_NAME.get(moved[1].split(" ", 1)[0])
+        new_pos = (
+            (pos[0] + moved_dir.delta[0], pos[1] + moved_dir.delta[1])
+            if moved_dir is not None
+            else None
+        )
+        if new_pos is not None and _manhattan(new_pos, target) < _manhattan(pos, target):
+            _waypoint_stuck.pop(uid, None)  # real progress toward the target
+        elif _count_stuck():
+            return _finish("waypoint-unreachable")
         _record([tuple(pos), target], complete=False)
         return moved
 
-    unit.wait()
+    if _count_stuck():
+        return _finish("waypoint-unreachable")
     _record([tuple(pos), target], complete=True)
     return ("WAIT", f"waypoint-blocked {target}")
 
@@ -1943,6 +1988,11 @@ _worker_path_cache: dict[str, dict] = {}
 _worker_stuck_ticks: dict[str, int] = {}
 _worker_stuck_pos: dict[str, tuple[int, int]] = {}
 _STUCK_THRESHOLD = 8
+# Consecutive ticks a unit fails to get closer to its manual waypoint before the
+# waypoint auto-clears and the unit resumes its normal program. (An obstacle
+# target never resolves to entry — being adjacent counts as arrival instead.)
+_waypoint_stuck: dict[str, tuple[int, tuple[int, int]]] = {}
+_WAYPOINT_STUCK_THRESHOLD = 15
 _map_dirty: bool = False
 _last_map_save_tick: int = -1
 
@@ -2411,6 +2461,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _worker_stuck_ticks.pop(dead_id, None)
     for dead_id in set(_worker_stuck_pos) - alive_ids:
         _worker_stuck_pos.pop(dead_id, None)
+    for dead_id in set(_waypoint_stuck) - alive_ids:
+        _waypoint_stuck.pop(dead_id, None)
     for (prefix, obj_id), name in list(_object_names.items()):
         if prefix in ("W", "V", "R") and str(obj_id) not in alive_ids:
             _object_names.pop((prefix, obj_id), None)

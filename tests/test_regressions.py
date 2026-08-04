@@ -2181,6 +2181,7 @@ class ManualWaypointTests(unittest.TestCase):
         tactic._worker_last_pos.update(self._last_pos)
         tactic._worker_recent.clear()
         tactic._worker_recent.update(self._recent)
+        tactic._waypoint_stuck.clear()
         tactic.turn_context.worker_routes = {}
         tactic.turn_context.unit_routes = {}
 
@@ -2252,6 +2253,57 @@ class ManualWaypointTests(unittest.TestCase):
                 tactic._write_waypoints({"W1": (10, -20), "R3": (-5, 8)})
                 loaded = tactic._load_waypoints()
         self.assertEqual(loaded, {"W1": (10, -20), "R3": (-5, 8)})
+
+    def test_obstacle_target_adjacent_counts_as_arrived(self) -> None:
+        # The target cell is a wall — it can never be entered. Standing next to
+        # it is the closest reachable success: clear the waypoint and resume.
+        unit = self.Unit("w1", (1, 0), UnitType.WORKER)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "waypoints.json"
+            with patch.object(tactic, "WAYPOINTS_PATH", path):
+                tactic._write_waypoints({"W1": (2, 0)})
+                action, detail = self._plan(
+                    unit, "W1", (2, 0),
+                    obstacle_cells=frozenset({(2, 0)}),
+                )
+                remaining = tactic._load_waypoints()
+        self.assertEqual(action, "WAIT")
+        self.assertIn("waypoint-reached-adjacent", detail)
+        self.assertNotIn("W1", remaining)
+
+    def test_unreachable_target_auto_clears_after_stuck_threshold(self) -> None:
+        # Unit boxed in on all four sides: the waypoint can never be reached.
+        # After the stuck threshold the waypoint clears and the unit resumes
+        # its normal program instead of standing there forever.
+        unit = self.Unit("w1", (0, 0), UnitType.WORKER)
+        obstacles = frozenset({(1, 0), (-1, 0), (0, 1), (0, -1)})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "waypoints.json"
+            with patch.object(tactic, "WAYPOINTS_PATH", path):
+                tactic._write_waypoints({"W1": (9, 0)})
+                last = None
+                for _ in range(tactic._WAYPOINT_STUCK_THRESHOLD):
+                    last = self._plan(unit, "W1", (9, 0), obstacle_cells=obstacles)
+                remaining = tactic._load_waypoints()
+        self.assertEqual(last[0], "WAIT")
+        self.assertIn("waypoint-unreachable", last[1])
+        self.assertNotIn("W1", remaining)
+
+    def test_progress_resets_stuck_counter(self) -> None:
+        unit = self.Unit("w1", (0, 0), UnitType.WORKER)
+        tactic._waypoint_stuck["w1"] = (tactic._WAYPOINT_STUCK_THRESHOLD - 1, (3, 0))
+        action, _ = self._plan(unit, "W1", (3, 0))
+        self.assertEqual(action, "MOVE")
+        self.assertNotIn("w1", tactic._waypoint_stuck)  # real progress → reset
+
+    def test_worker_flee_resets_stuck_counter(self) -> None:
+        unit = self.Unit("w1", (0, 0), UnitType.WORKER)
+        enemy = self.Enemy((1, 0))
+        tactic._waypoint_stuck["w1"] = (tactic._WAYPOINT_STUCK_THRESHOLD - 1, (9, 0))
+        action, detail = self._plan(unit, "W1", (9, 0), enemies=(enemy,))
+        self.assertEqual(action, "MOVE")
+        self.assertIn("flee", detail)
+        self.assertNotIn("w1", tactic._waypoint_stuck)  # fleeing is not stagnation
 
 
 class DashboardWaypointTests(unittest.TestCase):
