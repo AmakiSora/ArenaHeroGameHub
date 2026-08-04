@@ -44,6 +44,7 @@ CONFIG_FIELDS = (
     ConfigField("bfs_max_steps", "BFS 搜索节点", "worker", "integer", 2500, 50, 8000, 50),
     ConfigField("avoid_backtracking", "避免立即回头", "worker", "boolean", True),
     ConfigField("backtrack_penalty", "载矿回头惩罚", "worker", "integer", 10, 0, 100, 1),
+    ConfigField("enemy_threat_radius", "工人遇敌回避半径", "worker", "integer", 3, 0, 10, 1),
     ConfigField("core_movement_enabled", "允许核心移动", "core", "boolean", True),
     ConfigField("prefer_resources_for_core", "核心优先靠近矿点", "core", "boolean", True),
     ConfigField("core_target_enabled", "启用核心目标坐标", "core", "boolean", False),

@@ -680,6 +680,65 @@ def _worker_cached_path_step(
     return ("MOVE", f"{bfs_dir.name} -> {goal}")
 
 
+def _worker_flee(
+    worker,
+    uid: str,
+    pos: tuple[int, int],
+    enemy_pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    others: frozenset[tuple[int, int]],
+    carrying: bool,
+) -> tuple[str, str]:
+    """Move one step away from the enemy.
+
+    Game rule (player-confirmed): a moving unit is never hit — only a
+    stationary one takes damage. A threatened worker must therefore spend every
+    Tick MOVING (never WAIT / HARVEST / DEPOSIT). Pick a free, non-dead-end
+    cell that maximizes distance from the enemy; fall back to any free cell;
+    only WAIT when every neighbor is blocked. `others` includes the enemy cells
+    themselves, so the worker can never step onto an enemy.
+    """
+    prev = _worker_last_pos.get(uid)
+    recent = _worker_recent.get(uid, [])
+    recent_set = set(recent)
+    candidates: list[tuple[float, int, Direction, tuple[int, int]]] = []
+    for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+        nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
+        npos = (nx, ny)
+        if npos in obstacle_cells or npos in others:
+            continue
+        score = -_manhattan(npos, enemy_pos) * 10.0
+        if _is_dead_end_step(npos, obstacle_cells):
+            score -= 5.0
+        else:
+            score += 5.0
+        if prev and npos == prev:
+            score -= 3.0  # avoid backtracking when an alternative exists
+        if npos in recent_set:
+            score -= 2.0
+        if carrying and _manhattan(npos, core_pos) < _manhattan(pos, core_pos):
+            score += 0.5  # nudge cargo workers homeward while escaping
+        candidates.append((score, d.delta[0] * 4 + d.delta[1], d, npos))
+    candidates.sort(reverse=True)
+    for allow_dead_end in (False, True):
+        for _score, _tie, d, npos in candidates:
+            if not allow_dead_end and _is_dead_end_step(npos, obstacle_cells):
+                continue
+            worker.move(d)
+            _worker_last_pos[uid] = pos
+            recent = _worker_recent.get(uid, [])
+            recent.append(pos)
+            if len(recent) > 6:
+                recent.pop(0)
+            _worker_recent[uid] = recent
+            _set_worker_route(worker, tuple(npos), [tuple(pos), npos], complete=False)
+            return ("MOVE", f"{d.name} flee-enemy@{enemy_pos}")
+    worker.wait()
+    _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
+    return ("WAIT", "flee-boxed")
+
+
 def _plan_worker(
     worker,
     core,
@@ -689,6 +748,7 @@ def _plan_worker(
     depleted: set[tuple[int, int]],
     config: dict[str, int | bool],
     occupied: frozenset[tuple[int, int]] = frozenset(),
+    enemies: tuple = (),
 ) -> tuple[str, str]:
     """Return (action_name, detail)."""
     pos = worker.position
@@ -706,6 +766,33 @@ def _plan_worker(
     # wedging the worker on the mine at partial cargo. Such a worker returns
     # home to deposit what it carries; only empty workers mine.
     carrying = worker.cargo > 0
+
+    # ── Enemy evasion ─────────────────────────────────────────────────
+    # Game rule (player-confirmed): a moving unit is never hit — only a
+    # stationary target takes damage. When a visible enemy is inside the
+    # threat radius, this worker must spend the Tick MOVING away from it,
+    # never HARVEST / DEPOSIT / WAIT. Evasion outranks everything: a dead
+    # worker mines nothing. Radius 0 (dashboard knob) disables the safety.
+    threat_radius = int(config.get("enemy_threat_radius", 3))
+    if enemies and threat_radius > 0:
+        nearest_enemy = min(
+            enemies, key=lambda e: _manhattan(pos, tuple(e.position))
+        )
+        if _manhattan(pos, tuple(nearest_enemy.position)) <= threat_radius:
+            # `others` already carries the enemy cells in production (occupied
+            # includes them); union them again so a fleeing worker can never
+            # step onto an enemy even if `occupied` was not passed.
+            flee_blocked = others | {tuple(e.position) for e in enemies}
+            return _worker_flee(
+                worker,
+                uid,
+                pos,
+                tuple(nearest_enemy.position),
+                core_pos,
+                obstacle_cells,
+                flee_blocked,
+                carrying,
+            )
 
     if pos == core.position and turn_context.resource_space > 0 and carrying:
         worker.deposit()
@@ -2320,6 +2407,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 depleted=depleted,
                 config=config,
                 occupied=occupied,
+                enemies=enemies,
             )
             unit_actions_detail[uid] = f"{action}:{detail}"
         elif unit.unit_type == UnitType.VANGUARD:

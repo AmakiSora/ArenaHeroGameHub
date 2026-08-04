@@ -405,6 +405,162 @@ class ConfiguredPlannerTests(unittest.TestCase):
         self.assertNotEqual(worker.direction, tactic.Direction.LEFT)
 
 
+class WorkerEnemyEvasionTests(unittest.TestCase):
+    """Workers must keep MOVING when an enemy is in range — a stationary unit
+    takes damage in this game, a moving unit never does."""
+
+    class Worker:
+        def __init__(self, position: tuple[int, int], cargo: int = 0) -> None:
+            self.id = "worker-1"
+            self.position = position
+            self.cargo = cargo
+            self.direction = None
+            self.waited = False
+            self.deposited = False
+            self.harvested = False
+
+        def move(self, direction) -> None:
+            self.direction = direction
+
+        def wait(self) -> None:
+            self.waited = True
+
+        def deposit(self) -> None:
+            self.deposited = True
+
+        def harvest(self) -> None:
+            self.harvested = True
+
+    class Enemy:
+        def __init__(self, position: tuple[int, int]) -> None:
+            self.position = position
+
+    class Core:
+        position = (0, 0)
+
+    def _clear_worker_state(self) -> None:
+        tactic._worker_last_pos.clear()
+        tactic._worker_recent.clear()
+        tactic.turn_context.worker_routes = {}
+
+    def test_worker_on_mine_flees_when_enemy_adjacent(self) -> None:
+        worker = self.Worker((5, 0))
+        config = default_config()
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                self.Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+                enemies=(self.Enemy((5, 1)),),
+            )
+        finally:
+            self._clear_worker_state()
+
+        # Evasion outranks harvesting: the worker leaves the mine instead of
+        # standing still to harvest next to an enemy.
+        self.assertEqual(action, "MOVE")
+        self.assertIn("flee", detail)
+        self.assertIsNotNone(worker.direction)
+        self.assertFalse(worker.harvested)
+        self.assertFalse(worker.waited)
+        # The chosen cell must be free and not the enemy's own cell.
+        dx, dy = worker.direction.delta
+        npos = (5 + dx, 0 + dy)
+        self.assertNotEqual(npos, (5, 1))
+        self.assertGreaterEqual(tactic._manhattan(npos, (5, 1)), tactic._manhattan((5, 0), (5, 1)))
+
+    def test_carrying_worker_flees_instead_of_depositing(self) -> None:
+        worker = self.Worker((0, 0), cargo=1)
+        tactic.turn_context.resource_space = 5
+        config = default_config()
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                self.Core(),
+                resource_cells=frozenset(),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+                enemies=(self.Enemy((1, 0)),),
+            )
+        finally:
+            self._clear_worker_state()
+
+        # A full worker standing on the core would normally DEPOSIT, but with
+        # an enemy adjacent it must keep moving instead of taking damage.
+        self.assertEqual(action, "MOVE")
+        self.assertIn("flee", detail)
+        self.assertFalse(worker.deposited)
+        self.assertFalse(worker.waited)
+
+    def test_worker_outside_threat_radius_harvests_normally(self) -> None:
+        worker = self.Worker((5, 0))
+        config = default_config()
+        try:
+            action, _ = tactic._plan_worker(
+                worker,
+                self.Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+                enemies=(self.Enemy((9, 0)),),
+            )
+        finally:
+            self._clear_worker_state()
+
+        # Enemy 4 cells away is beyond the default radius 3 → normal harvest.
+        self.assertEqual(action, "HARVEST")
+        self.assertTrue(worker.harvested)
+
+    def test_evasion_disabled_by_radius_zero(self) -> None:
+        worker = self.Worker((5, 0))
+        config = default_config()
+        config["enemy_threat_radius"] = 0
+        try:
+            action, _ = tactic._plan_worker(
+                worker,
+                self.Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+                enemies=(self.Enemy((5, 1)),),
+            )
+        finally:
+            self._clear_worker_state()
+
+        self.assertEqual(action, "HARVEST")
+        self.assertTrue(worker.harvested)
+
+    def test_flee_never_enters_enemy_or_obstacle_cell(self) -> None:
+        worker = self.Worker((0, 0))
+        config = default_config()
+        obstacle = (0, 1)
+        enemy = (1, 0)
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                self.Core(),
+                resource_cells=frozenset(),
+                obstacle_cells=frozenset({obstacle}),
+                depleted=set(),
+                config=config,
+                enemies=(self.Enemy(enemy),),
+            )
+        finally:
+            self._clear_worker_state()
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("flee", detail)
+        dx, dy = worker.direction.delta
+        npos = (dx, dy)
+        self.assertNotIn(npos, {obstacle, enemy})
+
+
 class CombatTeamPlannerTests(unittest.TestCase):
     class CombatUnit:
         def __init__(self, unit_id: str, position: tuple[int, int]) -> None:
