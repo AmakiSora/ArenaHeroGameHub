@@ -115,6 +115,14 @@ class TacticConfigTests(unittest.TestCase):
             self.assertIn(f'id="{state_id}"', panel)
         self.assertIn("/ 需求", panel)
         self.assertIn("prod-state", panel)
+        # Production targets must be INSIDE the strategy form, otherwise
+        # "保存配置" never submits them and edited targets are silently lost
+        # (regression: the section used to be a sibling of the form).
+        form_open = panel.index('id="tacticConfigForm"')
+        form_close = panel.index("</form>")
+        for key in ("target_workers", "target_vanguards", "target_rangers"):
+            self.assertLess(form_open, panel.index(f'name="{key}"'))
+            self.assertLess(panel.index(f'name="{key}"'), form_close)
         self.assertNotIn("productionQueueList", panel)
         self.assertNotIn("productionQueueClear", panel)
         self.assertNotIn('name="home_team"', panel)

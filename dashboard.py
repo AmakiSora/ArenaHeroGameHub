@@ -379,11 +379,15 @@ def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) 
         '<section class="panel config-panel">'
         '<div class="panel-title"><span>策略配置</span>'
         '<span class="count" id="configState">当前值</span></div>'
+        '<form id="tacticConfigForm">'
+        # Production targets must live INSIDE the form so "保存配置" submits
+        # them via form.querySelectorAll('[name]') and applyConfigValues()
+        # re-syncs them on load/save/reset. Being a sibling of the form made
+        # every save silently drop the edited worker/vanguard/ranger targets.
         '<section class="production-section" aria-labelledby="productionTargetsTitle">'
         '<div class="production-title"><div><b id="productionTargetsTitle">生产需求目标</b>'
         '<span class="count">低于目标自动补兵 · 超出自动自裁 · 阵亡自动补充 · 改后点保存生效</span></div></div>'
         f'<div class="production-targets" id="productionTargets">{target_rows}</div></section>'
-        '<form id="tacticConfigForm">'
         f'<div class="config-groups">{"".join(groups)}</div>'
         '<div class="config-actions">'
         '<button type="submit" id="configSaveBtn">保存配置</button>'
