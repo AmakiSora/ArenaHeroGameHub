@@ -30,8 +30,14 @@ server --WebSocket state--> SDK --Turn--> choose_actions() --plan--> SDK --HTTP 
 
 **删除规则：**
 - 采集失败提示矿已耗尽（`HARVEST_FAILED / RESOURCE_DEPLETED`）→ 删除
+- 采集失败提示 `HARVEST_FAILED / CARGO_FULL` 且工人仍有剩余载货容量 → 视为该矿点已枯竭，删除并打入 `unharvestable` 黑名单（服务器对“已枯竭但仍显示为矿点”的格子报的是 CARGO_FULL 而非 RESOURCE_DEPLETED；若不处理，工人会永远站在废矿上反复 HARVEST）
+- 处于黑名单的矿点即使仍可见，也不会重新进入记忆或分配（除非之后该点 HARVEST_SUCCEEDED，说明刷新复活，自动解禁）
 - 工人到达记忆矿点但当前格没有矿 → 删除并在同一 Tick 转入探索
 - 前端手动录入的矿点同样会在工人到达并确认无矿后删除
+
+**枯竭矿处理：**
+- 站在枯竭矿点上的空载工人 → 直接转入探索寻找新矿
+- 站在枯竭矿点上的部分载货工人（如携带 1 但载满需 2）→ 标记为“回程卸货”，直接返回 Core 卸掉已有货物，避免永远卡在废矿上
 
 **使用规则：**
 - 无货工人优先去**指派给自己的矿点**（见下方资源分配机制）

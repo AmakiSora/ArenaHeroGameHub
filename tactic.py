@@ -75,10 +75,14 @@ def _merge_resource_cells(
     remembered: set[tuple[int, int]],
     depleted: set[tuple[int, int]],
 ) -> list[tuple[int, int]]:
-    """Return unique, available resource cells in deterministic order."""
+    """Return unique, available resource cells in deterministic order.
+
+    Known-exhausted nodes are excluded even when still visible, so workers are
+    never assigned to a mine the server refuses to harvest.
+    """
     cells = {tuple(position) for position in visible}
     cells.update(tuple(position) for position in remembered)
-    return sorted(cells - depleted)
+    return sorted(cells - depleted - _unharvestable_resources)
 
 
 def _step_towards(
@@ -693,18 +697,38 @@ def _plan_worker(
     core_pos = tuple(core.position)
     others = occupied - {pos}
 
-    if worker.cargo >= max_cargo and pos == core.position and turn_context.resource_space > 0:
+    # A worker standing on an exhausted mine with partial cargo can no longer
+    # top up to full capacity — order it home to deposit what it has instead of
+    # issuing HARVEST (CARGO_FULL) against the dead node forever.
+    if pos in _unharvestable_resources and worker.cargo > 0:
+        _returning_workers.add(uid)
+    returning = uid in _returning_workers
+
+    if (
+        pos == core.position
+        and turn_context.resource_space > 0
+        and (worker.cargo >= max_cargo or returning)
+    ):
         worker.deposit()
+        _returning_workers.discard(uid)
         _set_worker_route(worker, tuple(core.position), [tuple(pos)], complete=True)
         return ("DEPOSIT", f"at_core cargo={worker.cargo}")
 
-    if pos in resource_cells and pos not in depleted and worker.cargo < max_cargo:
+    if (
+        pos in resource_cells
+        and pos not in depleted
+        and pos not in _unharvestable_resources
+        and worker.cargo < max_cargo
+    ):
         worker.harvest()
         _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
         return ("HARVEST", f"on_resource {pos}")
 
     goal: tuple[int, int] | None = None
-    if worker.cargo >= max_cargo:
+    if returning:
+        # Exhausted-mine worker heading home to deposit its partial cargo.
+        goal = core.position
+    elif worker.cargo >= max_cargo:
         # Only FULL workers target the core. A partially-loaded worker (e.g. a
         # second haul while the beacon is carried) must keep harvesting — sending
         # it to the core just parks it on the unloading cell where it can't
@@ -724,8 +748,9 @@ def _plan_worker(
 
     # Reaching a remembered target without seeing a resource confirms that the
     # memory is stale. Forget it and explore immediately instead of waiting on
-    # the empty cell forever.
-    if goal == pos and worker.cargo < max_cargo and pos not in resource_cells:
+    # the empty cell forever. (Returning workers are heading home, not chasing a
+    # mine, so the Core cell is never a stale resource target.)
+    if goal == pos and not returning and worker.cargo < max_cargo and pos not in resource_cells:
         _forget_resource(pos)
         _resource_assignments.pop(uid, None)
         goal = None
@@ -744,7 +769,7 @@ def _plan_worker(
     if stuck >= _STUCK_THRESHOLD:
         _worker_path_cache.pop(uid, None)
         if worker.cargo < max_cargo:
-            if goal is not None:
+            if goal is not None and tuple(goal) != core_pos:
                 _forget_resource(goal)
             _resource_assignments.pop(uid, None)
             _worker_stuck_ticks[uid] = 0
@@ -1657,6 +1682,14 @@ def _plan_ranger(
 
 # ── shared map memory (persists across ticks + process restarts) ───────────
 _resource_memory: set[tuple[int, int]] = set()
+# Mines the server refuses to harvest (HARVEST_FAILED / CARGO_FULL while the
+# worker still had spare capacity). The game keeps showing exhausted nodes as
+# resource cells, so without this set they are re-added to memory every Tick and
+# workers park on them issuing HARVEST forever.
+_unharvestable_resources: set[tuple[int, int]] = set()
+# Workers ordered home to deposit a partial load after their assigned mine
+# turned out to be exhausted (they can no longer fill to full capacity).
+_returning_workers: set[str] = set()
 # Resources confirmed absent but not yet flushed to map_memory.json. Tombstones
 # prevent sticky manual entries on disk from being merged back during a save.
 _resource_tombstones: set[tuple[int, int]] = set()
@@ -1689,7 +1722,7 @@ _game_stats: dict[str, Any] = game_stats.load()
 
 def _load_map_memory() -> None:
     """Load permanent obstacle/resource/enemy memory from disk."""
-    global _resource_memory, _obstacle_memory, _enemy_memory
+    global _resource_memory, _obstacle_memory, _enemy_memory, _unharvestable_resources
     if not MAP_MEMORY_PATH.exists():
         return
     try:
@@ -1698,10 +1731,14 @@ def _load_map_memory() -> None:
         resources = {tuple(p) for p in data.get("resources", []) if len(p) == 2}
         manual = {tuple(p) for p in data.get("manual_resources", []) if len(p) == 2}
         _resource_memory = resources | manual
+        _unharvestable_resources = {
+            tuple(p) for p in data.get("unharvestable", []) if len(p) == 2
+        }
         _enemy_memory = {tuple(p) for p in data.get("enemy_sightings", []) if len(p) == 2}
         print(
             f"[map] loaded obstacles={len(_obstacle_memory)} resources={len(_resource_memory)} "
-            f"manual={len(manual)} enemies={len(_enemy_memory)} from {MAP_MEMORY_PATH}",
+            f"manual={len(manual)} unharvestable={len(_unharvestable_resources)} "
+            f"enemies={len(_enemy_memory)} from {MAP_MEMORY_PATH}",
             flush=True,
         )
     except Exception as e:
@@ -1738,7 +1775,11 @@ def _save_map_memory(
             manual = set()
 
     manual -= _resource_tombstones
-    resources = (set(_resource_memory) | manual) - _resource_tombstones
+    resources = (
+        (set(_resource_memory) | manual)
+        - _resource_tombstones
+        - _unharvestable_resources
+    )
     _resource_memory.clear()
     _resource_memory.update(resources)
 
@@ -1748,10 +1789,12 @@ def _save_map_memory(
         "obstacles": sorted([list(p) for p in _obstacle_memory]),
         "resources": sorted([list(p) for p in resources]),
         "manual_resources": sorted([list(p) for p in manual]),
+        "unharvestable": sorted([list(p) for p in _unharvestable_resources]),
         "enemy_sightings": sorted([list(p) for p in _enemy_memory]),
         "obstacle_count": len(_obstacle_memory),
         "resource_count": len(resources),
         "manual_count": len(manual),
+        "unharvestable_count": len(_unharvestable_resources),
         "enemy_sighting_count": len(_enemy_memory),
     }
     tmp = MAP_MEMORY_PATH.with_suffix(".tmp")
@@ -1784,28 +1827,68 @@ def _forget_resource(position: tuple[int, int]) -> None:
     _map_dirty = True
 
 
+def _mark_unharvestable(position: tuple[int, int]) -> None:
+    """Mark a node as exhausted: forget it and keep it out of future memory.
+
+    The server reports an exhausted-but-still-visible mine as HARVEST_FAILED /
+    CARGO_FULL (not RESOURCE_DEPLETED), so without this the node is re-added
+    from visibility every Tick and workers keep being assigned to it.
+    """
+    _forget_resource(position)
+    _unharvestable_resources.add(tuple(position))
+
+
 def _update_resource_memory(turn) -> None:
     """Remember visible resources permanently until depletion is confirmed.
 
-    Manual resources are never auto-removed here; only RESOURCE_DEPLETED clears
-    a remembered point. HARVEST_SUCCEEDED alone does not prove the node is gone.
+    A node is marked exhausted when the server refuses a harvest:
+    HARVEST_FAILED / RESOURCE_DEPLETED always, and HARVEST_FAILED / CARGO_FULL
+    when the harvesting worker still had spare cargo capacity. CARGO_FULL is the
+    reason the server returns for an exhausted-but-still-visible mine, so
+    without this the node is re-added from visibility every Tick and workers
+    park on it issuing HARVEST forever.
     """
     global _resource_memory, _map_dirty
     before = set(_resource_memory)
 
+    core = getattr(turn, "core", None)
+    beacon = getattr(turn, "beacon", None)
+    max_w_cargo = 1
+    if (
+        core is not None
+        and beacon is not None
+        and getattr(beacon, "status", None) == "CARRIED"
+        and getattr(beacon, "carrier_id", None) == core.id
+    ):
+        max_w_cargo = 2
+    worker_cargo = {str(w.id): w.cargo for w in (getattr(turn, "workers", ()) or ())}
+
     for p in turn.resource_cells:
         pos = tuple(p) if not isinstance(p, tuple) else p
+        if pos in _unharvestable_resources:
+            continue  # known exhausted — do not resurrect in memory
         _resource_memory.add(pos)
         _resource_tombstones.discard(pos)
 
     for event in turn.events:
-        if (
-            event.event_type == "HARVEST_FAILED"
-            and event.reason_code == "RESOURCE_DEPLETED"
-            and event.position
+        if not event.position:
+            continue
+        if event.event_type == "HARVEST_SUCCEEDED":
+            # Node proved harvestable again (e.g. respawned) — lift the dead mark.
+            _unharvestable_resources.discard(tuple(event.position))
+            continue
+        if event.event_type != "HARVEST_FAILED":
+            continue
+        if event.reason_code not in ("RESOURCE_DEPLETED", "CARGO_FULL"):
+            continue
+        if event.reason_code == "CARGO_FULL" and not (
+            event.actor_id
+            and worker_cargo.get(str(event.actor_id), max_w_cargo) < max_w_cargo
         ):
-            pos = tuple(event.position)
-            _forget_resource(pos)
+            # The worker itself is full (a state our planner never harvests
+            # from) — not evidence the node is dead.
+            continue
+        _mark_unharvestable(tuple(event.position))
 
     if _resource_memory != before:
         _map_dirty = True
@@ -1977,6 +2060,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _worker_stuck_ticks.pop(dead_id, None)
     for dead_id in set(_worker_stuck_pos) - alive_ids:
         _worker_stuck_pos.pop(dead_id, None)
+    for dead_id in set(_returning_workers) - alive_ids:
+        _returning_workers.discard(dead_id)
     for (prefix, obj_id), name in list(_object_names.items()):
         if prefix in ("W", "V", "R") and str(obj_id) not in alive_ids:
             _object_names.pop((prefix, obj_id), None)
