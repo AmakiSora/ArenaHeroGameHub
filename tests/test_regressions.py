@@ -380,6 +380,156 @@ class ConfiguredPlannerTests(unittest.TestCase):
         self.assertEqual(action, "HARVEST")
         self.assertTrue(worker.harvested)
 
+    def test_empty_worker_explores_when_gold_full_and_enabled(self) -> None:
+        class Worker:
+            id = "worker-1"
+            position = (5, 0)
+            cargo = 0
+
+            def harvest(self) -> None:
+                self.harvested = True
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        config = default_config()
+        config["worker_explore_when_full"] = True
+        orig_space = tactic.turn_context.resource_space
+        tactic.turn_context.resource_space = 0
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+            )
+        finally:
+            tactic.turn_context.resource_space = orig_space
+            tactic.turn_context.worker_routes = {}
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("explore", detail)
+        self.assertFalse(getattr(worker, "harvested", False))
+        self.assertFalse(getattr(worker, "waited", False))
+
+    def test_carrying_worker_explores_when_gold_full_and_enabled(self) -> None:
+        class Worker:
+            id = "worker-1"
+            position = (5, 0)
+            cargo = 2
+
+            def deposit(self) -> None:
+                self.deposited = True
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        config = default_config()
+        config["worker_explore_when_full"] = True
+        orig_space = tactic.turn_context.resource_space
+        tactic.turn_context.resource_space = 0
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                Core(),
+                resource_cells=frozenset(),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+            )
+        finally:
+            tactic.turn_context.resource_space = orig_space
+            tactic.turn_context.worker_routes = {}
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("explore", detail)
+        self.assertFalse(getattr(worker, "deposited", False))
+        self.assertFalse(getattr(worker, "waited", False))
+
+    def test_worker_harvests_when_gold_full_but_config_off(self) -> None:
+        # Feature is opt-in: with the toggle off, full storage keeps today's
+        # behavior (empty workers still harvest even though deposits are blocked).
+        class Worker:
+            id = "worker-1"
+            position = (5, 0)
+            cargo = 0
+
+            def harvest(self) -> None:
+                self.harvested = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        orig_space = tactic.turn_context.resource_space
+        tactic.turn_context.resource_space = 0
+        try:
+            action, _ = tactic._plan_worker(
+                worker,
+                Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=default_config(),
+            )
+        finally:
+            tactic.turn_context.resource_space = orig_space
+            tactic.turn_context.worker_routes = {}
+
+        self.assertEqual(action, "HARVEST")
+        self.assertTrue(worker.harvested)
+
+    def test_worker_harvests_when_config_on_but_space_available(self) -> None:
+        # Explore mode only triggers when storage is actually full; with free
+        # space the toggle changes nothing.
+        class Worker:
+            id = "worker-1"
+            position = (5, 0)
+            cargo = 0
+
+            def harvest(self) -> None:
+                self.harvested = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        config = default_config()
+        config["worker_explore_when_full"] = True
+        orig_space = tactic.turn_context.resource_space
+        tactic.turn_context.resource_space = 5
+        try:
+            action, _ = tactic._plan_worker(
+                worker,
+                Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+            )
+        finally:
+            tactic.turn_context.resource_space = orig_space
+            tactic.turn_context.worker_routes = {}
+
+        self.assertEqual(action, "HARVEST")
+        self.assertTrue(worker.harvested)
+
     def test_bfs_path_routes_around_obstacles(self) -> None:
         path = tactic._bfs_path(
             (0, 0),

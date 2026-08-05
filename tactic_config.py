@@ -48,6 +48,7 @@ CONFIG_FIELDS = (
     ConfigField("backtrack_penalty", "载矿回头惩罚", "worker", "integer", 10, 0, 100, 1),
     ConfigField("enemy_threat_radius", "工人遇敌回避半径", "worker", "integer", 3, 0, 10, 1),
     ConfigField("worker_mine_max_distance", "工人采矿最大距离", "worker", "integer", 0, 0, 200, 1),
+    ConfigField("worker_explore_when_full", "金币满后工人探索", "worker", "boolean", False),
     ConfigField("core_movement_enabled", "允许核心移动", "core", "boolean", True),
     ConfigField("prefer_resources_for_core", "核心优先靠近矿点", "core", "boolean", True),
     ConfigField("core_target_enabled", "启用核心目标坐标", "core", "boolean", False),

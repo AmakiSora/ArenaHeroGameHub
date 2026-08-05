@@ -972,6 +972,14 @@ def _plan_worker(
     # home to deposit what it carries; only empty workers mine.
     carrying = worker.cargo > 0
 
+    # 金币满仓 + 配置开启 → 工人进入探索模式（仅工人）。仓库放不下更多金币时，
+    # 工人不再挖矿/围在核心转圈，而是散开去探索；空载与载货都探索。仓库一旦有
+    # 空位（生产/修盾花掉金币），下个 tick 自动恢复正常挖矿/交矿。
+    explore_mode = (
+        bool(config.get("worker_explore_when_full", False))
+        and turn_context.resource_space == 0
+    )
+
     # ── Enemy evasion ─────────────────────────────────────────────────
     # Game rule (player-confirmed): a moving unit is never hit — only a
     # stationary target takes damage. When a visible enemy is inside the
@@ -1009,27 +1017,28 @@ def _plan_worker(
         _set_worker_route(worker, tuple(core.position), [tuple(pos)], complete=True)
         return ("DEPOSIT", f"at_core cargo={worker.cargo}")
 
-    if pos in resource_cells and pos not in depleted and not carrying:
+    if pos in resource_cells and pos not in depleted and not carrying and not explore_mode:
         worker.harvest()
         _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
         return ("HARVEST", f"on_resource {pos}")
 
     goal: tuple[int, int] | None = None
-    if carrying:
-        # A partial load is still worth depositing; the worker can never fill
-        # the rest en route, so it heads home with whatever it has.
-        goal = core.position
-    elif resource_cells:
-        # Only go to assigned resource, not the nearest one
-        assigned = _resource_assignments.get(uid)
-        if assigned and assigned in resource_cells:
-            goal = assigned
-        # If no assignment, skip visible resources (they're assigned to other workers)
-    # Fallback: use remembered resource coordinates (only if assigned)
-    if goal is None and not carrying:
-        assigned = _resource_assignments.get(uid)
-        if assigned and assigned in _resource_memory:
-            goal = assigned
+    if not explore_mode:
+        if carrying:
+            # A partial load is still worth depositing; the worker can never fill
+            # the rest en route, so it heads home with whatever it has.
+            goal = core.position
+        elif resource_cells:
+            # Only go to assigned resource, not the nearest one
+            assigned = _resource_assignments.get(uid)
+            if assigned and assigned in resource_cells:
+                goal = assigned
+            # If no assignment, skip visible resources (they're assigned to other workers)
+        # Fallback: use remembered resource coordinates (only if assigned)
+        if goal is None and not carrying:
+            assigned = _resource_assignments.get(uid)
+            if assigned and assigned in _resource_memory:
+                goal = assigned
 
     # Reaching a remembered target without seeing a resource confirms that the
     # memory is stale. Forget it and explore immediately instead of waiting on
@@ -1053,7 +1062,7 @@ def _plan_worker(
     _worker_stuck_ticks[uid] = stuck
     if stuck >= _STUCK_THRESHOLD:
         _worker_path_cache.pop(uid, None)
-        if not carrying:
+        if not carrying or explore_mode:
             if goal is not None and tuple(goal) != core_pos:
                 _forget_resource(goal)
             _resource_assignments.pop(uid, None)
@@ -1154,7 +1163,7 @@ def _plan_worker(
     if worker.cargo and goal is not None:
         # Re-bind goal to core for the cargo march detail string.
         goal = tuple(core.position)
-    if worker.cargo:
+    if worker.cargo and not explore_mode:
         prev = _worker_last_pos.get(uid)
         recent = _worker_recent.get(uid, [])
         recent_set = set(recent)
@@ -1189,8 +1198,11 @@ def _plan_worker(
             )
             return ("MOVE", f"{d.name} -> {core.position}")
 
-    # No goal at all: fan out with backtracking + dead-end avoidance
-    if goal is None and not carrying:
+    # No goal at all: fan out with backtracking + dead-end avoidance.
+    # In explore_mode a carrying worker may also fan out (it cannot deposit while
+    # storage is full, and a moving unit cannot be hit, so scouting is safer
+    # than milling around the core).
+    if goal is None and (not carrying or explore_mode):
         uid = str(worker.id)
         prev = _worker_last_pos.get(uid)
         recent = _worker_recent.get(uid, [])
@@ -2649,52 +2661,61 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         ):
             depleted.add(event.position)
 
-    # Assign each resource to one worker (avoid stampede).
-    # Keep sticky assignments across ticks so two nearby workers do not swap the
-    # same mine every tick (that produced goal/explore A-B-A flipping).
-    # Only empty workers mine: a worker carrying cargo (full or partial) heads
-    # home to deposit, so it is never assigned a fresh mine.
-    idle_workers = [(str(w.id), tuple(w.position)) for w in turn.workers if w.cargo == 0]
-    idle_ids = {wid for wid, _ in idle_workers}
-    all_resources = _merge_resource_cells(
-        turn.resource_cells,
-        _resource_memory,
-        depleted,
+    # 金币满仓 + 开启"满仓探索"时，不给工人派矿点：空载工人失去目标后自然进入
+    # 探索分支，去各处侦察。仓库一旦有空位，下一 tick 恢复派矿。
+    gold_full_explore = (
+        bool(config.get("worker_explore_when_full", False))
+        and turn_context.resource_space == 0
     )
-    resource_set = set(all_resources)
+    if gold_full_explore:
+        _resource_assignments.clear()
+    else:
+        # Assign each resource to one worker (avoid stampede).
+        # Keep sticky assignments across ticks so two nearby workers do not swap the
+        # same mine every tick (that produced goal/explore A-B-A flipping).
+        # Only empty workers mine: a worker carrying cargo (full or partial) heads
+        # home to deposit, so it is never assigned a fresh mine.
+        idle_workers = [(str(w.id), tuple(w.position)) for w in turn.workers if w.cargo == 0]
+        idle_ids = {wid for wid, _ in idle_workers}
+        all_resources = _merge_resource_cells(
+            turn.resource_cells,
+            _resource_memory,
+            depleted,
+        )
+        resource_set = set(all_resources)
 
-    # Workers ignore mines farther than this Manhattan distance from the core —
-    # a far deposit round-trip wastes more ticks than it earns, and a worker
-    # stranded out deep is easy prey. 0 (default) disables the cap.
-    mine_max_distance = int(config.get("worker_mine_max_distance", 0))
-    if mine_max_distance > 0:
-        all_resources = [
-            r for r in all_resources
-            if _manhattan(tuple(r), core_pos) <= mine_max_distance
-        ]
+        # Workers ignore mines farther than this Manhattan distance from the core —
+        # a far deposit round-trip wastes more ticks than it earns, and a worker
+        # stranded out deep is easy prey. 0 (default) disables the cap.
+        mine_max_distance = int(config.get("worker_mine_max_distance", 0))
+        if mine_max_distance > 0:
+            all_resources = [
+                r for r in all_resources
+                if _manhattan(tuple(r), core_pos) <= mine_max_distance
+            ]
 
-    sticky: dict[str, tuple[int, int]] = {}
-    claimed_resources: set[tuple[int, int]] = set()
-    for wid, res in list(_resource_assignments.items()):
-        res_t = tuple(res)
-        if wid in idle_ids and res_t in resource_set and res_t not in claimed_resources:
-            sticky[wid] = res_t
-            claimed_resources.add(res_t)
-    _resource_assignments.clear()
-    _resource_assignments.update(sticky)
+        sticky: dict[str, tuple[int, int]] = {}
+        claimed_resources: set[tuple[int, int]] = set()
+        for wid, res in list(_resource_assignments.items()):
+            res_t = tuple(res)
+            if wid in idle_ids and res_t in resource_set and res_t not in claimed_resources:
+                sticky[wid] = res_t
+                claimed_resources.add(res_t)
+        _resource_assignments.clear()
+        _resource_assignments.update(sticky)
 
-    available = [w for w in idle_workers if w[0] not in sticky]
-    open_resources = [r for r in all_resources if r not in claimed_resources]
-    for res in sorted(
-        open_resources,
-        key=lambda p: min(_manhattan(p, w[1]) for w in available) if available else 0,
-    ):
-        if not available:
-            break
-        closest = min(available, key=lambda w: _manhattan(res, w[1]))
-        wid = closest[0]
-        _resource_assignments[wid] = res
-        available.remove(closest)
+        available = [w for w in idle_workers if w[0] not in sticky]
+        open_resources = [r for r in all_resources if r not in claimed_resources]
+        for res in sorted(
+            open_resources,
+            key=lambda p: min(_manhattan(p, w[1]) for w in available) if available else 0,
+        ):
+            if not available:
+                break
+            closest = min(available, key=lambda w: _manhattan(res, w[1]))
+            wid = closest[0]
+            _resource_assignments[wid] = res
+            available.remove(closest)
 
     # ── Core action ─────────────────────────────────────────────────────
     core_done = False
