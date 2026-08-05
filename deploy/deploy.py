@@ -49,6 +49,7 @@ USERNAME = env.get("DEPLOY_USER", "root")
 PASSWORD = env.get("DEPLOY_PASSWORD", "")
 REMOTE_BASE = env.get("DEPLOY_REMOTE_BASE", "/srv/arena-game")
 ARENA_HERO_API_KEY = env.get("ARENA_HERO_API_KEY", "")
+DASHBOARD_TOKEN = env.get("DASHBOARD_TOKEN", "")
 LOG_LEVEL = env.get("LOG_LEVEL", "info")
 APP_PORT = int(env.get("APP_PORT", "4399"))
 LOCAL_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -186,9 +187,13 @@ def write_remote_env(client: paramiko.SSHClient) -> None:
     if not ARENA_HERO_API_KEY:
         print("ERROR: ARENA_HERO_API_KEY is not set in .env.deploy")
         sys.exit(1)
+    if not DASHBOARD_TOKEN:
+        print("ERROR: DASHBOARD_TOKEN is not set in .env.deploy")
+        sys.exit(1)
 
     env_content = (
         f"ARENA_HERO_API_KEY={ARENA_HERO_API_KEY}\n"
+        f"DASHBOARD_TOKEN={DASHBOARD_TOKEN}\n"
         f"LOG_LEVEL={LOG_LEVEL}\n"
     )
     stdin, stdout, stderr = client.exec_command(

@@ -3,6 +3,7 @@ Run: python dashboard.py  -> http://localhost:4399
 """
 from __future__ import annotations
 
+import hmac
 import html
 import json
 import os
@@ -10,9 +11,10 @@ import re
 import time
 from collections import defaultdict
 from functools import wraps
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 import game_stats
 from tactic_config import (
@@ -35,6 +37,10 @@ MAP_FILE = _data_path("map_memory.json")
 WAYPOINTS_FILE = _data_path("waypoints.json")
 HOST = "0.0.0.0"
 PORT = 4399
+# Auth gate: requests from outside must present this token (cookie / Bearer /
+# ?token=). Empty => auth disabled (local dev without env). Loopback always
+# bypasses so the Docker healthcheck and deploy smoke-tests keep working.
+DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
 
 
 # ---------- data loading --------------------------------------------------
@@ -1656,6 +1662,7 @@ JS = r"""
     refreshing = true;
     try{
       const res = await fetch('/api/state?ts=' + Date.now(), {cache:'no-store'});
+      if(res.status === 401){ location.href = '/'; return; }
       if(!res.ok) return;
       const data = await res.json();
       if(!data || data.tick == null) return;
@@ -2758,6 +2765,73 @@ def build_parts():
     }
 
 
+LOGIN_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><link rel="icon" href="data:,"><title>Arena Hero 战术仪表盘 · 登录</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:#11141a; color:#e8eef7; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",
+         "Microsoft YaHei",sans-serif; }
+  .login-card { width:min(360px, 92vw); padding:28px 24px; border-radius:12px;
+                background:#181d26; border:1px solid #262e3a; box-shadow:0 10px 30px rgba(0,0,0,.35); }
+  h1 { margin:0 0 6px; font-size:18px; letter-spacing:.5px; }
+  p { margin:0 0 18px; font-size:12.5px; color:#8a94a6; }
+  input { width:100%; padding:10px 12px; border-radius:8px; border:1px solid #303a48;
+          background:#0f1218; color:#e8eef7; font-size:14px; outline:none; }
+  input:focus { border-color:#4a86ff; }
+  button { width:100%; margin-top:12px; padding:10px; border:0; border-radius:8px;
+           background:#4a86ff; color:#fff; font-size:14px; cursor:pointer; }
+  button:hover { background:#3a72e0; }
+  .err { margin-top:12px; font-size:12.5px; color:#ff6b6b; min-height:1em; }
+</style>
+</head>
+<body>
+  <form class="login-card" id="loginForm" autocomplete="off">
+    <h1>🔐 Arena Hero 战术仪表盘</h1>
+    <p>请输入访问令牌以继续</p>
+    <input id="tokenInput" type="password" placeholder="DASHBOARD_TOKEN" autocomplete="current-password" required>
+    <button type="submit">进入</button>
+    <div class="err" id="errMsg"></div>
+  </form>
+<script>
+(function(){
+  var form = document.getElementById('loginForm');
+  var input = document.getElementById('tokenInput');
+  var err = document.getElementById('errMsg');
+  input.focus();
+  form.addEventListener('submit', async function(e){
+    e.preventDefault();
+    err.textContent = '';
+    var btn = form.querySelector('button');
+    btn.disabled = true;
+    btn.textContent = '验证中…';
+    try{
+      var res = await fetch('/api/login', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({token: input.value})
+      });
+      if(res.ok){ location.href = '/'; return; }
+      var data = await res.json().catch(function(){ return {}; });
+      err.textContent = (data && data.error) || '令牌无效';
+      input.value = '';
+      input.focus();
+    }catch(e){
+      err.textContent = '网络错误';
+    }finally{
+      btn.disabled = false;
+      btn.textContent = '进入';
+    }
+  });
+})();
+</script>
+</body>
+</html>"""
+
+
 def generate_html() -> str:
     parts = build_parts()
     if not parts:
@@ -2858,6 +2932,41 @@ def generate_html() -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # ---- token auth -------------------------------------------------------
+
+    def _is_loopback(self) -> bool:
+        host = self.client_address[0] if self.client_address else ""
+        return host in ("127.0.0.1", "::1", "localhost")
+
+    def _token_ok(self, token: str) -> bool:
+        if not DASHBOARD_TOKEN:
+            return True  # token not configured -> auth disabled (local dev)
+        return bool(token) and hmac.compare_digest(token, DASHBOARD_TOKEN)
+
+    def _client_token(self) -> str:
+        # 1) HttpOnly cookie set by /api/login
+        cookie = self.headers.get("Cookie")
+        if cookie:
+            try:
+                parsed = SimpleCookie()
+                parsed.load(cookie)
+                if parsed.get("arena_token"):
+                    return parsed["arena_token"].value
+            except Exception:
+                pass
+        # 2) Authorization: Bearer <token>
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            return auth[7:].strip()
+        # 3) ?token= query param
+        query = urlsplit(self.path).query
+        qs = parse_qs(query)
+        values = qs.get("token")
+        return values[0] if values else ""
+
+    def _authed(self) -> bool:
+        return self._is_loopback() or self._token_ok(self._client_token())
+
     def _send(self, code: int, body: bytes, content_type: str):
         try:
             self.send_response(code)
@@ -2889,6 +2998,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if not self._authed():
+            if path == "/":
+                self._send(401, LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8")
+            else:
+                self._send_json(401, {"ok": False, "error": "未授权：缺少或错误的 DASHBOARD_TOKEN"})
+            return
         if path == "/":
             self._send(200, generate_html().encode("utf-8"), "text/html; charset=utf-8")
             return
@@ -2921,6 +3036,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         data = self._read_json()
+        if path == "/api/login":
+            # Login is the one endpoint that must work without auth.
+            token = str(data.get("token", "")).strip()
+            if self._token_ok(token):
+                self.send_response(200)
+                self.send_header("Set-Cookie", f"arena_token={token}; Path=/; HttpOnly; SameSite=Lax")
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(b'{"ok":true}')))
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+            else:
+                self._send_json(401, {"ok": False, "error": "token 错误"})
+            return
+        if not self._authed():
+            self._send_json(401, {"ok": False, "error": "未授权：缺少或错误的 DASHBOARD_TOKEN"})
+            return
         if path in {"/api/config", "/api/config/reset"}:
             try:
                 config = (

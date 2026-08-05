@@ -8,6 +8,7 @@ services:
       PORT: "4399"
       ARENA_DATA_DIR: /app/runtime
       ARENA_HERO_API_KEY: ${ARENA_HERO_API_KEY:?Set ARENA_HERO_API_KEY in .env}
+      DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:?Set DASHBOARD_TOKEN in .env}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "4399:4399"

@@ -30,9 +30,11 @@ USERNAME = env.get("DEPLOY_USER", "root")
 PASSWORD = env.get("DEPLOY_PASSWORD", "")
 REMOTE_BASE = env.get("DEPLOY_REMOTE_BASE", "/srv/arena-game")
 APP_PORT = int(env.get("APP_PORT", "4399"))
+DASHBOARD_TOKEN = env.get("DASHBOARD_TOKEN", "")
 LOCAL_BASE = Path(__file__).resolve().parents[1]
 
 FILES = (
+    "compose.yml",
     "Dockerfile",
     "tactic.py",
     "tactic_config.py",
@@ -54,6 +56,42 @@ for name in FILES:
     print(f"  upload {name} -> {remote}")
     sftp.put(str(local), remote)
 sftp.close()
+
+# Keep remote .env's DASHBOARD_TOKEN in sync (preserving all other keys).
+if DASHBOARD_TOKEN:
+    remote_env = f"{REMOTE_BASE}/.env"
+    stdin, stdout, stderr = client.exec_command(
+        f"test -f {remote_env} && cat {remote_env} || echo '__MISSING__'"
+    )
+    raw = stdout.read().decode()
+    stdout.channel.recv_exit_status()
+    if raw.strip() == "__MISSING__":
+        print(f"  {remote_env} not found; skipping .env sync (run deploy.py first)")
+    else:
+        lines = raw.splitlines()
+        out_lines = []
+        found = False
+        for line in lines:
+            if line.strip().startswith("DASHBOARD_TOKEN="):
+                out_lines.append(f"DASHBOARD_TOKEN={DASHBOARD_TOKEN}")
+                found = True
+            else:
+                out_lines.append(line)
+        if not found:
+            out_lines.append(f"DASHBOARD_TOKEN={DASHBOARD_TOKEN}")
+        content = "\n".join(out_lines) + "\n"
+        stdin, stdout, stderr = client.exec_command(
+            f"cat > {remote_env} << 'ENVEOF'\n{content}ENVEOF\n"
+            f"chmod 600 {remote_env}"
+        )
+        stdout.channel.recv_exit_status()
+        err = stderr.read().decode().strip()
+        if err:
+            print(f"  warn updating .env: {err}")
+        else:
+            print("  .env DASHBOARD_TOKEN synced")
+else:
+    print("  DASHBOARD_TOKEN not set in .env.deploy; leaving remote .env as-is")
 
 print("Rebuilding and restarting container (volume untouched)...")
 stdin, stdout, stderr = client.exec_command(

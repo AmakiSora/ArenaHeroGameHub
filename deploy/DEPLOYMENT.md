@@ -10,12 +10,20 @@ It is intentionally a single replica. Runtime files (`map_memory.json`,
 
 ## Security Notice
 
-This deployment uses unencrypted HTTP. Anyone who can reach TCP port `4399`
-can open the dashboard and change tactic config / production queue.
+This deployment uses unencrypted HTTP. **Access is gated by a shared token**:
+every page and API route requires `DASHBOARD_TOKEN` (except requests from
+loopback, which the container healthcheck and deploy smoke-tests use). Without
+a valid token you cannot even view the dashboard, let alone change tactic
+config / production queue.
 
-Restrict TCP `4399` to trusted source IPs, a VPN, or a private network in the
-cloud firewall/security group. Do not expose this endpoint broadly on an
-untrusted network. Keep `ARENA_HERO_API_KEY` only in server-side `.env`.
+- Token lives in `deploy/.env.deploy` locally and in the remote `/srv/arena-game/.env`
+  (`DASHBOARD_TOKEN`). Generate one with
+  `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+- Log in by opening the dashboard and entering the token, or pass it on
+  non-loopback calls as `Authorization: Bearer <token>` or `?token=<token>`.
+- Restrict TCP `4399` to trusted source IPs / a VPN in the cloud
+  firewall/security group as well. Keep `ARENA_HERO_API_KEY` and
+  `DASHBOARD_TOKEN` only in server-side `.env`.
 
 ## Prerequisites
 
@@ -53,7 +61,7 @@ python deploy/deploy.py
 The script will:
 
 1. SFTP project files to `DEPLOY_REMOTE_BASE`
-2. Write remote `.env` with `ARENA_HERO_API_KEY`
+2. Write remote `.env` with `ARENA_HERO_API_KEY` + `DASHBOARD_TOKEN`
 3. Run `docker compose up --build --detach`
 4. Smoke-check `http://127.0.0.1:4399/` and `/api/state`
 
@@ -62,7 +70,7 @@ The script will:
 ```bash
 cd /srv/arena-game
 cp .env.example .env
-nano .env   # set ARENA_HERO_API_KEY
+nano .env   # set ARENA_HERO_API_KEY and DASHBOARD_TOKEN
 chmod 600 .env
 docker compose up --build --detach
 docker compose ps
@@ -72,8 +80,9 @@ docker compose logs --follow app
 Verify:
 
 ```bash
-curl -i http://SERVER_IP:4399/
-curl -i http://SERVER_IP:4399/api/state
+# From a remote client (non-loopback) you must pass the token:
+curl -i http://SERVER_IP:4399/ -H "Authorization: Bearer YOUR_TOKEN"
+curl -i http://SERVER_IP:4399/api/state -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
 `docker compose ps` should show `0.0.0.0:4399->4399/tcp`.
@@ -133,8 +142,9 @@ tactic WebSocket session.
 
 After every deployment:
 
-1. `http://SERVER_IP:4399/` loads the Chinese dashboard
-2. `/api/state` returns JSON
+1. `http://SERVER_IP:4399/` shows the login page when no token is given, and
+   the dashboard after entering the token
+2. `/api/state` returns JSON (with a valid token)
 3. `/api/config` responds (production targets live in the config form)
 4. `docker compose logs app` shows tactic connecting when API key is set
 5. New ticks appear in the dashboard after the tactic joins a game
