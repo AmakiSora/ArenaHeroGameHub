@@ -1278,34 +1278,31 @@ body{margin:0;min-height:100vh;color:var(--text);
 .teams-hero b{display:block;font-size:15px;color:#eef5ff;margin-bottom:4px}
 .teams-hero p{margin:0;color:var(--muted);font-size:12px;line-height:1.5}
 .teams-actions{display:flex;gap:8px;flex-wrap:wrap}
-.teams-actions button,.team-chip{appearance:none;border:1px solid rgba(110,168,255,.35);border-radius:999px;padding:8px 13px;background:#285b8f;color:#fff;font-size:12px;font-weight:700;cursor:pointer}
+.teams-actions button{appearance:none;border:1px solid rgba(110,168,255,.35);border-radius:999px;padding:8px 13px;background:#285b8f;color:#fff;font-size:12px;font-weight:700;cursor:pointer}
 .teams-actions button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}
 .teams-actions button:disabled{opacity:.55;cursor:wait}
-.team-board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
-.team-column{min-width:0;border-radius:18px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.025);overflow:hidden;display:flex;flex-direction:column;min-height:220px}
-.team-column.tone-idle{background:linear-gradient(180deg,rgba(148,163,184,.08),rgba(255,255,255,.02))}
-.team-column.tone-home{background:linear-gradient(180deg,rgba(87,214,163,.12),rgba(255,255,255,.02));border-color:rgba(87,214,163,.22)}
-.team-column.tone-attack{background:linear-gradient(180deg,rgba(255,107,157,.12),rgba(255,255,255,.02));border-color:rgba(255,107,157,.22)}
-.team-column.tone-guerrilla{background:linear-gradient(180deg,rgba(179,140,255,.12),rgba(255,255,255,.02));border-color:rgba(179,140,255,.22)}
-.team-column.drag-over{box-shadow:0 0 0 2px rgba(110,168,255,.35) inset;transform:translateY(-1px)}
-.team-column-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;padding:12px 12px 8px}
+.team-board{display:grid;grid-template-columns:1fr;gap:10px}
+.team-column{min-width:0;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.025);overflow:hidden;display:flex;flex-direction:row;align-items:stretch}
+.team-column.tone-idle{background:linear-gradient(90deg,rgba(148,163,184,.08),rgba(255,255,255,.02))}
+.team-column.tone-home{background:linear-gradient(90deg,rgba(87,214,163,.12),rgba(255,255,255,.02));border-color:rgba(87,214,163,.22)}
+.team-column.tone-attack{background:linear-gradient(90deg,rgba(255,107,157,.12),rgba(255,255,255,.02));border-color:rgba(255,107,157,.22)}
+.team-column.tone-guerrilla{background:linear-gradient(90deg,rgba(179,140,255,.12),rgba(255,255,255,.02));border-color:rgba(179,140,255,.22)}
+.team-column.drag-over{box-shadow:0 0 0 2px rgba(110,168,255,.35) inset}
+.team-column-head{display:flex;flex-direction:column;justify-content:center;gap:2px;flex:0 0 108px;padding:10px 14px;border-right:1px solid rgba(255,255,255,.06)}
 .team-column-head b{display:block;font-size:13px;color:#eef3ff}
-.team-column-head span{display:block;margin-top:3px;color:var(--muted);font-size:11px}
-.team-count{min-width:24px;height:24px;border-radius:999px;display:grid;place-items:center;background:rgba(0,0,0,.22);color:#d7e8ff;font:700 11px Consolas,monospace;font-style:normal}
-.team-drop{flex:1;display:flex;flex-direction:column;gap:8px;padding:0 10px 12px;min-height:150px}
-.team-empty{margin:auto 0;padding:18px 10px;border:1px dashed rgba(255,255,255,.12);border-radius:14px;color:#7f8eab;font-size:12px;text-align:center}
-.team-chip{display:flex;align-items:center;gap:8px;width:100%;border-radius:14px;padding:9px 10px;background:rgba(8,14,26,.72);border:1px solid rgba(255,255,255,.10);color:#eef3ff;cursor:grab;text-align:left;box-shadow:0 8px 18px rgba(0,0,0,.18)}
+.team-column-head span{display:block;color:var(--muted);font-size:10px;line-height:1.3}
+.team-count{width:20px;height:20px;border-radius:999px;display:grid;place-items:center;background:rgba(0,0,0,.22);color:#d7e8ff;font:700 11px Consolas,monospace;font-style:normal}
+.team-drop{flex:1;display:flex;flex-direction:row;flex-wrap:wrap;align-items:center;align-content:center;gap:8px;padding:10px 12px;min-height:58px}
+.team-empty{padding:8px 14px;border:1px dashed rgba(255,255,255,.12);border-radius:12px;color:#7f8eab;font-size:11px}
+.team-chip{position:relative;display:grid;place-items:center;width:34px;height:34px;padding:0;border-radius:12px;background:rgba(8,14,26,.72);border:1px solid rgba(255,255,255,.12);cursor:grab;color:#081018;font:800 12px Consolas,monospace;box-shadow:0 4px 10px rgba(0,0,0,.2)}
 .team-chip:active{cursor:grabbing}
 .team-chip.dragging{opacity:.45}
-.team-chip .glyph{width:28px;height:28px;border-radius:10px;display:grid;place-items:center;font:800 12px Consolas,monospace;color:#081018}
+.team-chip .glyph{width:100%;height:100%;display:grid;place-items:center;font:800 12px Consolas,monospace;color:#081018;border-radius:10px}
 .team-chip.kind-VANGUARD .glyph{background:#ff8c42}
 .team-chip.kind-RANGER .glyph{background:#b38cff}
 .team-chip.kind-COMBAT .glyph{background:#6ea8ff}
-.team-chip .meta{min-width:0;flex:1}
-.team-chip .meta b{display:block;font-size:12px;line-height:1.2}
-.team-chip .meta span{display:block;color:#93a0bf;font-size:10px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.team-chip.ghost{opacity:.55;border-style:dashed}
-.team-chip .pulse{width:8px;height:8px;border-radius:50%;background:#57d6a3;box-shadow:0 0 0 4px rgba(87,214,163,.12)}
+.team-chip.ghost{opacity:.5;border-style:dashed}
+.team-chip .pulse{position:absolute;right:-2px;top:-2px;width:8px;height:8px;border-radius:50%;background:#57d6a3;box-shadow:0 0 0 3px rgba(87,214,163,.12)}
 .team-chip.ghost .pulse{background:#7f8eab;box-shadow:none}
 .team-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}
 .team-settings label{display:grid;gap:6px;padding:10px 12px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);color:var(--muted);font-size:11px}
@@ -1367,14 +1364,13 @@ body{margin:0;min-height:100vh;color:var(--text);
   .topbar{flex-direction:column}
 }
 @media (max-width:1100px){
-  .team-board{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .team-column-head{flex:0 0 88px;padding:8px 10px}
   .team-settings{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media (max-width:680px){
   .config-groups{grid-template-columns:1fr}
   .config-message{width:100%;margin-left:0}
   .production-targets{grid-template-columns:1fr}
-  .team-board{grid-template-columns:1fr}
   .team-settings{grid-template-columns:1fr}
   .teams-hero{flex-direction:column}
 }
@@ -2203,20 +2199,13 @@ JS = r"""
       chip.draggable = true;
       chip.dataset.unitName = unit.name;
       chip.dataset.team = team;
-      chip.title = '拖到其他队伍';
+      chip.title = unit.name + ' · ' + teamMetaLine(unit) + '（拖到其他队伍）';
       const glyph = document.createElement('span');
       glyph.className = 'glyph';
-      glyph.textContent = String(unit.name || '?').slice(0,2);
-      const meta = document.createElement('div');
-      meta.className = 'meta';
-      const title = document.createElement('b');
-      title.textContent = unit.name;
-      const sub = document.createElement('span');
-      sub.textContent = teamMetaLine(unit);
-      meta.append(title, sub);
+      glyph.textContent = String(unit.name || '?').slice(0, 2);
       const pulse = document.createElement('span');
       pulse.className = 'pulse';
-      chip.append(glyph, meta, pulse);
+      chip.append(glyph, pulse);
       chip.addEventListener('dragstart', function(e){
         dragUnitName = unit.name;
         chip.classList.add('dragging');
