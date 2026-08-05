@@ -109,11 +109,15 @@ if exit_code != 0:
 print("Verifying...")
 stdin, stdout, stderr = client.exec_command("sleep 3")
 stdout.channel.recv_exit_status()
+# Note: host-side curls reach the container through docker-proxy, so the
+# source is the bridge gateway, not loopback -> auth applies. Pass the token
+# via Bearer header so the smoke test verifies the authenticated path.
+AUTH = f"-H 'Authorization: Bearer {DASHBOARD_TOKEN}'" if DASHBOARD_TOKEN else ""
 cmds = [
     "docker compose ps",
     f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{APP_PORT}/",
-    f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{APP_PORT}/api/state",
-    f"curl -s http://127.0.0.1:{APP_PORT}/api/config | head -c 400",
+    f"curl -s -o /dev/null -w '%{{http_code}}' {AUTH} http://127.0.0.1:{APP_PORT}/api/state",
+    f"curl -s {AUTH} http://127.0.0.1:{APP_PORT}/api/config | head -c 400",
     "docker compose logs --tail=5 app",
 ]
 for cmd in cmds:

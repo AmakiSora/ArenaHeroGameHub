@@ -311,7 +311,9 @@ def main() -> None:
     cmds = [
         "docker compose ps",
         f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{APP_PORT}/",
-        f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{APP_PORT}/api/state",
+        # Host-side curls hit the container via docker-proxy (source = bridge
+        # gateway, not loopback), so pass the token through Bearer.
+        f"curl -s -o /dev/null -w '%{{http_code}}' -H 'Authorization: Bearer {DASHBOARD_TOKEN}' http://127.0.0.1:{APP_PORT}/api/state",
         "docker exec arena-game-app-1 ls -la /app/runtime",
     ]
     for cmd in cmds:
