@@ -135,6 +135,68 @@ def _line_blocked(
     return False
 
 
+def _vision_obstructed(
+    a: tuple[int, int],
+    b: tuple[int, int],
+    obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]],
+) -> bool:
+    """True when an obstacle cell lies on the integer supercover line a→b.
+
+    Vision follows the game rule: obstacles block sight along the line, the
+    obstacle cell itself is visible but cells behind it are not, and when the
+    line passes exactly through a shared corner an obstacle in either adjacent
+    cell blocks it. The viewer `a` and the looked-at cell `b` never block.
+    """
+    x0, y0 = a
+    x1, y1 = b
+    if (x0, y0) == (x1, y1):
+        return False
+    dx = x1 - x0
+    dy = y1 - y0
+    adx = abs(dx)
+    ady = abs(dy)
+    sx = 1 if dx > 0 else -1
+    sy = 1 if dy > 0 else -1
+
+    if adx == 0:  # purely vertical
+        for yy in range(y0 + sy, y1, sy):
+            if (x0, yy) in obstacles:
+                return True
+        return False
+    if ady == 0:  # purely horizontal
+        for xx in range(x0 + sx, x1, sx):
+            if (xx, y0) in obstacles:
+                return True
+        return False
+
+    # Integer DDA over the grid the segment crosses. `px`/`py` are the progress
+    # (in units of adx*ady) at which the segment next hits a vertical/horizontal
+    # gridline; equal values mean it passes exactly through a shared corner, so
+    # an obstacle on either side blocks the line (rules supercover rule).
+    px = ady
+    py = adx
+    cx, cy = x0, y0
+    while (cx, cy) != (x1, y1):
+        if px < py:
+            cx += sx
+            px += ady
+        elif py < px:
+            cy += sy
+            py += adx
+        else:
+            if (cx + sx, cy) in obstacles or (cx, cy + sy) in obstacles:
+                return True
+            cx += sx
+            cy += sy
+            px += ady
+            py += adx
+        if (cx, cy) == (x1, y1):
+            break
+        if (cx, cy) in obstacles:
+            return True
+    return False
+
+
 # ── Dead-end map recognition ──────────────────────────────────────────────────
 # A free cell with only one open cardinal neighbor is a 凸-shaped cul-de-sac
 # (three sides walled). One-wide corridors that only lead into such pockets are
@@ -2360,20 +2422,25 @@ def _update_resource_memory(turn) -> None:
 
 def _update_enemy_sightings(turn) -> None:
     """Record every position where enemies were seen.  Remove stale sightings
-    when a friendly unit is looking at the cell and no enemy is there."""
+    only when a friendly unit can genuinely see the cell (within its own vision
+    radius, with unobstructed line of sight) and no enemy is there.  A sighting
+    no friendly can actually see is kept as last-known enemy info."""
     global _enemy_memory, _map_dirty
     before = len(_enemy_memory)
 
-    # Collect all friendly positions for sight checking
-    friendly_positions: set[tuple[int, int]] = set()
+    # Vision radius differs by object type (rules): Core 5 / Worker 3 /
+    # Vanguard 4 / Ranger 5.  A sighting is confirmed empty only when the cell
+    # falls inside a unit's *own* radius — a far worker with radius 3 passing
+    # within 5 cells of a spot must not erase it.
+    friendly_views: list[tuple[tuple[int, int], int]] = []
     if turn.core:
-        friendly_positions.add(tuple(turn.core.position))
+        friendly_views.append((tuple(turn.core.position), 5))
     for w in turn.workers:
-        friendly_positions.add(tuple(w.position))
+        friendly_views.append((tuple(w.position), 3))
     for v in turn.vanguards:
-        friendly_positions.add(tuple(v.position))
+        friendly_views.append((tuple(v.position), 4))
     for r in turn.rangers:
-        friendly_positions.add(tuple(r.position))
+        friendly_views.append((tuple(r.position), 5))
 
     # Visible enemies this tick
     visible_enemy_positions: set[tuple[int, int]] = {
@@ -2385,16 +2452,19 @@ def _update_enemy_sightings(turn) -> None:
         if pos not in _enemy_memory:
             _enemy_memory.add(pos)
 
-    # Remove stale sightings: friendly unit within range 5 of a sighting,
-    # but no visible enemy there
-    VISION_RANGE = 5
+    # Remove stale sightings: some friendly unit can actually see the cell
+    # (within its own vision radius, line of sight unobstructed) but no enemy
+    # is there.  Obstacles block sight, so a spot behind a wall stays a hint.
+    obstacles = frozenset(_obstacle_memory) | turn.obstacle_cells
     stale: set[tuple[int, int]] = set()
     for sighting in _enemy_memory:
         if sighting in visible_enemy_positions:
             continue  # still there
-        # Check if any friendly unit is close enough to see this cell
-        for fpos in friendly_positions:
-            if _manhattan(fpos, sighting) <= VISION_RANGE:
+        for fpos, radius in friendly_views:
+            if (
+                _manhattan(fpos, sighting) <= radius
+                and not _vision_obstructed(fpos, sighting, obstacles)
+            ):
                 stale.add(sighting)
                 break
 

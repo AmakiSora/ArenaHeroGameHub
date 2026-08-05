@@ -2610,5 +2610,122 @@ class DashboardWaypointTests(unittest.TestCase):
         self.assertEqual(len(saved), 24)
 
 
+class EnemySightingsMemoryTests(unittest.TestCase):
+    """Stale enemy sightings are removed only when a friendly unit can
+    actually see the cell (its own vision radius + unobstructed line of
+    sight), never just because it is within the old flat range-5 check."""
+
+    @staticmethod
+    def _unit(pos: tuple[int, int]):
+        return SimpleNamespace(position=pos)
+
+    @staticmethod
+    def _core(pos: tuple[int, int]):
+        return SimpleNamespace(position=pos)
+
+    @staticmethod
+    def _turn(*, core=None, workers=(), vanguards=(), rangers=(), visible=(), obstacles=()):
+        return SimpleNamespace(
+            core=core,
+            workers=tuple(workers),
+            vanguards=tuple(vanguards),
+            rangers=tuple(rangers),
+            visible_enemies=tuple(visible),
+            obstacle_cells=frozenset(obstacles),
+        )
+
+    def setUp(self) -> None:
+        self._enemies_backup = set(tactic._enemy_memory)
+        self._obstacles_backup = set(tactic._obstacle_memory)
+        self._dirty_backup = tactic._map_dirty
+        tactic._enemy_memory.clear()
+        tactic._obstacle_memory.clear()
+
+    def tearDown(self) -> None:
+        tactic._enemy_memory.clear()
+        tactic._enemy_memory.update(self._enemies_backup)
+        tactic._obstacle_memory.clear()
+        tactic._obstacle_memory.update(self._obstacles_backup)
+        tactic._map_dirty = self._dirty_backup
+
+    def test_worker_within_old_range_5_keeps_sighting_it_cannot_see(self) -> None:
+        # Worker vision is 3; a worker 4 cells away must NOT erase the marker
+        # (the old flat range-5 check would have).
+        tactic._enemy_memory.update({(5, 0)})
+        turn = self._turn(workers=[self._unit((1, 0))])
+        tactic._update_enemy_sightings(turn)
+        self.assertIn((5, 0), tactic._enemy_memory)
+
+    def test_ranger_within_own_radius_confirms_empty_and_clears(self) -> None:
+        # Ranger vision is 5; standing 5 away with clear sight confirms the
+        # cell is empty and the stale marker goes away.
+        tactic._enemy_memory.update({(5, 0)})
+        turn = self._turn(rangers=[self._unit((0, 0))])
+        tactic._update_enemy_sightings(turn)
+        self.assertNotIn((5, 0), tactic._enemy_memory)
+
+    def test_worker_adjacent_confirms_empty_and_clears(self) -> None:
+        tactic._enemy_memory.update({(1, 0)})
+        turn = self._turn(workers=[self._unit((0, 0))])
+        tactic._update_enemy_sightings(turn)
+        self.assertNotIn((1, 0), tactic._enemy_memory)
+
+    def test_obstacle_between_unit_and_sighting_keeps_memory(self) -> None:
+        # A wall on the straight line blocks sight, so the marker survives even
+        # though the ranger is within its vision radius.
+        tactic._enemy_memory.update({(3, 0)})
+        turn = self._turn(
+            rangers=[self._unit((0, 0))],
+            obstacles=[(1, 0)],
+        )
+        tactic._update_enemy_sightings(turn)
+        self.assertIn((3, 0), tactic._enemy_memory)
+
+    def test_visible_enemy_still_in_memory_is_kept(self) -> None:
+        tactic._enemy_memory.update({(5, 0)})
+        turn = self._turn(
+            rangers=[self._unit((0, 0))],
+            visible=[self._unit((5, 0))],
+        )
+        tactic._update_enemy_sightings(turn)
+        self.assertIn((5, 0), tactic._enemy_memory)
+
+    def test_new_visible_enemy_is_recorded(self) -> None:
+        turn = self._turn(visible=[self._unit((7, 2))])
+        tactic._update_enemy_sightings(turn)
+        self.assertIn((7, 2), tactic._enemy_memory)
+
+    def test_vision_obstructed_axis_lines(self) -> None:
+        self.assertTrue(tactic._vision_obstructed((0, 0), (0, 3), {(0, 2)}))
+        self.assertTrue(tactic._vision_obstructed((0, 0), (0, 3), {(0, 1)}))
+        self.assertFalse(tactic._vision_obstructed((0, 0), (0, 3), {(0, 3)}))
+        self.assertFalse(tactic._vision_obstructed((0, 0), (0, 3), {(0, 0)}))
+        self.assertFalse(tactic._vision_obstructed((0, 0), (0, 3), {(1, 1)}))
+        self.assertTrue(tactic._vision_obstructed((0, 0), (3, 0), {(1, 0)}))
+        self.assertFalse(tactic._vision_obstructed((0, 0), (3, 0), {(0, 1)}))
+        self.assertFalse(tactic._vision_obstructed((0, 0), (3, 0), {(3, 0)}))
+
+    def test_vision_obstructed_diagonal_corner_rule(self) -> None:
+        # (0,0)→(2,2) crosses the shared corner at (1,1); an obstacle in either
+        # adjacent cell, or on the line itself, blocks. Source/target and cells
+        # beside the line do not.
+        self.assertTrue(tactic._vision_obstructed((0, 0), (2, 2), {(1, 0)}))
+        self.assertTrue(tactic._vision_obstructed((0, 0), (2, 2), {(0, 1)}))
+        self.assertTrue(tactic._vision_obstructed((0, 0), (2, 2), {(1, 1)}))
+        self.assertTrue(tactic._vision_obstructed((0, 0), (2, 2), {(2, 1)}))
+        self.assertTrue(tactic._vision_obstructed((0, 0), (2, 2), {(1, 2)}))
+        self.assertFalse(tactic._vision_obstructed((0, 0), (2, 2), {(0, 0)}))
+        self.assertFalse(tactic._vision_obstructed((0, 0), (2, 2), {(2, 2)}))
+        self.assertFalse(tactic._vision_obstructed((0, 0), (2, 2), {(2, 0)}))
+
+    def test_vision_obstructed_side_cell_never_blocks_shallow_line(self) -> None:
+        # (0,0)→(3,1) passes through (1,0),(2,0) and the endpoint corner; the
+        # cell (1,1) sits beside the line and must not block it.
+        self.assertTrue(tactic._vision_obstructed((0, 0), (3, 1), {(1, 0)}))
+        self.assertTrue(tactic._vision_obstructed((0, 0), (3, 1), {(2, 0)}))
+        self.assertTrue(tactic._vision_obstructed((0, 0), (3, 1), {(2, 1)}))
+        self.assertFalse(tactic._vision_obstructed((0, 0), (3, 1), {(1, 1)}))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,13 @@ server --WebSocket state--> SDK --Turn--> choose_actions() --plan--> SDK --HTTP 
 - 工人到达记忆矿点但当前格没有矿 → 删除并在同一 Tick 转入探索
 - 前端手动录入的矿点同样会在工人到达并确认无矿后删除
 
+**敌人踪迹记忆（`_enemy_memory`，同样持久化到 map_memory.json）：**
+- 任何可见敌人所在的格 → 自动加入踪迹
+- 旧踪迹只在**某友方单位确实能看到该格**（该单位自己的视野半径内，且连线无遮挡）
+  且该格没有敌人时才清除——工人（视野 3）/先锋（视野 4）路过 4~5 格外的旧踪迹
+  不会误删；被墙体挡住视线的踪迹也会保留为"最后一次看到"的线索
+- 面板「清除」按钮可随时手动清空全部踪迹
+
 **注意（重要游戏机制）：** 一次采集会把工人载货槽一次性填满（核心携带冠军信标时
 容量为 2，采集即得 2）。因此身上已带部分货物的工人**无法再采集**——服务器对任何
 继续采集返回 `HARVEST_FAILED / CARGO_FULL`。CARGO_FULL **不代表矿点枯竭**，矿点仍
@@ -323,6 +330,7 @@ b558d97 feat: add direct-play wrapper with BFS pathfinding, enemy avoidance, aut
 | 变量 | 类型 | 说明 |
 |------|------|------|
 | `_resource_memory` | `set[tuple[int,int]]` | 跨 Tick 持久化的矿点坐标 |
+| `_enemy_memory` | `set[tuple[int,int]]` | 跨 Tick 持久化的敌人踪迹（最近目击点） |
 | `_resource_assignments` | `dict[str, tuple[int,int]]` | 每 Tick 重算的矿→工人分配 |
 | `_worker_last_pos` | `dict[str, tuple[int,int]]` | 每个工人上一帧坐标（防回朔） |
 
