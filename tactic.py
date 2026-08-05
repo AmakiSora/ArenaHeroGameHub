@@ -29,7 +29,7 @@ from arena_hero import (
 )
 from arena_hero.errors import ProtocolError, TransportError
 import game_stats
-from state_io import atomic_write_text, file_lock
+from state_io import append_jsonl, atomic_write_text, file_lock
 from tactic_config import CONFIG_PATH, load_config, mutate_config
 
 def _data_dir() -> Path:
@@ -39,6 +39,9 @@ def _data_dir() -> Path:
 
 MAP_MEMORY_PATH = _data_dir() / "map_memory.json"
 DEFAULT_LOG_PATH = str(_data_dir() / "tactic_log.jsonl")
+# Categorized battle log (discoveries / kills / defeats / config changes) that
+# both the tactic process and the dashboard process append to.
+BATTLE_LOG_PATH = _data_dir() / "battle_log.jsonl"
 # Manual per-unit target coordinates set from the dashboard (display-name keyed).
 WAYPOINTS_PATH = _data_dir() / "waypoints.json"
 
@@ -2472,6 +2475,158 @@ def _update_enemy_sightings(turn) -> None:
         _map_dirty = True
 
 
+# ── Categorized battle log (dashboard「战斗日志」panel) ────────────────────────
+# The tactic process appends one row per discovery / combat / economy / failure
+# each tick; the dashboard process appends config-change rows. Categories are
+# the filter chips in the dashboard log panel.
+
+_LOG_CAT_REASONS = {
+    "HARVEST_FAILED": {
+        "CARGO_FULL": "货舱满",
+        "RESOURCE_DEPLETED": "矿点被抢先采空",
+        "NOT_RESOURCE_CELL": "当前格非矿点",
+    },
+    "DEPOSIT_FAILED": {
+        "CORE_RESOURCE_FULL": "仓库满",
+        "CORE_NOT_PRESENT": "核心不在本格",
+        "CORE_MOVING": "核心迁移中",
+        "WORKER_EMPTY": "身上无货",
+    },
+    "CORE_SPAWN_FAILED": {
+        "CELL_UNIT_LIMIT": "格位已满",
+        "INSUFFICIENT_RESOURCES": "资源不足",
+        "DETERMINISTIC_ID_COLLISION": "生成 ID 冲突",
+    },
+}
+_UNIT_TYPE_LABELS = {"WORKER": "工人", "VANGUARD": "先锋", "RANGER": "游侠"}
+
+
+def _battle_actor_name(turn: Any, object_id: Any) -> str:
+    """Resolve a resolution-event object id to its stable display name."""
+    if object_id is None:
+        return "—"
+    key = str(object_id)
+    for unit in getattr(turn, "units", ()) or ():
+        if str(unit.id) == key:
+            prefix = _UNIT_NAME_PREFIX.get(getattr(unit, "unit_type", None), "U")
+            return _object_name(object_id, prefix)
+    for enemy in getattr(turn, "visible_enemies", ()) or ():
+        if str(enemy.id) == key:
+            return _object_name(object_id, "E")
+    core = getattr(turn, "core", None)
+    if core is not None and str(core.id) == key:
+        return _object_name(object_id, "C")
+    return _object_name(object_id, "U")
+
+
+def _classify_battle_event(turn: Any, event: Any) -> tuple[str | None, str | None]:
+    """Map one resolution event to a (category, human message) log row."""
+    et = getattr(event, "event_type", "")
+    reason = getattr(event, "reason_code", None) or ""
+    actor = _battle_actor_name(turn, getattr(event, "actor_id", None))
+    target = _battle_actor_name(turn, getattr(event, "target_id", None))
+    values = getattr(event, "values", None) or {}
+    # SDK ResolutionEvent exposes `resource_amount` as a property; tests / stub
+    # objects carry the raw value in `values["amount"]` instead.
+    amount = getattr(event, "resource_amount", None)
+    if amount is None:
+        amount = values.get("amount")
+
+    if et == "SHOT_HIT":
+        dmg = values.get("damage")
+        return "combat", f"{actor} 击中 {target}" + (f" 造成 {dmg} 伤害" if dmg else "")
+    if et == "SWEEP_RESOLVED":
+        n = values.get("targets_hit", 0)
+        return "combat", f"{actor} 横扫命中 {n} 个目标"
+    if et == "DESTRUCTION_PARTICIPATION":
+        return "kill", f"{actor} 参与摧毁 {target}"
+    if et == "CORE_RESOURCES_CAPTURED":
+        return "kill", "摧毁敌方核心" + (f"，缴获 {amount} 资源" if amount else "")
+    if et == "UNIT_DAMAGED":
+        hp = values.get("hp")
+        dmg = values.get("damage")
+        if hp == 0:
+            return "defeat", f"{target} 被击败"
+        if reason == "UPKEEP_DEFICIT":
+            return "defeat", f"{target} 因维护费亏损 {dmg} 点"
+        return "combat", f"{target} 受 {dmg} 伤害（HP {hp}）"
+    if et == "UNIT_SELF_DESTRUCTED":
+        return "defeat", f"{actor} 超编自裁"
+    if et == "CORE_DAMAGED":
+        return "defeat", "核心受到攻击"
+    if et == "CORE_DESTROYED":
+        return "defeat", "核心被摧毁"
+    if et == "HARVEST_SUCCEEDED":
+        return "economy", f"{actor} 挖矿 +{amount or '?'}"
+    if et == "DEPOSIT_SUCCEEDED":
+        return "economy", f"{actor} 卸货 +{amount or '?'}"
+    if et == "BEACON_HARVEST_BONUS":
+        return "economy", f"{actor} 信标加成 +{amount or '?'}"
+    if et == "UPKEEP_PAID":
+        due = values.get("due", 0)
+        deficit = values.get("deficit", 0)
+        msg = f"维护费 {due}"
+        if deficit:
+            msg += f"，亏损 {deficit} 自裁单位"
+        return "economy", msg
+    if et == "CORE_REPAIR_SUCCEEDED":
+        return "economy", "核心修盾 +1"
+    if et in ("CORE_HEAL_SUCCEEDED", "UNIT_HEAL_SUCCEEDED"):
+        who = "核心" if et.startswith("CORE") else actor
+        return "economy", f"{who} 回血 +{amount or '?'}"
+    if et == "CORE_SPAWN_SUCCEEDED":
+        tname = _UNIT_TYPE_LABELS.get(str(values.get("unit_type", "")), "单位")
+        return "economy", f"生产 {tname}（{target}）"
+    if et == "CORE_RESOURCE_OVERFLOW_DESTROYED":
+        return "economy", f"人口下降，{amount or '?'} 资源被销毁"
+
+    if et == "HARVEST_FAILED":
+        return "warn", f"{actor} 挖矿失败：{_LOG_CAT_REASONS['HARVEST_FAILED'].get(reason, reason)}"
+    if et == "DEPOSIT_FAILED":
+        return "warn", f"{actor} 卸货失败：{_LOG_CAT_REASONS['DEPOSIT_FAILED'].get(reason, reason)}"
+    if et == "SHOT_MISSED":
+        return "warn", f"{actor} 射击未命中"
+    if et in ("CORE_HEAL_FAILED", "UNIT_HEAL_FAILED", "CORE_REPAIR_FAILED"):
+        return "warn", f"修复/回血失败：{reason or '—'}"
+    if et == "CORE_SPAWN_FAILED":
+        why = _LOG_CAT_REASONS["CORE_SPAWN_FAILED"].get(reason, reason or "—")
+        return "warn", f"生产失败：{why}"
+    if et in (
+        "UNIT_MOVE_FAILED",
+        "CORE_MOVE_FAILED",
+        "CORE_MOVE_START_FAILED",
+        "CORE_ACTION_FAILED",
+    ):
+        return "warn", f"{actor} 移动/动作失败：{reason or '—'}"
+    return None, None
+
+
+def _battle_log_entries(
+    turn: Any,
+    *,
+    new_resources: set[tuple[int, int]],
+    new_enemy_sightings: set[tuple[int, int]],
+) -> list[dict]:
+    """Build the categorized log rows for one Tick (discoveries + events)."""
+    entries: list[dict] = []
+    tick = turn_context.tick
+    for pos in sorted(new_resources):
+        entries.append({
+            "tick": tick, "cat": "discover",
+            "msg": f"发现新矿点 ({pos[0]},{pos[1]})",
+        })
+    for pos in sorted(new_enemy_sightings):
+        entries.append({
+            "tick": tick, "cat": "discover",
+            "msg": f"发现敌人踪迹 ({pos[0]},{pos[1]})",
+        })
+    for event in getattr(turn, "events", ()) or ():
+        cat, msg = _classify_battle_event(turn, event)
+        if cat and msg:
+            entries.append({"tick": tick, "cat": cat, "msg": msg})
+    return entries
+
+
 # Context holder for the current turn's resource_space (set by choose_actions)
 turn_context = type(
     "_Ctx",
@@ -2686,12 +2841,29 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     # Honor dashboard clears before we re-accumulate or plan against memory.
     _apply_dashboard_map_edits()
     known_obstacles = _update_obstacle_memory(turn)
+    res_before = set(_resource_memory)
+    enemy_before = set(_enemy_memory)
     _update_resource_memory(turn)
     _update_enemy_sightings(turn)
     _save_map_memory(
         tick=getattr(turn, "tick", None),
         save_interval_ticks=int(config["map_save_interval_ticks"]),
     )
+
+    # ── Categorized battle log (discoveries + resolution events) ────────
+    # Best-effort: a log write must never break the game loop, so failures
+    # are swallowed.  New discoveries are diffed from the memory updates above;
+    # combat/economy/warn rows come from this Tick's resolution events.
+    battle_entries = _battle_log_entries(
+        turn,
+        new_resources=set(_resource_memory) - res_before,
+        new_enemy_sightings=set(_enemy_memory) - enemy_before,
+    )
+    if battle_entries:
+        try:
+            append_jsonl(BATTLE_LOG_PATH, battle_entries)
+        except OSError:
+            pass
 
     # ── Lifecycle guard ─────────────────────────────────────────────────
     if turn.core is None:

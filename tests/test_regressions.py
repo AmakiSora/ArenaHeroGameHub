@@ -2788,5 +2788,139 @@ class EnemySightingsMemoryTests(unittest.TestCase):
         self.assertFalse(tactic._vision_obstructed((0, 0), (3, 1), {(1, 1)}))
 
 
+class BattleLogTests(unittest.TestCase):
+    """Categorized battle log: append_jsonl persistence, event classification,
+    discovery rows, and the dashboard reader/panel render."""
+
+    @staticmethod
+    def _event(event_type, reason=None, actor=None, target=None, values=None, pos=None):
+        return SimpleNamespace(
+            event_type=event_type, reason_code=reason,
+            actor_id=actor, target_id=target, values=values, position=pos,
+        )
+
+    @staticmethod
+    def _unit(uid, unit_type, pos):
+        return SimpleNamespace(id=uid, unit_type=unit_type, position=pos)
+
+    def setUp(self) -> None:
+        self._names = dict(tactic._object_names)
+        self._counters = dict(tactic._object_name_counters)
+        self._tick = tactic.turn_context.tick
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        tactic.turn_context.tick = 42
+
+    def tearDown(self) -> None:
+        tactic._object_names.clear()
+        tactic._object_names.update(self._names)
+        tactic._object_name_counters.clear()
+        tactic._object_name_counters.update(self._counters)
+        tactic.turn_context.tick = self._tick
+
+    def test_append_jsonl_appends_and_rotates(self) -> None:
+        from state_io import append_jsonl
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "battle_log.jsonl"
+            append_jsonl(path, [{"cat": "discover", "msg": "a"}, {"cat": "kill", "msg": "b"}])
+            append_jsonl(path, [{"cat": "defeat", "msg": "c"}])
+            lines = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x]
+            self.assertEqual([e["cat"] for e in lines], ["discover", "kill", "defeat"])
+            # Rotation keeps only the newest lines once the file is oversized.
+            append_jsonl(path, [{"msg": f"row{i}"} for i in range(10)], max_bytes=1, keep_lines=3)
+            tail = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines() if x]
+            self.assertEqual(len(tail), 3)
+            self.assertEqual(tail[-1]["msg"], "row9")
+
+    def test_classify_battle_event_categories(self) -> None:
+        turn = SimpleNamespace(
+            units=(
+                self._unit("u1", UnitType.WORKER, (0, 0)),
+                self._unit("u2", UnitType.VANGUARD, (1, 0)),
+                self._unit("u3", UnitType.RANGER, (2, 0)),
+            ),
+            visible_enemies=(self._unit("e1", UnitType.WORKER, (9, 9)),),
+            core=None,
+        )
+        cases = [
+            ("SHOT_HIT", None, "u3", "e1", {"damage": 1}, "combat", "R1"),
+            ("SWEEP_RESOLVED", None, "u2", None, {"targets_hit": 2}, "combat", "V1"),
+            ("DESTRUCTION_PARTICIPATION", "UNIT", "u3", "e1", None, "kill", "E1"),
+            ("UNIT_DAMAGED", "ATTACK", None, "u1", {"damage": 2, "hp": 0}, "defeat", "W1"),
+            ("UNIT_SELF_DESTRUCTED", None, "u1", None, None, "defeat", "W1"),
+            ("CORE_DESTROYED", "ATTACK", None, None, None, "defeat", "核心"),
+            ("HARVEST_SUCCEEDED", None, "u1", None, {"amount": 2}, "economy", "挖矿"),
+            ("DEPOSIT_SUCCEEDED", None, "u1", None, {"amount": 2}, "economy", "卸货"),
+            ("SHOT_MISSED", "SHOT_MISSED", "u3", None, None, "warn", "未命中"),
+            ("HARVEST_FAILED", "CARGO_FULL", "u1", None, None, "warn", "货舱满"),
+            ("CORE_SPAWN_FAILED", "INSUFFICIENT_RESOURCES", None, None, None, "warn", "资源不足"),
+        ]
+        for et, reason, actor, target, values, cat, needle in cases:
+            event = self._event(et, reason, actor, target, values)
+            got_cat, got_msg = tactic._classify_battle_event(turn, event)
+            self.assertEqual(got_cat, cat, et)
+            self.assertIn(needle, got_msg, et)
+
+    def test_battle_log_entries_include_discoveries_and_events(self) -> None:
+        turn = SimpleNamespace(
+            units=(self._unit("u1", UnitType.WORKER, (0, 0)),),
+            visible_enemies=(),
+            core=None,
+            events=(self._event("HARVEST_SUCCEEDED", actor="u1", values={"amount": 2}),),
+        )
+        entries = tactic._battle_log_entries(
+            turn,
+            new_resources={(3, 4)},
+            new_enemy_sightings={(7, 8)},
+        )
+        cats = [e["cat"] for e in entries]
+        self.assertIn("discover", cats)
+        self.assertIn("economy", cats)
+        self.assertTrue(all(e["tick"] == 42 for e in entries))
+        self.assertTrue(any("(3,4)" in e["msg"] for e in entries))
+        self.assertTrue(any("(7,8)" in e["msg"] for e in entries))
+
+    def test_read_battle_log_returns_newest_first(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "battle_log.jsonl"
+            path.write_text(
+                json.dumps({"msg": "first"}) + "\n" + json.dumps({"msg": "second"}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
+                entries = dashboard.read_battle_log(10)
+        self.assertEqual([e["msg"] for e in entries], ["second", "first"])
+
+    def test_config_log_message_uses_field_labels(self) -> None:
+        msg = dashboard._config_log_message({"target_workers": 8, "ranger_attack_range": 2})
+        self.assertIn("工人目标=8", msg)
+        self.assertIn("游侠开火距离=2", msg)
+
+    def test_log_panel_html_renders_rows_with_categories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "battle_log.jsonl"
+            path.write_text(
+                json.dumps({"tick": 1, "cat": "discover", "msg": "发现矿点"}) + "\n"
+                + json.dumps({"tick": 2, "cat": "kill", "msg": "参与摧毁"}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
+                html, count = dashboard._battle_log_html()
+        self.assertEqual(count, 2)
+        self.assertIn('data-cat="discover"', html)
+        self.assertIn('data-cat="kill"', html)
+        self.assertIn("发现矿点", html)
+        self.assertIn("tick 1", html)
+
+    def test_log_panel_is_present_below_config(self) -> None:
+        page = dashboard.generate_html()
+        self.assertIn('id="logPanel"', page)
+        self.assertIn('id="logSection"', page)
+        self.assertIn('id="logCount"', page)
+        for cat in ("discover", "kill", "defeat", "combat", "economy", "config", "warn"):
+            self.assertIn(f'data-log-cat="{cat}"', page)
+        self.assertGreater(page.index('id="logPanel"'), page.index('id="tacticConfigForm"'))
+
+
 if __name__ == "__main__":
     unittest.main()

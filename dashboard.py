@@ -25,7 +25,7 @@ from tactic_config import (
     load_config,
     update_config,
 )
-from state_io import atomic_write_text, file_lock
+from state_io import append_jsonl, atomic_write_text, file_lock
 
 def _data_path(name: str) -> str:
     raw = os.environ.get("ARENA_DATA_DIR", "").strip()
@@ -35,6 +35,7 @@ def _data_path(name: str) -> str:
 LOG_FILE = _data_path("tactic_log.jsonl")
 MAP_FILE = _data_path("map_memory.json")
 WAYPOINTS_FILE = _data_path("waypoints.json")
+BATTLE_LOG_FILE = _data_path("battle_log.jsonl")
 HOST = "0.0.0.0"
 PORT = 4399
 # Auth gate: requests from outside must present this token (cookie / Bearer /
@@ -89,6 +90,87 @@ def read_history(ticks: int = 40):
             if len(out) >= ticks:
                 break
     return out
+
+
+# ── Categorized battle log (「战斗日志」panel below the config) ──────────────
+# The tactic process appends discovery/combat/economy/failure rows each tick;
+# the dashboard process appends config-change rows on save.  Filter chips in
+# the panel map to the entry "cat" field.
+
+# Log-category chips shown in the panel header (label + default visibility).
+LOG_CATEGORIES = (
+    ("discover", "发现", True),
+    ("kill", "击杀", True),
+    ("defeat", "被击败", True),
+    ("combat", "战斗", False),
+    ("economy", "经济", False),
+    ("config", "配置", True),
+    ("warn", "异常", True),
+)
+
+_CONFIG_FIELD_LABELS = {f["key"]: f["label"] for f in config_schema()["fields"]}
+
+
+def read_battle_log(n: int = 200) -> list[dict]:
+    """Return up to ``n`` newest battle-log entries (newest first)."""
+    if n <= 0 or not os.path.exists(BATTLE_LOG_FILE):
+        return []
+    out = []
+    for line in _iter_log_lines_reverse(BATTLE_LOG_FILE):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict) and rec.get("msg"):
+            out.append(rec)
+            if len(out) >= n:
+                break
+    return out
+
+
+def _config_log_message(updates: dict) -> str:
+    """Human-readable summary of which config keys changed, newest-named."""
+    if not updates:
+        return "配置保存（无变化）"
+    parts = []
+    for key in sorted(updates):
+        label = _CONFIG_FIELD_LABELS.get(key, key)
+        parts.append(f"{label}={updates[key]}")
+    return "配置调整： " + "，".join(parts)
+
+
+def append_config_log(updates: dict, *, action: str = "") -> None:
+    """Record a dashboard-initiated config/team change into the battle log."""
+    msg = _config_log_message(updates)
+    if action:
+        msg = f"{action}：{msg}"
+    try:
+        append_jsonl(BATTLE_LOG_FILE, [{"tick": None, "ts": time.time(), "cat": "config", "msg": msg}])
+    except OSError:
+        pass
+
+
+def _battle_log_html() -> tuple[str, int]:
+    """Render the newest battle-log rows for the panel."""
+    entries = read_battle_log(200)
+    if not entries:
+        return '<div class="muted">暂无日志</div>', 0
+    rows = []
+    for e in entries:
+        tick = e.get("tick")
+        ts = e.get("ts")
+        if tick is not None:
+            tick_label = f"tick {tick}"
+        elif ts:
+            tick_label = time.strftime("%H:%M:%S", time.localtime(float(ts)))
+        else:
+            tick_label = ""
+        rows.append(
+            f'<div class="log-row" data-cat="{html.escape(str(e.get("cat", "")))}">'
+            f'<span class="log-tick">{html.escape(tick_label)}</span>'
+            f'<span class="log-msg">{html.escape(str(e.get("msg", "")))}</span></div>'
+        )
+    return "".join(rows), len(entries)
 
 
 
@@ -1333,6 +1415,25 @@ body{margin:0;min-height:100vh;color:var(--text);
 .config-actions button:disabled{opacity:.55;cursor:wait}
 .config-message{min-height:18px;color:var(--muted);font-size:12px;margin-left:auto}
 .config-message.ok{color:#8ef0c4}.config-message.err{color:#ff9b9b}
+.log-panel{margin-top:14px}
+.log-filters{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.log-filter{appearance:none;font:inherit;font-size:11px;color:var(--muted);padding:3px 11px;border-radius:999px;
+ background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);cursor:pointer;transition:.12s}
+.log-filter:hover{color:#eef3ff;border-color:rgba(255,255,255,.22)}
+.log-filter.on{background:rgba(110,168,255,.16);border-color:rgba(110,168,255,.4);color:#cfe6ff}
+.log-filter.off{opacity:.35;text-decoration:line-through}
+.log-list{display:grid;gap:2px;max-height:46vh;overflow:auto;padding-right:4px}
+.log-row{display:flex;align-items:baseline;gap:8px;padding:4px 8px;border-radius:8px;font-size:11.5px;line-height:1.45}
+.log-row:nth-child(odd){background:rgba(255,255,255,.025)}
+.log-tick{flex:0 0 64px;color:#7f8eab;font-family:Consolas,monospace;font-size:10.5px}
+.log-msg{color:#c7d1e5;word-break:break-word}
+.log-row[data-cat="discover"] .log-msg{color:#ffe08a}
+.log-row[data-cat="kill"] .log-msg{color:#ff9b9b}
+.log-row[data-cat="defeat"] .log-msg{color:#ff7aa9}
+.log-row[data-cat="combat"] .log-msg{color:#c9a2ff}
+.log-row[data-cat="economy"] .log-msg{color:#8ef0c4}
+.log-row[data-cat="config"] .log-msg{color:#6ea8ff}
+.log-row[data-cat="warn"] .log-msg{color:#ffc857}
 .production-section{margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid var(--line)}
 .production-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
 .production-title>div{display:flex;flex-direction:column;gap:2px}
@@ -1401,6 +1502,11 @@ JS = r"""
                     'enemy-worker','enemy-vanguard','enemy-ranger','enemy-core','enemy',
                     'enemy-trace','wall','ore','ore-mem','route','target','beacon',
                     'attack-target','core-target','wp'];
+  const LOG_FILTER_KEY = 'arenaLogFilters.v1';
+  let logFilters = null;
+  const LOG_CATS = ['discover','kill','defeat','combat','economy','config','warn'];
+  // Noisy categories default off so the panel starts readable.
+  const LOG_CATS_DEFAULT_OFF = ['combat','economy'];
 
   const PICK_TARGETS = {
     attack: {xId: 'teamAttackX', yId: 'teamAttackY'},
@@ -1744,6 +1850,47 @@ JS = r"""
     });
   }
 
+  // ── Battle-log category filters ─────────────────────────────────────────
+  function loadLogFilters(){
+    const out = {};
+    LOG_CATS.forEach(function(c){ out[c] = LOG_CATS_DEFAULT_OFF.indexOf(c) < 0; });
+    try{
+      const raw = JSON.parse(localStorage.getItem(LOG_FILTER_KEY) || 'null');
+      if(raw && typeof raw === 'object'){
+        LOG_CATS.forEach(function(c){ out[c] = raw[c] !== false; });
+      }
+    }catch(e){}
+    return out;
+  }
+  function applyLogFilters(){
+    const list = document.getElementById('logSection');
+    if(!list) return;
+    logFilters = logFilters || loadLogFilters();
+    const rows = list.querySelectorAll('.log-row');
+    for(let i = 0; i < rows.length; i++){
+      const cat = rows[i].getAttribute('data-cat') || '';
+      rows[i].style.display = logFilters[cat] === false ? 'none' : '';
+    }
+    const btns = document.querySelectorAll('.log-filter[data-log-cat]');
+    for(let i = 0; i < btns.length; i++){
+      const cat = btns[i].getAttribute('data-log-cat');
+      btns[i].classList.toggle('on', logFilters[cat] !== false);
+      btns[i].classList.toggle('off', logFilters[cat] === false);
+    }
+  }
+  function bindLogFilters(){
+    const btns = document.querySelectorAll('.log-filter[data-log-cat]');
+    for(let i = 0; i < btns.length; i++){
+      btns[i].addEventListener('click', function(){
+        logFilters = logFilters || loadLogFilters();
+        const cat = btns[i].getAttribute('data-log-cat');
+        logFilters[cat] = !logFilters[cat];
+        try{ localStorage.setItem(LOG_FILTER_KEY, JSON.stringify(logFilters)); }catch(e){}
+        applyLogFilters();
+      });
+    }
+  }
+
   async function softRefresh(){
     if(document.hidden || drag || refreshing) return;
     refreshing = true;
@@ -1798,6 +1945,14 @@ JS = r"""
           }
         }
       }
+      if(data.logHtml){
+        const logList = document.getElementById('logSection');
+        if(logList){
+          logList.innerHTML = data.logHtml;
+          applyLogFilters();
+        }
+      }
+      if(data.logCount !== undefined) setText('#logCount', String(data.logCount));
     } catch(e) {
     } finally {
       refreshing = false;
@@ -2427,12 +2582,14 @@ JS = r"""
   bindTeamsBoard();
   bindWaypointPanel();
   bindMapFilters();
+  bindLogFilters();
   loadTeams(true);
   ensureView();
   bindStage();
   bindPickButtons();
   syncPickButtonsDisabled();
   applyMapFilters();
+  applyLogFilters();
   apply();
   window.addEventListener('resize', function(){ apply(); });
   document.addEventListener('keydown', function(e){
@@ -2719,6 +2876,8 @@ def build_parts():
         f'<div>更新于 {time.strftime("%H:%M:%S")} · Tick {rec.get("tick")}</div>'
     )
 
+    log_html, log_count = _battle_log_html()
+
 
     left_core = (
         f'<div class="kv"><span>名称</span><b>{rec.get("core_name") or "C1"}</b></div>'
@@ -2845,6 +3004,8 @@ def build_parts():
         "eventsCount": len(events),
         "waypointCount": len(waypoints),
         "combatUnits": combat_units,
+        "logHtml": log_html,
+        "logCount": log_count,
     }
 
 
@@ -2982,6 +3143,19 @@ def generate_html() -> str:
       </section>
       {render_teams_panel()}
       {render_config_panel(parts['workersCount'], parts['vgCount'], parts['rgCount'])}
+      <section class="panel log-panel" id="logPanel">
+        <div class="panel-title"><span>战斗日志</span><span class="count" id="logCount">{parts['logCount']}</span></div>
+        <div class="log-filters" id="logFilters">
+          <button type="button" class="log-filter" data-log-cat="discover">发现</button>
+          <button type="button" class="log-filter" data-log-cat="kill">击杀</button>
+          <button type="button" class="log-filter" data-log-cat="defeat">被击败</button>
+          <button type="button" class="log-filter" data-log-cat="combat">战斗</button>
+          <button type="button" class="log-filter" data-log-cat="economy">经济</button>
+          <button type="button" class="log-filter" data-log-cat="config">配置</button>
+          <button type="button" class="log-filter" data-log-cat="warn">异常</button>
+        </div>
+        <div class="log-list" id="logSection">{parts['logHtml']}</div>
+      </section>
       <div id="issuesSection" style="display:none">{parts['issuesHtml']}</div>
     </section>
 
@@ -3143,9 +3317,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path in {"/api/config", "/api/config/reset"}:
             try:
+                is_reset = path.endswith("/reset")
                 config = (
                     reset_strategy_config(CONFIG_PATH)
-                    if path.endswith("/reset")
+                    if is_reset
                     else update_config(data, CONFIG_PATH)
                 )
             except ConfigValidationError as exc:
@@ -3158,6 +3333,12 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as exc:
                 self._send_json(500, {"ok": False, "error": f"保存失败: {exc}"})
                 return
+            if is_reset:
+                append_config_log({}, action="恢复默认配置")
+            elif data:
+                changed = {key: value for key, value in data.items() if key in config}
+                if changed:
+                    append_config_log(changed)
             self._send_json(200, {"ok": True, "config": config})
             return
 
@@ -3182,6 +3363,8 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as exc:
                 self._send_json(500, {"ok": False, "error": f"保存失败: {exc}"})
                 return
+            if updates:
+                append_config_log(updates, action="分队调整")
             history = read_history(1)
             rec = history[0] if history else {}
             self._send_json(200, {
