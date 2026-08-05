@@ -2922,5 +2922,36 @@ class BattleLogTests(unittest.TestCase):
         self.assertGreater(page.index('id="logPanel"'), page.index('id="tacticConfigForm"'))
 
 
+class UnitTabsTests(unittest.TestCase):
+    """Right sidebar unit cards are one panel with three tabs."""
+
+    def setUp(self) -> None:
+        self.page = dashboard.generate_html()
+
+    def test_three_unit_tabs_in_one_panel(self) -> None:
+        for tab in ("workers", "vanguards", "rangers"):
+            self.assertIn(f'data-unit-tab="{tab}"', self.page)
+        for pane in ("workers", "vanguards", "rangers"):
+            self.assertIn(f'data-unit-pane="{pane}"', self.page)
+        # One tab container, exactly three tab buttons + three panes.
+        self.assertEqual(self.page.count("class=\"units-tabs\""), 1)
+        self.assertEqual(self.page.count("data-unit-tab="), 3)
+        self.assertEqual(self.page.count("data-unit-pane="), 3)
+        # The three grids are the tab panes' contents.
+        self.assertEqual(self.page.count("data-unit-pane="), 3)
+
+    def test_unit_grids_and_counts_still_present(self) -> None:
+        for grid in ("workersGrid", "vgGrid", "rgGrid"):
+            self.assertIn(f'id="{grid}"', self.page)
+        for count in ("workersCount", "vgCount", "rgCount"):
+            self.assertIn(f'id="{count}"', self.page)
+
+    def test_separate_unit_panels_removed(self) -> None:
+        # The old per-type <section class="panel"> cards are gone; the tabs are
+        # inside a single units-panel section.
+        self.assertNotIn('<section class="panel">\n        <div class="panel-title"><span>工人</span>', self.page)
+        self.assertIn('class="panel units-panel"', self.page)
+
+
 if __name__ == "__main__":
     unittest.main()

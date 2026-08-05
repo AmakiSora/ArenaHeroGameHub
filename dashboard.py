@@ -1315,6 +1315,15 @@ body{margin:0;min-height:100vh;color:var(--text);
 .compact-list{display:grid;gap:8px;max-height:42vh;overflow:auto;padding-right:2px}
 .compact-list::-webkit-scrollbar{width:6px}
 .compact-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:99px}
+.units-tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.unit-tab{appearance:none;font:inherit;font-size:12px;color:var(--muted);padding:6px 12px;border-radius:999px;
+ background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);cursor:pointer;
+ display:inline-flex;align-items:center;gap:6px;transition:.12s}
+.unit-tab:hover{color:#eef3ff;border-color:rgba(255,255,255,.22)}
+.unit-tab.active{background:rgba(110,168,255,.16);border-color:rgba(110,168,255,.4);color:#cfe6ff}
+.unit-tab .count{font-size:11px}
+.unit-tab-pane{display:none}
+.unit-tab-pane.active{display:block}
 .kv{display:flex;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:12px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);font-size:12px}
 .kv b{color:#eef3ff;font-weight:700}
 .kv span{color:var(--muted)}
@@ -1886,6 +1895,37 @@ JS = r"""
         try{ localStorage.setItem(LOG_FILTER_KEY, JSON.stringify(logFilters)); }catch(e){}
         applyLogFilters();
       });
+    }
+  }
+
+  // ── Right-sidebar unit tabs (工人 / 先锋 / 游侠) ──────────────────────
+  // One panel, three tabs. Active tab persists so a soft refresh / reload
+  // keeps showing the type the user was reading.
+  const UNIT_TAB_KEY = 'arenaUnitTab.v1';
+  function applyUnitTab(tab){
+    const tabs = document.querySelectorAll('.unit-tab[data-unit-tab]');
+    const panes = document.querySelectorAll('.unit-tab-pane[data-unit-pane]');
+    for(let i = 0; i < tabs.length; i++){
+      const on = tabs[i].getAttribute('data-unit-tab') === tab;
+      tabs[i].classList.toggle('active', on);
+      tabs[i].setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+    for(let i = 0; i < panes.length; i++){
+      panes[i].classList.toggle('active', panes[i].getAttribute('data-unit-pane') === tab);
+    }
+    try{ localStorage.setItem(UNIT_TAB_KEY, tab); }catch(e){}
+  }
+  function bindUnitTabs(){
+    const tabs = document.querySelectorAll('.unit-tab[data-unit-tab]');
+    for(let i = 0; i < tabs.length; i++){
+      tabs[i].addEventListener('click', function(){
+        applyUnitTab(tabs[i].getAttribute('data-unit-tab'));
+      });
+    }
+    let saved = null;
+    try{ saved = localStorage.getItem(UNIT_TAB_KEY); }catch(e){}
+    if(saved && ['workers','vanguards','rangers'].indexOf(saved) >= 0){
+      applyUnitTab(saved);
     }
   }
 
@@ -2579,6 +2619,7 @@ JS = r"""
   bindWaypointPanel();
   bindMapFilters();
   bindLogFilters();
+  bindUnitTabs();
   loadTeams(true);
   ensureView();
   bindStage();
@@ -3137,17 +3178,21 @@ def generate_html() -> str:
     </section>
 
     <aside class="side-col">
-      <section class="panel">
-        <div class="panel-title"><span>工人</span><span class="count" id="workersCount">{parts['workersCount']} 个</span></div>
-        <div class="unit-grid compact-list" id="workersGrid">{parts['workersHtml']}</div>
-      </section>
-      <section class="panel">
-        <div class="panel-title"><span>先锋</span><span class="count" id="vgCount">{parts['vgCount']}</span></div>
-        <div class="unit-grid" id="vgGrid">{parts['vgHtml']}</div>
-      </section>
-      <section class="panel">
-        <div class="panel-title"><span>游侠</span><span class="count" id="rgCount">{parts['rgCount']}</span></div>
-        <div class="unit-grid" id="rgGrid">{parts['rgHtml']}</div>
+      <section class="panel units-panel">
+        <div class="units-tabs" role="tablist">
+          <button type="button" class="unit-tab active" data-unit-tab="workers" role="tab" aria-selected="true">工人<span class="count" id="workersCount">{parts['workersCount']} 个</span></button>
+          <button type="button" class="unit-tab" data-unit-tab="vanguards" role="tab" aria-selected="false">先锋<span class="count" id="vgCount">{parts['vgCount']}</span></button>
+          <button type="button" class="unit-tab" data-unit-tab="rangers" role="tab" aria-selected="false">游侠<span class="count" id="rgCount">{parts['rgCount']}</span></button>
+        </div>
+        <div class="unit-tab-pane active" data-unit-pane="workers" role="tabpanel">
+          <div class="unit-grid compact-list" id="workersGrid">{parts['workersHtml']}</div>
+        </div>
+        <div class="unit-tab-pane" data-unit-pane="vanguards" role="tabpanel">
+          <div class="unit-grid compact-list" id="vgGrid">{parts['vgHtml']}</div>
+        </div>
+        <div class="unit-tab-pane" data-unit-pane="rangers" role="tabpanel">
+          <div class="unit-grid compact-list" id="rgGrid">{parts['rgHtml']}</div>
+        </div>
       </section>
       <div id="waypointSection">{parts['waypointHtml']}</div>
       <section class="panel res-panel" id="resPanel">
