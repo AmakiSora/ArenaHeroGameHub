@@ -2945,6 +2945,7 @@ def build_parts():
     eco = game_stat.get("economy", {}) or {}
     prod = game_stat.get("production", {}) or {}
     comb = game_stat.get("combat", {}) or {}
+    prediction = game_stat.get("shot_prediction", {}) or {}
     death = game_stat.get("deaths", {}) or {}
     spawned = prod.get("spawned", {}) or {}
     self_destructed = prod.get("self_destructed", {}) or {}
@@ -2983,6 +2984,15 @@ def build_parts():
         f'<span class="pill">参与击杀 {int(comb.get("kill_participations", 0) or 0)}</span>'
         f'<span class="pill">承伤 {int(comb.get("damage_taken", 0) or 0)}</span>'
         f'<span class="pill">扫描 {int(comb.get("sweeps_resolved", 0) or 0)}</span></div>'
+        '<div class="kv" style="margin-top:8px"><span>影子预判</span>'
+        f'<b>候选 {int(prediction.get("eligible_candidates", 0) or 0)} / '
+        f'{int(prediction.get("candidates", 0) or 0)}</b></div>'
+        '<div class="stat-chips">'
+        f'<span class="pill">正确 {int(prediction.get("predicted_correct", 0) or 0)}</span>'
+        f'<span class="pill">错误 {int(prediction.get("predicted_wrong", 0) or 0)}</span>'
+        f'<span class="pill">未知 {int(prediction.get("unknown", 0) or 0)}</span>'
+        f'<span class="pill">理论 +{int(prediction.get("improvements", 0) or 0)} '
+        f'/ -{int(prediction.get("harms", 0) or 0)}</span></div>'
         '<div class="kv" style="margin-top:8px"><span>移动</span>'
         f'<b>成功 {eco.get("moves_succeeded", 0)} · 失败 {eco.get("moves_failed", 0)}</b></div>'
         '</section>'

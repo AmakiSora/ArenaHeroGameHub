@@ -477,6 +477,8 @@ class TickRecord:
     beacon_pos: list[int] | None = None
     beacon_status: str | None = None
     events: list[dict] = field(default_factory=list)
+    shot_predictions: list[dict] = field(default_factory=list)
+    shot_prediction_results: list[dict] = field(default_factory=list)
     plan_unit_actions: dict[str, str] = field(default_factory=dict)
     plan_core_action: str | None = None
     accepted: bool = False
@@ -501,7 +503,7 @@ class TacticLogger:
         header = {
             "_meta": "arena-hero-tactic-log",
             "_started_at": datetime.now(timezone.utc).isoformat(),
-            "_version": 2,
+            "_version": 3,
         }
         self._file.write(json.dumps(header, ensure_ascii=False) + "\n")
         self._file.flush()
@@ -591,6 +593,11 @@ class TacticLogger:
         rec.beacon_status = turn.beacon.status.name if turn.beacon.status else None
         rec.core_action = core_action
         rec.plan_unit_actions = unit_actions or {}
+        rec.shot_predictions = [
+            {key: value for key, value in item.items() if not key.startswith("_")}
+            for item in turn_context.shot_predictions
+        ]
+        rec.shot_prediction_results = list(turn_context.shot_prediction_results)
         rec.accepted = accepted
         rec.latency_ms = round(latency_ms, 1)
 
@@ -1632,6 +1639,165 @@ def _vanguard_adjacent_sweep(
     return None
 
 
+def _update_enemy_motion_tracks(enemies: Iterable[Any], tick: int) -> None:
+    """Keep at most four consecutive observations for each visible enemy."""
+    for enemy in enemies:
+        enemy_id = str(enemy.id)
+        position = tuple(enemy.position)
+        history = _enemy_motion_tracks.get(enemy_id, [])
+        if history and history[-1][0] == tick:
+            history[-1] = (tick, position)
+        elif history and history[-1][0] == tick - 1:
+            history.append((tick, position))
+        else:
+            history = [(tick, position)]
+        _enemy_motion_tracks[enemy_id] = history[-4:]
+
+    for enemy_id, history in list(_enemy_motion_tracks.items()):
+        if not history or tick - history[-1][0] > 4:
+            _enemy_motion_tracks.pop(enemy_id, None)
+
+
+def _motion_streak(
+    history: list[tuple[int, tuple[int, int]]],
+) -> tuple[tuple[int, int] | None, int]:
+    """Return the latest velocity and its consecutive repetition count."""
+    if len(history) < 2:
+        return None, 0
+    latest = history[-1][1]
+    previous = history[-2][1]
+    velocity = latest[0] - previous[0], latest[1] - previous[1]
+    if abs(velocity[0]) + abs(velocity[1]) != 1:
+        return velocity, 0
+
+    streak = 1
+    for index in range(len(history) - 2, 0, -1):
+        current = history[index][1]
+        earlier = history[index - 1][1]
+        if (current[0] - earlier[0], current[1] - earlier[1]) != velocity:
+            break
+        streak += 1
+    return velocity, streak
+
+
+def _shadow_shot_prediction(
+    ranger: Any,
+    ranger_pos: tuple[int, int],
+    target: Any,
+    obstacle_cells: frozenset[tuple[int, int]],
+    attack_range: int,
+) -> dict[str, Any]:
+    """Describe a lead-shot candidate without changing the queued shot."""
+    target_id = str(target.id)
+    current_cell = tuple(target.position)
+    history = _enemy_motion_tracks.get(target_id, [])
+    velocity, move_streak = _motion_streak(history)
+    predicted_cell: tuple[int, int] | None = None
+    legal = False
+    reason = "insufficient_history"
+
+    if velocity is not None:
+        if velocity == (0, 0):
+            reason = "stationary"
+        elif abs(velocity[0]) + abs(velocity[1]) != 1:
+            reason = "invalid_velocity"
+        else:
+            predicted_cell = (
+                current_cell[0] + velocity[0],
+                current_cell[1] + velocity[1],
+            )
+            dx = predicted_cell[0] - ranger_pos[0]
+            dy = predicted_cell[1] - ranger_pos[1]
+            distance = max(abs(dx), abs(dy))
+            if not 1 <= distance <= attack_range:
+                reason = "out_of_range"
+            elif not (dx == 0 or dy == 0 or abs(dx) == abs(dy)):
+                reason = "invalid_line"
+            elif _line_blocked(ranger_pos, predicted_cell, obstacle_cells):
+                reason = "blocked"
+            else:
+                legal = True
+                reason = "eligible" if move_streak >= 2 else "unstable_velocity"
+
+    return {
+        "tick": turn_context.tick,
+        "ranger_id": str(ranger.id)[:8],
+        "ranger_name": _object_name(ranger.id, "R"),
+        "target_id": target_id[:8],
+        "target_name": _object_name(target.id, "E"),
+        "target_type": _enemy_unit_type_name(target) or "ENEMY",
+        "current_cell": list(current_cell),
+        "predicted_cell": list(predicted_cell) if predicted_cell else None,
+        "velocity": list(velocity) if velocity is not None else None,
+        "move_streak": move_streak,
+        "prediction_legal": legal,
+        "eligible": legal and move_streak >= 2,
+        "reason": reason,
+        "_ranger_key": str(ranger.id),
+        "_target_key": target_id,
+    }
+
+
+def _resolve_shadow_predictions(turn: Any, tick: int) -> list[dict[str, Any]]:
+    """Resolve committed shadow candidates against the following Tick."""
+    global _pending_shot_predictions
+    if not _pending_shot_predictions:
+        return []
+
+    event_by_actor = {
+        str(event.actor_id): str(event.event_type)
+        for event in getattr(turn, "events", ()) or ()
+        if getattr(event, "actor_id", None)
+        and str(getattr(event, "event_type", "")) in ("SHOT_HIT", "SHOT_MISSED")
+    }
+    enemy_positions = {
+        str(enemy.id): tuple(enemy.position)
+        for enemy in getattr(turn, "visible_enemies", ()) or ()
+    }
+    resolved: list[dict[str, Any]] = []
+    for pending in _pending_shot_predictions:
+        public = {
+            key: value for key, value in pending.items() if not key.startswith("_")
+        }
+        tick_gap = tick - int(pending.get("tick", tick))
+        actual = (
+            enemy_positions.get(pending["_target_key"])
+            if tick_gap == 1
+            else None
+        )
+        predicted = pending.get("predicted_cell")
+        current = pending.get("current_cell")
+        public.update({
+            "resolved_tick": tick,
+            "tick_gap": tick_gap,
+            "actual_cell": list(actual) if actual is not None else None,
+            "shot_result": (
+                event_by_actor.get(pending["_ranger_key"], "UNRESOLVED")
+                if tick_gap == 1
+                else "UNRESOLVED"
+            ),
+            "predicted_match": (
+                actual == tuple(predicted) if actual is not None and predicted else None
+            ),
+            "current_match": (
+                actual == tuple(current) if actual is not None and current else None
+            ),
+        })
+        resolved.append(public)
+    _pending_shot_predictions = []
+    return resolved
+
+
+def _commit_shadow_predictions(accepted: bool) -> None:
+    """Commit only predictions from an accepted plan for next-Tick resolution."""
+    global _pending_shot_predictions
+    if not accepted:
+        return
+    committed = [dict(item) for item in turn_context.shot_predictions]
+    _pending_shot_predictions.extend(committed)
+    game_stats.record_prediction_candidates(_game_stats, committed)
+
+
 def _ranger_best_shot(
     ranger: Any,
     pos: tuple[int, int],
@@ -1660,6 +1826,16 @@ def _ranger_best_shot(
             best_target = enemy
     if best_target is None:
         return None
+    turn_context.shot_predictions.append(
+        _shadow_shot_prediction(
+            ranger,
+            pos,
+            best_target,
+            obstacle_cells,
+            attack_range,
+        )
+    )
+    # Shadow mode only: keep the authoritative current-cell shot unchanged.
     ranger.shoot(best_target)
     return ("SHOOT", f"enemy at {best_target.position} dist={best_dist}")
 
@@ -2105,6 +2281,10 @@ _resource_tombstones: set[tuple[int, int]] = set()
 _obstacle_memory: set[tuple[int, int]] = set()
 # Enemy sightings: remember every position where enemies were seen
 _enemy_memory: set[tuple[int, int]] = set()
+# Consecutive visible positions keyed by full enemy UUID. This is intentionally
+# in-memory only; reconnects must rebuild confidence from fresh observations.
+_enemy_motion_tracks: dict[str, list[tuple[int, tuple[int, int]]]] = {}
+_pending_shot_predictions: list[dict[str, Any]] = []
 # Last applied dashboard enemy-clear sequence from map_memory.json.
 _enemy_clear_seq: int = 0
 # Signature of the last dashboard map edits we absorbed (avoid re-applying every tick).
@@ -2682,6 +2862,8 @@ turn_context = type(
         "unit_routes": {},
         "tick": 0,
         "beacon_pos": None,
+        "shot_predictions": [],
+        "shot_prediction_results": [],
     },
 )()
 
@@ -2858,6 +3040,14 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.worker_routes = {}
     turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
+    turn_context.shot_predictions = []
+    turn_context.shot_prediction_results = _resolve_shadow_predictions(
+        turn, turn_context.tick,
+    )
+    game_stats.record_prediction_results(
+        _game_stats, turn_context.shot_prediction_results,
+    )
+    _update_enemy_motion_tracks(turn.visible_enemies, turn_context.tick)
 
     # Manual per-unit targets set from the dashboard (display-name keyed).
     # Prune targets whose unit no longer exists — names are computed BEFORE the
@@ -3250,6 +3440,7 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             continue
                         try:
                             accepted = turn.submit()
+                            _commit_shadow_predictions(accepted.accepted)
                             latency = (time.monotonic() - tick_start) * 1000
                             plan_actions: dict[str, str] = {}
                             for uid, detail in unit_actions.items():

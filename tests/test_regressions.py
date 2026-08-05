@@ -927,7 +927,9 @@ class CombatTeamPlannerTests(unittest.TestCase):
 
     class Enemy:
         def __init__(self, position: tuple[int, int]) -> None:
+            self.id = f"enemy-{position[0]}-{position[1]}"
             self.position = position
+            self.unit_type = UnitType.VANGUARD
 
     def setUp(self) -> None:
         self.config = default_config()
@@ -2326,18 +2328,73 @@ class GameStatsTests(unittest.TestCase):
         self.assertEqual(derived["vanguard_hit_rate"], 30.0)
         self.assertEqual(derived["window_harvest_per_tick"], 2.0)
 
+    def test_shadow_prediction_candidates_and_results_are_aggregated(self) -> None:
+        stats = game_stats.new_stats()
+        candidate = {
+            "target_type": "WORKER",
+            "move_streak": 2,
+            "prediction_legal": True,
+            "eligible": True,
+        }
+        result = {
+            **candidate,
+            "predicted_match": True,
+            "shot_result": "SHOT_MISSED",
+        }
+
+        game_stats.record_prediction_candidates(stats, [candidate])
+        game_stats.record_prediction_results(stats, [result])
+
+        prediction = stats["shot_prediction"]
+        self.assertEqual(prediction["candidates"], 1)
+        self.assertEqual(prediction["legal_candidates"], 1)
+        self.assertEqual(prediction["eligible_candidates"], 1)
+        self.assertEqual(prediction["predicted_correct"], 1)
+        self.assertEqual(prediction["baseline_misses"], 1)
+        self.assertEqual(prediction["improvements"], 1)
+        self.assertEqual(prediction["harms"], 0)
+        self.assertEqual(prediction["by_streak"]["2"]["improvements"], 1)
+        self.assertEqual(
+            prediction["by_target_type"]["WORKER"]["predicted_correct"], 1,
+        )
+
+    def test_shadow_prediction_unknown_and_harm_are_counted(self) -> None:
+        stats = game_stats.new_stats()
+        common = {
+            "target_type": "VANGUARD",
+            "move_streak": 3,
+            "prediction_legal": True,
+            "eligible": True,
+        }
+        game_stats.record_prediction_results(stats, [
+            {**common, "predicted_match": False, "shot_result": "SHOT_HIT"},
+            {**common, "predicted_match": None, "shot_result": "UNRESOLVED"},
+        ])
+
+        prediction = stats["shot_prediction"]
+        self.assertEqual(prediction["predicted_wrong"], 1)
+        self.assertEqual(prediction["unknown"], 1)
+        self.assertEqual(prediction["harms"], 1)
+        self.assertEqual(prediction["by_streak"]["3_plus"]["resolved"], 2)
+
     def test_save_load_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "stats.json"
             stats = game_stats.new_stats()
             stats["current_tick"] = 42
             stats["economy"]["harvested_total"] = 123
+            stats["shot_prediction"]["eligible_candidates"] = 7
+            stats["shot_prediction"]["by_streak"]["2"]["predicted_correct"] = 3
             game_stats.save(stats, path)
 
             loaded = game_stats.load(path)
 
         self.assertEqual(loaded["current_tick"], 42)
         self.assertEqual(loaded["economy"]["harvested_total"], 123)
+        self.assertEqual(loaded["shot_prediction"]["eligible_candidates"], 7)
+        self.assertEqual(
+            loaded["shot_prediction"]["by_streak"]["2"]["predicted_correct"], 3,
+        )
 
     def test_maybe_save_respects_interval(self) -> None:
         stats = game_stats.new_stats()
@@ -2355,6 +2412,7 @@ class RangerShootingTests(unittest.TestCase):
 
     class Ranger:
         def __init__(self, position: tuple[int, int]) -> None:
+            self.id = "ranger-shadow-1"
             self.position = position
             self.action = None
             self.arg = None
@@ -2364,8 +2422,33 @@ class RangerShootingTests(unittest.TestCase):
             self.arg = target
 
     class Enemy:
-        def __init__(self, position: tuple[int, int]) -> None:
+        def __init__(self, position: tuple[int, int], index: int = 1) -> None:
+            self.id = f"enemy-shadow-{index}"
             self.position = position
+            self.unit_type = UnitType.VANGUARD
+
+    def setUp(self) -> None:
+        self._tracks = {
+            key: list(value) for key, value in tactic._enemy_motion_tracks.items()
+        }
+        self._pending = [dict(item) for item in tactic._pending_shot_predictions]
+        self._tick = tactic.turn_context.tick
+        self._predictions = list(tactic.turn_context.shot_predictions)
+        self._results = list(tactic.turn_context.shot_prediction_results)
+        tactic._enemy_motion_tracks.clear()
+        tactic._pending_shot_predictions.clear()
+        tactic.turn_context.tick = 0
+        tactic.turn_context.shot_predictions = []
+        tactic.turn_context.shot_prediction_results = []
+
+    def tearDown(self) -> None:
+        tactic._enemy_motion_tracks.clear()
+        tactic._enemy_motion_tracks.update(self._tracks)
+        tactic._pending_shot_predictions.clear()
+        tactic._pending_shot_predictions.extend(self._pending)
+        tactic.turn_context.tick = self._tick
+        tactic.turn_context.shot_predictions = self._predictions
+        tactic.turn_context.shot_prediction_results = self._results
 
     def _shoot(
         self,
@@ -2375,7 +2458,10 @@ class RangerShootingTests(unittest.TestCase):
         ranger_pos: tuple[int, int] = (0, 0),
     ):
         ranger = self.Ranger(ranger_pos)
-        enemies = tuple(self.Enemy(p) for p in enemy_positions)
+        enemies = tuple(
+            self.Enemy(position, index)
+            for index, position in enumerate(enemy_positions, 1)
+        )
         result = tactic._ranger_best_shot(
             ranger,
             tuple(ranger_pos),
@@ -2429,6 +2515,132 @@ class RangerShootingTests(unittest.TestCase):
         self.assertTrue(tactic._line_blocked((0, 0), (2, 1), frozenset()))
         # Cardinal still works.
         self.assertTrue(tactic._line_blocked((0, 0), (0, 3), frozenset({(0, 2)})))
+
+    def test_shadow_prediction_records_stable_lead_without_changing_shot(self) -> None:
+        enemy = self.Enemy((0, 0))
+        for tick, position in ((1, (0, 0)), (2, (0, 1)), (3, (0, 2))):
+            enemy.position = position
+            tactic._update_enemy_motion_tracks((enemy,), tick)
+        tactic.turn_context.tick = 3
+        ranger = self.Ranger((0, 0))
+
+        result = tactic._ranger_best_shot(
+            ranger, ranger.position, (enemy,), frozenset(), 3,
+        )
+
+        prediction = tactic.turn_context.shot_predictions[0]
+        self.assertEqual(result[0], "SHOOT")
+        self.assertIs(ranger.arg, enemy)  # real shot still targets the current view
+        self.assertEqual(prediction["predicted_cell"], [0, 3])
+        self.assertEqual(prediction["move_streak"], 2)
+        self.assertTrue(prediction["eligible"])
+
+    def test_shadow_prediction_marks_direction_change_unstable(self) -> None:
+        enemy = self.Enemy((0, 0))
+        for tick, position in ((1, (0, 0)), (2, (0, 1)), (3, (1, 1))):
+            enemy.position = position
+            tactic._update_enemy_motion_tracks((enemy,), tick)
+        tactic.turn_context.tick = 3
+
+        prediction = tactic._shadow_shot_prediction(
+            self.Ranger((0, 1)), (0, 1), enemy, frozenset(), 3,
+        )
+
+        self.assertEqual(prediction["predicted_cell"], [2, 1])
+        self.assertEqual(prediction["move_streak"], 1)
+        self.assertTrue(prediction["prediction_legal"])
+        self.assertFalse(prediction["eligible"])
+        self.assertEqual(prediction["reason"], "unstable_velocity")
+
+    def test_enemy_track_resets_after_tick_gap(self) -> None:
+        enemy = self.Enemy((0, 0))
+        tactic._update_enemy_motion_tracks((enemy,), 1)
+        enemy.position = (0, 1)
+        tactic._update_enemy_motion_tracks((enemy,), 3)
+
+        prediction = tactic._shadow_shot_prediction(
+            self.Ranger((0, 0)), (0, 0), enemy, frozenset(), 3,
+        )
+
+        self.assertEqual(len(tactic._enemy_motion_tracks[str(enemy.id)]), 1)
+        self.assertIsNone(prediction["predicted_cell"])
+        self.assertEqual(prediction["reason"], "insufficient_history")
+
+    def test_pending_prediction_resolves_against_next_tick(self) -> None:
+        enemy = self.Enemy((0, 3))
+        tactic._pending_shot_predictions.append({
+            "tick": 3,
+            "ranger_id": "ranger-s",
+            "target_id": "enemy-s",
+            "target_type": "VANGUARD",
+            "current_cell": [0, 2],
+            "predicted_cell": [0, 3],
+            "move_streak": 2,
+            "prediction_legal": True,
+            "eligible": True,
+            "_ranger_key": "ranger-shadow-1",
+            "_target_key": "enemy-shadow-1",
+        })
+        turn = SimpleNamespace(
+            visible_enemies=(enemy,),
+            events=(SimpleNamespace(
+                actor_id="ranger-shadow-1", event_type="SHOT_MISSED",
+            ),),
+        )
+
+        results = tactic._resolve_shadow_predictions(turn, 4)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["actual_cell"], [0, 3])
+        self.assertTrue(results[0]["predicted_match"])
+        self.assertFalse(results[0]["current_match"])
+        self.assertEqual(results[0]["shot_result"], "SHOT_MISSED")
+        self.assertEqual(tactic._pending_shot_predictions, [])
+
+    def test_pending_prediction_is_unknown_after_tick_gap(self) -> None:
+        enemy = self.Enemy((0, 3))
+        tactic._pending_shot_predictions.append({
+            "tick": 3,
+            "current_cell": [0, 2],
+            "predicted_cell": [0, 3],
+            "move_streak": 2,
+            "eligible": True,
+            "_ranger_key": "ranger-shadow-1",
+            "_target_key": "enemy-shadow-1",
+        })
+        turn = SimpleNamespace(
+            visible_enemies=(enemy,),
+            events=(SimpleNamespace(
+                actor_id="ranger-shadow-1", event_type="SHOT_HIT",
+            ),),
+        )
+
+        results = tactic._resolve_shadow_predictions(turn, 6)
+
+        self.assertEqual(results[0]["tick_gap"], 3)
+        self.assertIsNone(results[0]["actual_cell"])
+        self.assertIsNone(results[0]["predicted_match"])
+        self.assertEqual(results[0]["shot_result"], "UNRESOLVED")
+
+    def test_shadow_candidates_commit_only_after_accepted_plan(self) -> None:
+        prediction = {
+            "tick": 3,
+            "move_streak": 2,
+            "eligible": True,
+            "_ranger_key": "ranger-shadow-1",
+            "_target_key": "enemy-shadow-1",
+        }
+        tactic.turn_context.shot_predictions = [prediction]
+
+        with patch.object(game_stats, "record_prediction_candidates") as record:
+            tactic._commit_shadow_predictions(False)
+            self.assertEqual(tactic._pending_shot_predictions, [])
+            record.assert_not_called()
+
+            tactic._commit_shadow_predictions(True)
+
+        self.assertEqual(len(tactic._pending_shot_predictions), 1)
+        record.assert_called_once()
 
 
 class HealingPlannerTests(unittest.TestCase):

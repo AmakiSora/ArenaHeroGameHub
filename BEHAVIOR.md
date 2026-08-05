@@ -321,6 +321,18 @@ Tactic 每 Tick 从解析事件聚合累计统计，持久化到 `game_stats.jso
 
 数据口径说明：`SHOT_HIT + SHOT_MISSED = 攻击次数`，`SHOT_HIT = 命中次数`；`DESTRUCTION_PARTICIPATION` 服务器不提供击杀者 id，故"参与击杀"仅全局计数；我方单位死亡由单位快照差异检测。
 
+### 游侠预判影子统计
+
+当前真实射击仍瞄准敌人本 Tick 所在格，不改变战斗行为。战术进程按敌方 UUID
+保留最近 4 个连续 Tick 的位置；游侠每次开火时计算下一格预测，并在下一 Tick
+对照实际位置和 `SHOT_HIT` / `SHOT_MISSED`。`tactic_log.jsonl` 的
+`shot_predictions` 保存候选，`shot_prediction_results` 保存对照结果；累计候选、
+正确、错误、未知及理论挽回/伤害写入 `game_stats.json` 的 `shot_prediction`。
+
+轨迹断档会重置；只有连续两步同方向、每步一个基数格且预测格满足射程、八向直线
+和障碍检查时才标记为 `eligible`。该标记仅用于采样，不会传入 SDK 的
+`expected_cell`。
+
 ---
 
 ## 八、Git 提交历史

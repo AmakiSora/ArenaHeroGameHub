@@ -47,6 +47,22 @@ def _new_unit_type_set() -> dict[str, int]:
     return _zeros(_UNIT_TYPES)
 
 
+def _prediction_counter() -> dict[str, int]:
+    return {
+        "candidates": 0,
+        "legal_candidates": 0,
+        "eligible_candidates": 0,
+        "resolved": 0,
+        "predicted_correct": 0,
+        "predicted_wrong": 0,
+        "unknown": 0,
+        "baseline_hits": 0,
+        "baseline_misses": 0,
+        "improvements": 0,
+        "harms": 0,
+    }
+
+
 def new_stats() -> dict[str, Any]:
     """Return a fresh cumulative statistics document."""
     return {
@@ -79,6 +95,19 @@ def new_stats() -> dict[str, Any]:
             "sweeps_resolved": 0,
         },
         "deaths": _new_unit_type_set(),
+        "shot_prediction": {
+            **_prediction_counter(),
+            "by_streak": {
+                "0": _prediction_counter(),
+                "1": _prediction_counter(),
+                "2": _prediction_counter(),
+                "3_plus": _prediction_counter(),
+            },
+            "by_target_type": {
+                unit_type: _prediction_counter()
+                for unit_type in (*_UNIT_TYPES, "CORE", "ENEMY")
+            },
+        },
         "types": {},  # short id -> UNIT_TYPE; kept after death to tag old events
         "per_worker": {},  # short id -> worker record
         "per_combat": {},  # short id -> combat record
@@ -98,6 +127,19 @@ def load(path: Path | str = STATS_PATH) -> dict[str, Any]:
             merged["current_tick"] = int(raw.get("current_tick") or 0)
             for section in ("economy", "production", "combat", "deaths"):
                 merged[section].update(raw.get(section, {}) or {})
+            prediction = raw.get("shot_prediction", {}) or {}
+            for key in _prediction_counter():
+                merged["shot_prediction"][key] = int(prediction.get(key, 0) or 0)
+            for group in ("by_streak", "by_target_type"):
+                for name, values in (prediction.get(group, {}) or {}).items():
+                    bucket = merged["shot_prediction"][group].setdefault(
+                        name, _prediction_counter(),
+                    )
+                    bucket.update({
+                        key: int(value or 0)
+                        for key, value in (values or {}).items()
+                        if key in bucket
+                    })
             merged["types"] = dict(raw.get("types", {}) or {})
             merged["per_worker"] = dict(raw.get("per_worker", {}) or {})
             merged["per_combat"] = dict(raw.get("per_combat", {}) or {})
@@ -287,6 +329,66 @@ def record_events(stats: dict[str, Any], turn: Any, tick: int) -> None:
             combat["damage_taken"] += 1
         elif event_type == "SWEEP_RESOLVED":
             combat["sweeps_resolved"] += 1
+
+
+def _prediction_buckets(
+    stats: dict[str, Any], item: dict[str, Any],
+) -> list[dict[str, int]]:
+    prediction = stats["shot_prediction"]
+    streak = int(item.get("move_streak", 0) or 0)
+    streak_key = str(streak) if streak < 3 else "3_plus"
+    target_type = str(item.get("target_type") or "ENEMY").upper()
+    return [
+        prediction,
+        prediction["by_streak"].setdefault(streak_key, _prediction_counter()),
+        prediction["by_target_type"].setdefault(target_type, _prediction_counter()),
+    ]
+
+
+def record_prediction_candidates(
+    stats: dict[str, Any], candidates: list[dict[str, Any]],
+) -> None:
+    """Count accepted shadow predictions without changing combat behavior."""
+    for item in candidates:
+        for bucket in _prediction_buckets(stats, item):
+            bucket["candidates"] += 1
+            if item.get("prediction_legal"):
+                bucket["legal_candidates"] += 1
+            if item.get("eligible"):
+                bucket["eligible_candidates"] += 1
+
+
+def record_prediction_results(
+    stats: dict[str, Any], results: list[dict[str, Any]],
+) -> None:
+    """Aggregate next-Tick outcomes for previously accepted shadow shots."""
+    for item in results:
+        predicted_match = item.get("predicted_match")
+        shot_result = str(item.get("shot_result") or "UNRESOLVED")
+        for bucket in _prediction_buckets(stats, item):
+            bucket["resolved"] += 1
+            if predicted_match is True:
+                bucket["predicted_correct"] += 1
+            elif predicted_match is False:
+                bucket["predicted_wrong"] += 1
+            else:
+                bucket["unknown"] += 1
+            if shot_result == "SHOT_HIT":
+                bucket["baseline_hits"] += 1
+            elif shot_result == "SHOT_MISSED":
+                bucket["baseline_misses"] += 1
+            if (
+                item.get("eligible")
+                and predicted_match is True
+                and shot_result == "SHOT_MISSED"
+            ):
+                bucket["improvements"] += 1
+            if (
+                item.get("eligible")
+                and predicted_match is False
+                and shot_result == "SHOT_HIT"
+            ):
+                bucket["harms"] += 1
 
 
 def sampled(stats: dict[str, Any], tick: int) -> None:
