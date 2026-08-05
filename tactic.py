@@ -1513,7 +1513,49 @@ def _move_towards(
     detail_prefix: str,
 ) -> tuple[str, str] | None:
     if pos == goal:
+        _combat_path_cache.pop(str(unit.id), None)
         return None
+
+    uid = str(unit.id)
+    cached = _combat_path_cache.get(uid)
+    path: list[tuple[int, int]] | None = None
+    if cached is not None and cached.get("goal") == goal:
+        cached_path = cached.get("path") or []
+        try:
+            index = cached_path.index(pos)
+        except ValueError:
+            index = -1
+        if index >= 0 and index + 1 < len(cached_path):
+            next_cell = cached_path[index + 1]
+            if next_cell not in obstacle_cells and not _is_dead_end_step(
+                next_cell, obstacle_cells, allow=(goal,),
+            ):
+                path = cached_path
+    if path is None:
+        _combat_path_cache.pop(uid, None)
+        path = _bfs_path(pos, goal, obstacle_cells, max_steps=2500)
+        if path and len(path) > 1:
+            _combat_path_cache[uid] = {"goal": goal, "path": path}
+
+    if path and len(path) > 1:
+        try:
+            index = path.index(pos)
+        except ValueError:
+            index = -1
+        next_cell = path[index + 1] if 0 <= index + 1 < len(path) else None
+        direction = _direction_for_step(pos, next_cell) if next_cell else None
+        if direction is not None and _try_move(
+            unit,
+            direction,
+            pos,
+            obstacle_cells,
+            avoid_dead_ends=True,
+            allow=(goal,),
+        ):
+            _set_unit_route(unit, goal, path, complete=True)
+            return ("MOVE", f"{direction.name} {detail_prefix} {goal}")
+
+    # Preserve the cheap greedy fallback when A* exhausts its search budget.
     direction = _step_towards(pos, goal)
     if direction is None:
         return None
@@ -2075,6 +2117,9 @@ _resource_assignments: dict[str, tuple[int, int]] = {}
 # Worker A* path cache: reuse a computed path across ticks instead of recomputing
 # from scratch every tick. Keyed by full str(worker.id); entry {goal, path}.
 _worker_path_cache: dict[str, dict] = {}
+# Combat units use the same map search but keep a separate cache because their
+# goals change independently as enemies move or team assignments change.
+_combat_path_cache: dict[str, dict] = {}
 # Consecutive ticks a worker has not moved — triggers un-stick recovery.
 # _worker_stuck_ticks counts consecutive same-position ticks; _worker_stuck_pos
 # remembers the position those ticks were counted at (independent of last-pos,
@@ -2742,6 +2787,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _resource_assignments.pop(dead_id, None)
     for dead_id in set(_worker_path_cache) - alive_ids:
         _worker_path_cache.pop(dead_id, None)
+    for dead_id in set(_combat_path_cache) - alive_ids:
+        _combat_path_cache.pop(dead_id, None)
     for dead_id in set(_worker_stuck_ticks) - alive_ids:
         _worker_stuck_ticks.pop(dead_id, None)
     for dead_id in set(_worker_stuck_pos) - alive_ids:

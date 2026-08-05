@@ -932,13 +932,17 @@ class CombatTeamPlannerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = default_config()
         self._prev_last_pos = dict(tactic._worker_last_pos)
+        self._prev_combat_paths = dict(tactic._combat_path_cache)
         tactic._worker_last_pos.clear()
+        tactic._combat_path_cache.clear()
         tactic.turn_context.tick = 0
         tactic.turn_context.beacon_pos = None
 
     def tearDown(self) -> None:
         tactic._worker_last_pos.clear()
         tactic._worker_last_pos.update(self._prev_last_pos)
+        tactic._combat_path_cache.clear()
+        tactic._combat_path_cache.update(self._prev_combat_paths)
         tactic.turn_context.beacon_pos = None
 
     def test_team_name_parsing_and_priority(self) -> None:
@@ -1042,6 +1046,107 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(action, "MOVE")
         self.assertIn("attack-march", detail)
         self.assertEqual(unit.arg.name, "RIGHT")
+
+    def test_attack_team_detours_when_direct_steps_are_blocked(self) -> None:
+        unit = self.CombatUnit("v-detour", (0, 0))
+        self.config["attack_target_x"] = 2
+        self.config["attack_target_y"] = 2
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(),
+            obstacle_cells=frozenset({(1, 0), (0, 1)}),
+            config=self.config,
+            core_pos=(0, 0),
+            team="attack",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("attack-march", detail)
+        self.assertEqual(unit.arg.name, "UP")
+        self.assertEqual(
+            tactic._combat_path_cache["v-detour"]["path"][:2],
+            [(0, 0), (0, -1)],
+        )
+
+    def test_combat_path_cache_is_reused_across_ticks(self) -> None:
+        unit = self.CombatUnit("v-cached", (0, 0))
+        self.config["attack_target_x"] = 2
+        self.config["attack_target_y"] = 0
+        path = [(0, 0), (0, -1), (1, -1), (2, -1), (2, 0)]
+
+        with patch.object(tactic, "_bfs_path", return_value=path) as bfs:
+            action1, _ = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+            unit.position = (0, -1)
+            action2, _ = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+        self.assertEqual(action1, "MOVE")
+        self.assertEqual(action2, "MOVE")
+        self.assertEqual(unit.arg.name, "RIGHT")
+        self.assertEqual(bfs.call_count, 1)
+
+    def test_combat_path_replans_when_next_step_becomes_blocked(self) -> None:
+        unit = self.CombatUnit("v-replan", (0, 0))
+        self.config["attack_target_x"] = 2
+        self.config["attack_target_y"] = 0
+        tactic._combat_path_cache["v-replan"] = {
+            "goal": (2, 0),
+            "path": [(0, 0), (1, 0), (2, 0)],
+        }
+        replacement = [(0, 0), (0, -1), (1, -1), (2, -1), (2, 0)]
+
+        with patch.object(tactic, "_bfs_path", return_value=replacement) as bfs:
+            action, _ = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset({(1, 0)}),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(unit.arg.name, "UP")
+        self.assertEqual(bfs.call_count, 1)
+
+    def test_combat_path_replans_when_goal_changes(self) -> None:
+        unit = self.CombatUnit("v-new-goal", (0, 0))
+        self.config["attack_target_x"] = 0
+        self.config["attack_target_y"] = 2
+        tactic._combat_path_cache["v-new-goal"] = {
+            "goal": (2, 0),
+            "path": [(0, 0), (1, 0), (2, 0)],
+        }
+        replacement = [(0, 0), (0, 1), (0, 2)]
+
+        with patch.object(tactic, "_bfs_path", return_value=replacement) as bfs:
+            action, _ = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(unit.arg.name, "DOWN")
+        self.assertEqual(bfs.call_count, 1)
+        self.assertEqual(tactic._combat_path_cache["v-new-goal"]["goal"], (0, 2))
 
     def test_attack_team_engages_enemies_en_route(self) -> None:
         unit = self.CombatUnit("r-attack", (0, 0))
@@ -1517,15 +1622,19 @@ class WorkerPathCacheTests(unittest.TestCase):
         self._last_pos = dict(tactic._worker_last_pos)
         self._recent = {k: list(v) for k, v in tactic._worker_recent.items()}
         self._assignments = dict(tactic._resource_assignments)
+        self._combat_paths = dict(tactic._combat_path_cache)
         tactic._object_names.clear()
         tactic._object_name_counters.clear()
         tactic._worker_last_pos.clear()
         tactic._worker_recent.clear()
         tactic._resource_assignments.clear()
         tactic._worker_path_cache.clear()
+        tactic._combat_path_cache.clear()
 
     def tearDown(self) -> None:
         tactic._worker_path_cache.clear()
+        tactic._combat_path_cache.clear()
+        tactic._combat_path_cache.update(self._combat_paths)
         tactic._worker_last_pos.clear()
         tactic._worker_last_pos.update(self._last_pos)
         tactic._worker_recent.clear()
@@ -1640,6 +1749,8 @@ class WorkerPathCacheTests(unittest.TestCase):
     def test_prune_helper_removes_cache_and_names(self) -> None:
         tactic._worker_path_cache["dead-1"] = {"goal": (0, 0), "path": [(0, 0)]}
         tactic._worker_path_cache["alive-1"] = {"goal": (0, 0), "path": [(0, 0)]}
+        tactic._combat_path_cache["dead-1"] = {"goal": (0, 0), "path": [(0, 0)]}
+        tactic._combat_path_cache["alive-1"] = {"goal": (0, 0), "path": [(0, 0)]}
         tactic._worker_last_pos["dead-1"] = (1, 1)
         tactic._worker_recent["dead-1"] = [(1, 1)]
         tactic._resource_assignments["dead-1"] = (1, 1)
@@ -1651,6 +1762,8 @@ class WorkerPathCacheTests(unittest.TestCase):
 
         self.assertNotIn("dead-1", tactic._worker_path_cache)
         self.assertIn("alive-1", tactic._worker_path_cache)
+        self.assertNotIn("dead-1", tactic._combat_path_cache)
+        self.assertIn("alive-1", tactic._combat_path_cache)
         self.assertNotIn("dead-1", tactic._worker_last_pos)
         self.assertNotIn("dead-1", tactic._worker_recent)
         self.assertNotIn("dead-1", tactic._resource_assignments)
