@@ -105,7 +105,8 @@ EXCLUDE_PATTERNS = [
     r"^nul$",
 ]
 
-# Local runtime state seeded into the remote Docker volume on each deploy.
+# Local runtime state seeded into a FRESH remote Docker volume only. On an
+# existing server these files are live data and are never overwritten.
 RUNTIME_SEED_FILES = (
     "map_memory.json",
     "tactic_config.json",
@@ -207,7 +208,12 @@ def write_remote_env(client: paramiko.SSHClient) -> None:
 
 
 def seed_runtime_data(client: paramiko.SSHClient, sftp: paramiko.SFTPClient) -> None:
-    """Upload local runtime DB/config/logs into the Docker volume."""
+    """Bootstrap local runtime files into the Docker volume on first launch.
+
+    Files already present in the volume (dashboard-set config, discovered map
+    memory, stats, logs) are kept as-is — seeding only fills an empty volume so
+    a brand-new server starts from the local state instead of defaults.
+    """
     remote_seed = f"{REMOTE_BASE}/.runtime-seed"
     print("Seeding runtime data from local machine...")
     stdin, stdout, stderr = client.exec_command(f"mkdir -p {remote_seed}")
@@ -229,6 +235,8 @@ def seed_runtime_data(client: paramiko.SSHClient, sftp: paramiko.SFTPClient) -> 
         return
 
     # Ensure volume exists, stop app so sqlite/log writers release files, then copy.
+    # Bootstrap-only: a file already present in the volume is LIVE data (dashboard
+    # config, map memory, stats, logs) and must NOT be overwritten by local state.
     seed_cmd = f"""
 set -e
 cd {REMOTE_BASE}
@@ -241,9 +249,11 @@ docker run --rm \
     set -e
     mkdir -p /data
     for f in map_memory.json tactic_config.json game_stats.json tactic_log.jsonl tactic_play.log; do
-      if [ -f "/seed/$f" ]; then
+      if [ -f "/seed/$f" ] && [ ! -e "/data/$f" ]; then
         cp -f "/seed/$f" "/data/$f"
-        echo "seeded $f"
+        echo "seeded $f (bootstrap)"
+      else
+        echo "kept existing $f"
       fi
     done
     # Container runs as uid 10001 (arena).
