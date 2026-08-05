@@ -654,8 +654,13 @@ def render_teams_panel() -> str:
         f'<input id="teamAttackY" name="attack_target_y" type="number" min="-500" max="500" '
         f'step="1" value="{config["attack_target_y"]}"{coords_locked}></label>'
         '<label>游侠射程'
-        f'<input id="teamRangerRange" name="ranger_attack_range" type="number" min="1" max="3" '
-        f'step="1" value="{config["ranger_attack_range"]}"></label>'
+        f'<select id="teamRangerRange" name="ranger_attack_range" title="游侠最大开火距离（游戏规则仅允许 1–3）">'
+        + "".join(
+            f'<option value="{n}"{" selected" if int(config["ranger_attack_range"]) == n else ""}>'
+            f'{n} 格</option>'
+            for n in (1, 2, 3)
+        )
+        + '</select></label>'
         '<div class="team-mode">'
         '<span class="team-mode-title">进攻方式</span>'
         '<div class="team-mode-opts">'
@@ -1304,7 +1309,9 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-chip.ghost .pulse{background:#7f8eab;box-shadow:none}
 .team-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}
 .team-settings label{display:grid;gap:6px;padding:10px 12px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);color:var(--muted);font-size:11px}
-.team-settings input{width:100%;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
+.team-settings input,.team-settings select{width:100%;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
+.team-settings select{cursor:pointer}
+.team-settings select option{background:#0b1222;color:var(--text)}
 .team-settings label.team-switch{display:flex;align-items:center;gap:8px;justify-content:space-between}
 .team-settings label.team-switch input{width:16px;height:16px;accent-color:#57d6a3;cursor:pointer}
 .team-settings input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}

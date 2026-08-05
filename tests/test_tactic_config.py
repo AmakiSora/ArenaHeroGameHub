@@ -160,6 +160,13 @@ class TacticConfigTests(unittest.TestCase):
         self.assertIn("进攻冠军信标", teams)
         self.assertIn("自动进攻", teams)
         self.assertNotIn('name="auto_attack_enabled"', teams)
+        # 游侠射程只有 1/2/3 三档，用下拉框而不是数字输入框。
+        self.assertIn('name="ranger_attack_range"', teams)
+        self.assertIn('<select id="teamRangerRange"', teams)
+        self.assertNotIn('<input id="teamRangerRange"', teams)
+        for n in (1, 2, 3):
+            self.assertIn(f'<option value="{n}"', teams)
+        self.assertNotIn('type="number" min="1" max="3"', teams)
         self.assertIn("resAddToggle", page)
         self.assertIn("resAddForm", page)
         self.assertIn("chip-x", page)
