@@ -14,6 +14,7 @@ map_memory.tmp
 tactic_config.json
 tactic_config.tmp
 game_stats.json
+*.lock
 
 # Python cache
 __pycache__/

@@ -72,6 +72,27 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(loaded["attack_target_x"], 12)
         self.assertEqual(loaded["home_patrol_radius"], 7)
 
+    def test_strategy_reset_preserves_team_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tactic_config.json"
+            config = default_config()
+            config["bfs_max_steps"] = 800
+            config["target_workers"] = 3
+            config["home_team"] = "V1, R1"
+            config["attack_team"] = "V2"
+            config["attack_mode"] = "auto"
+            config["attack_target_x"] = 42
+            save_config(config, path)
+
+            reset = dashboard.reset_strategy_config(path)
+
+        self.assertEqual(reset["bfs_max_steps"], default_config()["bfs_max_steps"])
+        self.assertEqual(reset["target_workers"], default_config()["target_workers"])
+        self.assertEqual(reset["home_team"], "V1, R1")
+        self.assertEqual(reset["attack_team"], "V2")
+        self.assertEqual(reset["attack_mode"], "auto")
+        self.assertEqual(reset["attack_target_x"], 42)
+
     def test_invalid_and_incomplete_values_are_rejected(self) -> None:
         with self.assertRaises(ConfigValidationError):
             validate_config({"ranger_attack_range": 4})

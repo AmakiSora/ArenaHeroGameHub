@@ -4,7 +4,9 @@ import json
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from state_io import atomic_write_text, file_lock
 
 # ARENA_DATA_DIR lets Docker keep mutable state on a volume.
 
@@ -45,6 +47,7 @@ CONFIG_FIELDS = (
     ConfigField("avoid_backtracking", "避免立即回头", "worker", "boolean", True),
     ConfigField("backtrack_penalty", "载矿回头惩罚", "worker", "integer", 10, 0, 100, 1),
     ConfigField("enemy_threat_radius", "工人遇敌回避半径", "worker", "integer", 3, 0, 10, 1),
+    ConfigField("worker_mine_max_distance", "工人采矿最大距离", "worker", "integer", 0, 0, 200, 1),
     ConfigField("core_movement_enabled", "允许核心移动", "core", "boolean", True),
     ConfigField("prefer_resources_for_core", "核心优先靠近矿点", "core", "boolean", True),
     ConfigField("core_target_enabled", "启用核心目标坐标", "core", "boolean", False),
@@ -226,18 +229,56 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, int | bool | str]:
     return config
 
 
-def save_config(values: dict[str, Any], path: Path = CONFIG_PATH) -> dict[str, int | bool | str]:
+def _store_config(
+    config: dict[str, int | bool | str],
+    path: Path,
+) -> dict[str, int | bool | str]:
     global _cache_path, _cache_signature, _cache_value
+    atomic_write_text(
+        path,
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+    )
+    _cache_path = path
+    _cache_signature = _path_signature(path)
+    _cache_value = dict(config)
+    return dict(config)
+
+
+def save_config(values: dict[str, Any], path: Path = CONFIG_PATH) -> dict[str, int | bool | str]:
     path = Path(path)
     missing = {field.key for field in CONFIG_FIELDS} - values.keys()
     if missing:
         raise ConfigValidationError({key: "缺少配置项" for key in sorted(missing)})
     config = validate_config(values)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-    _cache_path = path
-    _cache_signature = _path_signature(path)
-    _cache_value = dict(config)
-    return config
+    with file_lock(path):
+        return _store_config(config, path)
+
+
+def update_config(
+    values: dict[str, Any],
+    path: Path = CONFIG_PATH,
+) -> dict[str, int | bool | str]:
+    """Atomically merge partial values over the latest on-disk config."""
+    path = Path(path)
+    with file_lock(path):
+        current = load_config(path)
+        config = validate_config(values, base=current)
+        return _store_config(config, path)
+
+
+def mutate_config(
+    mutator: Callable[
+        [dict[str, int | bool | str]],
+        dict[str, Any] | None,
+    ],
+    path: Path = CONFIG_PATH,
+) -> dict[str, int | bool | str]:
+    """Run a read-modify-write callback while holding the config lock."""
+    path = Path(path)
+    with file_lock(path):
+        current = load_config(path)
+        values = mutator(dict(current))
+        if values is None:
+            return current
+        config = validate_config(values)
+        return _store_config(config, path)

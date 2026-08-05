@@ -102,6 +102,19 @@ def load(path: Path | str = STATS_PATH) -> dict[str, Any]:
             merged["per_worker"] = dict(raw.get("per_worker", {}) or {})
             merged["per_combat"] = dict(raw.get("per_combat", {}) or {})
             merged["samples"] = list(raw.get("samples", []) or [])[-_SAMPLE_MAX:]
+            # Version-1 files written before combat deaths were counted still
+            # contain died_tick records. Backfill their aggregate totals while
+            # preserving any larger historical count already on disk.
+            for unit_type in _COMBAT_TYPES:
+                detected = sum(
+                    1
+                    for rec in merged["per_combat"].values()
+                    if rec.get("type") == unit_type and rec.get("died_tick") is not None
+                )
+                merged["deaths"][unit_type] = max(
+                    int(merged["deaths"].get(unit_type, 0) or 0),
+                    detected,
+                )
             return merged
     except (OSError, json.JSONDecodeError):
         pass
@@ -187,6 +200,9 @@ def sync_units(stats: dict[str, Any], turn: Any, tick: int) -> None:
     for sid, rec in list(stats["per_combat"].items()):
         if rec.get("died_tick") is None and sid not in combat_sids:
             rec["died_tick"] = tick
+            unit_type = stats["types"].get(sid)
+            if unit_type in _COMBAT_TYPES:
+                stats["deaths"][unit_type] += 1
 
 
 def record_events(stats: dict[str, Any], turn: Any, tick: int) -> None:

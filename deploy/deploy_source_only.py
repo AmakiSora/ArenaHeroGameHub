@@ -32,7 +32,15 @@ REMOTE_BASE = env.get("DEPLOY_REMOTE_BASE", "/srv/arena-game")
 APP_PORT = int(env.get("APP_PORT", "4399"))
 LOCAL_BASE = Path(__file__).resolve().parents[1]
 
-FILES = ("tactic.py", "tactic_config.py", "dashboard.py", "BEHAVIOR.md")
+FILES = (
+    "Dockerfile",
+    "tactic.py",
+    "tactic_config.py",
+    "dashboard.py",
+    "game_stats.py",
+    "state_io.py",
+    "BEHAVIOR.md",
+)
 
 print(f"Connecting to {HOST}:{PORT} as {USERNAME}...")
 client = paramiko.SSHClient()

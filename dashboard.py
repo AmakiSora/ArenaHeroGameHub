@@ -3,10 +3,13 @@ Run: python dashboard.py  -> http://localhost:4399
 """
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import time
 from collections import defaultdict
+from functools import wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,8 +21,9 @@ from tactic_config import (
     config_schema,
     default_config,
     load_config,
-    save_config,
+    update_config,
 )
+from state_io import atomic_write_text, file_lock
 
 def _data_path(name: str) -> str:
     raw = os.environ.get("ARENA_DATA_DIR", "").strip()
@@ -108,12 +112,18 @@ def _read_map_file() -> dict:
         return empty
 
 
+def _map_mutation(func):
+    @wraps(func)
+    def locked(*args, **kwargs):
+        with file_lock(MAP_FILE):
+            return func(*args, **kwargs)
+
+    return locked
+
+
 def _write_map_file(payload: dict) -> None:
     """Atomically replace map_memory.json."""
-    tmp = MAP_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-    os.replace(tmp, MAP_FILE)
+    atomic_write_text(MAP_FILE, json.dumps(payload, ensure_ascii=False))
 
 
 def _coord_set(raw) -> set[tuple[int, int]]:
@@ -144,6 +154,7 @@ def load_map_memory():
     }
 
 
+@_map_mutation
 def save_manual_resource(x: int, y: int) -> dict:
     """Add a manually entered resource into map_memory.json."""
     data = _read_map_file()
@@ -182,6 +193,7 @@ def save_manual_resource(x: int, y: int) -> dict:
     }
 
 
+@_map_mutation
 def remove_manual_resource(x: int, y: int) -> dict:
     """Forget one remembered resource and sticky-tombstone it for the tactic process."""
     data = _read_map_file()
@@ -219,6 +231,7 @@ def remove_manual_resource(x: int, y: int) -> dict:
     }
 
 
+@_map_mutation
 def clear_remembered_resources() -> dict:
     """Clear all auto + manual resource memory and tombstone every former point."""
     data = _read_map_file()
@@ -252,6 +265,7 @@ def clear_remembered_resources() -> dict:
     }
 
 
+@_map_mutation
 def clear_enemy_sightings() -> dict:
     """Clear enemy sightings and bump a seq so the tactic process drops its RAM copy."""
     data = _read_map_file()
@@ -286,11 +300,27 @@ def _read_waypoints_file() -> dict:
         return {}
 
 
+def _waypoint_mutation(func):
+    @wraps(func)
+    def locked(*args, **kwargs):
+        with file_lock(WAYPOINTS_FILE):
+            return func(*args, **kwargs)
+
+    return locked
+
+
 def _write_waypoints_file(payload: dict) -> None:
-    tmp = WAYPOINTS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False)
-    os.replace(tmp, WAYPOINTS_FILE)
+    atomic_write_text(WAYPOINTS_FILE, json.dumps(payload, ensure_ascii=False))
+
+
+_WAYPOINT_NAME_RE = re.compile(r"^[WVR][1-9][0-9]*$")
+
+
+def _waypoint_name(raw: object) -> str:
+    name = str(raw or "").strip().upper()
+    if not _WAYPOINT_NAME_RE.fullmatch(name):
+        raise ValueError("name 必须是 W/V/R 加正整数，例如 W1")
+    return name
 
 
 def load_waypoints() -> dict[str, list[int]]:
@@ -306,14 +336,16 @@ def load_waypoints() -> dict[str, list[int]]:
                 and len(pos) == 2
             ):
                 try:
-                    out[name] = [int(pos[0]), int(pos[1])]
+                    out[_waypoint_name(name)] = [int(pos[0]), int(pos[1])]
                 except (TypeError, ValueError):
                     continue
     return out
 
 
+@_waypoint_mutation
 def set_waypoint(name: str, x: int, y: int) -> dict:
     """Set a manual target for one unit (display-name keyed)."""
+    name = _waypoint_name(name)
     targets = load_waypoints()
     targets[name] = [int(x), int(y)]
     _write_waypoints_file({
@@ -328,7 +360,9 @@ def set_waypoint(name: str, x: int, y: int) -> dict:
     }
 
 
+@_waypoint_mutation
 def remove_waypoint(name: str) -> dict:
+    name = _waypoint_name(name)
     targets = load_waypoints()
     if name not in targets:
         return {"ok": False, "error": "目标不存在"}
@@ -340,6 +374,7 @@ def remove_waypoint(name: str) -> dict:
     return {"ok": True, "name": name, "waypoint_count": len(targets)}
 
 
+@_waypoint_mutation
 def clear_waypoints() -> dict:
     _write_waypoints_file({
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -363,6 +398,19 @@ TEAM_SETTING_FIELDS = (
     "attack_mode",
     "ranger_attack_range",
 )
+STRATEGY_CONFIG_FIELDS = tuple(
+    key
+    for key in default_config()
+    if key not in set(TEAM_ROSTER_FIELDS) | set(TEAM_SETTING_FIELDS)
+)
+
+
+def reset_strategy_config(path: Path = CONFIG_PATH) -> dict[str, int | bool | str]:
+    defaults = default_config()
+    return update_config(
+        {key: defaults[key] for key in STRATEGY_CONFIG_FIELDS},
+        path,
+    )
 
 
 def _parse_roster_names(raw: object) -> list[str]:
@@ -643,7 +691,9 @@ def render_waypoints_panel(
     """Manual per-unit target panel: list current, add one for a live unit."""
     def _opts(label: str, names: list[str]) -> str:
         return "".join(
-            f'<option value="{n}">{n}（{label}）</option>' for n in names
+            f'<option value="{html.escape(n, quote=True)}">'
+            f'{html.escape(n)}（{label}）</option>'
+            for n in names
         )
 
     options = _opts("工人", workers) + _opts("先锋", vanguards) + _opts("游侠", rangers)
@@ -652,9 +702,11 @@ def render_waypoints_panel(
 
     if waypoints:
         chips = "".join(
-            f'<span class="chip removable wp-chip">{name} → ({x}, {y})'
-            f'<button type="button" class="chip-x" data-wp-remove="{name}" '
-            f'aria-label="删除 {name}" title="删除">×</button></span>'
+            f'<span class="chip removable wp-chip">{html.escape(name)} → ({x}, {y})'
+            f'<button type="button" class="chip-x" '
+            f'data-wp-remove="{html.escape(name, quote=True)}" '
+            f'aria-label="删除 {html.escape(name, quote=True)}" '
+            f'title="删除">×</button></span>'
             for name, (x, y) in sorted(waypoints.items())
         )
         list_html = f'<div class="wp-list">{chips}</div>'
@@ -983,7 +1035,7 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
             continue
         px, py = to_xy(x, y)
         cx, cy = px + cell / 2, py + cell / 2
-        label = f"{name}→({x},{y})"
+        label = html.escape(f"{name}→({x},{y})")
         w = 6.5 * len(label) + 12
         a(f'<circle cx="{cx}" cy="{cy}" r="9" fill="none" stroke="#3dd6c9" '
           f'stroke-width="1.6" stroke-dasharray="4 3" opacity="0.9"/>')
@@ -2871,15 +2923,11 @@ class Handler(BaseHTTPRequestHandler):
         data = self._read_json()
         if path in {"/api/config", "/api/config/reset"}:
             try:
-                values = default_config() if path.endswith("/reset") else data
-                if path == "/api/config":
-                    # Strategy form no longer owns combat rosters/settings.
-                    current = load_config(CONFIG_PATH)
-                    merged = dict(current)
-                    for key, value in values.items():
-                        merged[key] = value
-                    values = merged
-                config = save_config(values, CONFIG_PATH)
+                config = (
+                    reset_strategy_config(CONFIG_PATH)
+                    if path.endswith("/reset")
+                    else update_config(data, CONFIG_PATH)
+                )
             except ConfigValidationError as exc:
                 self._send_json(400, {
                     "ok": False,
@@ -2895,15 +2943,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/teams":
             try:
-                current = load_config(CONFIG_PATH)
-                merged = dict(current)
+                updates = {}
                 for key in list(TEAM_ROSTER_FIELDS) + list(TEAM_SETTING_FIELDS):
                     if key in data:
-                        merged[key] = data[key]
+                        updates[key] = data[key]
                 # Normalize roster text for stable dashboard/tactic display.
                 for key in TEAM_ROSTER_FIELDS:
-                    merged[key] = _format_roster_names(_parse_roster_names(merged.get(key, "")))
-                config = save_config(merged, CONFIG_PATH)
+                    if key in updates:
+                        updates[key] = _format_roster_names(_parse_roster_names(updates[key]))
+                config = update_config(updates, CONFIG_PATH)
             except ConfigValidationError as exc:
                 self._send_json(400, {
                     "ok": False,
@@ -2940,15 +2988,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/waypoint/set":
-            name = str(data.get("name", "") or "").strip()
             try:
+                name = _waypoint_name(data.get("name"))
                 x = int(data.get("x"))
                 y = int(data.get("y"))
-            except Exception:
-                self._send_json(400, {"ok": False, "error": "x/y 必须是整数"})
-                return
-            if not name:
-                self._send_json(400, {"ok": False, "error": "name 不能为空"})
+            except (TypeError, ValueError) as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
                 return
             x = max(-500, min(500, x))
             y = max(-500, min(500, y))
@@ -2956,9 +3001,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/waypoint/remove":
-            name = str(data.get("name", "") or "").strip()
-            if not name:
-                self._send_json(400, {"ok": False, "error": "name 不能为空"})
+            try:
+                name = _waypoint_name(data.get("name"))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
                 return
             result = remove_waypoint(name)
             self._send_json(200 if result.get("ok") else 400, result)

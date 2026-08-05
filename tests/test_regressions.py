@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -820,7 +821,11 @@ class CombatTeamPlannerTests(unittest.TestCase):
                 ),
                 rangers=(SimpleNamespace(id="rang-1"),),
             )
-            with patch.object(tactic, "save_config", side_effect=lambda values: save_config(values, path)), \
+            with patch.object(
+                tactic,
+                "mutate_config",
+                side_effect=lambda mutator, _path: tactic_config.mutate_config(mutator, path),
+            ), \
                  patch.object(tactic, "CONFIG_PATH", path):
                 updated = tactic._auto_enlist_new_combat_units(turn, load_config(path))
 
@@ -1833,14 +1838,12 @@ class ConfigClobberProtectionTests(unittest.TestCase):
             path.write_text(json.dumps(full, ensure_ascii=False), encoding="utf-8")
             stale = tactic_config.default_config()  # still target 2
             with patch.object(tactic, "CONFIG_PATH", path), \
-                 patch.object(tactic, "save_config", wraps=tactic_config.save_config) as save_mock:
+                 patch.object(tactic, "mutate_config", wraps=tactic_config.mutate_config) as mutate_mock:
                 result = tactic._ensure_home_team_membership(stale, ["V9"])
 
         self.assertEqual(result["target_vanguards"], 4)  # preserved from disk
         self.assertIn("V9", result["home_team"])
-        self.assertEqual(save_mock.call_count, 1)
-        saved = save_mock.call_args[0][0]
-        self.assertEqual(saved["target_vanguards"], 4)
+        self.assertEqual(mutate_mock.call_count, 1)
 
 
 class GameStatsTests(unittest.TestCase):
@@ -1925,6 +1928,38 @@ class GameStatsTests(unittest.TestCase):
 
         self.assertEqual(stats["deaths"]["WORKER"], 1)
         self.assertEqual(stats["per_worker"]["worker-6"]["died_tick"], 11)
+
+    def test_load_backfills_legacy_combat_death_totals(self) -> None:
+        stats = game_stats.new_stats()
+        stats["per_combat"] = {
+            "vg-old": {
+                "type": "VANGUARD", "shots": 0, "hits": 0,
+                "born_tick": 1, "died_tick": 5,
+            },
+            "rg-old": {
+                "type": "RANGER", "shots": 0, "hits": 0,
+                "born_tick": 1, "died_tick": 6,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "game_stats.json"
+            game_stats.save(stats, path)
+            loaded = game_stats.load(path)
+
+        self.assertEqual(loaded["deaths"]["VANGUARD"], 1)
+        self.assertEqual(loaded["deaths"]["RANGER"], 1)
+
+    def test_combat_deaths_are_counted_by_type(self) -> None:
+        stats = game_stats.new_stats()
+        vanguard = self._unit("vg-dead-1111", UnitType.VANGUARD)
+        ranger = self._unit("rg-dead-2222", UnitType.RANGER)
+        game_stats.sync_units(stats, self._turn(units=(vanguard, ranger)), tick=10)
+        game_stats.sync_units(stats, self._turn(units=()), tick=11)
+
+        self.assertEqual(stats["deaths"]["VANGUARD"], 1)
+        self.assertEqual(stats["deaths"]["RANGER"], 1)
+        self.assertEqual(stats["per_combat"]["vg-dead-"]["died_tick"], 11)
+        self.assertEqual(stats["per_combat"]["rg-dead-"]["died_tick"], 11)
 
     def test_self_destruct_and_global_combat_events(self) -> None:
         stats = game_stats.new_stats()
@@ -2254,6 +2289,17 @@ class ManualWaypointTests(unittest.TestCase):
                 loaded = tactic._load_waypoints()
         self.assertEqual(loaded, {"W1": (10, -20), "R3": (-5, 8)})
 
+    def test_reaching_old_target_does_not_delete_concurrent_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "waypoints.json"
+            with patch.object(tactic, "WAYPOINTS_PATH", path):
+                tactic._write_waypoints({"W1": (5, 0)})
+                tactic._write_waypoints({"W1": (9, 0)})
+                tactic._remove_waypoint("W1", expected_target=(5, 0))
+                remaining = tactic._load_waypoints()
+
+        self.assertEqual(remaining, {"W1": (9, 0)})
+
     def test_obstacle_target_adjacent_counts_as_arrived(self) -> None:
         # The target cell is a wall — it can never be entered. Standing next to
         # it is the closest reachable success: clear the waypoint and resume.
@@ -2305,6 +2351,34 @@ class ManualWaypointTests(unittest.TestCase):
         self.assertIn("flee", detail)
         self.assertNotIn("w1", tactic._waypoint_stuck)  # fleeing is not stagnation
 
+    def test_reachable_waypoint_routes_around_long_wall(self) -> None:
+        unit = self.Unit("v1", (0, 0), UnitType.VANGUARD)
+        obstacles = frozenset((1, y) for y in range(-16, 17))
+        details = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "waypoints.json"
+            with patch.object(tactic, "WAYPOINTS_PATH", path):
+                tactic._write_waypoints({"V1": (2, 0)})
+                for _ in range(50):
+                    action, detail = self._plan(
+                        unit,
+                        "V1",
+                        (2, 0),
+                        obstacle_cells=obstacles,
+                    )
+                    details.append(detail)
+                    if action == "MOVE":
+                        dx, dy = unit.arg.delta
+                        unit.position = (unit.position[0] + dx, unit.position[1] + dy)
+                    if "waypoint-reached" in detail:
+                        break
+                remaining = tactic._load_waypoints()
+
+        self.assertEqual(unit.position, (2, 0))
+        self.assertTrue(any("waypoint-reached" in detail for detail in details))
+        self.assertFalse(any("waypoint-unreachable" in detail for detail in details))
+        self.assertNotIn("V1", remaining)
+
 
 class DashboardWaypointTests(unittest.TestCase):
     def test_set_remove_clear_roundtrip(self) -> None:
@@ -2345,6 +2419,45 @@ class DashboardWaypointTests(unittest.TestCase):
         memory = {"obstacles": [], "resources": []}
         svg = dashboard.render_svg(rec, memory, waypoints={"W3": [0, 0]})
         self.assertIn("W3→(0,0)", svg)
+
+    def test_waypoint_name_rejects_markup_and_renderer_escapes(self) -> None:
+        malicious = '\"><img src=x onerror=alert(1)>'
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wp_file = Path(temp_dir) / "waypoints.json"
+            with patch.object(dashboard, "WAYPOINTS_FILE", str(wp_file)):
+                with self.assertRaises(ValueError):
+                    dashboard.set_waypoint(malicious, 1, 2)
+
+        html_output = dashboard.render_waypoints_panel(
+            {malicious: [1, 2]}, workers=[], vanguards=[], rangers=[],
+        )
+        self.assertNotIn("<img", html_output)
+        self.assertIn("&lt;img", html_output)
+
+    def test_concurrent_waypoint_updates_preserve_every_target(self) -> None:
+        failures = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            wp_file = Path(temp_dir) / "waypoints.json"
+            with patch.object(dashboard, "WAYPOINTS_FILE", str(wp_file)):
+                dashboard.clear_waypoints()
+                barrier = threading.Barrier(24)
+
+                def update(index: int) -> None:
+                    try:
+                        barrier.wait()
+                        dashboard.set_waypoint(f"W{index + 1}", index, -index)
+                    except Exception as exc:
+                        failures.append(exc)
+
+                threads = [threading.Thread(target=update, args=(i,)) for i in range(24)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                saved = dashboard.load_waypoints()
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(saved), 24)
 
 
 if __name__ == "__main__":

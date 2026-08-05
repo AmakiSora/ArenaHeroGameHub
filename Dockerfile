@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY dashboard.py \
      tactic.py \
      game_stats.py \
+     state_io.py \
      tactic_config.py \
      status.py \
      docker-entrypoint.py \

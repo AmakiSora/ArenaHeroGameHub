@@ -15,6 +15,7 @@ from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from functools import wraps
 from getpass import getpass
 from heapq import heappop, heappush
 from pathlib import Path
@@ -28,7 +29,8 @@ from arena_hero import (
 )
 from arena_hero.errors import ProtocolError, TransportError
 import game_stats
-from tactic_config import CONFIG_PATH, load_config, save_config
+from state_io import atomic_write_text, file_lock
+from tactic_config import CONFIG_PATH, load_config, mutate_config
 
 def _data_dir() -> Path:
     raw = os.environ.get("ARENA_DATA_DIR", "").strip()
@@ -857,7 +859,7 @@ def _plan_waypoint(
 
     def _finish(detail_prefix: str) -> tuple[str, str]:
         _waypoint_stuck.pop(uid, None)
-        _remove_waypoint(name)
+        _remove_waypoint(name, expected_target=target)
         _record([tuple(pos), target], complete=True)
         return ("WAIT", f"{detail_prefix} {target}")
 
@@ -900,9 +902,8 @@ def _plan_waypoint(
                     carrying=(getattr(unit, "cargo", 0) > 0),
                 )
 
-    # Adjacent but the target cell itself is blocked this tick (e.g. a unit is
-    # standing on it). Hold instead of wandering beside it; a transient occupant
-    # frees up, otherwise the stuck counter clears the waypoint.
+    # Adjacent but the target cell itself is occupied this tick. Hold instead of
+    # wandering beside it; a transient occupant may move away next tick.
     if _manhattan(pos, target) == 1 and target in blocked:
         if _count_stuck():
             return _finish("waypoint-unreachable")
@@ -910,20 +911,32 @@ def _plan_waypoint(
         _record([tuple(pos), target], complete=True)
         return ("WAIT", f"waypoint-blocked {target}")
 
-    moved = _move_towards(unit, pos, target, blocked, detail_prefix="waypoint")
-    if moved is not None:
-        moved_dir = _DIRECTION_BY_NAME.get(moved[1].split(" ", 1)[0])
-        new_pos = (
-            (pos[0] + moved_dir.delta[0], pos[1] + moved_dir.delta[1])
-            if moved_dir is not None
-            else None
+    goals = [target]
+    if target in obstacle_cells:
+        goals = [cell for cell in _neighbor_cells(target) if cell not in blocked]
+
+    paths = [
+        path
+        for goal in goals
+        if (
+            path := _bfs_path(
+                pos,
+                goal,
+                blocked,
+                max_steps=int(config.get("bfs_max_steps", 2500)),
+                avoid_dead_ends=False,
+            )
         )
-        if new_pos is not None and _manhattan(new_pos, target) < _manhattan(pos, target):
-            _waypoint_stuck.pop(uid, None)  # real progress toward the target
-        elif _count_stuck():
-            return _finish("waypoint-unreachable")
-        _record([tuple(pos), target], complete=False)
-        return moved
+    ]
+    path = min(paths, key=len) if paths else None
+    if path is not None and len(path) > 1:
+        direction = _direction_for_step(pos, path[1])
+        if direction is not None:
+            unit.move(direction)
+            _worker_last_pos[uid] = pos
+            _waypoint_stuck.pop(uid, None)
+            _record(path, complete=True)
+            return ("MOVE", f"{direction.name} waypoint {target}")
 
     if _count_stuck():
         return _finish("waypoint-unreachable")
@@ -1321,31 +1334,36 @@ def _ensure_home_team_membership(
     unit_names: Iterable[str],
 ) -> dict[str, Any]:
     """Auto-enlist unassigned Vanguards/Rangers into the home team roster."""
-    home = _parse_team_names(config.get("home_team", ""))
-    attack = _parse_team_names(config.get("attack_team", ""))
-    guerrilla = _parse_team_names(config.get("guerrilla_team", ""))
+    normalized_names = {
+        str(raw_name).strip().upper()
+        for raw_name in unit_names
+        if str(raw_name).strip()
+    }
     added: list[str] = []
-    for raw_name in unit_names:
-        name = str(raw_name).strip().upper()
-        if not name or name in home or name in attack or name in guerrilla:
-            continue
-        home.add(name)
-        added.append(name)
-    if not added:
-        return config
 
-    updated = dict(_freshest_config())
-    updated["home_team"] = _format_team_roster(home)
+    def apply(latest: dict[str, int | bool | str]) -> dict[str, Any] | None:
+        home = _parse_team_names(latest.get("home_team", ""))
+        attack = _parse_team_names(latest.get("attack_team", ""))
+        guerrilla = _parse_team_names(latest.get("guerrilla_team", ""))
+        assigned = home | attack | guerrilla
+        added.extend(sorted(normalized_names - assigned))
+        if not added:
+            return None
+        home.update(added)
+        latest["home_team"] = _format_team_roster(home)
+        return latest
+
     try:
-        saved = save_config(updated)
-        print(
-            f"[team] auto-enlisted {', '.join(added)} -> home_team={saved['home_team']}",
-            flush=True,
-        )
+        saved = mutate_config(apply, CONFIG_PATH)
+        if added:
+            print(
+                f"[team] auto-enlisted {', '.join(added)} -> home_team={saved['home_team']}",
+                flush=True,
+            )
         return saved
     except Exception as exc:
         print(f"[team] auto-enlist save failed: {exc}", flush=True)
-        return updated
+        return config
 
 
 def _auto_enlist_new_combat_units(turn: Any, config: dict[str, Any]) -> dict[str, Any]:
@@ -1360,26 +1378,28 @@ def _auto_enlist_new_combat_units(turn: Any, config: dict[str, Any]) -> dict[str
     alive = {n.upper() for n in names}
     config = _ensure_home_team_membership(config, names)
 
-    # Prune dead units from all team rosters
-    updated = dict(_freshest_config())
+    # Prune dead units from the latest config under the same cross-process lock
+    # used by dashboard saves.
     changed = False
-    for team_key in ("home_team", "attack_team", "guerrilla_team"):
-        old = _parse_team_names(config.get(team_key, ""))
-        pruned = old & alive
-        if pruned != old:
-            updated[team_key] = _format_team_roster(pruned)
-            changed = True
 
-    if changed:
-        try:
-            saved = save_config(updated)
+    def prune(latest: dict[str, int | bool | str]) -> dict[str, Any] | None:
+        nonlocal changed
+        for team_key in ("home_team", "attack_team", "guerrilla_team"):
+            old = _parse_team_names(latest.get(team_key, ""))
+            pruned = old & alive
+            if pruned != old:
+                latest[team_key] = _format_team_roster(pruned)
+                changed = True
+        return latest if changed else None
+
+    try:
+        saved = mutate_config(prune, CONFIG_PATH)
+        if changed:
             print(f"[team] pruned dead from rosters", flush=True)
-            return saved
-        except Exception as exc:
-            print(f"[team] roster prune failed: {exc}", flush=True)
-            return updated
-
-    return config
+        return saved
+    except Exception as exc:
+        print(f"[team] roster prune failed: {exc}", flush=True)
+        return config
 
 
 def _cardinal_toward_delta(dx: int, dy: int) -> Direction | None:
@@ -2111,6 +2131,16 @@ def _apply_dashboard_map_edits() -> None:
             _map_dirty = True
 
 
+def _map_transaction(func):
+    @wraps(func)
+    def locked(*args, **kwargs):
+        with file_lock(MAP_MEMORY_PATH):
+            return func(*args, **kwargs)
+
+    return locked
+
+
+@_map_transaction
 def _save_map_memory(
     tick: int | None = None,
     force: bool = False,
@@ -2173,9 +2203,7 @@ def _save_map_memory(
         "enemy_sighting_count": len(_enemy_memory),
         "enemy_clear_seq": _enemy_clear_seq,
     }
-    tmp = MAP_MEMORY_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(MAP_MEMORY_PATH)
+    atomic_write_text(MAP_MEMORY_PATH, json.dumps(payload, ensure_ascii=False))
     _map_dirty = False
     _last_dashboard_map_sig = _dashboard_map_sig(payload)
     if tick is not None:
@@ -2211,23 +2239,37 @@ def _load_waypoints() -> dict[str, tuple[int, int]]:
     return out
 
 
-def _write_waypoints(targets: dict[str, tuple[int, int]]) -> None:
+def _write_waypoints_unlocked(targets: dict[str, tuple[int, int]]) -> None:
     payload = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "targets": {name: [int(x), int(y)] for name, (x, y) in targets.items()},
     }
-    tmp = WAYPOINTS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(WAYPOINTS_PATH)
+    atomic_write_text(WAYPOINTS_PATH, json.dumps(payload, ensure_ascii=False))
 
 
-def _remove_waypoint(name: str) -> None:
+def _write_waypoints(targets: dict[str, tuple[int, int]]) -> None:
+    with file_lock(WAYPOINTS_PATH):
+        _write_waypoints_unlocked(targets)
+
+
+def _remove_waypoint(
+    name: str,
+    *,
+    expected_target: tuple[int, int] | None = None,
+) -> None:
     """Delete one manual target, preserving any concurrent dashboard writes."""
     try:
-        targets = _load_waypoints()
-        if name in targets:
-            del targets[name]
-            _write_waypoints(targets)
+        with file_lock(WAYPOINTS_PATH):
+            targets = _load_waypoints()
+            if (
+                name in targets
+                and (
+                    expected_target is None
+                    or targets[name] == tuple(expected_target)
+                )
+            ):
+                del targets[name]
+                _write_waypoints_unlocked(targets)
     except Exception:
         pass
 
@@ -2241,6 +2283,15 @@ def _prune_waypoint_targets(
     for name in stale:
         targets.pop(name, None)
     return bool(stale)
+
+
+def _load_and_prune_waypoints(alive_names: set[str]) -> dict[str, tuple[int, int]]:
+    """Load and prune targets as one transaction with dashboard writers."""
+    with file_lock(WAYPOINTS_PATH):
+        targets = _load_waypoints()
+        if _prune_waypoint_targets(targets, alive_names):
+            _write_waypoints_unlocked(targets)
+        return targets
 
 
 
@@ -2530,14 +2581,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     # Manual per-unit targets set from the dashboard (display-name keyed).
     # Prune targets whose unit no longer exists — names are computed BEFORE the
     # dead-unit cleanup below so a just-died unit's name is never re-issued.
-    waypoints = _load_waypoints()
-    if waypoints:
-        alive_names = {
-            _object_name(u.id, _UNIT_NAME_PREFIX.get(u.unit_type, "U"))
-            for u in turn.units
-        }
-        if _prune_waypoint_targets(waypoints, alive_names):
-            _write_waypoints(waypoints)
+    alive_names = {
+        _object_name(u.id, _UNIT_NAME_PREFIX.get(u.unit_type, "U"))
+        for u in turn.units
+    }
+    waypoints = _load_and_prune_waypoints(alive_names)
 
     # ── Cleanup dead-unit bookkeeping ──────────────────────────────────
     alive_ids: set[str] = set()
@@ -2614,6 +2662,16 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         depleted,
     )
     resource_set = set(all_resources)
+
+    # Workers ignore mines farther than this Manhattan distance from the core —
+    # a far deposit round-trip wastes more ticks than it earns, and a worker
+    # stranded out deep is easy prey. 0 (default) disables the cap.
+    mine_max_distance = int(config.get("worker_mine_max_distance", 0))
+    if mine_max_distance > 0:
+        all_resources = [
+            r for r in all_resources
+            if _manhattan(tuple(r), core_pos) <= mine_max_distance
+        ]
 
     sticky: dict[str, tuple[int, int]] = {}
     claimed_resources: set[tuple[int, int]] = set()
