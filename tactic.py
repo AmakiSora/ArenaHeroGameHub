@@ -639,15 +639,12 @@ class TacticLogger:
             })
 
         for enemy in turn.visible_enemies:
-            enemy_type = getattr(enemy, "unit_type", None)
-            if hasattr(enemy_type, "value"):
-                enemy_type = enemy_type.value
             rec.enemies.append({
                 "id": str(enemy.id)[:8],
                 "name": _object_name(enemy.id, "E"),
                 "pos": list(enemy.position),
                 "hp": getattr(enemy, "hp", None),
-                "type": str(enemy_type) if enemy_type is not None else "ENEMY",
+                "type": _enemy_unit_type_name(enemy) or "ENEMY",
             })
 
         for event in turn.events:

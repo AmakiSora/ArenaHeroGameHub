@@ -1244,6 +1244,67 @@ class DashboardLogTests(unittest.TestCase):
         for name in ("C1", "W1", "V1", "R1", "E1"):
             self.assertIn(f">{name}</text>", svg)
 
+    def test_svg_elements_are_tagged_for_map_filters(self) -> None:
+        """Every drawable category carries a data-cat so legend toggles can
+        show/hide it client-side."""
+        rec = {
+            "core_pos": [0, 0],
+            "core_name": "C1",
+            "beacon_pos": [1, 1],
+            "workers": [{
+                "name": "W1", "pos": [2, 0], "cargo": 0,
+                "path": [[0, 0], [1, 0], [2, 0]], "path_complete": True,
+                "target": [2, 0],
+            }],
+            "vanguards": [{"name": "V1", "pos": [1, 2]}],
+            "rangers": [{"name": "R1", "pos": [2, 2]}],
+            "enemies": [{"name": "E1", "pos": [3, 2]}],
+            "resource_cells": [[4, 4]],
+        }
+        memory = {
+            "obstacles": [[5, 5]],
+            "resources": [[6, 6]],
+            "enemy_sightings": [[7, 7]],
+        }
+        svg = dashboard.render_svg(rec, memory, waypoints={"W1": [2, 0]})
+
+        for cat, minimum in (
+            ("core", 1), ("worker", 1), ("vanguard", 1), ("ranger", 1),
+            ("enemy", 1), ("enemy-trace", 1), ("wall", 1), ("ore", 1),
+            ("ore-mem", 1), ("route", 1), ("target", 1), ("beacon", 1),
+            ("wp", 1),
+        ):
+            self.assertGreaterEqual(
+                svg.count(f'data-cat="{cat}"'), minimum,
+                f"category {cat} should be tagged in the map SVG",
+            )
+
+    def test_svg_enemy_type_is_filtered_per_type(self) -> None:
+        """Visible enemies carry their unit type and are tagged with a per-type
+        category (enemy-worker / enemy-vanguard / enemy-ranger / enemy-core /
+        enemy) so the legend can hide each enemy class independently."""
+        rec = {
+            "core_pos": [0, 0],
+            "core_name": "C1",
+            "workers": [], "vanguards": [], "rangers": [],
+            "resource_cells": [],
+            "enemies": [
+                {"name": "E1", "pos": [1, 0], "type": "WORKER"},
+                {"name": "E2", "pos": [2, 0], "type": "VANGUARD"},
+                {"name": "E3", "pos": [3, 0], "type": "RANGER"},
+                {"name": "E4", "pos": [4, 0], "type": "CORE"},
+                {"name": "E5", "pos": [5, 0], "type": None},
+            ],
+        }
+        svg = dashboard.render_svg(rec, {"obstacles": [], "resources": []})
+
+        for cat in ("enemy-worker", "enemy-vanguard", "enemy-ranger",
+                    "enemy-core", "enemy"):
+            self.assertGreaterEqual(
+                svg.count(f'data-cat="{cat}"'), 2,
+                f"enemy category {cat} should be tagged",
+            )
+
     def test_svg_y_axis_matches_game_up_direction(self) -> None:
         """Smaller world-Y must render higher because Direction.UP is (0, -1)."""
         rec = {
