@@ -1252,9 +1252,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .issue.warn{background:rgba(255,200,87,.10);border-color:rgba(255,200,87,.22)}
 .issue strong{font-size:13px}
 .issue span{color:var(--muted);font-size:12px}
-.events{width:100%;border-collapse:collapse;font-size:12px}
-.events th,.events td{text-align:left;padding:8px 6px;border-bottom:1px solid rgba(255,255,255,.06)}
-.events th{color:var(--muted);font-weight:600}
+
 .footer{margin-top:16px;color:var(--muted);font-size:12px;display:flex;justify-content:space-between;gap:12px}
 .map-panel .game-map{display:block;background:transparent;cursor:grab;
  touch-action:none;user-select:none;max-width:none;transform-origin:0 0;
@@ -1916,7 +1914,6 @@ JS = r"""
       if(data.resHtml){ setHtml('#resSection', data.resHtml); bindOreForm(); }
       if(data.waypointHtml){ setHtml('#waypointSection', data.waypointHtml); bindWaypointPanel(); }
       if(data.enemyHtml){ setHtml('#enemySection', data.enemyHtml); }
-      if(data.eventsHtml) setHtml('#eventsSection', data.eventsHtml);
       if(data.mapTitle) setHtml('#mapTitleCount', data.mapTitle);
       if(data.footerHtml) setHtml('#footerSection', data.footerHtml);
       if(data.workersCount !== undefined) setText('#workersCount', data.workersCount + ' 个');
@@ -1927,7 +1924,6 @@ JS = r"""
       }
       if(data.resCount !== undefined) setText('#resCount', data.resCount + ' 可见');
       if(data.enemyCount !== undefined) setText('#enemyCount', data.enemyCount);
-      if(data.eventsCount !== undefined) setText('#eventsCount', String(data.eventsCount));
       if(data.combatUnits && !teamsDirty && !teamsBusy){
         teamsUnits = data.combatUnits;
         renderTeamBoard();
@@ -2635,7 +2631,6 @@ def build_parts():
     mm = load_map_memory()
     waypoints = load_waypoints()
     svg = render_svg(rec, mm, waypoints=waypoints)
-    events = (rec.get("events", []) or [])[:8]
     running = age < 30
     status_cls = "ok" if running else "down"
     status_text = "运行中" if running else "已停止"
@@ -2810,22 +2805,6 @@ def build_parts():
     else:
         enemy_html = '<div class="muted">暂无敌人踪迹</div>'
 
-    if events:
-        rows = ""
-        for e in events:
-            rows += (
-                f"<tr><td>{e.get('type','')}</td><td>{e.get('reason') or '—'}</td>"
-                f"<td>{short_id(e.get('actor')) if e.get('actor') else '—'}</td>"
-                f"<td>{fmt_pos(e.get('pos'))}</td></tr>"
-            )
-        events_html = (
-            '<table class="events"><thead><tr><th>事件</th><th>原因</th>'
-            '<th>单位</th><th>位置</th></tr></thead>'
-            f'<tbody>{rows}</tbody></table>'
-        )
-    else:
-        events_html = '<div class="muted">本帧无特殊事件</div>'
-
     brand = (
         f"Tick {rec.get('tick')} · 延迟 {rec.get('latency_ms',0):.0f} ms · "
         f"核心 {fmt_pos(rec.get('core_pos'))}"
@@ -2991,7 +2970,6 @@ def build_parts():
         "rgHtml": rg_html,
         "resHtml": res_html,
         "enemyHtml": enemy_html,
-        "eventsHtml": events_html,
         "waypointHtml": waypoint_html,
         "mapSvg": svg,
         "mapTitle": map_title,
@@ -3001,7 +2979,6 @@ def build_parts():
         "rgCount": len(rgs),
         "resCount": len(rcells),
         "enemyCount": f"{len(ex_sightings)} 处",
-        "eventsCount": len(events),
         "waypointCount": len(waypoints),
         "combatUnits": combat_units,
         "logHtml": log_html,
@@ -3179,10 +3156,6 @@ def generate_html() -> str:
           <button type="button" class="add-ore-btn" id="resAddToggle" title="录入矿点">+</button>
         </div>
         <div id="resSection">{parts['resHtml']}</div>
-      </section>
-      <section class="panel">
-        <div class="panel-title"><span>事件</span><span class="count" id="eventsCount">{parts['eventsCount']}</span></div>
-        <div id="eventsSection">{parts['eventsHtml']}</div>
       </section>
     </aside>
   </div>
