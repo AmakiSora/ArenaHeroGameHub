@@ -581,8 +581,9 @@ class TacticLogger:
         rec.resources = turn.resources
         rec.resource_capacity = turn.resource_capacity
         rec.population = state.population
-        rec.population_tier = state.population_tier
-        rec.upkeep_next_tick = state.upkeep_next_tick
+        # SDK 0.2.9+ dropped these two server fields; keep the dashboard/log shape.
+        rec.population_tier = getattr(state, "population_tier", 0)
+        rec.upkeep_next_tick = getattr(state, "upkeep_next_tick", 0)
         rec.visible_enemies = len(turn.visible_enemies)
         rec.resource_cells_visible = len(turn.resource_cells)
         rec.resource_cells = [list(p) for p in turn.resource_cells]
