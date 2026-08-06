@@ -59,6 +59,13 @@ LOG_BACKUP_COUNT = 3
 # Shutdown summary only reads this many of the newest tick records.
 _SUMMARY_TAIL_RECORDS = 10000
 
+# Enemy motion is sampled in shadow mode only. Three consecutive steps are
+# required before a lead shot becomes eligible; two consecutive zero-steps
+# establish that a target is stationary.
+_ENEMY_MOTION_HISTORY = 4
+_STABLE_MOVE_STREAK = 3
+_STATIONARY_STREAK = 2
+
 # Resource cost of each spawnable unit type (demand-based production).
 UNIT_SPAWN_COSTS = {
     "WORKER": 5,
@@ -1652,7 +1659,7 @@ def _update_enemy_motion_tracks(enemies: Iterable[Any], tick: int) -> None:
             history.append((tick, position))
         else:
             history = [(tick, position)]
-        _enemy_motion_tracks[enemy_id] = history[-4:]
+        _enemy_motion_tracks[enemy_id] = history[-_ENEMY_MOTION_HISTORY:]
 
     for enemy_id, history in list(_enemy_motion_tracks.items()):
         if not history or tick - history[-1][0] > 4:
@@ -1681,6 +1688,18 @@ def _motion_streak(
     return velocity, streak
 
 
+def _stationary_streak(
+    history: list[tuple[int, tuple[int, int]]],
+) -> int:
+    """Return the number of latest consecutive zero-velocity steps."""
+    streak = 0
+    for index in range(len(history) - 1, 0, -1):
+        if history[index][1] != history[index - 1][1]:
+            break
+        streak += 1
+    return streak
+
+
 def _shadow_shot_prediction(
     ranger: Any,
     ranger_pos: tuple[int, int],
@@ -1693,16 +1712,29 @@ def _shadow_shot_prediction(
     current_cell = tuple(target.position)
     history = _enemy_motion_tracks.get(target_id, [])
     velocity, move_streak = _motion_streak(history)
+    stationary_streak = _stationary_streak(history)
     predicted_cell: tuple[int, int] | None = None
     legal = False
     reason = "insufficient_history"
+    motion_state = "insufficient"
 
     if velocity is not None:
         if velocity == (0, 0):
-            reason = "stationary"
+            if stationary_streak >= _STATIONARY_STREAK:
+                motion_state = "stationary"
+                reason = "stationary"
+            else:
+                motion_state = "uncertain"
+                reason = "stationary_unconfirmed"
         elif abs(velocity[0]) + abs(velocity[1]) != 1:
+            motion_state = "uncertain"
             reason = "invalid_velocity"
         else:
+            motion_state = (
+                "moving_stable"
+                if move_streak >= _STABLE_MOVE_STREAK
+                else "moving_unstable"
+            )
             predicted_cell = (
                 current_cell[0] + velocity[0],
                 current_cell[1] + velocity[1],
@@ -1718,7 +1750,11 @@ def _shadow_shot_prediction(
                 reason = "blocked"
             else:
                 legal = True
-                reason = "eligible" if move_streak >= 2 else "unstable_velocity"
+                reason = (
+                    "eligible"
+                    if move_streak >= _STABLE_MOVE_STREAK
+                    else "unstable_velocity"
+                )
 
     return {
         "tick": turn_context.tick,
@@ -1731,8 +1767,10 @@ def _shadow_shot_prediction(
         "predicted_cell": list(predicted_cell) if predicted_cell else None,
         "velocity": list(velocity) if velocity is not None else None,
         "move_streak": move_streak,
+        "stationary_streak": stationary_streak,
+        "motion_state": motion_state,
         "prediction_legal": legal,
-        "eligible": legal and move_streak >= 2,
+        "eligible": legal and move_streak >= _STABLE_MOVE_STREAK,
         "reason": reason,
         "_ranger_key": str(ranger.id),
         "_target_key": target_id,

@@ -2332,7 +2332,8 @@ class GameStatsTests(unittest.TestCase):
         stats = game_stats.new_stats()
         candidate = {
             "target_type": "WORKER",
-            "move_streak": 2,
+            "move_streak": 3,
+            "motion_state": "moving_stable",
             "prediction_legal": True,
             "eligible": True,
         }
@@ -2353,9 +2354,12 @@ class GameStatsTests(unittest.TestCase):
         self.assertEqual(prediction["baseline_misses"], 1)
         self.assertEqual(prediction["improvements"], 1)
         self.assertEqual(prediction["harms"], 0)
-        self.assertEqual(prediction["by_streak"]["2"]["improvements"], 1)
+        self.assertEqual(prediction["by_streak"]["3_plus"]["improvements"], 1)
         self.assertEqual(
             prediction["by_target_type"]["WORKER"]["predicted_correct"], 1,
+        )
+        self.assertEqual(
+            prediction["by_motion_state"]["moving_stable"]["improvements"], 1,
         )
 
     def test_shadow_prediction_unknown_and_harm_are_counted(self) -> None:
@@ -2385,6 +2389,9 @@ class GameStatsTests(unittest.TestCase):
             stats["economy"]["harvested_total"] = 123
             stats["shot_prediction"]["eligible_candidates"] = 7
             stats["shot_prediction"]["by_streak"]["2"]["predicted_correct"] = 3
+            stats["shot_prediction"]["by_motion_state"]["stationary"][
+                "baseline_hits"
+            ] = 9
             game_stats.save(stats, path)
 
             loaded = game_stats.load(path)
@@ -2395,6 +2402,28 @@ class GameStatsTests(unittest.TestCase):
         self.assertEqual(
             loaded["shot_prediction"]["by_streak"]["2"]["predicted_correct"], 3,
         )
+        self.assertEqual(
+            loaded["shot_prediction"]["by_motion_state"]["stationary"][
+                "baseline_hits"
+            ],
+            9,
+        )
+
+    def test_load_puts_pre_classification_prediction_totals_in_legacy(self) -> None:
+        stats = game_stats.new_stats()
+        stats["shot_prediction"]["candidates"] = 12
+        stats["shot_prediction"]["resolved"] = 10
+        stats["shot_prediction"]["baseline_hits"] = 8
+        stats["shot_prediction"].pop("by_motion_state")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "stats.json"
+            game_stats.save(stats, path)
+            loaded = game_stats.load(path)
+
+        legacy = loaded["shot_prediction"]["by_motion_state"]["legacy"]
+        self.assertEqual(legacy["candidates"], 12)
+        self.assertEqual(legacy["resolved"], 10)
+        self.assertEqual(legacy["baseline_hits"], 8)
 
     def test_maybe_save_respects_interval(self) -> None:
         stats = game_stats.new_stats()
@@ -2518,22 +2547,65 @@ class RangerShootingTests(unittest.TestCase):
 
     def test_shadow_prediction_records_stable_lead_without_changing_shot(self) -> None:
         enemy = self.Enemy((0, 0))
-        for tick, position in ((1, (0, 0)), (2, (0, 1)), (3, (0, 2))):
+        for tick, position in (
+            (1, (0, 0)),
+            (2, (0, 1)),
+            (3, (0, 2)),
+            (4, (0, 3)),
+        ):
             enemy.position = position
             tactic._update_enemy_motion_tracks((enemy,), tick)
-        tactic.turn_context.tick = 3
+        tactic.turn_context.tick = 4
         ranger = self.Ranger((0, 0))
 
         result = tactic._ranger_best_shot(
-            ranger, ranger.position, (enemy,), frozenset(), 3,
+            ranger, ranger.position, (enemy,), frozenset(), 4,
         )
 
         prediction = tactic.turn_context.shot_predictions[0]
         self.assertEqual(result[0], "SHOOT")
         self.assertIs(ranger.arg, enemy)  # real shot still targets the current view
-        self.assertEqual(prediction["predicted_cell"], [0, 3])
-        self.assertEqual(prediction["move_streak"], 2)
+        self.assertEqual(prediction["predicted_cell"], [0, 4])
+        self.assertEqual(prediction["move_streak"], 3)
+        self.assertEqual(prediction["motion_state"], "moving_stable")
         self.assertTrue(prediction["eligible"])
+
+    def test_shadow_prediction_classifies_confirmed_stationary_target(self) -> None:
+        enemy = self.Enemy((0, 2))
+        for tick in (1, 2, 3):
+            tactic._update_enemy_motion_tracks((enemy,), tick)
+        tactic.turn_context.tick = 3
+
+        prediction = tactic._shadow_shot_prediction(
+            self.Ranger((0, 0)), (0, 0), enemy, frozenset(), 3,
+        )
+
+        self.assertEqual(prediction["stationary_streak"], 2)
+        self.assertEqual(prediction["motion_state"], "stationary")
+        self.assertEqual(prediction["reason"], "stationary")
+        self.assertIsNone(prediction["predicted_cell"])
+        self.assertFalse(prediction["eligible"])
+
+    def test_shadow_prediction_requires_three_steps_for_stable_motion(self) -> None:
+        enemy = self.Enemy((0, 0))
+        for tick, position in (
+            (1, (0, 0)),
+            (2, (0, 1)),
+            (3, (0, 2)),
+        ):
+            enemy.position = position
+            tactic._update_enemy_motion_tracks((enemy,), tick)
+        tactic.turn_context.tick = 3
+
+        prediction = tactic._shadow_shot_prediction(
+            self.Ranger((0, 0)), (0, 0), enemy, frozenset(), 3,
+        )
+
+        self.assertEqual(prediction["move_streak"], 2)
+        self.assertEqual(prediction["motion_state"], "moving_unstable")
+        self.assertTrue(prediction["prediction_legal"])
+        self.assertFalse(prediction["eligible"])
+        self.assertEqual(prediction["reason"], "unstable_velocity")
 
     def test_shadow_prediction_marks_direction_change_unstable(self) -> None:
         enemy = self.Enemy((0, 0))
@@ -2548,6 +2620,7 @@ class RangerShootingTests(unittest.TestCase):
 
         self.assertEqual(prediction["predicted_cell"], [2, 1])
         self.assertEqual(prediction["move_streak"], 1)
+        self.assertEqual(prediction["motion_state"], "moving_unstable")
         self.assertTrue(prediction["prediction_legal"])
         self.assertFalse(prediction["eligible"])
         self.assertEqual(prediction["reason"], "unstable_velocity")

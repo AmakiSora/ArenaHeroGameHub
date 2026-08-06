@@ -2959,6 +2959,11 @@ def build_parts():
     def kv_row(k: str, v: str) -> str:
         return f'<div class="kv"><span>{k}</span><b>{v}</b></div>'
 
+    def prediction_group_count(group: str, name: str) -> int:
+        groups = prediction.get(group, {}) or {}
+        bucket = groups.get(name, {}) or {}
+        return int(bucket.get("candidates", 0) or 0)
+
     vg_rate = derived["vanguard_hit_rate"]
     rg_rate = derived["ranger_hit_rate"]
     report_html = (
@@ -2993,6 +2998,16 @@ def build_parts():
         f'<span class="pill">未知 {int(prediction.get("unknown", 0) or 0)}</span>'
         f'<span class="pill">理论 +{int(prediction.get("improvements", 0) or 0)} '
         f'/ -{int(prediction.get("harms", 0) or 0)}</span></div>'
+        '<div class="stat-chips" style="margin-top:8px">'
+        f'<span class="pill">静止 {prediction_group_count("by_motion_state", "stationary")}</span>'
+        f'<span class="pill">移动观察 '
+        f'{prediction_group_count("by_motion_state", "moving_unstable")}</span>'
+        f'<span class="pill">稳定移动 '
+        f'{prediction_group_count("by_motion_state", "moving_stable")}</span>'
+        f'<span class="pill">状态不足 '
+        f'{prediction_group_count("by_motion_state", "uncertain") + prediction_group_count("by_motion_state", "insufficient")}</span>'
+        f'<span class="pill">旧样本 '
+        f'{prediction_group_count("by_motion_state", "legacy")}</span></div>'
         '<div class="kv" style="margin-top:8px"><span>移动</span>'
         f'<b>成功 {eco.get("moves_succeeded", 0)} · 失败 {eco.get("moves_failed", 0)}</b></div>'
         '</section>'

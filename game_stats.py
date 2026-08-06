@@ -37,6 +37,10 @@ _SAMPLE_MAX = 60
 
 _UNIT_TYPES = ("WORKER", "VANGUARD", "RANGER")
 _COMBAT_TYPES = ("VANGUARD", "RANGER")
+_MOTION_STATES = (
+    "stationary", "moving_unstable", "moving_stable", "uncertain", "insufficient",
+    "legacy",
+)
 
 
 def _zeros(keys: tuple[str, ...]) -> dict[str, int]:
@@ -107,6 +111,9 @@ def new_stats() -> dict[str, Any]:
                 unit_type: _prediction_counter()
                 for unit_type in (*_UNIT_TYPES, "CORE", "ENEMY")
             },
+            "by_motion_state": {
+                state: _prediction_counter() for state in _MOTION_STATES
+            },
         },
         "types": {},  # short id -> UNIT_TYPE; kept after death to tag old events
         "per_worker": {},  # short id -> worker record
@@ -130,7 +137,7 @@ def load(path: Path | str = STATS_PATH) -> dict[str, Any]:
             prediction = raw.get("shot_prediction", {}) or {}
             for key in _prediction_counter():
                 merged["shot_prediction"][key] = int(prediction.get(key, 0) or 0)
-            for group in ("by_streak", "by_target_type"):
+            for group in ("by_streak", "by_target_type", "by_motion_state"):
                 for name, values in (prediction.get(group, {}) or {}).items():
                     bucket = merged["shot_prediction"][group].setdefault(
                         name, _prediction_counter(),
@@ -140,6 +147,12 @@ def load(path: Path | str = STATS_PATH) -> dict[str, Any]:
                         for key, value in (values or {}).items()
                         if key in bucket
                     })
+            if not prediction.get("by_motion_state"):
+                legacy = merged["shot_prediction"]["by_motion_state"]["legacy"]
+                legacy.update({
+                    key: int(prediction.get(key, 0) or 0)
+                    for key in _prediction_counter()
+                })
             merged["types"] = dict(raw.get("types", {}) or {})
             merged["per_worker"] = dict(raw.get("per_worker", {}) or {})
             merged["per_combat"] = dict(raw.get("per_combat", {}) or {})
@@ -338,10 +351,14 @@ def _prediction_buckets(
     streak = int(item.get("move_streak", 0) or 0)
     streak_key = str(streak) if streak < 3 else "3_plus"
     target_type = str(item.get("target_type") or "ENEMY").upper()
+    motion_state = str(item.get("motion_state") or "legacy").lower()
     return [
         prediction,
         prediction["by_streak"].setdefault(streak_key, _prediction_counter()),
         prediction["by_target_type"].setdefault(target_type, _prediction_counter()),
+        prediction["by_motion_state"].setdefault(
+            motion_state, _prediction_counter(),
+        ),
     ]
 
 

@@ -329,9 +329,12 @@ Tactic 每 Tick 从解析事件聚合累计统计，持久化到 `game_stats.jso
 `shot_predictions` 保存候选，`shot_prediction_results` 保存对照结果；累计候选、
 正确、错误、未知及理论挽回/伤害写入 `game_stats.json` 的 `shot_prediction`。
 
-轨迹断档会重置；只有连续两步同方向、每步一个基数格且预测格满足射程、八向直线
-和障碍检查时才标记为 `eligible`。该标记仅用于采样，不会传入 SDK 的
-`expected_cell`。
+轨迹断档会重置。连续两个零位移步骤归类为 `stationary`；刚移动、刚停下或换向的
+目标归类为不稳定/不确定；只有连续三个步骤同方向、每步一个基数格才归类为稳定
+移动。稳定移动目标的预测格还必须满足射程、八向直线和障碍检查，才标记为
+`eligible`。运动分类累计写入 `shot_prediction.by_motion_state`，仪表盘分别展示
+静止、移动观察、稳定移动和状态不足样本。`eligible` 仍只用于采样，不会传入 SDK
+的 `expected_cell`；升级前没有运动分类字段的累计数据保留在 `legacy` 桶。
 
 ---
 
