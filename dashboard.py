@@ -1377,6 +1377,49 @@ body{margin:0;min-height:100vh;color:var(--text);
 .side-col{display:grid;gap:12px;min-width:0}
 .side-col .panel{padding:14px}
 .side-col .panel-title{font-size:14px;margin-bottom:10px}
+.left-rail-panel{--rail-tone:110,168,255;background:
+ radial-gradient(220px 120px at 0 0,rgba(var(--rail-tone),.11),transparent 72%),
+ linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.025));
+ border-color:rgba(var(--rail-tone),.13);border-radius:18px}
+.left-rail-panel::after{content:"";position:absolute;inset:14px auto 14px 0;width:3px;border-radius:0 3px 3px 0;
+ background:rgb(var(--rail-tone));box-shadow:0 0 14px rgba(var(--rail-tone),.45);opacity:.78}
+.left-rail-panel.resource-summary{--rail-tone:87,214,163}
+.left-rail-panel.battle-summary{--rail-tone:255,140,66}
+.left-rail-panel.issue-summary{--rail-tone:255,107,107}
+.left-rail-panel.report-panel{--rail-tone:179,140,255}
+.left-rail-panel.enemy-panel{--rail-tone:255,100,100}
+.rail-title{display:flex;align-items:center;gap:8px;min-width:0}
+.rail-mark{display:grid;place-items:center;width:24px;height:24px;border-radius:8px;
+ color:rgb(var(--rail-tone));background:rgba(var(--rail-tone),.12);border:1px solid rgba(var(--rail-tone),.2);
+ font:12px Consolas,monospace;line-height:1;box-shadow:inset 0 1px 0 rgba(255,255,255,.08)}
+.rail-focus{display:flex;align-items:flex-end;justify-content:space-between;gap:10px;padding:10px 11px;margin-bottom:7px;
+ border-radius:12px;background:rgba(0,0,0,.16);border:1px solid rgba(var(--rail-tone),.12)}
+.rail-focus-main{display:grid;gap:3px;min-width:0}
+.rail-eyebrow{color:var(--muted);font-size:10px;letter-spacing:.35px}
+.rail-value{color:#f4f7ff;font:700 19px Consolas,monospace;white-space:nowrap}
+.rail-value small{margin-left:4px;color:var(--muted);font-size:11px;font-weight:500}
+.rail-focus-meta{flex:0 0 auto;color:rgb(var(--rail-tone));font:11px Consolas,monospace;white-space:nowrap}
+.rail-progress{height:5px;border-radius:99px;background:rgba(255,255,255,.07);overflow:hidden;margin-top:4px}
+.rail-progress>span{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,rgba(var(--rail-tone),.7),rgb(var(--rail-tone)));
+ box-shadow:0 0 10px rgba(var(--rail-tone),.35)}
+.rail-rows{display:grid}
+.rail-row{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:29px;padding:5px 2px;
+ border-bottom:1px solid rgba(255,255,255,.055);font-size:11px}
+.rail-row:last-child{border-bottom:0}
+.rail-row span{color:var(--muted)}
+.rail-row b{max-width:68%;overflow:hidden;text-overflow:ellipsis;color:#e8eef9;font:600 11px Consolas,monospace;white-space:nowrap}
+.rail-metric-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}
+.rail-metric{display:grid;gap:3px;padding:8px 9px;border-radius:10px;background:rgba(255,255,255,.025);
+ border:1px solid rgba(255,255,255,.055)}
+.rail-metric span{color:var(--muted);font-size:10px}
+.rail-metric b{color:#eef3ff;font:700 14px Consolas,monospace}
+.rail-activity{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:7px}
+.rail-activity span{padding:3px 7px;border-radius:7px;background:rgba(var(--rail-tone),.075);color:#b9c5da;font-size:10px}
+.report-panel .kv{padding:7px 2px;border:0;border-bottom:1px solid rgba(255,255,255,.055);border-radius:0;background:transparent;font-size:11px}
+.report-panel .kv b{font-size:11px;text-align:right}
+.report-panel .stat-chips .pill{padding:3px 7px;border-radius:7px;background:rgba(179,140,255,.075);font-size:10px;color:#c5bdd8}
+.issue-summary .issue{padding:9px 10px;border-radius:10px}
+.enemy-panel .chip{padding:4px 8px;font-size:10px}
 .enemy-clear-btn{appearance:none;border:1px solid rgba(255,100,100,.25);border-radius:6px;background:rgba(255,100,100,.08);color:#ffb6b6;font-size:10px;padding:2px 8px;cursor:pointer;transition:.12s}
 .enemy-clear-btn:hover{background:rgba(255,100,100,.22);border-color:rgba(255,100,100,.5);color:#fff}
 .center-col{display:grid;gap:12px;min-width:0}
@@ -3268,31 +3311,32 @@ def build_parts():
 
 
     left_core = (
-        f'<div class="kv"><span>名称</span><b>{rec.get("core_name") or "C1"}</b></div>'
-        f'<div class="kv"><span>位置</span><b>{fmt_pos(rec.get("core_pos"))}</b></div>'
-        f'<div class="kv"><span>动作</span><b>{rec.get("core_action") or "—"}</b></div>'
-        f'<div class="kv"><span>状态</span><b>{rec.get("core_state") or "—"}</b></div>'
-        f'<div class="kv"><span>HP / 盾</span><b>{rec.get("core_hp","?")} / {rec.get("core_shield","?")}</b></div>'
-        f'<div class="kv"><span>人口</span><b>{rec.get("population",0)}</b></div>'
-        f'<div class="kv"><span>信标</span><b>{fmt_pos(rec.get("beacon_pos"))}</b></div>'
+        f'<div class="rail-focus"><div class="rail-focus-main"><span class="rail-eyebrow">当前位置</span>'
+        f'<strong class="rail-value">{fmt_pos(rec.get("core_pos"))}</strong></div>'
+        f'<span class="rail-focus-meta">HP {rec.get("core_hp","?")} · 盾 {rec.get("core_shield","?")}</span></div>'
+        f'<div class="rail-rows"><div class="rail-row"><span>当前动作</span><b>{rec.get("core_action") or "—"}</b></div>'
+        f'<div class="rail-row"><span>人口</span><b>{rec.get("population",0)}</b></div>'
+        f'<div class="rail-row"><span>信标坐标</span><b>{fmt_pos(rec.get("beacon_pos"))}</b></div></div>'
     )
     left_res = (
-        f'<div class="kv"><span>库存</span><b>{resources} / {cap}</b></div>'
-        f'<div class="mini-bar"><span style="width:{pct}%"></span></div>'
-        f'<div class="kv" style="margin-top:8px"><span>可见矿</span><b>{len(rcells)}</b></div>'
-        f'<div class="kv"><span>记忆矿</span><b>{mm.get("resource_count",0)}</b></div>'
-        f'<div class="kv"><span>墙记忆</span><b>{mm.get("obstacle_count",0)}</b></div>'
-        f'<div class="kv"><span>可见墙</span><b>{rec.get("obstacle_cells_visible",0)}</b></div>'
+        f'<div class="rail-focus"><div class="rail-focus-main" style="flex:1"><span class="rail-eyebrow">资源库存</span>'
+        f'<strong class="rail-value">{resources}<small>/ {cap}</small></strong>'
+        f'<div class="rail-progress"><span style="width:{pct}%"></span></div></div>'
+        f'<span class="rail-focus-meta">{pct}%</span></div>'
+        f'<div class="rail-metric-grid"><div class="rail-metric"><span>可见矿点</span><b>{len(rcells)}</b></div>'
+        f'<div class="rail-metric"><span>记忆矿点</span><b>{mm.get("resource_count",0)}</b></div>'
+        f'<div class="rail-metric"><span>墙体记忆</span><b>{mm.get("obstacle_count",0)}</b></div>'
+        f'<div class="rail-metric"><span>可见墙体</span><b>{rec.get("obstacle_cells_visible",0)}</b></div></div>'
     )
     left_fight = (
-        f'<div class="kv"><span>敌人</span><b>{enemies}</b></div>'
-        f'<div class="kv"><span>工人</span><b>{len(workers)}</b></div>'
-        f'<div class="kv"><span>先锋 / 游侠</span><b>{len(vgs)} / {len(rgs)}</b></div>'
-        f'<div class="stat-chips" style="margin-top:8px">'
-        f'<span class="pill">回矿 {stats["cargo"]+stats["deposit"]}</span>'
-        f'<span class="pill">探索 {stats["explore"]}</span>'
-        f'<span class="pill">等待 {stats["wait"]}</span>'
-        f'<span class="pill">挖矿 {stats["harvest"]}</span></div>'
+        f'<div class="rail-focus"><div class="rail-focus-main"><span class="rail-eyebrow">可见敌人</span>'
+        f'<strong class="rail-value">{enemies}</strong></div>'
+        f'<span class="rail-focus-meta">我方 {len(workers)+len(vgs)+len(rgs)}</span></div>'
+        f'<div class="rail-metric-grid"><div class="rail-metric"><span>工人</span><b>{len(workers)}</b></div>'
+        f'<div class="rail-metric"><span>先锋 / 游侠</span><b>{len(vgs)} / {len(rgs)}</b></div></div>'
+        f'<div class="rail-activity"><span>回矿 {stats["cargo"]+stats["deposit"]}</span>'
+        f'<span>探索 {stats["explore"]}</span><span>等待 {stats["wait"]}</span>'
+        f'<span>挖矿 {stats["harvest"]}</span></div>'
     )
     if issues:
         left_issues = "".join(
@@ -3335,7 +3379,8 @@ def build_parts():
     vg_rate = derived["vanguard_hit_rate"]
     rg_rate = derived["ranger_hit_rate"]
     report_html = (
-        '<section class="panel"><div class="panel-title"><span>战报统计</span>'
+        '<section class="panel left-rail-panel report-panel"><div class="panel-title">'
+        '<span class="rail-title"><i class="rail-mark">▥</i>战报统计</span>'
         f'<span class="count">累计 {derived["ticks"]} tick</span></div>'
         '<div class="kv"><span>总采集</span>'
         f'<b>{eco.get("harvested_total", 0)} <small>({eco.get("harvest_count", 0)} 次)</small></b></div>'
@@ -3390,12 +3435,22 @@ def build_parts():
     )
 
     left_html = (
-        f'<section class="panel"><div class="panel-title"><span>核心</span><span class="count">状态</span></div>{left_core}</section>'
-        f'<section class="panel"><div class="panel-title"><span>资源</span><span class="count">{pct}%</span></div>{left_res}</section>'
-        f'<section class="panel"><div class="panel-title"><span>战场</span><span class="count">摘要</span></div>{left_fight}</section>'
-        f'<section class="panel"><div class="panel-title"><span>异常</span><span class="count">{len(issues)}</span></div><div class="compact-list">{left_issues}</div></section>'
+        f'<section class="panel left-rail-panel core-summary"><div class="panel-title">'
+        f'<span class="rail-title"><i class="rail-mark">◆</i>核心 · {rec.get("core_name") or "C1"}</span>'
+        f'<span class="count">{rec.get("core_state") or "—"}</span></div>{left_core}</section>'
+        f'<section class="panel left-rail-panel resource-summary"><div class="panel-title">'
+        f'<span class="rail-title"><i class="rail-mark">⬡</i>资源</span><span class="count">采集态势</span></div>{left_res}</section>'
+        f'<section class="panel left-rail-panel battle-summary"><div class="panel-title">'
+        f'<span class="rail-title"><i class="rail-mark">◎</i>战场</span><span class="count">实时兵力</span></div>{left_fight}</section>'
+        f'<section class="panel left-rail-panel issue-summary"><div class="panel-title">'
+        f'<span class="rail-title"><i class="rail-mark">!</i>异常</span><span class="count">{len(issues)}</span></div>'
+        f'<div class="compact-list">{left_issues}</div></section>'
         + report_html
-        + f'<section class="panel enemy-panel" id="leftEnemyPanel"><div class="panel-title"><span>敌人踪迹</span><span class="count" id="enemyCount">{len(ex_sightings)} 处</span><button type="button" id="clearEnemyBtn" class="enemy-clear-btn">清除</button></div><div id="enemySection">{enemy_html}</div></section>'
+        + f'<section class="panel left-rail-panel enemy-panel" id="leftEnemyPanel"><div class="panel-title">'
+        f'<span class="rail-title"><i class="rail-mark">⌁</i>敌人踪迹</span>'
+        f'<span class="count" id="enemyCount">{len(ex_sightings)} 处</span>'
+        f'<button type="button" id="clearEnemyBtn" class="enemy-clear-btn">清除</button></div>'
+        f'<div id="enemySection">{enemy_html}</div></section>'
     )
 
     return {

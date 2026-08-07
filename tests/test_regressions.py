@@ -3378,6 +3378,25 @@ class BattleLogTests(unittest.TestCase):
         self.assertGreater(page.index('id="logPanel"'), page.index('id="tacticConfigForm"'))
 
 
+class LeftSidebarTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.page = dashboard.generate_html()
+
+    def test_left_sidebar_uses_layered_summary_panels(self) -> None:
+        for panel in (
+            "core-summary",
+            "resource-summary",
+            "battle-summary",
+            "issue-summary",
+            "report-panel",
+            "enemy-panel",
+        ):
+            self.assertIn(panel, self.page)
+        self.assertIn('class="rail-focus"', self.page)
+        self.assertIn('class="rail-metric-grid"', self.page)
+        self.assertIn('class="rail-activity"', self.page)
+
+
 class TrendPanelTests(unittest.TestCase):
     def test_chart_series_names_match_trend_point_keys(self) -> None:
         for key in ("r", "c", "w", "v", "g", "e"):
