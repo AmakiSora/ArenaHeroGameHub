@@ -92,6 +92,32 @@ def read_history(ticks: int = 40):
     return out
 
 
+def _trend_points(records: list[dict], max_points: int = 240) -> list[dict]:
+    """Flatten newest-first tick records into a chronological compact series.
+
+    Each point carries the metrics the trend charts plot.  Missing fields are
+    treated as 0 so both old (v2) and current (v3) log lines chart correctly.
+    Long windows are downsampled by a stride so the JSON payload stays small.
+    """
+    if not records:
+        return []
+    if len(records) > max_points:
+        stride = (len(records) + max_points - 1) // max_points
+        records = records[::stride]
+    points = []
+    for rec in reversed(records):
+        points.append({
+            "t": int(rec.get("tick") or 0),
+            "r": int(rec.get("resources") or 0),
+            "c": int(rec.get("resource_capacity") or 0),
+            "w": len(rec.get("workers") or []),
+            "v": len(rec.get("vanguards") or []),
+            "g": len(rec.get("rangers") or []),
+            "e": int(rec.get("visible_enemies") or 0),
+        })
+    return points
+
+
 # ── Categorized battle log (「战斗日志」panel below the config) ──────────────
 # The tactic process appends discovery/combat/economy/failure rows each tick;
 # the dashboard process appends config-change rows on save.  Filter chips in
@@ -774,6 +800,45 @@ def render_teams_panel() -> str:
         f'{settings}'
         '<div class="teams-message" id="teamsMessage" aria-live="polite">'
         '拖拽单位后自动保存，下个 Tick 生效</div>'
+        '</section>'
+    )
+
+
+def render_trends_panel() -> str:
+    """Static shell for the 历史趋势 panel; charts are filled client-side.
+
+    The SVG figures are rendered from /api/trends by the JS IIFE, so this shell
+    is emitted once in generate_html() and never part of the 2s fragment swap.
+    """
+    def figure(chart: str, title: str) -> str:
+        return (
+            f'<figure class="trend-figure" data-trend-chart="{chart}">'
+            f'<figcaption>{title}</figcaption>'
+            '<div class="trend-legend" data-trend-legend></div>'
+            '<svg class="trend-svg" data-trend-svg viewBox="0 0 400 160" '
+            'role="img" aria-label="' + title + '"></svg>'
+            '<div class="trend-tooltip" data-trend-tooltip hidden></div>'
+            '</figure>'
+        )
+
+    return (
+        '<section class="panel trends-panel" id="trendsPanel">'
+        '<div class="panel-title"><span>历史趋势</span>'
+        '<span class="count" data-trend-range>—</span></div>'
+        '<div class="trend-toolbar">'
+        '<span class="trend-window-label">窗口</span>'
+        + "".join(
+            f'<button type="button" class="trend-window-btn{" active" if n == 400 else ""}" '
+            f'data-trend-window="{n}">{n}</button>'
+            for n in (100, 400, 1000, 2000)
+        )
+        + '<span class="trend-window-hint">Tick</span>'
+        '</div>'
+        '<div class="trend-charts">'
+        + figure("res", "资源") + figure("pop", "人口") + figure("enemy", "敌人")
+        + '</div>'
+        '<details class="trend-details"><summary>数据明细</summary>'
+        '<div class="trend-table" data-trend-table></div></details>'
         '</section>'
     )
 
@@ -1485,6 +1550,57 @@ body{margin:0;min-height:100vh;color:var(--text);
   .teams-hero{flex-direction:column}
 }
 
+/* ── 历史趋势 panel ──────────────────────────────────────────────── */
+.trends-panel{position:relative}
+.trend-toolbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.trend-window-label,.trend-window-hint{color:var(--muted);font-size:12px}
+.trend-window-hint{margin-left:2px}
+.trend-window-btn{appearance:none;font:inherit;font-size:12px;color:var(--muted);padding:5px 11px;
+ border-radius:999px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);
+ cursor:pointer;transition:.12s;font-family:Consolas,monospace}
+.trend-window-btn:hover{color:#eef3ff;border-color:rgba(255,255,255,.22)}
+.trend-window-btn.active{background:rgba(110,168,255,.16);border-color:rgba(110,168,255,.4);color:#cfe6ff}
+.trend-charts{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.trend-figure{position:relative;margin:0;padding:12px;border-radius:16px;
+ background:rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.06)}
+.trend-figure figcaption{font-size:13px;font-weight:700;margin-bottom:8px}
+.trend-svg{display:block;width:100%;height:auto;background:#0b1222;
+ border:1px solid rgba(255,255,255,.05);border-radius:10px;touch-action:manipulation}
+.trend-svg .t-grid{stroke:rgba(255,255,255,.06);stroke-width:1}
+.trend-svg .t-line{fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.trend-svg .t-line.dash{stroke-dasharray:4 3;stroke-width:1.5}
+.trend-svg .t-crosshair{stroke:rgba(255,255,255,.45);stroke-width:1;pointer-events:none}
+.trend-legend{display:flex;flex-wrap:wrap;gap:6px 10px;margin-bottom:8px;min-height:16px}
+.trend-legend .t-key{display:inline-flex;align-items:center;gap:5px;color:var(--muted);font-size:11px}
+.trend-legend .t-key i{width:12px;height:3px;border-radius:2px;display:inline-block}
+.trend-tooltip{position:absolute;z-index:5;min-width:132px;max-width:210px;padding:8px 10px;
+ border-radius:10px;background:rgba(7,11,22,.92);border:1px solid rgba(255,255,255,.14);
+ box-shadow:0 8px 24px rgba(0,0,0,.5);font-size:11px;color:var(--text);pointer-events:none;
+ transform:translate(-50%,-110%);white-space:nowrap}
+.trend-tooltip .tt-tick{color:var(--muted);font-family:Consolas,monospace;margin-bottom:4px}
+.trend-tooltip .tt-row{display:flex;align-items:center;gap:6px;justify-content:space-between}
+.trend-tooltip .tt-row i{width:10px;height:3px;border-radius:2px;display:inline-block;flex:none}
+.trend-tooltip .tt-row b{font-weight:700}
+.trend-tooltip .tt-row span{color:var(--muted)}
+.trend-details{margin-top:12px}
+.trend-details summary{cursor:pointer;color:var(--muted);font-size:12px;user-select:none}
+.trend-details summary:hover{color:#eef3ff}
+.trend-table{max-height:220px;overflow:auto;margin-top:8px;border:1px solid rgba(255,255,255,.06);
+ border-radius:10px;background:rgba(0,0,0,.18)}
+.trend-table table{width:100%;border-collapse:collapse;font-size:12px}
+.trend-table th,.trend-table td{padding:5px 10px;text-align:right;border-bottom:1px solid rgba(255,255,255,.05)}
+.trend-table th:first-child,.trend-table td:first-child{text-align:left}
+.trend-table th{position:sticky;top:0;background:#10182b;color:var(--muted);font-weight:600}
+.trend-table td{color:#d7e1f7;font-family:Consolas,monospace}
+.trend-table tr:hover td{background:rgba(110,168,255,.08)}
+.trend-empty{padding:22px;text-align:center;color:var(--muted);font-size:13px}
+@media (max-width:1100px){
+  .trend-charts{grid-template-columns:1fr}
+}
+@media (max-width:680px){
+  .trend-charts{grid-template-columns:1fr}
+}
+
 """
 
 JS = r"""
@@ -1516,6 +1632,30 @@ JS = r"""
   const LOG_CATS = ['discover','kill','defeat','combat','economy','config','warn'];
   // Noisy categories default off so the panel starts readable.
   const LOG_CATS_DEFAULT_OFF = ['combat','economy'];
+
+  // 历史趋势 panel: window persisted, tick-deduped like softRefresh.
+  const TREND_WINDOW_KEY = 'arenaTrendWindow.v1';
+  let trendWindow = 400;
+  let lastTrendTick = null;
+  let trendPoints = [];
+  const TREND_WINDOWS = [100, 400, 1000, 2000];
+  const TREND_CHART_STATE = {};
+  const TREND_CHARTS = {
+    res:   { keys: ['r', 'c'], label: '资源' },
+    pop:   { keys: ['w', 'v', 'g'], label: '人口' },
+    enemy: { keys: ['e'], label: '敌人' },
+  };
+  // Entity colors match the map (same entity reads as the same color):
+  // resources gold, muted capacity, worker blue, vanguard orange, ranger
+  // purple, enemy red. See render_svg().
+  const TREND_SERIES = {
+    res:   { key: 'r', label: '资源',  color: '#ffc857' },
+    cap:   { key: 'c', label: '容量',  color: '#93a0bf', dash: true },
+    w:     { key: 'w', label: '工人',  color: '#8aa4ff' },
+    v:     { key: 'v', label: '先锋',  color: '#ff8c42' },
+    g:     { key: 'g', label: '游侠',  color: '#b38cff' },
+    e:     { key: 'e', label: '敌人',  color: '#ff6464' },
+  };
 
   const PICK_TARGETS = {
     attack: {xId: 'teamAttackX', yId: 'teamAttackY'},
@@ -2615,6 +2755,227 @@ JS = r"""
     };
   }
 
+  // ── 历史趋势 panel ──────────────────────────────────────────────────
+  function trendNum(v){ return (v == null) ? 0 : Number(v); }
+  function trendNiceStep(maxVal){
+    if(!(maxVal > 0)) return 4;
+    const mag = Math.pow(10, Math.floor(Math.log10(maxVal)));
+    const norm = maxVal / mag;
+    let step;
+    if(norm <= 1) step = 1;
+    else if(norm <= 2) step = 2;
+    else if(norm <= 5) step = 5;
+    else step = 10;
+    return step * mag;
+  }
+
+  function renderTrendChart(name){
+    const fig = document.querySelector('.trend-figure[data-trend-chart="' + name + '"]');
+    if(!fig) return;
+    const series = TREND_CHARTS[name].keys.map(function(k){ return TREND_SERIES[k]; });
+    const points = trendPoints;
+    const svg = fig.querySelector('[data-trend-svg]');
+    const legend = fig.querySelector('[data-trend-legend]');
+    if(!points.length){
+      if(svg) svg.innerHTML = '';
+      if(legend) legend.innerHTML = '<span class="t-key">暂无数据</span>';
+      TREND_CHART_STATE[name] = {points: [], series: series, svg: svg};
+      return;
+    }
+
+    let maxVal = 0;
+    points.forEach(function(p){
+      series.forEach(function(s){ const v = trendNum(p[s.key]); if(v > maxVal) maxVal = v; });
+    });
+    const yMax = trendNiceStep(maxVal);
+    const W = 400, H = 160, PL = 30, PR = 10, PT = 8, PB = 18;
+    const PW = W - PL - PR, PH = H - PT - PB;
+    const x = function(i){ return PL + (points.length === 1 ? PW / 2 : (i / (points.length - 1)) * PW); };
+    const y = function(v){ return PT + (1 - v / yMax) * PH; };
+
+    let grid = '';
+    const ticks = 4;
+    for(let g = 0; g <= ticks; g++){
+      const val = yMax * g / ticks;
+      const gy = y(val);
+      grid += '<line class="t-grid" x1="' + PL + '" y1="' + gy.toFixed(2) +
+              '" x2="' + (W - PR) + '" y2="' + gy.toFixed(2) + '"/>' +
+              '<text x="' + (PL - 4) + '" y="' + (gy + 3).toFixed(2) + '" text-anchor="end" ' +
+              'font-size="8" fill="#7f8eab">' + Math.round(val) + '</text>';
+    }
+    let xlabels = '';
+    [0, Math.floor((points.length - 1) / 2), points.length - 1]
+      .filter(function(v, i, a){ return a.indexOf(v) === i; })
+      .forEach(function(i){
+        xlabels += '<text x="' + x(i).toFixed(2) + '" y="' + (H - 4) + '" text-anchor="middle" ' +
+                   'font-size="8" fill="#7f8eab">' + points[i].t + '</text>';
+      });
+
+    let lines = '';
+    series.forEach(function(s){
+      const pts = points.map(function(p, i){
+        return x(i).toFixed(2) + ',' + y(trendNum(p[s.key])).toFixed(2);
+      }).join(' ');
+      lines += '<polyline class="t-line' + (s.dash ? ' dash' : '') + '" points="' + pts + '" stroke="' + s.color + '"/>';
+      const last = points[points.length - 1];
+      lines += '<circle cx="' + x(points.length - 1).toFixed(2) + '" cy="' + y(trendNum(last[s.key])).toFixed(2) +
+               '" r="3" fill="' + s.color + '" stroke="#0b1222" stroke-width="1.5"/>';
+    });
+
+    const cross = '<line class="t-crosshair" x1="0" y1="' + PT + '" x2="0" y2="' + (H - PB) + '" visibility="hidden"/>';
+    svg.innerHTML = grid + xlabels + lines + cross;
+    if(legend){
+      legend.innerHTML = series.map(function(s){
+        return '<span class="t-key"><i style="background:' + s.color + (s.dash ? ';height:2px' : '') + '"></i>' +
+               s.label + '</span>';
+      }).join('');
+    }
+    TREND_CHART_STATE[name] = {points: points, series: series, svg: svg, x: x};
+  }
+
+  function onTrendMove(name, e){
+    const st = TREND_CHART_STATE[name];
+    if(!st || !st.points.length) return;
+    const fig = document.querySelector('.trend-figure[data-trend-chart="' + name + '"]');
+    const rect = st.svg.getBoundingClientRect();
+    const t = (e.clientX - rect.left) / rect.width;
+    let idx = Math.round(t * (st.points.length - 1));
+    idx = Math.max(0, Math.min(st.points.length - 1, idx));
+    const line = st.svg.querySelector('.t-crosshair');
+    if(line){
+      line.setAttribute('x1', st.x(idx).toFixed(2));
+      line.setAttribute('x2', st.x(idx).toFixed(2));
+      line.setAttribute('visibility', 'visible');
+    }
+    const tip = fig.querySelector('[data-trend-tooltip]');
+    if(!tip) return;
+    tip.innerHTML = '';
+    const tick = document.createElement('div');
+    tick.className = 'tt-tick';
+    tick.textContent = 'tick ' + st.points[idx].t;
+    tip.appendChild(tick);
+    st.series.forEach(function(s){
+      const row = document.createElement('div');
+      row.className = 'tt-row';
+      const sw = document.createElement('i');
+      sw.style.background = s.color;
+      if(s.dash) sw.style.height = '2px';
+      const label = document.createElement('span');
+      label.textContent = s.label;
+      const val = document.createElement('b');
+      val.textContent = String(trendNum(st.points[idx][s.key]));
+      row.appendChild(sw); row.appendChild(label); row.appendChild(val);
+      tip.appendChild(row);
+    });
+    tip.hidden = false;
+    const figRect = fig.getBoundingClientRect();
+    tip.style.left = (e.clientX - figRect.left) + 'px';
+    tip.style.top = (rect.top - figRect.top) + 'px';
+  }
+
+  function onTrendLeave(name){
+    const st = TREND_CHART_STATE[name];
+    if(!st) return;
+    const line = st.svg && st.svg.querySelector('.t-crosshair');
+    if(line) line.setAttribute('visibility', 'hidden');
+    const tip = document.querySelector('.trend-figure[data-trend-chart="' + name + '"] [data-trend-tooltip]');
+    if(tip) tip.hidden = true;
+  }
+
+  function buildTrendTable(points){
+    const el = document.querySelector('[data-trend-table]');
+    if(!el) return;
+    const rows = points.slice(-30).reverse();
+    const table = document.createElement('table');
+    const hr = document.createElement('tr');
+    ['tick', '资源', '容量', '工人', '先锋', '游侠', '敌人'].forEach(function(h){
+      const th = document.createElement('th');
+      th.textContent = h;
+      hr.appendChild(th);
+    });
+    const thead = document.createElement('thead');
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    const tb = document.createElement('tbody');
+    rows.forEach(function(p){
+      const tr = document.createElement('tr');
+      [p.t, p.r, p.c, p.w, p.v, p.g, p.e].forEach(function(v){
+        const td = document.createElement('td');
+        td.textContent = String(v);
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    });
+    table.appendChild(tb);
+    el.replaceChildren(table);
+  }
+
+  function updateTrendWindowButtons(){
+    const panel = document.getElementById('trendsPanel');
+    if(!panel) return;
+    panel.querySelectorAll('[data-trend-window]').forEach(function(btn){
+      btn.classList.toggle('active', Number(btn.getAttribute('data-trend-window')) === trendWindow);
+    });
+  }
+
+  async function loadTrends(){
+    if(document.hidden) return;
+    const panel = document.getElementById('trendsPanel');
+    if(!panel) return;
+    try{
+      const res = await fetch('/api/trends?ticks=' + trendWindow + '&ts=' + Date.now(), {cache: 'no-store'});
+      if(!res.ok) return;
+      const data = await res.json();
+      if(!data || !data.points) return;
+      if(lastTrendTick !== null && data.lastTick === lastTrendTick) return;
+      lastTrendTick = data.lastTick;
+      trendPoints = data.points;
+      renderTrendCharts();
+      buildTrendTable(data.points);
+      const range = panel.querySelector('[data-trend-range]');
+      if(range){
+        range.textContent = data.points.length
+          ? (data.points.length + ' 点 · ' + data.points[0].t + ' → ' + data.points[data.points.length - 1].t)
+          : '—';
+      }
+    }catch(e){}
+  }
+
+  function renderTrendCharts(){
+    Object.keys(TREND_CHARTS).forEach(renderTrendChart);
+  }
+
+  function bindTrends(){
+    const panel = document.getElementById('trendsPanel');
+    if(!panel) return;
+    try{
+      const saved = localStorage.getItem(TREND_WINDOW_KEY);
+      if(saved && TREND_WINDOWS.indexOf(Number(saved)) !== -1) trendWindow = Number(saved);
+    }catch(e){}
+    updateTrendWindowButtons();
+    if(!panel._bound){
+      panel._bound = true;
+      panel.querySelectorAll('[data-trend-window]').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          trendWindow = Number(btn.getAttribute('data-trend-window'));
+          updateTrendWindowButtons();
+          try{ localStorage.setItem(TREND_WINDOW_KEY, String(trendWindow)); }catch(e){}
+          lastTrendTick = null;
+          loadTrends();
+        });
+      });
+      panel.querySelectorAll('.trend-figure').forEach(function(fig){
+        const name = fig.getAttribute('data-trend-chart');
+        const svg = fig.querySelector('[data-trend-svg]');
+        if(!svg || svg._bound) return;
+        svg._bound = true;
+        svg.addEventListener('pointermove', function(e){ onTrendMove(name, e); });
+        svg.addEventListener('pointerleave', function(){ onTrendLeave(name); });
+      });
+    }
+    loadTrends();
+  }
+
   bindOreForm();
   bindConfigForm();
   bindTeamsBoard();
@@ -2622,6 +2983,7 @@ JS = r"""
   bindMapFilters();
   bindLogFilters();
   bindUnitTabs();
+  bindTrends();
   loadTeams(true);
   ensureView();
   bindStage();
@@ -2642,6 +3004,7 @@ JS = r"""
     }, {passive:false});
   }
   setInterval(softRefresh, 2000);
+  setInterval(loadTrends, 2000);
   setInterval(function(){ loadConfig(false); }, 10000);
   setInterval(function(){ loadTeams(false); }, 5000);
 })();
@@ -3194,6 +3557,7 @@ def generate_html() -> str:
       </section>
       {render_teams_panel()}
       {render_config_panel(parts['workersCount'], parts['vgCount'], parts['rgCount'])}
+      {render_trends_panel()}
       <section class="panel log-panel" id="logPanel">
         <div class="panel-title"><span>战斗日志</span><span class="count" id="logCount">{parts['logCount']}</span></div>
         <div class="log-filters" id="logFilters">
@@ -3340,6 +3704,23 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "config": config,
                 "combat_units": collect_combat_units(rec, config),
+            })
+            return
+        if path == "/api/trends":
+            query = parse_qs(urlsplit(self.path).query)
+            raw = query.get("ticks", ["400"])[0]
+            try:
+                window = int(raw)
+            except (TypeError, ValueError):
+                window = 400
+            window = max(50, min(2000, window))
+            history = read_history(window)
+            points = _trend_points(history)
+            self._send_json(200, {
+                "ok": True,
+                "window": window,
+                "lastTick": points[-1]["t"] if points else None,
+                "points": points,
             })
             return
         if path == "/api/waypoints":
