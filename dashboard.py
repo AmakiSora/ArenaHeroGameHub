@@ -1281,8 +1281,8 @@ body{margin:0;min-height:100vh;color:var(--text);
 .layout{display:grid;grid-template-columns:1.4fr .9fr;gap:14px}
 .panel-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-size:16px;font-weight:700}
 .count{color:var(--muted);font-size:13px;font-weight:500}
-.unit-grid{display:grid;grid-template-columns:1fr;gap:6px}
-.unit{border-radius:14px;padding:9px 11px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);transition:transform .15s,border-color .15s}
+.unit-grid{display:grid;grid-template-columns:1fr;gap:8px}
+.unit{border-radius:16px;padding:12px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);transition:transform .15s,border-color .15s}
 .unit:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.14)}
 .unit.cargo{background:rgba(87,214,163,.08)}
 .unit.harvest{background:rgba(255,200,87,.08)}
@@ -1290,21 +1290,22 @@ body{margin:0;min-height:100vh;color:var(--text);
 .unit.wait{background:rgba(255,107,107,.10)}
 .unit.explore{background:rgba(179,140,255,.08)}
 .unit.combat{background:rgba(255,107,157,.10)}
-.unit-top{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:6px}
-.unit-ops{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end;min-width:0}
-.unit-id{font-family:Consolas,monospace;font-size:13px;display:flex;gap:6px;align-items:center;min-width:0;white-space:nowrap}
-.badge{font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid transparent;white-space:nowrap}
+.unit-top{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}
+.unit-id{font-family:Consolas,monospace;font-size:13px;display:flex;gap:6px;align-items:center}
+.badge{font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid transparent}
 .badge.cargo,.badge.deposit{background:rgba(87,214,163,.15);color:#8ef0c4}
 .badge.harvest{background:rgba(255,200,87,.15);color:#ffd98a}
 .badge.wait{background:rgba(255,107,107,.15);color:#ff9b9b}
 .badge.explore{background:rgba(179,140,255,.15);color:#d0b8ff}
 .badge.combat{background:rgba(255,107,157,.15);color:#ff9ec0}
 .badge.move,.badge.other{background:rgba(110,168,255,.12);color:#a9c8ff}
-.pill{padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.05);white-space:nowrap}
-.unit-sub{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;font-size:11px;line-height:1.5;color:var(--muted);min-width:0}
-.u-route{font-family:Consolas,monospace;color:#cfe6ff;white-space:nowrap}
-.u-steps{white-space:nowrap}
-.u-act{font-family:Consolas,monospace;color:#9fb1d6;word-break:break-all;min-width:0}
+.unit-meta{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:12px;margin-bottom:8px}
+.unit-coords{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}
+.unit-coords>div{display:grid;gap:2px;min-width:0;padding:6px 7px;background:rgba(0,0,0,.16);border:1px solid rgba(255,255,255,.05);border-radius:6px}
+.unit-coords span{color:var(--muted);font-size:10px}
+.unit-coords b{color:#e5edff;font:11px Consolas,monospace;white-space:nowrap}
+.pill{padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.05)}
+.unit-action{font-size:12px;color:#d7e1f7;line-height:1.4;word-break:break-word}
 .side-stack{display:grid;gap:14px}
 .chip-row{display:flex;flex-wrap:wrap;gap:8px}
 .chip{padding:6px 10px;border-radius:999px;background:rgba(110,168,255,.12);border:1px solid rgba(110,168,255,.18);
@@ -3063,26 +3064,25 @@ def build_parts():
         path = w.get("path") or []
         target = w.get("target")
         steps = max(0, len(path) - 1)
-        route_text = f"路径 {steps} 步" if w.get("path_complete") else f"规划 {steps} 步"
-        state_pill = (
-            f'<span class="pill" title="载货量">矿 {cargo}</span>'
-            if cargo else f'<span class="pill" title="生命">HP {w.get("hp","?")}</span>'
+        route_text = f"路径 {steps} 步" if w.get("path_complete") else f"当前规划 {steps} 步"
+        extra = (
+            f'<span class="pill">矿 {cargo}</span>'
+            if cargo else f'<span class="pill">HP {w.get("hp","?")}</span>'
         )
         pw = per_worker.get(sid)
-        stat_pill = ""
         if pw is not None:
-            stat_pill = (
+            extra += (
                 f'<span class="pill" title="累计采矿 / 卸货">采 {pw.get("harvested", 0)}'
                 f' · 卸 {pw.get("deposited", 0)}</span>'
             )
-        route = f'{fmt_pos(w.get("pos"))}→{fmt_pos(target)}'
         return (
             f'<div class="unit {kind}"><div class="unit-top">'
             f'<div class="unit-id">{name}<span class="count">{sid}</span></div>'
-            f'<div class="unit-ops"><span class="badge {kind}">{badge}</span>{state_pill}{stat_pill}</div></div>'
-            f'<div class="unit-sub"><span class="u-route" title="{html.escape(route)}">{route}</span>'
-            f'<span class="u-steps">{route_text}</span>'
-            f'<span class="u-act">{html.escape(act)}</span></div></div>'
+            f'<span class="badge {kind}">{badge}</span></div>'
+            f'<div class="unit-coords"><div><span>当前坐标</span><b>{fmt_pos(w.get("pos"))}</b></div>'
+            f'<div><span>目标坐标</span><b>{fmt_pos(target)}</b></div></div>'
+            f'<div class="unit-meta">{extra}<span>{route_text}</span></div>'
+            f'<div class="unit-action">{act}</div></div>'
         )
 
     def team_label(act: str) -> str:
@@ -3115,21 +3115,14 @@ def build_parts():
         name = u.get("name") or sid
         act = actions.get(sid) or actions.get(uid, "")
         label = team_label(act)
-        kind = action_kind(act)
         stat_line = combat_stat_line(sid)
-        path = u.get("path") or []
-        target = u.get("target")
-        steps = max(0, len(path) - 1)
-        route_text = f"路径 {steps} 步" if u.get("path_complete") else f"规划 {steps} 步"
-        route = f'{fmt_pos(u.get("pos"))}→{fmt_pos(target)}'
         return (
             f'<div class="unit {color_cls}"><div class="unit-top">'
             f'<div class="unit-id">{name}<span class="count">{sid}</span></div>'
-            f'<div class="unit-ops"><span class="badge {kind}">{label}</span>'
-            f'<span class="pill" title="生命">HP {u.get("hp","?")}</span>{stat_line}</div></div>'
-            f'<div class="unit-sub"><span class="u-route" title="{html.escape(route)}">{route}</span>'
-            f'<span class="u-steps">{route_text}</span>'
-            f'<span class="u-act">{html.escape(act)}</span></div></div>'
+            f'<span class="badge {color_cls}">{label}</span></div>'
+            f'<div class="unit-meta"><span>{fmt_pos(u.get("pos"))}</span>'
+            f'<span class="pill">HP {u.get("hp","?")}</span>{stat_line}</div>'
+            f'<div class="unit-action">{act}</div></div>'
         )
 
     w_html = "".join(wcard(w) for w in workers) or '<div class="empty">暂无工人</div>'
