@@ -2860,8 +2860,6 @@ def build_parts():
         f'HP {rec.get("core_hp","?")} / Shield {rec.get("core_shield","?")}</div>'
         f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">'
         f'<span class="pill">人口 {rec.get("population",0)}</span>'
-        f'<span class="pill">人口层 {rec.get("population_tier",0)}</span>'
-        f'<span class="pill">保养 {rec.get("upkeep_next_tick",0)}</span>'
         f'<span class="pill">信标 {fmt_pos(rec.get("beacon_pos"))}</span></div></div>'
         f'<div class="card"><div class="kicker">资源</div>'
         f'<div class="big">{resources}<span style="font-size:18px;color:var(--muted)"> / {cap}</span></div>'
@@ -2904,7 +2902,7 @@ def build_parts():
         f'<div class="kv"><span>动作</span><b>{rec.get("core_action") or "—"}</b></div>'
         f'<div class="kv"><span>状态</span><b>{rec.get("core_state") or "—"}</b></div>'
         f'<div class="kv"><span>HP / 盾</span><b>{rec.get("core_hp","?")} / {rec.get("core_shield","?")}</b></div>'
-        f'<div class="kv"><span>人口</span><b>{rec.get("population",0)} · 层{rec.get("population_tier",0)}</b></div>'
+        f'<div class="kv"><span>人口</span><b>{rec.get("population",0)}</b></div>'
         f'<div class="kv"><span>信标</span><b>{fmt_pos(rec.get("beacon_pos"))}</b></div>'
     )
     left_res = (

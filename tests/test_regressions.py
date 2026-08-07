@@ -1473,7 +1473,7 @@ class DashboardLogTests(unittest.TestCase):
 class LoggerRotationTests(unittest.TestCase):
     @staticmethod
     def _fake_turn(tick: int):
-        state = SimpleNamespace(population=5, population_tier=1, upkeep_next_tick=0)
+        state = SimpleNamespace(population=5)
         core = SimpleNamespace(
             id=f"core-{tick}",
             position=(0, 0),
@@ -2037,6 +2037,34 @@ class DemandSpawnTests(unittest.TestCase):
             tactic._plan_demand_spawn(turn, core, resources=25, config=config),
             "SPAWN_WORKER",
         )
+
+    def test_dynamic_price_above_population_20(self) -> None:
+        # Game rules v0.14: the 21st Unit is the first +30% (Worker 5 -> 7).
+        turn = self._turn(workers=9, population=21)  # worker below target, pop 21
+        core = self.Core()
+        config = dict(self.config)
+        config["resource_reserve"] = 0
+
+        self.assertEqual(tactic._spawn_cost(UnitType.WORKER, 21), 7)
+        self.assertIsNone(tactic._plan_demand_spawn(turn, core, resources=6, config=config))
+        self.assertEqual(
+            tactic._plan_demand_spawn(turn, core, resources=7, config=config),
+            "SPAWN_WORKER",
+        )
+
+    def test_spawn_success_log_shows_dynamic_cost(self) -> None:
+        event = SimpleNamespace(
+            event_type="CORE_SPAWN_SUCCEEDED",
+            reason_code=None,
+            actor_id=None,
+            target_id=None,
+            values={"unit_type": "VANGUARD", "cost": 13},
+            resource_amount=None,
+        )
+        cat, msg = tactic._classify_battle_event(self._turn(workers=8), event)
+        self.assertEqual(cat, "economy")
+        self.assertIn("生产", msg)
+        self.assertIn("13 资源", msg)
 
 
 class ConfigClobberProtectionTests(unittest.TestCase):

@@ -26,6 +26,7 @@ from arena_hero import (
     CoreState,
     Direction,
     UnitType,
+    unit_cost,
 )
 from arena_hero.errors import ProtocolError, TransportError
 import game_stats
@@ -66,7 +67,8 @@ _ENEMY_MOTION_HISTORY = 4
 _STABLE_MOVE_STREAK = 3
 _STATIONARY_STREAK = 2
 
-# Resource cost of each spawnable unit type (demand-based production).
+# Base price of each spawnable unit type (demand-based production). The actual
+# charge grows with population — see _spawn_cost below.
 UNIT_SPAWN_COSTS = {
     "WORKER": 5,
     "VANGUARD": 10,
@@ -469,8 +471,6 @@ class TickRecord:
     resources: int = 0
     resource_capacity: int = 0
     population: int = 0
-    population_tier: int = 0
-    upkeep_next_tick: int = 0
     workers: list[dict] = field(default_factory=list)
     vanguards: list[dict] = field(default_factory=list)
     rangers: list[dict] = field(default_factory=list)
@@ -588,9 +588,6 @@ class TacticLogger:
         rec.resources = turn.resources
         rec.resource_capacity = turn.resource_capacity
         rec.population = state.population
-        # SDK 0.2.9+ dropped these two server fields; keep the dashboard/log shape.
-        rec.population_tier = getattr(state, "population_tier", 0)
-        rec.upkeep_next_tick = getattr(state, "upkeep_next_tick", 0)
         rec.visible_enemies = len(turn.visible_enemies)
         rec.resource_cells_visible = len(turn.resource_cells)
         rec.resource_cells = [list(p) for p in turn.resource_cells]
@@ -2811,8 +2808,6 @@ def _classify_battle_event(turn: Any, event: Any) -> tuple[str | None, str | Non
         dmg = values.get("damage")
         if hp == 0:
             return "defeat", f"{target} 被击败"
-        if reason == "UPKEEP_DEFICIT":
-            return "defeat", f"{target} 因维护费亏损 {dmg} 点"
         return "combat", f"{target} 受 {dmg} 伤害（HP {hp}）"
     if et == "UNIT_SELF_DESTRUCTED":
         return "defeat", f"{actor} 超编自裁"
@@ -2826,13 +2821,6 @@ def _classify_battle_event(turn: Any, event: Any) -> tuple[str | None, str | Non
         return "economy", f"{actor} 卸货 +{amount or '?'}"
     if et == "BEACON_HARVEST_BONUS":
         return "economy", f"{actor} 信标加成 +{amount or '?'}"
-    if et == "UPKEEP_PAID":
-        due = values.get("due", 0)
-        deficit = values.get("deficit", 0)
-        msg = f"维护费 {due}"
-        if deficit:
-            msg += f"，亏损 {deficit} 自裁单位"
-        return "economy", msg
     if et == "CORE_REPAIR_SUCCEEDED":
         return "economy", "核心修盾 +1"
     if et in ("CORE_HEAL_SUCCEEDED", "UNIT_HEAL_SUCCEEDED"):
@@ -2840,7 +2828,9 @@ def _classify_battle_event(turn: Any, event: Any) -> tuple[str | None, str | Non
         return "economy", f"{who} 回血 +{amount or '?'}"
     if et == "CORE_SPAWN_SUCCEEDED":
         tname = _UNIT_TYPE_LABELS.get(str(values.get("unit_type", "")), "单位")
-        return "economy", f"生产 {tname}（{target}）"
+        cost = values.get("cost")
+        suffix = f"（{cost} 资源）" if cost is not None else ""
+        return "economy", f"生产 {tname}{suffix}"
     if et == "CORE_RESOURCE_OVERFLOW_DESTROYED":
         return "economy", f"人口下降，{amount or '?'} 资源被销毁"
 
@@ -2907,6 +2897,21 @@ turn_context = type(
 )()
 
 
+def _spawn_cost(unit_type: UnitType, population: int) -> int:
+    """Estimate the dynamic production price for a unit type (game rules v0.14).
+
+    Units 1-20 cost the base price; the 21st Unit is the first +30% and the exact
+    1.3 multiplier rises again every five more Units. The server settles the price
+    after same-Tick Unit self-destructs and combat deaths, so this is a preview —
+    `CORE_SPAWN_SUCCEEDED.values.cost` / `CORE_SPAWN_FAILED.values.required` are
+    authoritative.
+    """
+    try:
+        return unit_cost(unit_type, population)
+    except Exception:
+        return UNIT_SPAWN_COSTS[unit_type.name]
+
+
 def _plan_demand_spawn(turn: Any, core: Any, resources: int, config: dict[str, Any]) -> str | None:
     """Spawn the highest-priority type whose current count is below its target.
 
@@ -2922,13 +2927,14 @@ def _plan_demand_spawn(turn: Any, core: Any, resources: int, config: dict[str, A
     if any(tuple(unit.position) == tuple(core.position) for unit in turn.units):
         return None
 
+    population = getattr(getattr(turn, "state", None), "population", 0) or 0
     reserve = int(config.get("resource_reserve", 0))
     for unit_type in _SPAWN_PRIORITY:
         count = _unit_type_count(turn, unit_type)
         target = int(config.get(_TARGET_KEYS[unit_type], _TARGET_DEFAULTS[unit_type]))
         if count >= target:
             continue
-        cost = UNIT_SPAWN_COSTS[unit_type.name]
+        cost = _spawn_cost(unit_type, population)
         if resources < cost + reserve:
             continue
         try:
@@ -3316,7 +3322,13 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     heal_enabled = bool(config.get("heal_enabled", True))
     heal_budget = resources - int(config.get("resource_reserve", 0))
     if core_action_name.startswith("SPAWN_"):
-        heal_budget -= UNIT_SPAWN_COSTS.get(core_action_name.split("_", 1)[1], 0)
+        spawn_type = core_action_name.split("_", 1)[1]
+        population = getattr(getattr(turn, "state", None), "population", 0) or 0
+        try:
+            spawn_cost = _spawn_cost(UnitType(spawn_type), population)
+        except ValueError:
+            spawn_cost = UNIT_SPAWN_COSTS.get(spawn_type, 0)
+        heal_budget -= spawn_cost
 
     for unit in turn.units:
         uid = str(unit.id)[:8]
