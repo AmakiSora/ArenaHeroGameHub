@@ -3378,6 +3378,26 @@ class BattleLogTests(unittest.TestCase):
         self.assertGreater(page.index('id="logPanel"'), page.index('id="tacticConfigForm"'))
 
 
+class DashboardVisualSystemTests(unittest.TestCase):
+    def test_major_panels_share_visual_system_tokens(self) -> None:
+        for token in ("--surface-soft", "--control-bg", "--radius-panel", "--radius-control"):
+            self.assertIn(token, dashboard.CSS)
+        for selector in (
+            ".map-panel",
+            ".teams-panel",
+            ".config-panel",
+            ".trends-panel",
+            ".log-panel",
+            ".units-panel",
+            ".waypoint-panel",
+            ".res-panel",
+        ):
+            self.assertIn(selector, dashboard.CSS)
+
+    def test_long_resource_list_has_bounded_desktop_region(self) -> None:
+        self.assertIn(".res-panel #resSection{max-height:430px;overflow:auto", dashboard.CSS)
+
+
 class LeftSidebarTests(unittest.TestCase):
     def setUp(self) -> None:
         self.page = dashboard.generate_html()
