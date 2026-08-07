@@ -3378,6 +3378,12 @@ class BattleLogTests(unittest.TestCase):
         self.assertGreater(page.index('id="logPanel"'), page.index('id="tacticConfigForm"'))
 
 
+class TrendPanelTests(unittest.TestCase):
+    def test_chart_series_names_match_trend_point_keys(self) -> None:
+        for key in ("r", "c", "w", "v", "g", "e"):
+            self.assertIn(f"{key}:     {{ key: '{key}'", dashboard.JS)
+
+
 class UnitTabsTests(unittest.TestCase):
     """Right sidebar unit cards are one panel with three tabs."""
 

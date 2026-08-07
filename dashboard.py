@@ -1652,8 +1652,8 @@ JS = r"""
   // resources gold, muted capacity, worker blue, vanguard orange, ranger
   // purple, enemy red. See render_svg().
   const TREND_SERIES = {
-    res:   { key: 'r', label: '资源',  color: '#ffc857' },
-    cap:   { key: 'c', label: '容量',  color: '#93a0bf', dash: true },
+    r:     { key: 'r', label: '资源',  color: '#ffc857' },
+    c:     { key: 'c', label: '容量',  color: '#93a0bf', dash: true },
     w:     { key: 'w', label: '工人',  color: '#8aa4ff' },
     v:     { key: 'v', label: '先锋',  color: '#ff8c42' },
     g:     { key: 'g', label: '游侠',  color: '#b38cff' },
