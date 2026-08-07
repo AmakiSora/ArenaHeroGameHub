@@ -1281,31 +1281,34 @@ body{margin:0;min-height:100vh;color:var(--text);
 .layout{display:grid;grid-template-columns:1.4fr .9fr;gap:14px}
 .panel-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;font-size:16px;font-weight:700}
 .count{color:var(--muted);font-size:13px;font-weight:500}
-.unit-grid{display:grid;grid-template-columns:1fr;gap:8px}
-.unit{border-radius:16px;padding:12px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);transition:transform .15s,border-color .15s}
-.unit:hover{transform:translateY(-1px);border-color:rgba(255,255,255,.14)}
-.unit.cargo{background:rgba(87,214,163,.08)}
-.unit.harvest{background:rgba(255,200,87,.08)}
-.unit.deposit{background:rgba(110,168,255,.10)}
-.unit.wait{background:rgba(255,107,107,.10)}
-.unit.explore{background:rgba(179,140,255,.08)}
-.unit.combat{background:rgba(255,107,157,.10)}
-.unit-top{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}
-.unit-id{font-family:Consolas,monospace;font-size:13px;display:flex;gap:6px;align-items:center}
-.badge{font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid transparent}
+.unit-grid{display:grid;grid-template-columns:1fr;gap:6px}
+.unit{--unit-tone:110,168,255;position:relative;border-radius:12px;padding:9px 10px 8px 13px;
+ background:linear-gradient(100deg,rgba(var(--unit-tone),.10),rgba(255,255,255,.025) 58%);
+ border:1px solid rgba(255,255,255,.065);overflow:hidden;transition:border-color .15s,background .15s}
+.unit::after{content:"";position:absolute;inset:8px auto 8px 0;width:3px;border-radius:0 3px 3px 0;background:rgb(var(--unit-tone));opacity:.8}
+.unit:hover{border-color:rgba(var(--unit-tone),.30);background:linear-gradient(100deg,rgba(var(--unit-tone),.14),rgba(255,255,255,.04) 62%)}
+.unit.cargo{--unit-tone:87,214,163}
+.unit.harvest{--unit-tone:255,200,87}
+.unit.deposit{--unit-tone:110,168,255}
+.unit.wait{--unit-tone:255,107,107}
+.unit.explore{--unit-tone:179,140,255}
+.unit.combat{--unit-tone:255,107,157}
+.unit-top{display:flex;justify-content:space-between;gap:8px;align-items:center;min-width:0}
+.unit-id{min-width:0;font-family:Consolas,monospace;font-size:13px;font-weight:700;display:flex;gap:6px;align-items:baseline}
+.unit-id .count{max-width:92px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:400;opacity:.72}
+.badge{flex:0 0 auto;font-size:10px;padding:2px 7px;border-radius:999px;border:1px solid transparent;line-height:1.35}
 .badge.cargo,.badge.deposit{background:rgba(87,214,163,.15);color:#8ef0c4}
 .badge.harvest{background:rgba(255,200,87,.15);color:#ffd98a}
 .badge.wait{background:rgba(255,107,107,.15);color:#ff9b9b}
 .badge.explore{background:rgba(179,140,255,.15);color:#d0b8ff}
 .badge.combat{background:rgba(255,107,157,.15);color:#ff9ec0}
 .badge.move,.badge.other{background:rgba(110,168,255,.12);color:#a9c8ff}
-.unit-meta{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:12px;margin-bottom:8px}
-.unit-coords{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}
-.unit-coords>div{display:grid;gap:2px;min-width:0;padding:6px 7px;background:rgba(0,0,0,.16);border:1px solid rgba(255,255,255,.05);border-radius:6px}
-.unit-coords span{color:var(--muted);font-size:10px}
-.unit-coords b{color:#e5edff;font:11px Consolas,monospace;white-space:nowrap}
+.unit-facts{display:flex;align-items:center;gap:7px;min-width:0;margin-top:5px;color:var(--muted);font-size:10px;line-height:1.35}
+.unit-locator{min-width:0;flex:1;color:#c8d4eb;font:10.5px Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.unit-locator .arrow{padding:0 3px;color:rgb(var(--unit-tone))}
+.unit-fact{flex:0 0 auto;white-space:nowrap;color:#afbdd5}
+.unit-fact+.unit-fact{padding-left:7px;border-left:1px solid rgba(255,255,255,.09)}
 .pill{padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.05)}
-.unit-action{font-size:12px;color:#d7e1f7;line-height:1.4;word-break:break-word}
 .side-stack{display:grid;gap:14px}
 .chip-row{display:flex;flex-wrap:wrap;gap:8px}
 .chip{padding:6px 10px;border-radius:999px;background:rgba(110,168,255,.12);border:1px solid rgba(110,168,255,.18);
@@ -1380,7 +1383,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .map-panel{margin:0}
 .map-panel .map-toolbar{margin-bottom:8px}
 .map-legend{margin-top:8px}
-.compact-list{display:grid;gap:8px;max-height:42vh;overflow:auto;padding-right:2px}
+.compact-list{display:grid;gap:6px;max-height:52vh;overflow:auto;padding-right:2px}
 .compact-list::-webkit-scrollbar{width:6px}
 .compact-list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:99px}
 .units-tabs{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
@@ -3064,25 +3067,25 @@ def build_parts():
         path = w.get("path") or []
         target = w.get("target")
         steps = max(0, len(path) - 1)
-        route_text = f"路径 {steps} 步" if w.get("path_complete") else f"当前规划 {steps} 步"
-        extra = (
-            f'<span class="pill">矿 {cargo}</span>'
-            if cargo else f'<span class="pill">HP {w.get("hp","?")}</span>'
-        )
+        route_text = f"{steps}步" if w.get("path_complete") else f"规划{steps}步"
+        vitals = f"矿 {cargo}" if cargo else f'HP {w.get("hp","?")}'
         pw = per_worker.get(sid)
-        if pw is not None:
-            extra += (
-                f'<span class="pill" title="累计采矿 / 卸货">采 {pw.get("harvested", 0)}'
-                f' · 卸 {pw.get("deposited", 0)}</span>'
+        history_text = ""
+        if pw is not None and (pw.get("harvested", 0) or pw.get("deposited", 0)):
+            history_text = (
+                f'<span class="unit-fact" title="累计采矿 / 卸货">'
+                f'采{pw.get("harvested", 0)}·卸{pw.get("deposited", 0)}</span>'
             )
+        safe_name = html.escape(str(name))
+        safe_sid = html.escape(str(sid))
+        safe_act = html.escape(str(act or "暂无指令"))
         return (
-            f'<div class="unit {kind}"><div class="unit-top">'
-            f'<div class="unit-id">{name}<span class="count">{sid}</span></div>'
-            f'<span class="badge {kind}">{badge}</span></div>'
-            f'<div class="unit-coords"><div><span>当前坐标</span><b>{fmt_pos(w.get("pos"))}</b></div>'
-            f'<div><span>目标坐标</span><b>{fmt_pos(target)}</b></div></div>'
-            f'<div class="unit-meta">{extra}<span>{route_text}</span></div>'
-            f'<div class="unit-action">{act}</div></div>'
+            f'<div class="unit {kind}" title="{safe_act}"><div class="unit-top">'
+            f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
+            f'<span class="badge {kind}">{html.escape(str(badge))}</span></div>'
+            f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(w.get("pos"))}'
+            f'<span class="arrow">→</span>{fmt_pos(target)}</span>'
+            f'<span class="unit-fact">{vitals}</span><span class="unit-fact">{route_text}</span>{history_text}</div></div>'
         )
 
     def team_label(act: str) -> str:
@@ -3097,7 +3100,7 @@ def build_parts():
         return "作战"
 
     def combat_stat_line(sid: str) -> str:
-        """Per-combat-unit stats: shots / hits / hit-rate, or '已阵亡'."""
+        """Compact per-combat-unit shots / hits, or death summary."""
         rec = per_combat.get(sid)
         if not rec:
             return ""
@@ -3106,8 +3109,8 @@ def build_parts():
         rate = (hits * 100 / shots) if shots else 0.0
         alive = rec.get("died_tick") is None
         if alive:
-            return f'<span class="pill" title="攻击次数 / 命中次数">攻 {shots} · 中 {hits} ({rate:.0f}%)</span>'
-        return f'<span class="pill" title="生前攻击 / 命中">已阵亡 · 生前攻 {shots} · 中 {hits}</span>'
+            return f'<span class="unit-fact" title="攻击 / 命中 / 命中率">攻{shots}·中{hits}·{rate:.0f}%</span>'
+        return f'<span class="unit-fact" title="生前攻击 / 命中">阵亡·{shots}/{hits}</span>'
 
     def ucard(u, color_cls):
         uid = u.get("id", "")
@@ -3116,13 +3119,15 @@ def build_parts():
         act = actions.get(sid) or actions.get(uid, "")
         label = team_label(act)
         stat_line = combat_stat_line(sid)
+        safe_name = html.escape(str(name))
+        safe_sid = html.escape(str(sid))
+        safe_act = html.escape(str(act or "暂无指令"))
         return (
-            f'<div class="unit {color_cls}"><div class="unit-top">'
-            f'<div class="unit-id">{name}<span class="count">{sid}</span></div>'
+            f'<div class="unit {color_cls}" title="{safe_act}"><div class="unit-top">'
+            f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
             f'<span class="badge {color_cls}">{label}</span></div>'
-            f'<div class="unit-meta"><span>{fmt_pos(u.get("pos"))}</span>'
-            f'<span class="pill">HP {u.get("hp","?")}</span>{stat_line}</div>'
-            f'<div class="unit-action">{act}</div></div>'
+            f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(u.get("pos"))}</span>'
+            f'<span class="unit-fact">HP {u.get("hp","?")}</span>{stat_line}</div></div>'
         )
 
     w_html = "".join(wcard(w) for w in workers) or '<div class="empty">暂无工人</div>'

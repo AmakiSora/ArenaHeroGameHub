@@ -3408,6 +3408,14 @@ class UnitTabsTests(unittest.TestCase):
         self.assertNotIn('<section class="panel">\n        <div class="panel-title"><span>工人</span>', self.page)
         self.assertIn('class="panel units-panel"', self.page)
 
+    def test_unit_cards_use_compact_two_row_layout(self) -> None:
+        self.assertIn('class="unit-facts"', self.page)
+        self.assertIn('class="unit-locator"', self.page)
+        self.assertIn('class="unit-fact"', self.page)
+        self.assertNotIn('class="unit-coords"', self.page)
+        self.assertNotIn('class="unit-meta"', self.page)
+        self.assertNotIn('class="unit-action"', self.page)
+
 
 if __name__ == "__main__":
     unittest.main()
