@@ -909,6 +909,7 @@ class CombatTeamPlannerTests(unittest.TestCase):
             self.position = position
             self.action = None
             self.arg = None
+            self.expected_cell = None
 
         def move(self, direction) -> None:
             self.action = "MOVE"
@@ -921,9 +922,10 @@ class CombatTeamPlannerTests(unittest.TestCase):
             self.action = "SWEEP"
             self.arg = direction
 
-        def shoot(self, target) -> None:
+        def shoot(self, target, *, expected_cell=None) -> None:
             self.action = "SHOOT"
             self.arg = target
+            self.expected_cell = expected_cell
 
     class Enemy:
         def __init__(self, position: tuple[int, int]) -> None:
@@ -1168,6 +1170,26 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(action, "SHOOT")
         self.assertIn("enemy at", detail)
         self.assertIs(unit.arg, enemy)
+
+    def test_lead_fire_switch_reaches_ranger_shot_planner(self) -> None:
+        unit = self.CombatUnit("r-config", (0, 0))
+        self.config["ranger_lead_fire_enabled"] = False
+        with patch.object(
+            tactic,
+            "_ranger_best_shot",
+            return_value=("SHOOT", "mock"),
+        ) as shot:
+            action, _ = tactic._plan_ranger(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="unassigned",
+            )
+
+        self.assertEqual(action, "SHOOT")
+        self.assertFalse(shot.call_args.kwargs["lead_fire_enabled"])
 
     def test_attack_team_beacon_mode_marches_to_beacon_ignoring_coords(self) -> None:
         tactic.turn_context.beacon_pos = (8, 0)
@@ -2102,6 +2124,19 @@ class ConfigClobberProtectionTests(unittest.TestCase):
         self.assertIn("V9", result["home_team"])
         self.assertEqual(mutate_mock.call_count, 1)
 
+    def test_lead_fire_defaults_on_for_existing_config_and_renders_switch(self) -> None:
+        legacy = tactic_config.default_config()
+        legacy.pop("ranger_lead_fire_enabled")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tactic_config.json"
+            path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+            loaded = tactic_config.load_config(path)
+
+        self.assertTrue(loaded["ranger_lead_fire_enabled"])
+        html = dashboard.render_config_panel()
+        self.assertIn('name="ranger_lead_fire_enabled"', html)
+        self.assertIn("稳定移动预判实射", html)
+
 
 class GameStatsTests(unittest.TestCase):
     """Cumulative battle-report aggregation (economy / combat / production)."""
@@ -2312,6 +2347,49 @@ class GameStatsTests(unittest.TestCase):
         self.assertEqual(prediction["harms"], 1)
         self.assertEqual(prediction["by_streak"]["3_plus"]["resolved"], 2)
 
+    def test_live_lead_fire_results_are_counted_separately(self) -> None:
+        stats = game_stats.new_stats()
+        common = {
+            "target_type": "VANGUARD",
+            "move_streak": 3,
+            "motion_state": "moving_stable",
+            "prediction_legal": True,
+            "eligible": True,
+            "lead_fire_used": True,
+        }
+        candidates = [common, common]
+        results = [
+            {
+                **common,
+                "predicted_match": True,
+                "current_match": False,
+                "shot_result": "SHOT_HIT",
+            },
+            {
+                **common,
+                "predicted_match": False,
+                "current_match": True,
+                "shot_result": "SHOT_MISSED",
+            },
+        ]
+
+        game_stats.record_prediction_candidates(stats, candidates)
+        game_stats.record_prediction_results(stats, results)
+
+        prediction = stats["shot_prediction"]
+        self.assertEqual(prediction["lead_fire_attempts"], 2)
+        self.assertEqual(prediction["lead_fire_hits"], 1)
+        self.assertEqual(prediction["lead_fire_misses"], 1)
+        self.assertEqual(prediction["lead_fire_improvements"], 1)
+        self.assertEqual(prediction["lead_fire_harms"], 1)
+        self.assertEqual(prediction["baseline_hits"], 0)
+        self.assertEqual(prediction["baseline_misses"], 0)
+        self.assertEqual(prediction["improvements"], 0)
+        self.assertEqual(prediction["harms"], 0)
+        stable = prediction["by_motion_state"]["moving_stable"]
+        self.assertEqual(stable["lead_fire_attempts"], 2)
+        self.assertEqual(stable["lead_fire_hits"], 1)
+
     def test_save_load_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "stats.json"
@@ -2376,10 +2454,12 @@ class RangerShootingTests(unittest.TestCase):
             self.position = position
             self.action = None
             self.arg = None
+            self.expected_cell = None
 
-        def shoot(self, target) -> None:
+        def shoot(self, target, *, expected_cell=None) -> None:
             self.action = "SHOOT"
             self.arg = target
+            self.expected_cell = expected_cell
 
     class Enemy:
         def __init__(self, position: tuple[int, int], index: int = 1) -> None:
@@ -2487,10 +2567,10 @@ class RangerShootingTests(unittest.TestCase):
             enemy.position = position
             tactic._update_enemy_motion_tracks((enemy,), tick)
         tactic.turn_context.tick = 4
-        ranger = self.Ranger((0, 0))
+        ranger = self.Ranger((0, 1))
 
         result = tactic._ranger_best_shot(
-            ranger, ranger.position, (enemy,), frozenset(), 4,
+            ranger, ranger.position, (enemy,), frozenset(), 3,
         )
 
         prediction = tactic.turn_context.shot_predictions[0]
@@ -2500,6 +2580,40 @@ class RangerShootingTests(unittest.TestCase):
         self.assertEqual(prediction["move_streak"], 3)
         self.assertEqual(prediction["motion_state"], "moving_stable")
         self.assertTrue(prediction["eligible"])
+        self.assertFalse(prediction["lead_fire_used"])
+        self.assertEqual(prediction["fired_cell"], [0, 3])
+        self.assertIsNone(ranger.expected_cell)
+
+    def test_stable_legal_prediction_uses_expected_cell_when_enabled(self) -> None:
+        enemy = self.Enemy((0, 0))
+        for tick, position in (
+            (1, (0, 0)),
+            (2, (0, 1)),
+            (3, (0, 2)),
+            (4, (0, 3)),
+        ):
+            enemy.position = position
+            tactic._update_enemy_motion_tracks((enemy,), tick)
+        tactic.turn_context.tick = 4
+        ranger = self.Ranger((0, 1))
+
+        result = tactic._ranger_best_shot(
+            ranger,
+            ranger.position,
+            (enemy,),
+            frozenset(),
+            3,
+            lead_fire_enabled=True,
+        )
+
+        prediction = tactic.turn_context.shot_predictions[0]
+        self.assertEqual(result[0], "SHOOT")
+        self.assertIn("lead", result[1])
+        self.assertIs(ranger.arg, enemy)
+        self.assertEqual(ranger.expected_cell, (0, 4))
+        self.assertTrue(prediction["lead_fire_used"])
+        self.assertEqual(prediction["fire_mode"], "lead")
+        self.assertEqual(prediction["fired_cell"], [0, 4])
 
     def test_shadow_prediction_classifies_confirmed_stationary_target(self) -> None:
         enemy = self.Enemy((0, 2))
@@ -2537,6 +2651,19 @@ class RangerShootingTests(unittest.TestCase):
         self.assertTrue(prediction["prediction_legal"])
         self.assertFalse(prediction["eligible"])
         self.assertEqual(prediction["reason"], "unstable_velocity")
+
+        ranger = self.Ranger((0, 0))
+        tactic._ranger_best_shot(
+            ranger,
+            ranger.position,
+            (enemy,),
+            frozenset(),
+            3,
+            lead_fire_enabled=True,
+        )
+        queued = tactic.turn_context.shot_predictions[-1]
+        self.assertFalse(queued["lead_fire_used"])
+        self.assertIsNone(ranger.expected_cell)
 
     def test_shadow_prediction_marks_direction_change_unstable(self) -> None:
         enemy = self.Enemy((0, 0))

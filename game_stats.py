@@ -64,6 +64,12 @@ def _prediction_counter() -> dict[str, int]:
         "baseline_misses": 0,
         "improvements": 0,
         "harms": 0,
+        "lead_fire_attempts": 0,
+        "lead_fire_hits": 0,
+        "lead_fire_misses": 0,
+        "lead_fire_unknown": 0,
+        "lead_fire_improvements": 0,
+        "lead_fire_harms": 0,
     }
 
 
@@ -365,7 +371,7 @@ def _prediction_buckets(
 def record_prediction_candidates(
     stats: dict[str, Any], candidates: list[dict[str, Any]],
 ) -> None:
-    """Count accepted shadow predictions without changing combat behavior."""
+    """Count accepted prediction decisions, including live lead shots."""
     for item in candidates:
         for bucket in _prediction_buckets(stats, item):
             bucket["candidates"] += 1
@@ -373,15 +379,19 @@ def record_prediction_candidates(
                 bucket["legal_candidates"] += 1
             if item.get("eligible"):
                 bucket["eligible_candidates"] += 1
+            if item.get("lead_fire_used"):
+                bucket["lead_fire_attempts"] += 1
 
 
 def record_prediction_results(
     stats: dict[str, Any], results: list[dict[str, Any]],
 ) -> None:
-    """Aggregate next-Tick outcomes for previously accepted shadow shots."""
+    """Aggregate next-Tick shadow and live lead-fire outcomes."""
     for item in results:
         predicted_match = item.get("predicted_match")
+        current_match = item.get("current_match")
         shot_result = str(item.get("shot_result") or "UNRESOLVED")
+        lead_fire_used = bool(item.get("lead_fire_used"))
         for bucket in _prediction_buckets(stats, item):
             bucket["resolved"] += 1
             if predicted_match is True:
@@ -390,22 +400,43 @@ def record_prediction_results(
                 bucket["predicted_wrong"] += 1
             else:
                 bucket["unknown"] += 1
-            if shot_result == "SHOT_HIT":
-                bucket["baseline_hits"] += 1
-            elif shot_result == "SHOT_MISSED":
-                bucket["baseline_misses"] += 1
-            if (
-                item.get("eligible")
-                and predicted_match is True
-                and shot_result == "SHOT_MISSED"
-            ):
-                bucket["improvements"] += 1
-            if (
-                item.get("eligible")
-                and predicted_match is False
-                and shot_result == "SHOT_HIT"
-            ):
-                bucket["harms"] += 1
+            if not lead_fire_used:
+                if shot_result == "SHOT_HIT":
+                    bucket["baseline_hits"] += 1
+                elif shot_result == "SHOT_MISSED":
+                    bucket["baseline_misses"] += 1
+            if lead_fire_used:
+                if shot_result == "SHOT_HIT":
+                    bucket["lead_fire_hits"] += 1
+                elif shot_result == "SHOT_MISSED":
+                    bucket["lead_fire_misses"] += 1
+                else:
+                    bucket["lead_fire_unknown"] += 1
+                if (
+                    predicted_match is True
+                    and current_match is False
+                    and shot_result == "SHOT_HIT"
+                ):
+                    bucket["lead_fire_improvements"] += 1
+                if (
+                    predicted_match is False
+                    and current_match is True
+                    and shot_result == "SHOT_MISSED"
+                ):
+                    bucket["lead_fire_harms"] += 1
+            else:
+                if (
+                    item.get("eligible")
+                    and predicted_match is True
+                    and shot_result == "SHOT_MISSED"
+                ):
+                    bucket["improvements"] += 1
+                if (
+                    item.get("eligible")
+                    and predicted_match is False
+                    and shot_result == "SHOT_HIT"
+                ):
+                    bucket["harms"] += 1
 
 
 def sampled(stats: dict[str, Any], tick: int) -> None:

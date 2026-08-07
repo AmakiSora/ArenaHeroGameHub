@@ -96,6 +96,13 @@ CONFIG_FIELDS = (
         options=("coords", "auto", "beacon"),
     ),
     ConfigField("ranger_attack_range", "游侠开火距离", "combat", "integer", 3, 1, 3, 1),
+    ConfigField(
+        "ranger_lead_fire_enabled",
+        "稳定移动预判实射",
+        "combat",
+        "boolean",
+        True,
+    ),
     ConfigField("map_save_interval_ticks", "地图保存间隔 Tick", "runtime", "integer", 10, 1, 200, 1),
     ConfigField("target_workers", "工人目标", "production", "integer", 10, 0, 19, 1),
     ConfigField("target_vanguards", "先锋目标", "production", "integer", 2, 0, 19, 1),

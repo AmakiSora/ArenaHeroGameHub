@@ -1704,7 +1704,7 @@ def _shadow_shot_prediction(
     obstacle_cells: frozenset[tuple[int, int]],
     attack_range: int,
 ) -> dict[str, Any]:
-    """Describe a lead-shot candidate without changing the queued shot."""
+    """Describe a lead-shot candidate before the caller queues the shot."""
     target_id = str(target.id)
     current_cell = tuple(target.position)
     history = _enemy_motion_tracks.get(target_id, [])
@@ -1803,6 +1803,7 @@ def _resolve_shadow_predictions(turn: Any, tick: int) -> list[dict[str, Any]]:
         )
         predicted = pending.get("predicted_cell")
         current = pending.get("current_cell")
+        fired = pending.get("fired_cell") or current
         public.update({
             "resolved_tick": tick,
             "tick_gap": tick_gap,
@@ -1817,6 +1818,9 @@ def _resolve_shadow_predictions(turn: Any, tick: int) -> list[dict[str, Any]]:
             ),
             "current_match": (
                 actual == tuple(current) if actual is not None and current else None
+            ),
+            "fired_match": (
+                actual == tuple(fired) if actual is not None and fired else None
             ),
         })
         resolved.append(public)
@@ -1840,6 +1844,8 @@ def _ranger_best_shot(
     enemies: tuple,
     obstacle_cells: frozenset[tuple[int, int]],
     attack_range: int,
+    *,
+    lead_fire_enabled: bool = False,
 ) -> tuple[str, str] | None:
     """Pick the closest enemy in legal 8-way range (rules v0.8/v0.13).
 
@@ -1862,18 +1868,35 @@ def _ranger_best_shot(
             best_target = enemy
     if best_target is None:
         return None
-    turn_context.shot_predictions.append(
-        _shadow_shot_prediction(
-            ranger,
-            pos,
-            best_target,
-            obstacle_cells,
-            attack_range,
-        )
+    prediction = _shadow_shot_prediction(
+        ranger,
+        pos,
+        best_target,
+        obstacle_cells,
+        attack_range,
     )
-    # Shadow mode only: keep the authoritative current-cell shot unchanged.
+    predicted_cell = prediction.get("predicted_cell")
+    lead_fire_used = bool(
+        lead_fire_enabled and prediction.get("eligible") and predicted_cell
+    )
+    fired_cell = predicted_cell if lead_fire_used else prediction["current_cell"]
+    prediction.update({
+        "lead_fire_used": lead_fire_used,
+        "fire_mode": "lead" if lead_fire_used else "current",
+        "fired_cell": list(fired_cell),
+    })
+    turn_context.shot_predictions.append(prediction)
+
+    if lead_fire_used:
+        ranger.shoot(best_target, expected_cell=tuple(predicted_cell))
+        return (
+            "SHOOT",
+            f"lead {tuple(predicted_cell)} enemy at {best_target.position} "
+            f"dist={best_dist}",
+        )
+
     ranger.shoot(best_target)
-    return ("SHOOT", f"enemy at {best_target.position} dist={best_dist}")
+    return ("SHOOT", f"current enemy at {best_target.position} dist={best_dist}")
 
 
 def _scout_cardinal(
@@ -1973,6 +1996,7 @@ def _plan_home_combat(
             enemies,
             obstacle_cells,
             int(config["ranger_attack_range"]),
+            lead_fire_enabled=bool(config.get("ranger_lead_fire_enabled", True)),
         )
         if shot is not None:
             return shot
@@ -2058,6 +2082,7 @@ def _plan_attack_combat(
             enemies,
             obstacle_cells,
             int(config["ranger_attack_range"]),
+            lead_fire_enabled=bool(config.get("ranger_lead_fire_enabled", True)),
         )
         if shot is not None:
             return shot
@@ -2139,6 +2164,9 @@ def _plan_guerrilla_combat(
                 enemies,
                 obstacle_cells,
                 int(config["ranger_attack_range"]),
+                lead_fire_enabled=bool(
+                    config.get("ranger_lead_fire_enabled", True)
+                ),
             )
             if shot is not None:
                 return shot
@@ -2166,6 +2194,9 @@ def _plan_guerrilla_combat(
                 enemies,
                 obstacle_cells,
                 int(config["ranger_attack_range"]),
+                lead_fire_enabled=bool(
+                    config.get("ranger_lead_fire_enabled", True)
+                ),
             )
             if shot is not None:
                 return shot
@@ -2298,6 +2329,7 @@ def _plan_ranger(
         enemies,
         obstacle_cells,
         int(config["ranger_attack_range"]),
+        lead_fire_enabled=bool(config.get("ranger_lead_fire_enabled", True)),
     )
     if shot is not None:
         return shot

@@ -608,10 +608,13 @@ def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) 
     config = load_config(CONFIG_PATH)
     schema = config_schema()
     fields_by_group: dict[str, list[dict]] = defaultdict(list)
+    dedicated_fields = set(TEAM_ROSTER_FIELDS) | set(TEAM_SETTING_FIELDS)
     for field in schema["fields"]:
         # Combat rosters + team settings live on the dedicated teams card;
         # production targets live in the dedicated section below.
-        if field["group"] in {"combat", "production"}:
+        if field["key"] in dedicated_fields:
+            continue
+        if field["group"] == "production":
             continue
         fields_by_group[field["group"]].append(field)
 
@@ -2986,7 +2989,7 @@ def build_parts():
         f'<span class="pill">参与击杀 {int(comb.get("kill_participations", 0) or 0)}</span>'
         f'<span class="pill">承伤 {int(comb.get("damage_taken", 0) or 0)}</span>'
         f'<span class="pill">扫描 {int(comb.get("sweeps_resolved", 0) or 0)}</span></div>'
-        '<div class="kv" style="margin-top:8px"><span>影子预判</span>'
+        '<div class="kv" style="margin-top:8px"><span>预判候选</span>'
         f'<b>候选 {int(prediction.get("eligible_candidates", 0) or 0)} / '
         f'{int(prediction.get("candidates", 0) or 0)}</b></div>'
         '<div class="stat-chips">'
@@ -2995,6 +2998,14 @@ def build_parts():
         f'<span class="pill">未知 {int(prediction.get("unknown", 0) or 0)}</span>'
         f'<span class="pill">理论 +{int(prediction.get("improvements", 0) or 0)} '
         f'/ -{int(prediction.get("harms", 0) or 0)}</span></div>'
+        '<div class="kv" style="margin-top:8px"><span>真实预判</span>'
+        f'<b>{int(prediction.get("lead_fire_attempts", 0) or 0)} 攻 / '
+        f'{int(prediction.get("lead_fire_hits", 0) or 0)} 中</b></div>'
+        '<div class="stat-chips">'
+        f'<span class="pill">未中 {int(prediction.get("lead_fire_misses", 0) or 0)}</span>'
+        f'<span class="pill">未知 {int(prediction.get("lead_fire_unknown", 0) or 0)}</span>'
+        f'<span class="pill">实际 +{int(prediction.get("lead_fire_improvements", 0) or 0)} '
+        f'/ -{int(prediction.get("lead_fire_harms", 0) or 0)}</span></div>'
         '<div class="stat-chips" style="margin-top:8px">'
         f'<span class="pill">静止 {prediction_group_count("by_motion_state", "stationary")}</span>'
         f'<span class="pill">移动观察 '

@@ -320,11 +320,10 @@ Tactic 每 Tick 从解析事件聚合累计统计，持久化到 `game_stats.jso
 
 数据口径说明：`SHOT_HIT + SHOT_MISSED = 攻击次数`，`SHOT_HIT = 命中次数`；`DESTRUCTION_PARTICIPATION` 服务器不提供击杀者 id，故"参与击杀"仅全局计数；我方单位死亡由单位快照差异检测。
 
-### 游侠预判影子统计
+### 游侠稳定移动预判
 
-当前真实射击仍瞄准敌人本 Tick 所在格，不改变战斗行为。战术进程按敌方 UUID
-保留最近 4 个连续 Tick 的位置；游侠每次开火时计算下一格预测，并在下一 Tick
-对照实际位置和 `SHOT_HIT` / `SHOT_MISSED`。`tactic_log.jsonl` 的
+战术进程按敌方 UUID 保留最近 4 个连续 Tick 的位置；游侠每次开火时计算下一格
+预测，并在下一 Tick 对照实际位置和 `SHOT_HIT` / `SHOT_MISSED`。`tactic_log.jsonl` 的
 `shot_predictions` 保存候选，`shot_prediction_results` 保存对照结果；累计候选、
 正确、错误、未知及理论挽回/伤害写入 `game_stats.json` 的 `shot_prediction`。
 
@@ -332,8 +331,11 @@ Tactic 每 Tick 从解析事件聚合累计统计，持久化到 `game_stats.jso
 目标归类为不稳定/不确定；只有连续三个步骤同方向、每步一个基数格才归类为稳定
 移动。稳定移动目标的预测格还必须满足射程、八向直线和障碍检查，才标记为
 `eligible`。运动分类累计写入 `shot_prediction.by_motion_state`，仪表盘分别展示
-静止、移动观察、稳定移动和状态不足样本。`eligible` 仍只用于采样，不会传入 SDK
-的 `expected_cell`；升级前没有运动分类字段的累计数据保留在 `legacy` 桶。
+静止、移动观察、稳定移动和状态不足样本。`ranger_lead_fire_enabled` 默认开启；仅当
+目标为 `eligible` 时把预测格传给 SDK 的 `expected_cell`，其余射击继续使用当前格。
+配置面板可随时关闭该开关并恢复纯影子模式。日志用 `lead_fire_used` / `fired_cell`
+标记真实预判，真实尝试、命中、未中、实际改善和实际伤害单独累计在
+`lead_fire_*` 字段；升级前没有运动分类字段的累计数据保留在 `legacy` 桶。
 
 ---
 
