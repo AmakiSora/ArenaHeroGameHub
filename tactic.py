@@ -2917,13 +2917,9 @@ def _plan_demand_spawn(turn: Any, core: Any, resources: int, config: dict[str, A
 
     Spawn only when:
     - the Core cell is free (a unit standing on it blocks the spawn),
-    - population is below `population_cap`,
     - resources cover `cost + resource_reserve`.
     """
     if any(tuple(unit.position) == tuple(core.position) for unit in turn.units):
-        return None
-    pop_cap = int(config.get("population_cap", 20))
-    if getattr(turn.state, "population", 0) >= pop_cap:
         return None
 
     reserve = int(config.get("resource_reserve", 0))
@@ -2950,44 +2946,6 @@ def _unit_type_count(turn: Any, unit_type: UnitType) -> int:
         UnitType.RANGER: "rangers",
     }[unit_type]
     return len(getattr(turn, attr, ()) or ())
-
-
-def _plan_over_target_self_destruct(
-    turn: Any, core: Any, config: dict[str, Any],
-) -> list[tuple[Any, str]]:
-    """Pick one unit per over-target type to self-destruct this Tick.
-
-    When a type's current count exceeds its target (e.g. the target was lowered),
-    shed the least-useful unit: empty workers first, and among candidates the one
-    furthest from the Core. At most one unit per type per Tick so a big overrun is
-    trimmed gradually instead of wiping a whole corps at once. The Champion Beacon
-    carrier is never selected.
-    """
-    result: list[tuple[Any, str]] = []
-    core_pos = tuple(core.position)
-    beacon = getattr(turn, "beacon", None)
-    carrier_id = str(getattr(beacon, "carrier_id", None) or "")
-
-    for unit_type in _SPAWN_PRIORITY:
-        count = _unit_type_count(turn, unit_type)
-        target = int(config.get(_TARGET_KEYS[unit_type], _TARGET_DEFAULTS[unit_type]))
-        if count <= target:
-            continue
-        pool = [
-            unit for unit in turn.units
-            if unit.unit_type == unit_type and str(unit.id) != carrier_id
-        ]
-        if not pool:
-            continue
-
-        def key(unit: Any) -> tuple[int, int]:
-            # Farthest from Core first; for workers prefer an empty one.
-            empty = 1 if unit_type == UnitType.WORKER and getattr(unit, "cargo", 0) == 0 else 0
-            return (_manhattan(unit.position, core_pos), empty)
-
-        chosen = max(pool, key=key)
-        result.append((chosen, f"{count}>{target}"))
-    return result
 
 
 def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
@@ -3349,11 +3307,6 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     )
 
     # ── Unit actions ────────────────────────────────────────────────────
-    # Shed over-target units first so their self-destruct (not a normal action)
-    # is issued this Tick, and the per-unit planner skips them below.
-    self_destructs = _plan_over_target_self_destruct(turn, core, config)
-    sd_ids = {str(unit.id) for unit, _ in self_destructs}
-
     # Healing budget: leftover resources after reserve + this Tick's spawn cost,
     # so healing never starves production. Unit heals resolve before the Core
     # action (spawn), so the spawn's cost is reserved first.
@@ -3366,8 +3319,6 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         heal_budget -= UNIT_SPAWN_COSTS.get(core_action_name.split("_", 1)[1], 0)
 
     for unit in turn.units:
-        if str(unit.id) in sd_ids:
-            continue
         uid = str(unit.id)[:8]
         # Post-combat healing: a damaged Unit on the Core cell with a stationary
         # Core spends its whole action recovering HP (1 resource / 1 HP).
@@ -3433,10 +3384,6 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 team=team,
             )
             unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
-
-    for unit, detail in self_destructs:
-        unit.self_destruct()
-        unit_actions_detail[str(unit.id)[:8]] = f"SELF_DESTRUCT:{detail}"
 
     return core_action_name, unit_actions_detail
 

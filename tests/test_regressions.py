@@ -1999,7 +1999,7 @@ class DemandSpawnTests(unittest.TestCase):
         self.assertIsNone(tactic._plan_demand_spawn(turn, self.Core(), 100, self.config))
 
     def test_above_target_does_not_spawn(self) -> None:
-        # Over-target is the self-destruct's job, never extra spawning.
+        # Over-target stops production; existing units are kept as-is.
         turn = self._turn(workers=11, vanguards=2, rangers=2)
 
         self.assertIsNone(tactic._plan_demand_spawn(turn, self.Core(), 100, self.config))
@@ -2020,11 +2020,6 @@ class DemandSpawnTests(unittest.TestCase):
             "SPAWN_RANGER",
         )
 
-    def test_population_cap_blocks_spawn(self) -> None:
-        turn = self._turn(workers=8, population=20)
-
-        self.assertIsNone(tactic._plan_demand_spawn(turn, self.Core(), 100, self.config))
-
     def test_occupied_core_cell_blocks_spawn(self) -> None:
         blocking = self._unit("blocker", UnitType.WORKER, (0, 0))  # stands on the Core
         turn = self._turn(workers=8, extra_units=[blocking])
@@ -2044,98 +2039,6 @@ class DemandSpawnTests(unittest.TestCase):
         )
 
 
-class SelfDestructTests(unittest.TestCase):
-    """Over-target units shed one per type per Tick until back at target."""
-
-    class Core:
-        position = (0, 0)
-
-    def setUp(self) -> None:
-        self.config = default_config()
-
-    @staticmethod
-    def _unit(name: str, unit_type: UnitType, pos: tuple[int, int], cargo: int = 0):
-        unit = SimpleNamespace(id=name, unit_type=unit_type, position=pos, cargo=cargo)
-        unit.self_destruct_calls = []
-        unit.self_destruct = lambda: unit.self_destruct_calls.append(1)
-        return unit
-
-    def _turn(self, *, workers=(), vanguards=(), rangers=(), carrier: str | None = None):
-        units = list(workers) + list(vanguards) + list(rangers)
-        beacon = SimpleNamespace(carrier_id=carrier) if carrier is not None else None
-        return SimpleNamespace(
-            units=units,
-            workers=tuple(workers),
-            vanguards=tuple(vanguards),
-            rangers=tuple(rangers),
-            beacon=beacon,
-        )
-
-    def test_over_target_worker_trims_exactly_one(self) -> None:
-        workers = [self._unit(f"w{i}", UnitType.WORKER, (i + 1, 0)) for i in range(11)]
-        turn = self._turn(workers=workers)
-
-        result = tactic._plan_over_target_self_destruct(turn, self.Core(), self.config)
-
-        self.assertEqual(len(result), 1)
-        unit, detail = result[0]
-        self.assertEqual(unit.id, "w10")
-        self.assertEqual(detail, "11>10")
-        unit.self_destruct()
-        self.assertEqual(unit.self_destruct_calls, [1])
-
-    def test_two_types_over_target_each_trimmed(self) -> None:
-        workers = [self._unit(f"w{i}", UnitType.WORKER, (i + 1, 0)) for i in range(11)]
-        vanguards = [self._unit(f"v{i}", UnitType.VANGUARD, (-i - 1, 0)) for i in range(3)]
-        turn = self._turn(workers=workers, vanguards=vanguards)
-
-        result = tactic._plan_over_target_self_destruct(turn, self.Core(), self.config)
-
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result[0][1], "11>10")
-        self.assertEqual(result[1][1], "3>2")
-
-    def test_at_or_below_target_nothing_trimmed(self) -> None:
-        workers = [self._unit(f"w{i}", UnitType.WORKER, (i + 1, 0)) for i in range(10)]
-        vanguards = [self._unit(f"v{i}", UnitType.VANGUARD, (-i - 1, 0)) for i in range(2)]
-        rangers = [self._unit(f"r{i}", UnitType.RANGER, (-i - 1, 0)) for i in range(2)]
-        turn = self._turn(workers=workers, vanguards=vanguards, rangers=rangers)
-
-        self.assertEqual(tactic._plan_over_target_self_destruct(turn, self.Core(), self.config), [])
-
-    def test_beacon_carrier_is_never_selected(self) -> None:
-        workers = [self._unit(f"w{i}", UnitType.WORKER, (i + 1, 0)) for i in range(10)]
-        carrier = self._unit("w-beacon", UnitType.WORKER, (30, 30))
-        workers.append(carrier)
-        turn = self._turn(workers=workers, carrier="w-beacon")
-
-        result = tactic._plan_over_target_self_destruct(turn, self.Core(), self.config)
-
-        self.assertEqual(len(result), 1)
-        self.assertNotEqual(result[0][0].id, "w-beacon")
-
-    def test_prefers_empty_worker_at_equal_distance(self) -> None:
-        full = self._unit("w-full", UnitType.WORKER, (0, 10), cargo=2)
-        empty = self._unit("w-empty", UnitType.WORKER, (0, -10), cargo=0)
-        # Nine closer workers fill the roster (11 total → one over target).
-        others = [self._unit(f"w{i}", UnitType.WORKER, (i + 1, 0)) for i in range(9)]
-        turn = self._turn(workers=[full, empty, *others])
-
-        result = tactic._plan_over_target_self_destruct(turn, self.Core(), self.config)
-
-        self.assertEqual(result[0][0].id, "w-empty")
-
-    def test_sheds_furthest_before_near_empty(self) -> None:
-        near_empty = self._unit("w-near", UnitType.WORKER, (1, 0), cargo=0)
-        far_full = self._unit("w-far", UnitType.WORKER, (20, 0), cargo=2)
-        others = [self._unit(f"w{i}", UnitType.WORKER, (i + 3, 0)) for i in range(9)]
-        turn = self._turn(workers=[near_empty, far_full, *others])
-
-        result = tactic._plan_over_target_self_destruct(turn, self.Core(), self.config)
-
-        self.assertEqual(result[0][0].id, "w-far")
-
-
 class ConfigClobberProtectionTests(unittest.TestCase):
     """Auto-enlist must never overwrite newer dashboard edits (e.g. targets)."""
 
@@ -2152,7 +2055,7 @@ class ConfigClobberProtectionTests(unittest.TestCase):
         self.assertEqual(fresh["target_vanguards"], 4)
         self.assertEqual(fresh["target_rangers"], 5)
         # All fields survive, not just the edited ones.
-        for key in ("target_workers", "population_cap", "home_team"):
+        for key in ("target_workers", "home_team"):
             self.assertIn(key, fresh)
 
     def test_auto_enlist_preserves_newer_disk_targets(self) -> None:

@@ -655,7 +655,7 @@ def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) 
         if diff > 0:
             state_cls, state_text = "producing", f"缺 {diff} · 生产中"
         elif diff < 0:
-            state_cls, state_text = "culling", f"超编 {-diff} · 将自裁"
+            state_cls, state_text = "ok", f"超编 {-diff} · 停止生产"
         else:
             state_cls, state_text = "ok", "已达标"
         suffix = key.replace("target_", "").capitalize()  # Workers / Vanguards / Rangers
@@ -688,7 +688,7 @@ def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) 
         # every save silently drop the edited worker/vanguard/ranger targets.
         '<section class="production-section" aria-labelledby="productionTargetsTitle">'
         '<div class="production-title"><div><b id="productionTargetsTitle">生产需求目标</b>'
-        '<span class="count">低于目标自动补兵 · 超出自动自裁 · 阵亡自动补充 · 改后点保存生效</span></div></div>'
+        '<span class="count">低于目标自动补兵 · 达到或超出停止生产 · 阵亡自动补充 · 改后点保存生效</span></div></div>'
         f'<div class="production-targets" id="productionTargets">{target_rows}</div></section>'
         f'<div class="config-groups">{"".join(groups)}</div>'
         '<div class="config-actions">'
@@ -1457,7 +1457,6 @@ body{margin:0;min-height:100vh;color:var(--text);
 .prod-state{padding:2px 8px;border-radius:999px;font-size:10px;font-style:normal;font-family:"Segoe UI","Microsoft YaHei",sans-serif}
 .prod-state.producing{background:rgba(87,214,163,.15);color:#8ef0c4}
 .prod-state.ok{background:rgba(110,168,255,.12);color:#a9c8ff}
-.prod-state.culling{background:rgba(255,107,107,.15);color:#ff9b9b}
 .hero{display:none}
 .metrics{display:none}
 .layout{display:none}
@@ -2242,7 +2241,7 @@ JS = r"""
       const diff = target - current;
       let text, cls;
       if(diff > 0){ text = '缺 ' + diff + ' · 生产中'; cls = 'producing'; }
-      else if(diff < 0){ text = '超编 ' + (-diff) + ' · 将自裁'; cls = 'culling'; }
+      else if(diff < 0){ text = '超编 ' + (-diff) + ' · 停止生产'; cls = 'ok'; }
       else { text = '已达标'; cls = 'ok'; }
       el.textContent = text;
       el.className = 'prod-state ' + cls;
