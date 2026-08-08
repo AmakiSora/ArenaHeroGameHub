@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+from state_io import append_jsonl
+
 APP_DIR = Path("/app")
 RUNTIME_DIR = Path(os.environ.get("ARENA_DATA_DIR", "/app/runtime")).resolve()
 
@@ -23,6 +25,32 @@ STALE_SESSION_EXIT = 3
 # Clean gap (seconds) with no game connection before the container restarts, so
 # the server has time to reset the player's command baseline.
 STALE_SESSION_COOLDOWN = 60
+
+
+def _marker(message: str) -> None:
+    """Leave a visible lifecycle trace (boot / restart / shutdown) in the logs.
+
+    Writes the same line to the raw play log (tactic_play.log) and to the
+    dashboard's categorized battle log (battle_log.jsonl, warn category), so a
+    container restart is visible both in the raw log and in the 「战斗日志」panel.
+    Best-effort: a log write must never break the entrypoint loop.
+    """
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        global tactic_log
+        if tactic_log is None:
+            tactic_log = open(RUNTIME_DIR / "tactic_play.log", "a", encoding="utf-8")
+        tactic_log.write(f"[entrypoint] {stamp} {message}\n")
+        tactic_log.flush()
+    except OSError:
+        pass
+    try:
+        append_jsonl(
+            RUNTIME_DIR / "battle_log.jsonl",
+            [{"tick": None, "ts": time.time(), "cat": "warn", "msg": message}],
+        )
+    except Exception:
+        pass
 
 
 def prepare_runtime() -> None:
@@ -70,6 +98,7 @@ def stop_tactic() -> None:
 
 def shutdown(signum: int, _frame) -> None:
     print(f"[entrypoint] received signal {signum}, shutting down", flush=True)
+    _marker(f"收到信号 {signum}，容器关闭")
     stop_tactic()
     if tactic_log is not None:
         tactic_log.close()
@@ -80,6 +109,7 @@ def main() -> int:
     global tactic_proc
 
     prepare_runtime()
+    _marker(f"容器启动 (pid={os.getpid()})")
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
@@ -102,6 +132,7 @@ def main() -> int:
         if dashboard.poll() is not None:
             code = dashboard.returncode or 1
             print(f"[entrypoint] dashboard exited code={code}", flush=True)
+            _marker(f"dashboard 退出 (code={code})，容器将退出")
             stop_tactic()
             return code
         if tactic_proc is not None and tactic_proc.poll() is not None:
@@ -118,6 +149,10 @@ def main() -> int:
                     f"waiting {STALE_SESSION_COOLDOWN}s then container restart",
                     flush=True,
                 )
+                _marker(
+                    f"战术会话失同步（连续 TICK_MISMATCH），"
+                    f"容器将在 {STALE_SESSION_COOLDOWN} 秒后自动重启"
+                )
                 stop_tactic()
                 dashboard.terminate()
                 try:
@@ -130,6 +165,7 @@ def main() -> int:
                 f"[entrypoint] tactic exited code={code}; restarting",
                 flush=True,
             )
+            _marker(f"战术进程退出 (code={code})，2 秒后重启")
             time.sleep(2)
             tactic_proc = start_tactic()
         time.sleep(1)

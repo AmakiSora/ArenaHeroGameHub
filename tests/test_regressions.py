@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -3698,6 +3699,56 @@ class TickMismatchSelfHealTests(unittest.TestCase):
         results.extend(self._mismatch() for _ in range(6))
         code = self._run_play(results)
         self.assertEqual(code, 3)
+
+
+class EntrypointRestartLogTests(unittest.TestCase):
+    """Container restarts must leave a visible trace in the logs.
+
+    The dashboard's 「战斗日志」panel reads battle_log.jsonl (warn category shown
+    by default) and tactic_play.log is the raw play log; the entrypoint writes a
+    lifecycle marker to both so any boot / self-heal restart / crash-restart is
+    visible instead of the log just resuming silently.
+    """
+
+    @staticmethod
+    def _load_entrypoint(runtime_dir: str):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "docker_entrypoint", str(Path(__file__).parent.parent / "docker-entrypoint.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        with patch.dict(os.environ, {"ARENA_DATA_DIR": runtime_dir}):
+            spec.loader.exec_module(mod)
+        return mod
+
+    def test_marker_writes_to_play_log_and_battle_log(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            de = self._load_entrypoint(temp_dir)
+            try:
+                de._marker("容器启动 (pid=12345)")
+                de._marker("战术会话失同步（连续 TICK_MISMATCH），容器将在 60 秒后自动重启")
+
+                play = (Path(temp_dir) / "tactic_play.log").read_text(encoding="utf-8")
+                self.assertIn("[entrypoint]", play)
+                self.assertIn("容器启动 (pid=12345)", play)
+                self.assertIn("战术会话失同步", play)
+
+                battle = [
+                    json.loads(line)
+                    for line in (Path(temp_dir) / "battle_log.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                self.assertEqual(len(battle), 2)
+                for rec in battle:
+                    self.assertEqual(rec["cat"], "warn")
+                    self.assertIsNone(rec["tick"])
+                    self.assertIsInstance(rec["ts"], (int, float))
+                self.assertEqual(battle[0]["msg"], "容器启动 (pid=12345)")
+                self.assertIn("战术会话失同步", battle[1]["msg"])
+            finally:
+                de.tactic_log.close()
 
 
 if __name__ == "__main__":
