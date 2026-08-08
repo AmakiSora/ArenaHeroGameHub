@@ -45,6 +45,8 @@ DEFAULT_LOG_PATH = str(_data_dir() / "tactic_log.jsonl")
 BATTLE_LOG_PATH = _data_dir() / "battle_log.jsonl"
 # Manual per-unit target coordinates set from the dashboard (display-name keyed).
 WAYPOINTS_PATH = _data_dir() / "waypoints.json"
+# Manual per-unit self-destruct commands set from the dashboard (display-name keyed).
+SELF_DESTRUCT_PATH = _data_dir() / "self_destruct.json"
 
 # Display-name prefix per unit type (W / V / R), shared with the dashboard.
 _UNIT_NAME_PREFIX = {
@@ -2661,6 +2663,62 @@ def _load_and_prune_waypoints(alive_names: set[str]) -> dict[str, tuple[int, int
         return targets
 
 
+# ── manual per-unit self-destruct (dashboard 自裁 command) ───────────────────
+# Same cross-process file discipline as waypoints.json: the dashboard appends
+# display names here, and each Tick the tactic issues SELF_DESTRUCT for units
+# that are still alive, then removes only the names it actually commanded so a
+# concurrent dashboard write is never clobbered.
+
+def _load_self_destructs_unlocked() -> set[str]:
+    """Read pending self-destruct display names from the shared file."""
+    if not SELF_DESTRUCT_PATH.exists():
+        return set()
+    try:
+        data = json.loads(SELF_DESTRUCT_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    units = data.get("units") if isinstance(data, dict) else None
+    if not isinstance(units, list):
+        return set()
+    return {name for name in units if isinstance(name, str)}
+
+
+def _write_self_destructs_unlocked(names: set[str]) -> None:
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "units": sorted(names),
+    }
+    atomic_write_text(SELF_DESTRUCT_PATH, json.dumps(payload, ensure_ascii=False))
+
+
+def _load_and_prune_self_destructs(alive_names: set[str]) -> set[str]:
+    """Load pending self-destruct names, dropping units already gone.
+
+    Returns the names still alive that the planner should command this Tick.
+    """
+    with file_lock(SELF_DESTRUCT_PATH):
+        pending = _load_self_destructs_unlocked()
+        remaining = {n for n in pending if n in alive_names}
+        if remaining != pending:
+            _write_self_destructs_unlocked(remaining)
+        return remaining
+
+
+def _remove_self_destructs(names: set[str]) -> None:
+    """Delete specific pending names, preserving any concurrent dashboard writes."""
+    if not names:
+        return
+    try:
+        with file_lock(SELF_DESTRUCT_PATH):
+            pending = _load_self_destructs_unlocked()
+            before = len(pending)
+            pending.difference_update(names)
+            if len(pending) != before:
+                _write_self_destructs_unlocked(pending)
+    except Exception:
+        pass
+
+
 
 def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
     """Accumulate permanent obstacles. Returns full known obstacle set."""
@@ -3093,6 +3151,10 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     }
     waypoints = _load_and_prune_waypoints(alive_names)
 
+    # Manual per-unit self-destruct commands set from the dashboard. Commands
+    # for units still alive are issued in the unit loop below, then removed.
+    self_destructs = _load_and_prune_self_destructs(alive_names)
+
     # ── Cleanup dead-unit bookkeeping ──────────────────────────────────
     alive_ids: set[str] = set()
     for w in turn.workers:
@@ -3362,8 +3424,17 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             spawn_cost = UNIT_SPAWN_COSTS.get(spawn_type, 0)
         heal_budget -= spawn_cost
 
+    commanded_self_destructs: set[str] = set()
     for unit in turn.units:
         uid = str(unit.id)[:8]
+        name = _object_name(unit.id, _UNIT_NAME_PREFIX.get(unit.unit_type, "U"))
+        # Dashboard 自裁 command: remove the unit before any other action this
+        # Tick (Worker cargo drops on its final cell).
+        if name in self_destructs:
+            unit.self_destruct()
+            unit_actions_detail[uid] = "SELF_DESTRUCT:manual"
+            commanded_self_destructs.add(name)
+            continue
         # Post-combat healing: a damaged Unit on the Core cell with a stationary
         # Core spends its whole action recovering HP (1 resource / 1 HP).
         if _unit_needs_heal(
@@ -3378,7 +3449,6 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             continue
         # Manual per-unit waypoint: march to the configured coordinate, then
         # resume the normal planner once it is reached.
-        name = _object_name(unit.id, _UNIT_NAME_PREFIX.get(unit.unit_type, "U"))
         wp = waypoints.get(name)
         if wp is not None:
             action, detail = _plan_waypoint(
@@ -3405,8 +3475,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             )
             unit_actions_detail[uid] = f"{action}:{detail}"
         elif unit.unit_type == UnitType.VANGUARD:
-            unit_name = _object_name(unit.id, "V")
-            team = _combat_team_for(unit_name, config)
+            team = _combat_team_for(name, config)
             action, detail = _plan_vanguard(
                 unit,
                 enemies,
@@ -3417,8 +3486,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             )
             unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
         elif unit.unit_type == UnitType.RANGER:
-            unit_name = _object_name(unit.id, "R")
-            team = _combat_team_for(unit_name, config)
+            team = _combat_team_for(name, config)
             action, detail = _plan_ranger(
                 unit,
                 enemies,
@@ -3428,6 +3496,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 team=team,
             )
             unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
+
+    # Ack the dashboard's 自裁 commands we just issued; concurrent new commands
+    # added while planning stay pending for the next Tick.
+    if commanded_self_destructs:
+        _remove_self_destructs(commanded_self_destructs)
 
     return core_action_name, unit_actions_detail
 

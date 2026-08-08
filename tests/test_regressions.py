@@ -3127,6 +3127,122 @@ class DashboardWaypointTests(unittest.TestCase):
         self.assertEqual(len(saved), 24)
 
 
+class ManualSelfDestructTests(unittest.TestCase):
+    """Dashboard「自裁」commands consumed by the tactic each Tick."""
+
+    def test_load_and_prune_drops_dead_units(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "self_destruct.json"
+            with patch.object(tactic, "SELF_DESTRUCT_PATH", path):
+                tactic._write_self_destructs_unlocked({"W1", "V2", "R3"})
+                pending = tactic._load_and_prune_self_destructs({"W1", "R3"})
+                persisted = tactic._load_self_destructs_unlocked()
+
+        self.assertEqual(pending, {"W1", "R3"})
+        self.assertEqual(persisted, {"W1", "R3"})
+
+    def test_load_and_prune_preserves_all_alive_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "self_destruct.json"
+            with patch.object(tactic, "SELF_DESTRUCT_PATH", path):
+                tactic._write_self_destructs_unlocked({"W1", "V2"})
+                pending = tactic._load_and_prune_self_destructs({"W1", "V2"})
+
+        self.assertEqual(pending, {"W1", "V2"})
+
+    def test_remove_self_destructs_preserves_concurrent_adds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "self_destruct.json"
+            with patch.object(tactic, "SELF_DESTRUCT_PATH", path):
+                tactic._write_self_destructs_unlocked({"W1", "V2"})
+                # A dashboard write lands after the tactic's read.
+                tactic._write_self_destructs_unlocked({"W1", "V2", "W9"})
+                tactic._remove_self_destructs({"W1", "V2"})
+                persisted = tactic._load_self_destructs_unlocked()
+
+        self.assertEqual(persisted, {"W9"})
+
+    def test_dashboard_request_flows_into_tactic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sd_file = Path(temp_dir) / "self_destruct.json"
+            with patch.object(dashboard, "SELF_DESTRUCT_FILE", str(sd_file)), \
+                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")), \
+                 patch.object(tactic, "SELF_DESTRUCT_PATH", sd_file):
+                self.assertTrue(dashboard.request_self_destruct("W1")["ok"])
+                pending = tactic._load_and_prune_self_destructs({"W1"})
+
+        self.assertEqual(pending, {"W1"})
+
+
+class DashboardSelfDestructTests(unittest.TestCase):
+    def test_request_roundtrip_and_idempotency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sd_file = Path(temp_dir) / "self_destruct.json"
+            with patch.object(dashboard, "SELF_DESTRUCT_FILE", str(sd_file)), \
+                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")):
+                self.assertTrue(dashboard.request_self_destruct("W3")["ok"])
+                self.assertTrue(dashboard.request_self_destruct("W3")["ok"])
+                self.assertTrue(dashboard.request_self_destruct("v2")["ok"])
+                pending = dashboard._read_self_destruct_file()
+
+        self.assertEqual(pending, {"W3", "V2"})
+
+    def test_invalid_name_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sd_file = Path(temp_dir) / "self_destruct.json"
+            with patch.object(dashboard, "SELF_DESTRUCT_FILE", str(sd_file)):
+                with self.assertRaises(ValueError):
+                    dashboard.request_self_destruct('<img onerror=alert(1)>')
+                with self.assertRaises(ValueError):
+                    dashboard.request_self_destruct("not-a-unit")
+
+    def test_unit_cards_render_self_destruct_button(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "tactic_log.jsonl"
+            rec = {
+                "tick": 1,
+                "plan_unit_actions": {
+                    "aaaaaaaa": "HARVEST",
+                    "bbbbbbbb": "MOVE",
+                    "cccccccc": "MOVE",
+                },
+                "workers": [{
+                    "id": "aaaaaaaa", "name": "W1", "pos": [0, 0],
+                    "target": [2, 0], "path": [[0, 0], [1, 0], [2, 0]],
+                    "path_complete": True, "cargo": 0, "hp": 3,
+                }],
+                "vanguards": [{"id": "bbbbbbbb", "name": "V1", "pos": [1, 1], "hp": 5}],
+                "rangers": [{"id": "cccccccc", "name": "R1", "pos": [2, 2], "hp": 5}],
+                "resources": 0,
+                "resource_capacity": 50,
+                "visible_enemies": 0,
+                "resource_cells": [],
+                "core_pos": [0, 0],
+                "core_name": "C1",
+            }
+            log_path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+            game_stats_path = Path(temp_dir) / "game_stats.json"
+            config_path = Path(temp_dir) / "tactic_config.json"
+            with patch.object(dashboard, "LOG_FILE", str(log_path)), \
+                 patch.object(dashboard, "MAP_FILE", str(Path(temp_dir) / "map_memory.json")), \
+                 patch.object(dashboard, "WAYPOINTS_FILE", str(Path(temp_dir) / "waypoints.json")), \
+                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")), \
+                 patch.object(game_stats, "STATS_PATH", game_stats_path), \
+                 patch.object(tactic_config, "CONFIG_PATH", config_path):
+                parts = dashboard.build_parts()
+
+        self.assertIsNotNone(parts)
+        for unit_name in ("W1", "V1", "R1"):
+            self.assertIn(
+                f'data-sd-unit="{unit_name}"',
+                parts["workersHtml"] + parts["vgHtml"] + parts["rgHtml"],
+                f"{unit_name} card should carry a 自裁 button",
+            )
+        self.assertIn('class="sd-btn"', parts["workersHtml"])
+        self.assertIn('class="sd-btn"', parts["vgHtml"])
+        self.assertIn('class="sd-btn"', parts["rgHtml"])
+
+
 class EnemySightingsMemoryTests(unittest.TestCase):
     """Stale enemy sightings are removed only when a friendly unit can
     actually see the cell (its own vision radius + unobstructed line of

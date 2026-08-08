@@ -35,6 +35,7 @@ def _data_path(name: str) -> str:
 LOG_FILE = _data_path("tactic_log.jsonl")
 MAP_FILE = _data_path("map_memory.json")
 WAYPOINTS_FILE = _data_path("waypoints.json")
+SELF_DESTRUCT_FILE = _data_path("self_destruct.json")
 BATTLE_LOG_FILE = _data_path("battle_log.jsonl")
 HOST = "0.0.0.0"
 PORT = 4399
@@ -495,6 +496,50 @@ def clear_waypoints() -> dict:
         "targets": {},
     })
     return {"ok": True, "cleared": True, "waypoint_count": 0}
+
+
+# ── manual per-unit self-destruct (「自裁」command, shared with the tactic) ──
+# The dashboard appends display names here; the tactic process reads the file
+# each Tick, issues SELF_DESTRUCT for units that are still alive, then prunes
+# the names. Same cross-process lock discipline as waypoints.json.
+
+def _read_self_destruct_file() -> set[str]:
+    try:
+        with open(SELF_DESTRUCT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return set()
+    units = data.get("units") if isinstance(data, dict) else None
+    if not isinstance(units, list):
+        return set()
+    out: set[str] = set()
+    for name in units:
+        if isinstance(name, str) and _WAYPOINT_NAME_RE.fullmatch(name.upper()):
+            out.add(name.upper())
+    return out
+
+
+def _write_self_destruct_file(units: set[str]) -> None:
+    atomic_write_text(SELF_DESTRUCT_FILE, json.dumps({
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "units": sorted(units),
+    }, ensure_ascii=False))
+
+
+def request_self_destruct(name: str) -> dict:
+    """Queue a per-unit self-destruct command (display-name keyed)."""
+    name = _waypoint_name(name)
+    with file_lock(SELF_DESTRUCT_FILE):
+        units = _read_self_destruct_file()
+        units.add(name)
+        _write_self_destruct_file(units)
+    append_jsonl(BATTLE_LOG_FILE, [{
+        "tick": None,
+        "ts": time.time(),
+        "cat": "config",
+        "msg": f"自裁指令：{name}",
+    }])
+    return {"ok": True, "name": name, "pending": len(units)}
 
 
 TEAM_BOARD_KEYS = ("unassigned", "home", "attack", "guerrilla")
@@ -1303,6 +1348,12 @@ body{margin:0;min-height:100vh;color:var(--text);
 .badge.explore{background:rgba(179,140,255,.15);color:#d0b8ff}
 .badge.combat{background:rgba(255,107,157,.15);color:#ff9ec0}
 .badge.move,.badge.other{background:rgba(110,168,255,.12);color:#a9c8ff}
+.unit-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+.sd-btn{appearance:none;border:1px solid rgba(255,107,107,.35);background:rgba(255,80,80,.12);color:#ff9b9b;
+ width:18px;height:18px;border-radius:50%;font-size:10px;line-height:1;padding:0;cursor:pointer;
+ display:grid;place-items:center;opacity:0;transition:opacity .12s,background .12s,border-color .12s}
+.unit:hover .sd-btn{opacity:1}
+.sd-btn:hover{background:rgba(255,80,80,.42);color:#fff;border-color:rgba(255,120,120,.65)}
 .unit-facts{display:flex;align-items:center;gap:7px;min-width:0;margin-top:5px;color:var(--muted);font-size:10px;line-height:1.35}
 .unit-locator{min-width:0;flex:1;color:#c8d4eb;font:10.5px Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .unit-locator .arrow{padding:0 3px;color:rgb(var(--unit-tone))}
@@ -3163,6 +3214,28 @@ JS = r"""
   bindMapFilters();
   bindLogFilters();
   bindUnitTabs();
+  // ── per-unit 自裁 (self-destruct) buttons ─────────────────────────────
+  // Cards are re-rendered on every soft refresh, so bind once on the document
+  // and delegate by class.
+  document.addEventListener('click', function(e){
+    const el = e.target;
+    if(!(el instanceof Element)) return;
+    const btn = el.closest ? el.closest('.sd-btn') : null;
+    if(!btn) return;
+    const name = btn.getAttribute('data-sd-unit');
+    if(!name) return;
+    if(!confirm('确认自裁 ' + name + '？该单位将被立即移除，无法撤销。')) return;
+    fetch('/api/unit/self_destruct', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name:name})
+    })
+    .then(function(res){ return res.json(); })
+    .then(function(data){
+      if(data && data.ok){ lastTick = null; softRefresh(); }
+    })
+    .catch(function(){});
+  });
   bindTrends();
   loadTeams(true);
   ensureView();
@@ -3259,7 +3332,9 @@ def build_parts():
         return (
             f'<div class="unit {kind}" title="{safe_act}"><div class="unit-top">'
             f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
-            f'<span class="badge {kind}">{html.escape(str(badge))}</span></div>'
+            f'<span class="unit-actions"><span class="badge {kind}">{html.escape(str(badge))}</span>'
+            f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '
+            f'aria-label="自裁 {safe_name}" title="自裁">✕</button></span></div>'
             f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(w.get("pos"))}'
             f'<span class="arrow">→</span>{fmt_pos(target)}</span>'
             f'<span class="unit-fact">{vitals}</span><span class="unit-fact">{route_text}</span>{history_text}</div></div>'
@@ -3302,7 +3377,9 @@ def build_parts():
         return (
             f'<div class="unit {color_cls}" title="{safe_act}"><div class="unit-top">'
             f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
-            f'<span class="badge {color_cls}">{label}</span></div>'
+            f'<span class="unit-actions"><span class="badge {color_cls}">{label}</span>'
+            f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '
+            f'aria-label="自裁 {safe_name}" title="自裁">✕</button></span></div>'
             f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(u.get("pos"))}</span>'
             f'<span class="unit-fact">HP {u.get("hp","?")}</span>{stat_line}</div></div>'
         )
@@ -4041,6 +4118,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/waypoint/clear":
             self._send_json(200, clear_waypoints())
+            return
+
+        if path == "/api/unit/self_destruct":
+            try:
+                name = _waypoint_name(data.get("name"))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            result = request_self_destruct(name)
+            self._send_json(200 if result.get("ok") else 400, result)
             return
 
         try:
