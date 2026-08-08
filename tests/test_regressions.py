@@ -1364,6 +1364,124 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertIn("guerrilla-retreat", detail)
         self.assertEqual(unit.action, "MOVE")
 
+    def _setup_attack_retreat(self, squad_pos, squad_size, forbidden=frozenset(),
+                              cluster_centroid=None):
+        tactic.turn_context.attack_squad_pos = squad_pos
+        tactic.turn_context.attack_squad_size = squad_size
+        tactic.turn_context.attack_retreat = True
+        tactic.turn_context.attack_retreat_from = cluster_centroid
+        tactic.turn_context.attack_forbidden_targets = forbidden
+
+    def tearDown_attack_retreat(self):
+        tactic.turn_context.attack_squad_pos = None
+        tactic.turn_context.attack_squad_size = 0
+        tactic.turn_context.attack_retreat = False
+        tactic.turn_context.attack_retreat_from = None
+        tactic.turn_context.attack_forbidden_targets = frozenset()
+
+    def test_attack_retreat_when_outnumbered(self) -> None:
+        # 1 squad member vs 2 enemy combat units within radius: enemy >= squad
+        # => retreat away from the cluster centroid, never engage.
+        tactic._enemy_memory.update({(11, 10)})
+        self._setup_attack_retreat(
+            squad_pos=(10, 10), squad_size=1,
+            cluster_centroid=(12, 10), forbidden=frozenset({(11, 10)}),
+        )
+        # retreat decision helper: 2 threats within radius vs 1 squad member.
+        decision = tactic._attack_retreat_decision(
+            enemies=(self.Enemy((12, 10)), self.Enemy((13, 10))),
+            squad_pos=(10, 10), squad_size=1, radius=5,
+            enemy_memory={(11, 10)},
+        )
+        self.assertTrue(decision[0])  # retreat=True
+        self.assertEqual(decision[1], 2)  # 2 nearby threats
+        try:
+            unit = self.CombatUnit("v-attack", (10, 10))
+            self.config["attack_mode"] = "auto"
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(self.Enemy((12, 10)), self.Enemy((13, 10))),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(10, 10),
+                team="attack",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-retreat", detail)
+            # Must move away from the cluster at x=12 (i.e. LEFT/negative x).
+            self.assertEqual(unit.arg.name, "LEFT")
+        finally:
+            tactic._enemy_memory.discard((11, 10))
+            self.tearDown_attack_retreat()
+
+    def test_attack_retreat_forbidden_targets_skipped_in_autotarget(self) -> None:
+        # The retreating squad's auto scorer must skip the forbidden cluster cell
+        # and march on the next-best sighting instead.
+        tactic._enemy_memory.update({(9, 0), (50, 50)})
+        self._setup_attack_retreat(
+            squad_pos=(10, 0), squad_size=1,
+            cluster_centroid=(9, 0), forbidden=frozenset({(9, 0)}),
+        )
+        try:
+            unit = self.CombatUnit("r-attack", (10, 0))
+            self.config["attack_mode"] = "auto"
+            action, detail = tactic._plan_ranger(
+                unit,
+                enemies=(),  # hit only the target-selection path here
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-march-auto (50, 50)", detail)
+        finally:
+            tactic._enemy_memory.discard((9, 0))
+            tactic._enemy_memory.discard((50, 50))
+            self.tearDown_attack_retreat()
+
+    def test_attack_no_retreat_when_enemy_count_below_squad(self) -> None:
+        # 2 squad members, only 1 nearby enemy threat => not outnumbered.
+        decision = tactic._attack_retreat_decision(
+            enemies=(self.Enemy((12, 10)),),
+            squad_pos=(10, 10), squad_size=2, radius=5,
+            enemy_memory={(12, 10)},
+        )
+        self.assertFalse(decision[0])
+        self.assertEqual(decision[1], 1)
+
+    def test_attack_retreat_ignores_enemy_workers(self) -> None:
+        # 1 squad member, 1 enemy Vanguard + 3 enemy Workers within radius.
+        # Workers can't attack, so only 1 combat threat vs 1 squad => not >,
+        # and equal counts *do* retreat, but with only threats counted the
+        # nearby combat count is 1 == squad 1 => retreat fires on the 1 threat.
+        enemies = (
+            self.Enemy((12, 10)),  # VANGUARD threat
+            self.Enemy((11, 10)), self.Enemy((13, 10)), self.Enemy((10, 11)),
+        )
+        for e in enemies[1:]:
+            e.unit_type = UnitType.WORKER
+        decision = tactic._attack_retreat_decision(
+            enemies=enemies,
+            squad_pos=(10, 10), squad_size=1, radius=5,
+            enemy_memory={(12, 10)},
+        )
+        self.assertTrue(decision[0])
+        self.assertEqual(decision[1], 1)  # only the VANGUARD counts
+        # Forbidden set is built from the threat cell only.
+        self.assertIn((12, 10), decision[3])
+        for w in ((11, 10), (13, 10), (10, 11)):
+            self.assertNotIn(w, decision[3])
+
+    def test_attack_retreat_radius_zero_disables(self) -> None:
+        decision = tactic._attack_retreat_decision(
+            enemies=(self.Enemy((10, 10)), self.Enemy((10, 11))),
+            squad_pos=(10, 10), squad_size=1, radius=0,
+            enemy_memory={(10, 10)},
+        )
+        self.assertFalse(decision[0])
+        self.assertEqual(decision[1], 0)
+
     def test_guerrilla_engages_single_enemy(self) -> None:
         unit = self.CombatUnit("v-g2", (0, 0))
         enemy = self.Enemy((1, 0))

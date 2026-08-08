@@ -97,6 +97,12 @@ def _manhattan(a: tuple[int, int], b: tuple[int, int]) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
 
+def _chebyshev(a: tuple[int, int], b: tuple[int, int]) -> int:
+    """Chebyshev (max-norm) distance — the 8-connected step metric used for
+    Ranger range checks and attack-squad engagement radii."""
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
 def _merge_resource_cells(
     visible: Iterable[tuple[int, int]],
     remembered: set[tuple[int, int]],
@@ -819,6 +825,46 @@ def _is_combat_threat(enemy: Any) -> bool:
 def _combat_threats(enemies: tuple | list) -> tuple:
     """Filter visible enemies down to units/cores that can actually attack."""
     return tuple(e for e in enemies if _is_combat_threat(e))
+
+
+def _attack_retreat_decision(
+    enemies: tuple,
+    squad_pos: tuple[int, int] | None,
+    squad_size: int,
+    radius: int,
+    enemy_memory: set[tuple[int, int]],
+) -> tuple[bool, int, tuple[int, int] | None, frozenset[tuple[int, int]]]:
+    """Decide whether the attack squad is outmatched and should disengage.
+
+    Auto-attack engagement policy: if the enemy combat units within ``radius``
+    (Chebyshev) of the squad centroid are at least as numerous as the squad
+    itself, the squad retreats away from that cluster and re-targets. ``radius``
+    of 0 disables the check. Returns a ``(retreat, enemy_count, cluster_centroid,
+    forbidden_targets)`` tuple; ``forbidden_targets`` covers enemy-memory sightings
+    inside the cluster's footprint so the auto target scorer skips the cluster
+    and marches on the next-best sighting instead.
+    """
+    forbidden: frozenset[tuple[int, int]] = frozenset()
+    if radius <= 0 or squad_pos is None or squad_size <= 0 or not enemies:
+        return False, 0, None, forbidden
+
+    threats = [e for e in enemies if _is_combat_threat(e)]
+    nearby = [
+        e for e in threats if _chebyshev(tuple(e.position), squad_pos) <= radius
+    ]
+    if len(nearby) < squad_size:
+        return False, len(nearby), None, forbidden
+
+    # outnumbered (or tied): disengage and re-target.
+    cluster_cells = [tuple(e.position) for e in nearby]
+    cx = round(sum(x for x, _ in cluster_cells) / len(cluster_cells))
+    cy = round(sum(y for _, y in cluster_cells) / len(cluster_cells))
+    forbidden = frozenset(
+        p
+        for p in enemy_memory
+        if any(_chebyshev(p, c) <= radius for c in cluster_cells)
+    )
+    return True, len(nearby), (cx, cy), forbidden
 
 
 def _worker_flee(
@@ -2098,6 +2144,14 @@ def _plan_attack_combat(
     pos = tuple(unit.position)
 
     mode = str(config.get("attack_mode", "coords"))
+    # Squad-wide outnumbered-retreat verdict (set once per Tick in
+    # choose_actions from the full enemy view + squad centroid). In auto mode a
+    # True verdict short-circuits all engagement: the squad disengages away from
+    # the enemy cluster and the auto scorer re-targets past the forbidden cells.
+    retreat = bool(getattr(turn_context, "attack_retreat", False))
+    forbidden = getattr(turn_context, "attack_forbidden_targets", frozenset())
+    cluster_centroid = getattr(turn_context, "attack_retreat_from", None)
+
     if mode == "beacon":
         beacon_pos = getattr(turn_context, "beacon_pos", None)
         target = beacon_pos or (int(config["attack_target_x"]), int(config["attack_target_y"]))
@@ -2109,15 +2163,48 @@ def _plan_attack_combat(
         # squad is empty, fall back to the unit's own position.
         core_pos = getattr(turn_context, "core_pos", None)
         squad_pos = getattr(turn_context, "attack_squad_pos", None) or pos
-        if core_pos is None:
-            target = min(_enemy_memory, key=lambda p: _manhattan(p, squad_pos))
+        candidates = set(_enemy_memory) - set(forbidden)
+        if not candidates:
+            # Everything in memory is part of the outnumbering cluster (or
+            # memory only holds the cluster): regroup toward the home coords
+            # instead of charging back into the losing fight.
+            target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
+        elif core_pos is None:
+            target = min(candidates, key=lambda p: _manhattan(p, squad_pos))
         else:
             target = min(
-                _enemy_memory,
+                candidates,
                 key=lambda p: _manhattan(p, core_pos) + _manhattan(p, squad_pos),
             )
     else:
         target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
+
+    # Outnumbered-retreat policy (auto mode only): disengage away from the
+    # enemy cluster centroid and re-target. This deliberately overrides the
+    # adjacent-sweep / best-shot / engage steps so a losing fight is never
+    # traded into — the squad sheds contact first, then re-picks a target.
+    if retreat and enemies and cluster_centroid is not None:
+        squad_pos = getattr(turn_context, "attack_squad_pos", None) or pos
+        flee_dx = squad_pos[0] - cluster_centroid[0]
+        flee_dy = squad_pos[1] - cluster_centroid[1]
+        if flee_dx == 0 and flee_dy == 0:
+            direction = (
+                Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT
+            )[hash(str(unit.id)) % 4]
+        else:
+            direction = _cardinal_toward_delta(
+                1 if flee_dx > 0 else (-1 if flee_dx < 0 else 0),
+                1 if flee_dy > 0 else (-1 if flee_dy < 0 else 0),
+            )
+        if direction is not None and _try_move(unit, direction, pos, obstacle_cells):
+            return ("MOVE", f"{direction.name} attack-retreat n={len(enemies)}")
+        for fallback in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+            if direction is not None and fallback == direction:
+                continue
+            if _try_move(unit, fallback, pos, obstacle_cells):
+                return ("MOVE", f"{fallback.name} attack-retreat n={len(enemies)}")
+        unit.wait()
+        return ("WAIT", f"attack-retreat-blocked n={len(enemies)}")
 
     if unit_kind == "vanguard":
         sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
@@ -3075,6 +3162,10 @@ turn_context = type(
         "beacon_pos": None,
         "core_pos": None,
         "attack_squad_pos": None,
+        "attack_squad_size": 0,
+        "attack_retreat": False,
+        "attack_retreat_from": None,
+        "attack_forbidden_targets": frozenset(),
         "shot_predictions": [],
         "shot_prediction_results": [],
     },
@@ -3333,6 +3424,32 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         )
     else:
         turn_context.attack_squad_pos = None
+
+    # Squad-wide auto-attack retreat decision (computed once per Tick so every
+    # attack-team member acts on the same verdict). In auto mode, when the
+    # enemy combat units within attack_retreat_radius are at least as numerous
+    # as the squad, the whole team disengages and re-targets (see
+    # _plan_attack_combat). radius == 0 disables the policy.
+    retreat_radius = int(config.get("attack_retreat_radius", 5))
+    squad_size = len(squad_cells)
+    turn_context.attack_squad_size = squad_size
+    retreat, enemy_count, cluster_centroid, forbidden = _attack_retreat_decision(
+        enemies,
+        turn_context.attack_squad_pos,
+        squad_size,
+        retreat_radius,
+        _enemy_memory,
+    )
+    # Only the auto mode honors the outnumbered-retreat policy; beacon/coords
+    # mode march on a fixed destination and don't re-target from memory.
+    if retreat and str(config.get("attack_mode", "coords")) == "auto":
+        turn_context.attack_retreat = True
+        turn_context.attack_retreat_from = cluster_centroid
+        turn_context.attack_forbidden_targets = forbidden
+    else:
+        turn_context.attack_retreat = False
+        turn_context.attack_retreat_from = None
+        turn_context.attack_forbidden_targets = frozenset()
 
     beacon_on_ground_here = beacon.status == "GROUND" and beacon.position == core_pos
     beacon_carried_by_core = beacon.status == "CARRIED" and beacon.carrier_id == core.id

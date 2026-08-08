@@ -601,6 +601,7 @@ TEAM_SETTING_FIELDS = (
     "attack_target_y",
     "attack_mode",
     "ranger_attack_range",
+    "attack_retreat_radius",
 )
 STRATEGY_CONFIG_FIELDS = tuple(
     key
@@ -862,6 +863,10 @@ def render_teams_panel() -> str:
             for n in (1, 2, 3)
         )
         + '</select></label>'
+        '<label>遇敌撤退半径'
+        f'<input id="teamRetreatRadius" name="attack_retreat_radius" type="number" min="0" max="30" '
+        f'step="1" value="{config["attack_retreat_radius"]}"'
+        ' title="自动进攻时，进攻半径内敌方战斗单位数≥本队则撤退另寻目标（0=关闭）"></label>'
         '<div class="team-mode">'
         '<span class="team-mode-title">进攻方式</span>'
         '<div class="team-mode-opts">'
@@ -2796,7 +2801,8 @@ JS = r"""
       attack_target_x: Number((document.getElementById('teamAttackX') || {}).value || 0),
       attack_target_y: Number((document.getElementById('teamAttackY') || {}).value || 0),
       attack_mode: (modeEl && modeEl.value) || 'coords',
-      ranger_attack_range: Number((document.getElementById('teamRangerRange') || {}).value || 3)
+      ranger_attack_range: Number((document.getElementById('teamRangerRange') || {}).value || 3),
+      attack_retreat_radius: Number((document.getElementById('teamRetreatRadius') || {}).value || 5)
     };
   }
 
@@ -2817,7 +2823,8 @@ JS = r"""
       home_patrol_radius: 'teamHomeRadius',
       attack_target_x: 'teamAttackX',
       attack_target_y: 'teamAttackY',
-      ranger_attack_range: 'teamRangerRange'
+      ranger_attack_range: 'teamRangerRange',
+      attack_retreat_radius: 'teamRetreatRadius'
     };
     Object.keys(map).forEach(function(key){
       const el = document.getElementById(map[key]);
@@ -2856,7 +2863,8 @@ JS = r"""
       attack_target_x: settings.attack_target_x,
       attack_target_y: settings.attack_target_y,
       attack_mode: settings.attack_mode,
-      ranger_attack_range: settings.ranger_attack_range
+      ranger_attack_range: settings.ranger_attack_range,
+      attack_retreat_radius: settings.attack_retreat_radius
     };
   }
 
@@ -2991,7 +2999,7 @@ JS = r"""
         moveUnitToTeam(name, team);
       });
     });
-    ['teamHomeRadius','teamAttackX','teamAttackY','teamRangerRange'].forEach(function(id){
+    ['teamHomeRadius','teamAttackX','teamAttackY','teamRangerRange','teamRetreatRadius'].forEach(function(id){
       const el = document.getElementById(id);
       if(!el) return;
       el.addEventListener('change', function(){
