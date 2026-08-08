@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import tempfile
 import threading
 import unittest
@@ -1441,6 +1442,47 @@ class DashboardLogTests(unittest.TestCase):
         for name in ("C1", "W1", "V1", "R1", "E1"):
             self.assertIn(f">{name}</text>", svg)
 
+    def test_svg_route_is_trimmed_to_unwalked_remainder(self) -> None:
+        """Routes only draw the segment ahead of the unit, not the ground it
+        has already crossed. A unit mid-path must not re-render the cells it
+        already walked through."""
+        rec = {
+            "core_pos": [0, 0],
+            "core_name": "C1",
+            "workers": [{
+                "name": "W1", "pos": [1, 0],
+                "target": [3, 0],
+                "path": [[0, 0], [1, 0], [2, 0], [3, 0]],
+                "path_complete": True,
+            }],
+            "vanguards": [], "rangers": [], "enemies": [],
+            "resource_cells": [],
+        }
+        memory = {"obstacles": [], "resources": []}
+        svg = dashboard.render_svg(rec, memory)
+
+        m = re.search(
+            r'<polyline class="worker-route"[^>]*points="([^"]+)"', svg
+        )
+        self.assertIsNotNone(m, "worker route polyline should be drawn")
+        points = m.group(1).split()
+
+        # Decode the polyline back to grid cells via the SVG's own viewport
+        # attributes, so this does not depend on cell/pad/min-map-size internals.
+        xmin = int(re.search(r'data-xmin="(-?\d+)"', svg).group(1))
+        ymin = int(re.search(r'data-ymin="(-?\d+)"', svg).group(1))
+        cell = int(re.search(r'data-cell="(\d+)"', svg).group(1))
+        pad = int(re.search(r'data-pad="(\d+)"', svg).group(1))
+
+        def center(gx: int, gy: int) -> str:
+            return (f"{pad + (gx - xmin) * cell + cell / 2:.1f},"
+                    f"{pad + (gy - ymin) * cell + cell / 2:.1f}")
+
+        # Trimmed polyline starts at the unit's current cell (1,0) and never
+        # re-draws the already-walked origin (0,0).
+        self.assertEqual(points[0], center(1, 0))
+        self.assertNotIn(center(0, 0), points)
+
     def test_svg_elements_are_tagged_for_map_filters(self) -> None:
         """Every drawable category carries a data-cat so legend toggles can
         show/hide it client-side."""
@@ -1449,7 +1491,7 @@ class DashboardLogTests(unittest.TestCase):
             "core_name": "C1",
             "beacon_pos": [1, 1],
             "workers": [{
-                "name": "W1", "pos": [2, 0], "cargo": 0,
+                "name": "W1", "pos": [1, 0], "cargo": 0,
                 "path": [[0, 0], [1, 0], [2, 0]], "path_complete": True,
                 "target": [2, 0],
             }],

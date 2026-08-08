@@ -1037,6 +1037,29 @@ def check_stuck(history):
 
 # ---------- SVG map -------------------------------------------------------
 
+def _remaining_path(unit_data: dict) -> list:
+    """Return the planned route minus the cells the unit has already walked.
+
+    The planner re-emits the full A* polyline every tick while a unit advances
+    along a cached path, so the log record's ``path`` is stale — it still
+    contains the origin the unit started from. Trim everything up to and
+    including the unit's current cell so the map and step counts only show the
+    route that is actually still ahead.
+    """
+    path = []
+    for p in (unit_data.get("path") or []):
+        if len(p) == 2:
+            path.append([int(p[0]), int(p[1])])
+    cur = unit_data.get("pos") or []
+    if len(cur) == 2 and len(path) > 1:
+        try:
+            start = path.index([int(cur[0]), int(cur[1])])
+        except ValueError:
+            return path
+        return path[start:]
+    return path
+
+
 def _collect_points(rec, mm):
     pts = []
     c = rec.get("core_pos")
@@ -1197,7 +1220,10 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
     )
 
     def _draw_route(unit_data, name, color, css_class=""):
-        path = [p for p in (unit_data.get("path") or []) if len(p) == 2]
+        # Trim the already-walked segment: the planner logs the full A* polyline
+        # every tick while a unit advances along it, so without this the map
+        # keeps showing ground the unit has already crossed.
+        path = _remaining_path(unit_data)
         target = unit_data.get("target") or []
         if len(path) > 1:
             route_points = []
@@ -3384,7 +3410,7 @@ def build_parts():
         cargo = w.get("cargo", 0)
         kind = action_kind(act, cargo)
         badge = action_label(act, cargo)
-        path = w.get("path") or []
+        path = _remaining_path(w)
         target = w.get("target")
         steps = max(0, len(path) - 1)
         route_text = f"{steps}步" if w.get("path_complete") else f"规划{steps}步"
