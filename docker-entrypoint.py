@@ -16,6 +16,14 @@ RUNTIME_DIR = Path(os.environ.get("ARENA_DATA_DIR", "/app/runtime")).resolve()
 tactic_proc: subprocess.Popen[bytes] | None = None
 tactic_log = None
 
+# tactic.py exits with this code when it detects a permanently desynced game
+# session (a run of 409 TICK_MISMATCH rejects). It is the signal to restart the
+# whole container rather than restarting tactic in place, which does not resync.
+STALE_SESSION_EXIT = 3
+# Clean gap (seconds) with no game connection before the container restarts, so
+# the server has time to reset the player's command baseline.
+STALE_SESSION_COOLDOWN = 60
+
 
 def prepare_runtime() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,8 +105,29 @@ def main() -> int:
             stop_tactic()
             return code
         if tactic_proc is not None and tactic_proc.poll() is not None:
+            code = tactic_proc.returncode
+            if code == STALE_SESSION_EXIT:
+                # tactic.py detected a permanently desynced game session (sustained
+                # 409 TICK_MISMATCH). Restarting tactic in place does NOT recover —
+                # only a fresh container (all connections closed) resyncs the
+                # server baseline. Stop the dashboard, wait out a clean gap so the
+                # server resets, then exit so docker's restart policy relaunches
+                # the whole container.
+                print(
+                    f"[entrypoint] tactic exited code={code} (desynced session); "
+                    f"waiting {STALE_SESSION_COOLDOWN}s then container restart",
+                    flush=True,
+                )
+                stop_tactic()
+                dashboard.terminate()
+                try:
+                    dashboard.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    dashboard.kill()
+                time.sleep(STALE_SESSION_COOLDOWN)
+                return code
             print(
-                f"[entrypoint] tactic exited code={tactic_proc.returncode}; restarting",
+                f"[entrypoint] tactic exited code={code}; restarting",
                 flush=True,
             )
             time.sleep(2)

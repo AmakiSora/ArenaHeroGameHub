@@ -28,7 +28,7 @@ from arena_hero import (
     UnitType,
     unit_cost,
 )
-from arena_hero.errors import ProtocolError, TransportError
+from arena_hero.errors import APIError, ProtocolError, TransportError
 import game_stats
 from state_io import append_jsonl, atomic_write_text, file_lock
 from tactic_config import CONFIG_PATH, load_config, mutate_config
@@ -3522,10 +3522,16 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
     reconnect_delay = 1.0
     max_reconnect_delay = 30.0
     session = 0
+    # Consecutive 409 TICK_MISMATCH rejections = desynced game session. A fresh
+    # connection self-heals within a tick or two; a run well past that never
+    # recovers in-process, so we exit for the entrypoint's container restart.
+    stale_streak = 0
+    max_stale_streak = 5
 
     try:
         while True:
             session += 1
+            stale_streak = 0  # a new connection gets a fresh streak budget
             try:
                 print(f"[tactic] connecting session={session}", flush=True)
                 with ArenaHeroClient(api_key=api_key) as game:
@@ -3543,36 +3549,69 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             continue
                         try:
                             accepted = turn.submit()
-                            _commit_shadow_predictions(accepted.accepted)
-                            latency = (time.monotonic() - tick_start) * 1000
-                            plan_actions: dict[str, str] = {}
-                            for uid, detail in unit_actions.items():
-                                plan_actions[uid] = detail
-                            logger.record_tick(
-                                turn,
-                                core_action=core_action,
-                                unit_actions=plan_actions,
-                                accepted=accepted.accepted,
-                                latency_ms=latency,
-                            )
-                            print(
-                                f"tick={accepted.tick} "
-                                f"core={core_action} "
-                                f"res={turn.resources}/{turn.resource_capacity} "
-                                f"pop={turn.state.population} "
-                                f"workers={len(turn.workers)} "
-                                f"enemies={len(turn.visible_enemies)} "
-                                f"resources_visible={len(turn.resource_cells)} "
-                                f"memory={len(_resource_memory)} "
-                                f"walls={len(_obstacle_memory)}",
-                                flush=True,
-                            )
-                        except Exception as e:
+                        except APIError as e:
+                            # 409 TICK_MISMATCH: the server rejects every tick of
+                            # a desynced session. A fresh connection normally
+                            # self-heals within a tick or two; an unbroken run well
+                            # past that means the session is permanently desynced
+                            # (the SDK's in-place reconnect never recovers — stuck
+                            # for hours on the live server). Exit so the entrypoint
+                            # restarts the container, the only proven recovery.
+                            if e.status_code == 409 and e.error == "TICK_MISMATCH":
+                                stale_streak += 1
+                                print(
+                                    f"tick={turn.tick} submit_error={e} "
+                                    f"(streak={stale_streak}/{max_stale_streak})",
+                                    flush=True,
+                                )
+                                if stale_streak >= max_stale_streak:
+                                    print(
+                                        f"[tactic] {stale_streak} consecutive TICK_MISMATCH; "
+                                        "session desynced, exiting for container restart",
+                                        flush=True,
+                                    )
+                                    raise SystemExit(3) from e
+                                continue
+                            stale_streak = 0
                             print(
                                 f"tick={turn.tick} submit_error={e}\n"
                                 f"{traceback.format_exc()}",
                                 flush=True,
                             )
+                            continue
+                        except Exception as e:
+                            stale_streak = 0
+                            print(
+                                f"tick={turn.tick} submit_error={e}\n"
+                                f"{traceback.format_exc()}",
+                                flush=True,
+                            )
+                            continue
+                        stale_streak = 0
+                        _commit_shadow_predictions(accepted.accepted)
+                        latency = (time.monotonic() - tick_start) * 1000
+                        plan_actions: dict[str, str] = {}
+                        for uid, detail in unit_actions.items():
+                            plan_actions[uid] = detail
+                        logger.record_tick(
+                            turn,
+                            core_action=core_action,
+                            unit_actions=plan_actions,
+                            accepted=accepted.accepted,
+                            latency_ms=latency,
+                        )
+                        print(
+                            f"tick={accepted.tick} "
+                            f"core={core_action} "
+                            f"res={turn.resources}/{turn.resource_capacity} "
+                            f"pop={turn.state.population} "
+                            f"workers={len(turn.workers)} "
+                            f"enemies={len(turn.visible_enemies)} "
+                            f"resources_visible={len(turn.resource_cells)} "
+                            f"memory={len(_resource_memory)} "
+                            f"walls={len(_obstacle_memory)}",
+                            flush=True,
+                        )
             except KeyboardInterrupt:
                 raise
             except (ProtocolError, TransportError, OSError, ConnectionError, TimeoutError) as e:

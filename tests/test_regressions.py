@@ -3578,5 +3578,127 @@ class UnitTabsTests(unittest.TestCase):
         self.assertNotIn('class="unit-action"', self.page)
 
 
+class TickMismatchSelfHealTests(unittest.TestCase):
+    """The bot must self-heal from 409 TICK_MISMATCH instead of stalling forever.
+
+    Regression for production incidents: after a WebSocket keepalive timeout the
+    SDK reconnects in place but the server keeps rejecting every submit with 409
+    TICK_MISMATCH (1200+ rejections over hours). In-place reconnects and
+    tactic-only restarts do NOT recover — only a fresh container (all
+    connections closed) resyncs the server baseline. So a sustained mismatch
+    run must make the tactic exit with STALE_SESSION_EXIT (3) so the entrypoint
+    restarts the container.
+    """
+
+    class _FakeLogger:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def open(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        def record_tick(self, *args, **kwargs) -> None:
+            pass
+
+    class _FakeClient:
+        def __init__(self, turns: list) -> None:
+            self._turns = turns
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc) -> None:
+            return None
+
+        def turns(self):
+            return iter(self._turns)
+
+    @staticmethod
+    def _fake_turn(tick: int, result):
+        turn = SimpleNamespace(
+            tick=tick,
+            resources=0,
+            resource_capacity=10,
+            state=SimpleNamespace(population=1),
+            workers=(),
+            visible_enemies=(),
+            resource_cells=frozenset(),
+        )
+
+        def submit():
+            if result is None:
+                return SimpleNamespace(tick=tick, accepted={})
+            raise result
+
+        turn.submit = submit
+        return turn
+
+    @staticmethod
+    def _mismatch() -> tactic.APIError:
+        return tactic.APIError(status_code=409, error="TICK_MISMATCH")
+
+    def _run_play(self, results) -> int | None:
+        """Run play() over mocked turns; return the SystemExit code or None."""
+        turns = [
+            self._fake_turn(100 + i, r) for i, r in enumerate(results)
+        ]
+        client = self._FakeClient(turns)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with (
+                patch.object(tactic, "ArenaHeroClient", return_value=client),
+                patch.object(tactic, "TacticLogger", self._FakeLogger),
+                patch.object(tactic, "_load_map_memory", lambda: None),
+                patch.object(tactic, "_save_map_memory", lambda force=False: None),
+                patch.object(tactic, "_commit_shadow_predictions", lambda *a, **k: None),
+                patch.object(tactic, "_print_summary", lambda *a, **k: None),
+                patch.object(tactic, "choose_actions", lambda turn: ("WAIT", {})),
+                # Ends the loop when a healthy session winds down normally.
+                patch.object(tactic.time, "sleep", side_effect=SystemExit(9)),
+            ):
+                try:
+                    tactic.play("test-key")
+                except SystemExit as exc:
+                    return exc.code
+        return None
+
+    def test_benign_single_mismatch_does_not_exit(self) -> None:
+        # One mismatch after a fresh connection is normal and self-heals.
+        code = self._run_play([
+            self._mismatch(),
+            None,
+            None,
+        ])
+        self.assertEqual(code, 9)  # loop ended via the sleep sentinel, not exit 3
+
+    def test_warmup_few_mismatches_then_success_does_not_exit(self) -> None:
+        code = self._run_play([
+            self._mismatch(),
+            self._mismatch(),
+            None,
+            None,
+        ])
+        self.assertEqual(code, 9)
+
+    def test_sustained_mismatch_run_exits_for_container_restart(self) -> None:
+        # A run well past the fresh-connection warm-up means the session is
+        # permanently desynced: exit with code 3 so the entrypoint restarts the
+        # container (the only proven recovery).
+        code = self._run_play([self._mismatch() for _ in range(6)])
+        self.assertEqual(code, 3)
+
+    def test_success_resets_the_streak(self) -> None:
+        # 4 mismatches, then a success, then more mismatches: the success resets
+        # the streak, so the run restarts counting and eventually exits — proving
+        # the counter is not a global wall-clock but a consecutive run.
+        results = [self._mismatch() for _ in range(4)]
+        results.append(None)
+        results.extend(self._mismatch() for _ in range(6))
+        code = self._run_play(results)
+        self.assertEqual(code, 3)
+
+
 if __name__ == "__main__":
     unittest.main()
