@@ -786,6 +786,21 @@ def _enemy_unit_type_name(enemy: Any) -> str | None:
     return str(unit_type).upper()
 
 
+def _enemy_type_priority(etype: str | None) -> int:
+    """Rank for resolving which unit type a sighting cell should keep when
+    several enemies share one cell.  The enemy CORE (总部) is permanent and its
+    spawned workers routinely stand on its own cell, so a WORKER seen there must
+    never downgrade the label to a worker scout; CORE is the strongest hint,
+    unknown ENEMY the weakest."""
+    return {
+        "ENEMY": 0,
+        "WORKER": 1,
+        "VANGUARD": 2,
+        "RANGER": 2,
+        "CORE": 3,
+    }.get(str(etype or "").upper(), 0)
+
+
 def _is_combat_threat(enemy: Any) -> bool:
     """True when the visible enemy can deal combat damage.
 
@@ -2864,12 +2879,19 @@ def _update_enemy_sightings(turn) -> None:
 
     # Add new sightings and refresh each position's last-known unit type so the
     # dashboard can still tell a CORE from a worker scout after line of sight is
-    # lost.  Type-less stubs (tests / bare objects) land as "ENEMY".
+    # lost.  Type-less stubs (tests / bare objects) land as "ENEMY".  When
+    # several enemies share a cell (an enemy CORE has workers standing on its
+    # own square), the higher-priority type wins so a worker never overwrites
+    # the HQ label.
     for enemy in visible_enemies:
         pos = tuple(enemy.position)
         if pos not in _enemy_memory:
             _enemy_memory.add(pos)
-        _enemy_memory_types[pos] = _enemy_unit_type_name(enemy) or "ENEMY"
+        new_type = _enemy_unit_type_name(enemy) or "ENEMY"
+        if _enemy_type_priority(new_type) >= _enemy_type_priority(
+            _enemy_memory_types.get(pos)
+        ):
+            _enemy_memory_types[pos] = new_type
 
     # Remove stale sightings: some friendly unit can actually see the cell
     # (within its own vision radius, line of sight unobstructed) but no enemy

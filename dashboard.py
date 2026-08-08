@@ -1282,8 +1282,25 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
         unit(r.get("pos"), "#b38cff", r.get("name") or f"R{index + 1}", glow=True, cat="ranger")
     # Visible enemies are filtered per type (WORKER / VANGUARD / RANGER / CORE)
     # so the legend can show/hide each class independently.  Enemies without a
-    # typed unit_type land in the generic ENEMY category.
-    for index, enemy in enumerate(rec.get("enemies", [])):
+    # typed unit_type land in the generic ENEMY category.  Several enemies can
+    # share one cell — the enemy CORE has its spawned workers standing on the
+    # HQ square — so per cell only the highest-priority unit is drawn; otherwise
+    # a blue worker marker would cover the red enemy-HQ marker at the same spot.
+    _ENEMY_PRIORITY = {"ENEMY": 0, "WORKER": 1, "VANGUARD": 2, "RANGER": 2, "CORE": 3}
+
+    def _enemy_rank(e):
+        return _ENEMY_PRIORITY.get(str(e.get("type") or "ENEMY").upper(), 0)
+
+    drawn_enemy_cells: set[tuple[int, int]] = set()
+    fallback = 1
+    for enemy in sorted(rec.get("enemies", []) or [], key=_enemy_rank, reverse=True):
+        epos = enemy.get("pos") or []
+        if len(epos) != 2:
+            continue
+        ekey = (int(epos[0]), int(epos[1]))
+        if ekey in drawn_enemy_cells:
+            continue
+        drawn_enemy_cells.add(ekey)
         etype = str(enemy.get("type") or "ENEMY").upper()
         if etype == "WORKER":
             cat, color, ring = "enemy-worker", "#8aa4ff", None
@@ -1295,8 +1312,9 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
             cat, color, ring = "enemy-core", "#ff6464", "#ff9b9b"
         else:
             cat, color, ring = "enemy", "#ff6464", "#ff9b9b"
-        unit(enemy.get("pos"), color, enemy.get("name") or f"E{index + 1}",
-             glow=True, ring=ring, cat=cat)
+        name = enemy.get("name") or f"E{fallback}"
+        fallback += 1
+        unit(epos, color, name, glow=True, ring=ring, cat=cat)
 
     if core_cx is not None:
         a(f'<circle data-cat="core" cx="{core_cx}" cy="{core_cy}" r="15" fill="url(#coreGlow)"/>')

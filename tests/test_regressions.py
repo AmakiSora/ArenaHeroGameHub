@@ -1544,6 +1544,31 @@ class DashboardLogTests(unittest.TestCase):
                 f"enemy category {cat} should be tagged",
             )
 
+    def test_svg_same_cell_enemy_keeps_highest_priority_type(self) -> None:
+        """When a worker stands on the enemy CORE's own cell, only the CORE
+        marker is drawn there — the blue worker must not cover the enemy HQ."""
+        rec = {
+            "core_pos": [0, 0],
+            "core_name": "C1",
+            "workers": [], "vanguards": [], "rangers": [],
+            "resource_cells": [],
+            "enemies": [
+                {"name": "E1", "pos": [3, 0], "type": "CORE"},
+                {"name": "E2", "pos": [3, 0], "type": "WORKER"},
+                {"name": "E3", "pos": [5, 0], "type": "WORKER"},
+            ],
+        }
+        svg = dashboard.render_svg(rec, {"obstacles": [], "resources": []})
+
+        # The shared cell renders exactly one enemy marker, and it is the core.
+        self.assertGreaterEqual(svg.count('data-cat="enemy-core"'), 1)
+        self.assertEqual(svg.count(">E1</text>"), 1)
+        # The worker duplicated on the HQ cell is suppressed; the other worker
+        # (its own cell) is still drawn.
+        self.assertGreaterEqual(svg.count('data-cat="enemy-worker"'), 1)
+        self.assertEqual(svg.count(">E2</text>"), 0)
+        self.assertEqual(svg.count(">E3</text>"), 1)
+
     def test_svg_y_axis_matches_game_up_direction(self) -> None:
         """Smaller world-Y must render higher because Direction.UP is (0, -1)."""
         rec = {
@@ -3529,6 +3554,24 @@ class EnemySightingsMemoryTests(unittest.TestCase):
         # Type-less stubs default to ENEMY, never None.
         tactic._update_enemy_sightings(self._turn(visible=[self._unit((9, 9))]))
         self.assertEqual(tactic._enemy_memory_types.get((9, 9)), "ENEMY")
+
+    def test_worker_on_core_cell_does_not_downgrade_sighting_type(self) -> None:
+        # An enemy CORE has its spawned workers standing on its own square, so
+        # a cell can hold CORE + WORKER in the same tick.  The last-iterated
+        # unit must not win: a worker seen there must never relabel the HQ as a
+        # worker scout.
+        core = SimpleNamespace(position=(7, 2), kind=SimpleNamespace(value="CORE"))
+        worker = SimpleNamespace(position=(7, 2), kind=SimpleNamespace(value="WORKER"))
+        # Worker processed after the CORE (order matters for the old code).
+        tactic._update_enemy_sightings(self._turn(visible=[core, worker]))
+        self.assertEqual(tactic._enemy_memory_types.get((7, 2)), "CORE")
+        # And a fresh CORE sighting still upgrades a previously-scouted cell.
+        tactic._enemy_memory.update({(4, 4)})
+        tactic._enemy_memory_types[(4, 4)] = "WORKER"
+        tactic._update_enemy_sightings(
+            self._turn(visible=[SimpleNamespace(position=(4, 4), kind=SimpleNamespace(value="CORE"))])
+        )
+        self.assertEqual(tactic._enemy_memory_types.get((4, 4)), "CORE")
 
     def test_sighting_type_survives_disk_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
