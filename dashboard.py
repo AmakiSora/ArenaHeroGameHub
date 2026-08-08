@@ -1350,9 +1350,8 @@ body{margin:0;min-height:100vh;color:var(--text);
 .badge.move,.badge.other{background:rgba(110,168,255,.12);color:#a9c8ff}
 .unit-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto}
 .sd-btn{appearance:none;border:1px solid rgba(255,107,107,.35);background:rgba(255,80,80,.12);color:#ff9b9b;
- width:18px;height:18px;border-radius:50%;font-size:10px;line-height:1;padding:0;cursor:pointer;
- display:grid;place-items:center;opacity:0;transition:opacity .12s,background .12s,border-color .12s}
-.unit:hover .sd-btn{opacity:1}
+ font-size:10px;line-height:1.4;padding:1px 7px;border-radius:999px;cursor:pointer;white-space:nowrap;
+ transition:background .12s,border-color .12s}
 .sd-btn:hover{background:rgba(255,80,80,.42);color:#fff;border-color:rgba(255,120,120,.65)}
 .unit-facts{display:flex;align-items:center;gap:7px;min-width:0;margin-top:5px;color:var(--muted);font-size:10px;line-height:1.35}
 .unit-locator{min-width:0;flex:1;color:#c8d4eb;font:10.5px Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -3334,7 +3333,7 @@ def build_parts():
             f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
             f'<span class="unit-actions"><span class="badge {kind}">{html.escape(str(badge))}</span>'
             f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '
-            f'aria-label="自裁 {safe_name}" title="自裁">✕</button></span></div>'
+            f'aria-label="自裁 {safe_name}" title="自裁">自裁</button></span></div>'
             f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(w.get("pos"))}'
             f'<span class="arrow">→</span>{fmt_pos(target)}</span>'
             f'<span class="unit-fact">{vitals}</span><span class="unit-fact">{route_text}</span>{history_text}</div></div>'
@@ -3379,7 +3378,7 @@ def build_parts():
             f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
             f'<span class="unit-actions"><span class="badge {color_cls}">{label}</span>'
             f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '
-            f'aria-label="自裁 {safe_name}" title="自裁">✕</button></span></div>'
+            f'aria-label="自裁 {safe_name}" title="自裁">自裁</button></span></div>'
             f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(u.get("pos"))}</span>'
             f'<span class="unit-fact">HP {u.get("hp","?")}</span>{stat_line}</div></div>'
         )
