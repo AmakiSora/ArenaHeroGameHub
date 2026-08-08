@@ -331,9 +331,11 @@ Tactic 每 Tick 从解析事件聚合累计统计，持久化到 `game_stats.jso
 目标归类为不稳定/不确定；只有连续三个步骤同方向、每步一个基数格才归类为稳定
 移动。稳定移动目标的预测格还必须满足射程、八向直线和障碍检查，才标记为
 `eligible`。运动分类累计写入 `shot_prediction.by_motion_state`，仪表盘分别展示
-静止、移动观察、稳定移动和状态不足样本。`ranger_lead_fire_enabled` 默认开启；仅当
-目标为 `eligible` 时把预测格传给 SDK 的 `expected_cell`，其余射击继续使用当前格。
-配置面板可随时关闭该开关并恢复纯影子模式。日志用 `lead_fire_used` / `fired_cell`
+静止、移动观察、稳定移动和状态不足样本。`ranger_lead_fire_enabled` 默认开启；只有
+目标为 `eligible` 的敌方 Worker 才会把预测格传给 SDK 的 `expected_cell`，敌方
+Vanguard / Ranger 只保留影子评估。同一 Tick 对同一 Worker 最多一名游侠预判开火，
+其余游侠射击目标当前位置作为对冲。配置面板可随时关闭该开关并恢复纯影子模式。
+日志用 `lead_fire_used` / `lead_fire_rejection` / `fired_cell`
 标记真实预判，真实尝试、命中、未中、实际改善和实际伤害单独累计在
 `lead_fire_*` 字段；升级前没有运动分类字段的累计数据保留在 `legacy` 桶。
 

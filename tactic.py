@@ -1878,12 +1878,29 @@ def _ranger_best_shot(
         attack_range,
     )
     predicted_cell = prediction.get("predicted_cell")
+    target_is_worker = prediction["target_type"] == "WORKER"
+    lead_already_claimed = any(
+        item.get("lead_fire_used")
+        and item.get("_target_key") == prediction.get("_target_key")
+        for item in turn_context.shot_predictions
+    )
     lead_fire_used = bool(
-        lead_fire_enabled and prediction.get("eligible") and predicted_cell
+        lead_fire_enabled
+        and target_is_worker
+        and prediction.get("eligible")
+        and predicted_cell
+        and not lead_already_claimed
     )
     fired_cell = predicted_cell if lead_fire_used else prediction["current_cell"]
     prediction.update({
         "lead_fire_used": lead_fire_used,
+        "lead_fire_rejection": (
+            "target_type"
+            if not target_is_worker
+            else "target_claimed"
+            if lead_already_claimed
+            else None
+        ),
         "fire_mode": "lead" if lead_fire_used else "current",
         "fired_cell": list(fired_cell),
     })

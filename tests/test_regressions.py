@@ -2530,10 +2530,15 @@ class RangerShootingTests(unittest.TestCase):
             self.expected_cell = expected_cell
 
     class Enemy:
-        def __init__(self, position: tuple[int, int], index: int = 1) -> None:
+        def __init__(
+            self,
+            position: tuple[int, int],
+            index: int = 1,
+            unit_type: UnitType = UnitType.VANGUARD,
+        ) -> None:
             self.id = f"enemy-shadow-{index}"
             self.position = position
-            self.unit_type = UnitType.VANGUARD
+            self.unit_type = unit_type
 
     def setUp(self) -> None:
         self._tracks = {
@@ -2653,7 +2658,7 @@ class RangerShootingTests(unittest.TestCase):
         self.assertIsNone(ranger.expected_cell)
 
     def test_stable_legal_prediction_uses_expected_cell_when_enabled(self) -> None:
-        enemy = self.Enemy((0, 0))
+        enemy = self.Enemy((0, 0), unit_type=UnitType.WORKER)
         for tick, position in (
             (1, (0, 0)),
             (2, (0, 1)),
@@ -2682,6 +2687,79 @@ class RangerShootingTests(unittest.TestCase):
         self.assertTrue(prediction["lead_fire_used"])
         self.assertEqual(prediction["fire_mode"], "lead")
         self.assertEqual(prediction["fired_cell"], [0, 4])
+        self.assertIsNone(prediction["lead_fire_rejection"])
+
+    def test_stable_combat_target_remains_shadow_only_when_enabled(self) -> None:
+        for unit_type in (UnitType.VANGUARD, UnitType.RANGER):
+            with self.subTest(unit_type=unit_type):
+                tactic._enemy_motion_tracks.clear()
+                tactic.turn_context.shot_predictions = []
+                enemy = self.Enemy((0, 0), unit_type=unit_type)
+                for tick, position in (
+                    (1, (0, 0)),
+                    (2, (0, 1)),
+                    (3, (0, 2)),
+                    (4, (0, 3)),
+                ):
+                    enemy.position = position
+                    tactic._update_enemy_motion_tracks((enemy,), tick)
+                tactic.turn_context.tick = 4
+                ranger = self.Ranger((0, 1))
+
+                tactic._ranger_best_shot(
+                    ranger,
+                    ranger.position,
+                    (enemy,),
+                    frozenset(),
+                    3,
+                    lead_fire_enabled=True,
+                )
+
+                prediction = tactic.turn_context.shot_predictions[0]
+                self.assertTrue(prediction["eligible"])
+                self.assertFalse(prediction["lead_fire_used"])
+                self.assertEqual(prediction["lead_fire_rejection"], "target_type")
+                self.assertEqual(prediction["fired_cell"], [0, 3])
+                self.assertIsNone(ranger.expected_cell)
+
+    def test_only_one_ranger_leads_the_same_worker_per_tick(self) -> None:
+        enemy = self.Enemy((0, 0), unit_type=UnitType.WORKER)
+        for tick, position in (
+            (1, (0, 0)),
+            (2, (0, 1)),
+            (3, (0, 2)),
+            (4, (0, 3)),
+        ):
+            enemy.position = position
+            tactic._update_enemy_motion_tracks((enemy,), tick)
+        tactic.turn_context.tick = 4
+        first_ranger = self.Ranger((0, 1))
+        second_ranger = self.Ranger((0, 1))
+
+        tactic._ranger_best_shot(
+            first_ranger,
+            first_ranger.position,
+            (enemy,),
+            frozenset(),
+            3,
+            lead_fire_enabled=True,
+        )
+        tactic._ranger_best_shot(
+            second_ranger,
+            second_ranger.position,
+            (enemy,),
+            frozenset(),
+            3,
+            lead_fire_enabled=True,
+        )
+
+        first_prediction, second_prediction = tactic.turn_context.shot_predictions
+        self.assertEqual(first_ranger.expected_cell, (0, 4))
+        self.assertTrue(first_prediction["lead_fire_used"])
+        self.assertIsNone(second_ranger.expected_cell)
+        self.assertFalse(second_prediction["lead_fire_used"])
+        self.assertEqual(second_prediction["lead_fire_rejection"], "target_claimed")
+        self.assertEqual(second_prediction["fired_cell"], [0, 3])
 
     def test_shadow_prediction_classifies_confirmed_stationary_target(self) -> None:
         enemy = self.Enemy((0, 2))
