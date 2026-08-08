@@ -2058,7 +2058,8 @@ def _plan_attack_combat(
 
     attack_mode (三选一) picks the destination:
       - coords -> static attack_target_x / attack_target_y
-      - auto   -> nearest enemy sighting from memory
+      - auto   -> enemy sighting from memory weighted by distance to the CORE
+                  (base defense) and to the attack squad's current centroid
       - beacon -> the champion beacon's always-public position; the static
                   coordinate and auto-attack settings are ignored in this mode
     """
@@ -2069,7 +2070,20 @@ def _plan_attack_combat(
         beacon_pos = getattr(turn_context, "beacon_pos", None)
         target = beacon_pos or (int(config["attack_target_x"]), int(config["attack_target_y"]))
     elif mode == "auto" and _enemy_memory:
-        target = min(_enemy_memory, key=lambda p: _manhattan(pos, p))
+        # Prefer enemies close to the CORE (threats to the base) and close to
+        # the attack squad's centroid (reachable now). Both references are
+        # shared by every squad member, so the whole team converges on the same
+        # target instead of splitting toward per-unit nearest points. When the
+        # squad is empty, fall back to the unit's own position.
+        core_pos = getattr(turn_context, "core_pos", None)
+        squad_pos = getattr(turn_context, "attack_squad_pos", None) or pos
+        if core_pos is None:
+            target = min(_enemy_memory, key=lambda p: _manhattan(p, squad_pos))
+        else:
+            target = min(
+                _enemy_memory,
+                key=lambda p: _manhattan(p, core_pos) + _manhattan(p, squad_pos),
+            )
     else:
         target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
 
@@ -2351,6 +2365,10 @@ _resource_tombstones: set[tuple[int, int]] = set()
 _obstacle_memory: set[tuple[int, int]] = set()
 # Enemy sightings: remember every position where enemies were seen
 _enemy_memory: set[tuple[int, int]] = set()
+# Last-known unit type per sighted position (WORKER/VANGUARD/RANGER/CORE/ENEMY).
+# Kept in lockstep with _enemy_memory so an out-of-vision CORE can be told apart
+# from a worker scout on the dashboard.
+_enemy_memory_types: dict[tuple[int, int], str] = {}
 # Consecutive visible positions keyed by full enemy UUID. This is intentionally
 # in-memory only; reconnects must rebuild confidence from fresh observations.
 _enemy_motion_tracks: dict[str, list[tuple[int, tuple[int, int]]]] = {}
@@ -2399,9 +2417,28 @@ def _coords_from_payload(raw) -> set[tuple[int, int]]:
     return out
 
 
+def _enemy_sightings_from_payload(raw) -> tuple[set[tuple[int, int]], dict[tuple[int, int], str]]:
+    """Parse enemy-sighting payloads into (positions, type-per-position).
+
+    Supports the legacy ``[x, y]`` form and the typed ``[x, y, "CORE"]`` form;
+    unknown types default to "ENEMY".
+    """
+    positions: set[tuple[int, int]] = set()
+    types: dict[tuple[int, int], str] = {}
+    for item in raw or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        pos = (int(item[0]), int(item[1]))
+        positions.add(pos)
+        if len(item) >= 3 and item[2]:
+            types[pos] = str(item[2]).upper()
+    return positions, types
+
+
 def _load_map_memory() -> None:
     """Load permanent obstacle/resource/enemy memory from disk."""
-    global _resource_memory, _obstacle_memory, _enemy_memory, _enemy_clear_seq, _last_dashboard_map_sig
+    global _resource_memory, _obstacle_memory, _enemy_memory, _enemy_memory_types, \
+        _enemy_clear_seq, _last_dashboard_map_sig
     if not MAP_MEMORY_PATH.exists():
         return
     try:
@@ -2413,7 +2450,9 @@ def _load_map_memory() -> None:
         _resource_memory = (resources | manual) - forgotten
         _resource_tombstones.clear()
         _resource_tombstones.update(forgotten)
-        _enemy_memory = _coords_from_payload(data.get("enemy_sightings"))
+        _enemy_memory, _enemy_memory_types = _enemy_sightings_from_payload(
+            data.get("enemy_sightings")
+        )
         _enemy_clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
         _last_dashboard_map_sig = _dashboard_map_sig(data)
         print(
@@ -2432,7 +2471,7 @@ def _dashboard_map_sig(data: dict) -> tuple:
     forgotten = tuple(sorted(_coords_from_payload(data.get("forgotten_resources"))))
     manual = tuple(sorted(_coords_from_payload(data.get("manual_resources"))))
     resources = tuple(sorted(_coords_from_payload(data.get("resources"))))
-    enemies = tuple(sorted(_coords_from_payload(data.get("enemy_sightings"))))
+    enemies = tuple(sorted(_enemy_sightings_from_payload(data.get("enemy_sightings"))[0]))
     clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
     return (forgotten, manual, resources, enemies, clear_seq)
 
@@ -2448,7 +2487,8 @@ def _apply_dashboard_map_edits() -> None:
     live re-discovery after a clear is not immediately re-forgotten from a
     stale on-disk forget list.
     """
-    global _resource_memory, _enemy_memory, _enemy_clear_seq, _map_dirty, _last_dashboard_map_sig
+    global _resource_memory, _enemy_memory, _enemy_memory_types, _enemy_clear_seq, \
+        _map_dirty, _last_dashboard_map_sig
     if not MAP_MEMORY_PATH.exists():
         return
     try:
@@ -2493,10 +2533,14 @@ def _apply_dashboard_map_edits() -> None:
     clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
     if clear_seq > _enemy_clear_seq:
         _enemy_clear_seq = clear_seq
-        disk_enemies = _coords_from_payload(data.get("enemy_sightings"))
-        if _enemy_memory != disk_enemies:
+        disk_positions, disk_types = _enemy_sightings_from_payload(
+            data.get("enemy_sightings")
+        )
+        if _enemy_memory != disk_positions:
             _enemy_memory.clear()
-            _enemy_memory.update(disk_enemies)
+            _enemy_memory.update(disk_positions)
+            _enemy_memory_types.clear()
+            _enemy_memory_types.update(disk_types)
             _map_dirty = True
 
 
@@ -2565,7 +2609,9 @@ def _save_map_memory(
         "resources": sorted([list(p) for p in resources]),
         "manual_resources": sorted([list(p) for p in manual]),
         "forgotten_resources": sorted([list(p) for p in forgotten]),
-        "enemy_sightings": sorted([list(p) for p in _enemy_memory]),
+        "enemy_sightings": sorted(
+            [list(pos) + [_enemy_memory_types.get(pos) or "ENEMY"] for pos in _enemy_memory]
+        ),
         "obstacle_count": len(_obstacle_memory),
         "resource_count": len(resources),
         "manual_count": len(manual),
@@ -2776,7 +2822,7 @@ def _update_enemy_sightings(turn) -> None:
     only when a friendly unit can genuinely see the cell (within its own vision
     radius, with unobstructed line of sight) and no enemy is there.  A sighting
     no friendly can actually see is kept as last-known enemy info."""
-    global _enemy_memory, _map_dirty
+    global _enemy_memory, _enemy_memory_types, _map_dirty
     before = len(_enemy_memory)
 
     # Vision radius differs by object type (rules): Core 5 / Worker 3 /
@@ -2794,14 +2840,19 @@ def _update_enemy_sightings(turn) -> None:
         friendly_views.append((tuple(r.position), 5))
 
     # Visible enemies this tick
+    visible_enemies = tuple(getattr(turn, "visible_enemies", ()) or ())
     visible_enemy_positions: set[tuple[int, int]] = {
-        tuple(enemy.position) for enemy in turn.visible_enemies
+        tuple(enemy.position) for enemy in visible_enemies
     }
 
-    # Add new sightings
-    for pos in visible_enemy_positions:
+    # Add new sightings and refresh each position's last-known unit type so the
+    # dashboard can still tell a CORE from a worker scout after line of sight is
+    # lost.  Type-less stubs (tests / bare objects) land as "ENEMY".
+    for enemy in visible_enemies:
+        pos = tuple(enemy.position)
         if pos not in _enemy_memory:
             _enemy_memory.add(pos)
+        _enemy_memory_types[pos] = _enemy_unit_type_name(enemy) or "ENEMY"
 
     # Remove stale sightings: some friendly unit can actually see the cell
     # (within its own vision radius, line of sight unobstructed) but no enemy
@@ -2821,6 +2872,8 @@ def _update_enemy_sightings(turn) -> None:
 
     if stale:
         _enemy_memory -= stale
+        for pos in stale:
+            _enemy_memory_types.pop(pos, None)
 
     if len(_enemy_memory) != before:
         _map_dirty = True
@@ -2981,6 +3034,8 @@ turn_context = type(
         "unit_routes": {},
         "tick": 0,
         "beacon_pos": None,
+        "core_pos": None,
+        "attack_squad_pos": None,
         "shot_predictions": [],
         "shot_prediction_results": [],
     },
@@ -3220,6 +3275,25 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.beacon_pos = (
         tuple(beacon.position) if getattr(beacon, "position", None) else None
     )
+
+    # Shared auto-attack references: the CORE's cell and the attack squad's
+    # current centroid. Both are the same for every squad member, so auto mode
+    # picks one target the whole team marches on (see _plan_attack_combat).
+    turn_context.core_pos = tuple(core_pos)
+    attack_squad_names = _parse_team_names(config.get("attack_team", ""))
+    squad_cells = [
+        tuple(u.position)
+        for u in turn.units
+        if _object_name(u.id, _UNIT_NAME_PREFIX.get(u.unit_type, "U")).upper()
+        in attack_squad_names
+    ]
+    if squad_cells:
+        turn_context.attack_squad_pos = (
+            round(sum(x for x, _ in squad_cells) / len(squad_cells)),
+            round(sum(y for _, y in squad_cells) / len(squad_cells)),
+        )
+    else:
+        turn_context.attack_squad_pos = None
 
     beacon_on_ground_here = beacon.status == "GROUND" and beacon.position == core_pos
     beacon_carried_by_core = beacon.status == "CARRIED" and beacon.carrier_id == core.id

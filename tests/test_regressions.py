@@ -942,6 +942,8 @@ class CombatTeamPlannerTests(unittest.TestCase):
         tactic._combat_path_cache.clear()
         tactic.turn_context.tick = 0
         tactic.turn_context.beacon_pos = None
+        tactic.turn_context.core_pos = None
+        tactic.turn_context.attack_squad_pos = None
 
     def tearDown(self) -> None:
         tactic._worker_last_pos.clear()
@@ -949,6 +951,8 @@ class CombatTeamPlannerTests(unittest.TestCase):
         tactic._combat_path_cache.clear()
         tactic._combat_path_cache.update(self._prev_combat_paths)
         tactic.turn_context.beacon_pos = None
+        tactic.turn_context.core_pos = None
+        tactic.turn_context.attack_squad_pos = None
 
     def test_team_name_parsing_and_priority(self) -> None:
         config = default_config()
@@ -1274,6 +1278,69 @@ class CombatTeamPlannerTests(unittest.TestCase):
             self.assertIn("attack-march-auto (6, 6)", detail)
         finally:
             tactic._enemy_memory.discard((6, 6))
+
+    def test_attack_team_auto_mode_prefers_enemies_near_core_and_squad(self) -> None:
+        # Target score = dist(enemy, core) + dist(enemy, squad centroid).
+        # (9,0) sits beside the shared core/squad at (10,0); (0,5) is the
+        # nearest point to the unit itself. The weighting must override the
+        # per-unit nearest pick, proving the whole squad converges on the
+        # core-protecting target.
+        tactic._enemy_memory.update({(0, 5), (9, 0)})
+        tactic.turn_context.core_pos = (10, 0)
+        tactic.turn_context.attack_squad_pos = (10, 0)
+        try:
+            unit = self.CombatUnit("v-attack", (0, 0))
+            self.config["attack_mode"] = "auto"
+            self.config["attack_target_x"] = 90
+            self.config["attack_target_y"] = 90
+
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(10, 0),
+                team="attack",
+            )
+
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-march-auto (9, 0)", detail)
+            self.assertEqual(unit.arg.name, "RIGHT")
+        finally:
+            tactic._enemy_memory.discard((0, 5))
+            tactic._enemy_memory.discard((9, 0))
+            tactic.turn_context.core_pos = None
+            tactic.turn_context.attack_squad_pos = None
+
+    def test_attack_team_auto_mode_squad_proximity_counts_independently(self) -> None:
+        # Same unit, same core: the squad centroid at (10,0) tips the pick to
+        # (9,0) even though (0,5) is closer to both the unit and the core.
+        tactic._enemy_memory.update({(0, 5), (9, 0)})
+        tactic.turn_context.core_pos = (0, 0)
+        tactic.turn_context.attack_squad_pos = (10, 0)
+        try:
+            unit = self.CombatUnit("r-attack", (0, 0))
+            self.config["attack_mode"] = "auto"
+            self.config["attack_target_x"] = 90
+            self.config["attack_target_y"] = 90
+
+            action, detail = tactic._plan_ranger(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-march-auto (9, 0)", detail)
+            self.assertEqual(unit.arg.name, "RIGHT")
+        finally:
+            tactic._enemy_memory.discard((0, 5))
+            tactic._enemy_memory.discard((9, 0))
+            tactic.turn_context.core_pos = None
+            tactic.turn_context.attack_squad_pos = None
 
     def test_guerrilla_retreats_from_three_enemies(self) -> None:
         unit = self.CombatUnit("v-g", (5, 5))
@@ -3270,14 +3337,18 @@ class EnemySightingsMemoryTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._enemies_backup = set(tactic._enemy_memory)
+        self._enemy_types_backup = dict(tactic._enemy_memory_types)
         self._obstacles_backup = set(tactic._obstacle_memory)
         self._dirty_backup = tactic._map_dirty
         tactic._enemy_memory.clear()
+        tactic._enemy_memory_types.clear()
         tactic._obstacle_memory.clear()
 
     def tearDown(self) -> None:
         tactic._enemy_memory.clear()
         tactic._enemy_memory.update(self._enemies_backup)
+        tactic._enemy_memory_types.clear()
+        tactic._enemy_memory_types.update(self._enemy_types_backup)
         tactic._obstacle_memory.clear()
         tactic._obstacle_memory.update(self._obstacles_backup)
         tactic._map_dirty = self._dirty_backup
@@ -3328,6 +3399,43 @@ class EnemySightingsMemoryTests(unittest.TestCase):
         turn = self._turn(visible=[self._unit((7, 2))])
         tactic._update_enemy_sightings(turn)
         self.assertIn((7, 2), tactic._enemy_memory)
+
+    def test_visible_enemy_type_is_recorded_for_dashboard(self) -> None:
+        # The dashboard needs the last-known unit type so an out-of-vision CORE
+        # can be told from a worker scout without re-scouting.
+        enemy = SimpleNamespace(position=(7, 2), kind=SimpleNamespace(value="CORE"))
+        tactic._update_enemy_sightings(self._turn(visible=[enemy]))
+        self.assertEqual(tactic._enemy_memory_types.get((7, 2)), "CORE")
+        # Type-less stubs default to ENEMY, never None.
+        tactic._update_enemy_sightings(self._turn(visible=[self._unit((9, 9))]))
+        self.assertEqual(tactic._enemy_memory_types.get((9, 9)), "ENEMY")
+
+    def test_sighting_type_survives_disk_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._enemy_memory.clear()
+                tactic._enemy_memory_types.clear()
+                tactic._enemy_memory.update({(7, 2), (3, 3)})
+                tactic._enemy_memory_types[(7, 2)] = "CORE"
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(sorted(saved["enemy_sightings"]), [[3, 3, "ENEMY"], [7, 2, "CORE"]])
+
+                tactic._enemy_memory.clear()
+                tactic._enemy_memory_types.clear()
+                tactic._load_map_memory()
+                self.assertEqual(tactic._enemy_memory_types.get((7, 2)), "CORE")
+                self.assertIn((3, 3), tactic._enemy_memory)
+
+    def test_stale_removal_also_drops_recorded_type(self) -> None:
+        tactic._enemy_memory.update({(5, 0)})
+        tactic._enemy_memory_types[(5, 0)] = "RANGER"
+        turn = self._turn(rangers=[self._unit((0, 0))])
+        tactic._update_enemy_sightings(turn)
+        self.assertNotIn((5, 0), tactic._enemy_memory)
+        self.assertNotIn((5, 0), tactic._enemy_memory_types)
 
     def test_vision_obstructed_axis_lines(self) -> None:
         self.assertTrue(tactic._vision_obstructed((0, 0), (0, 3), {(0, 2)}))

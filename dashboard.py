@@ -249,18 +249,63 @@ def _coord_set(raw) -> set[tuple[int, int]]:
     return out
 
 
+# ── remembered enemy sightings (last-known positions + unit type) ───────────
+
+# Color + short label per enemy unit type, matching the live-enemy map colors.
+_ENEMY_TYPE_STYLE = {
+    "WORKER": ("#8aa4ff", "工"),
+    "VANGUARD": ("#ff8c42", "先"),
+    "RANGER": ("#b38cff", "游"),
+    "CORE": ("#ff6464", "总"),
+}
+
+
+def _enemy_type_char(etype: str) -> str:
+    """Short Chinese label for an enemy unit type (总/工/先/游, default 敌)."""
+    return _ENEMY_TYPE_STYLE.get(str(etype or "").upper(), ("#ff6464", "敌"))[1]
+
+
+def _enemy_type_color(etype: str) -> str:
+    return _ENEMY_TYPE_STYLE.get(str(etype or "").upper(), ("#ff6464", "敌"))[0]
+
+
+def _parse_enemy_sighting(item) -> tuple[tuple[int, int], str] | None:
+    """Normalize one enemy-sighting entry to ((x, y), type).
+
+    Accepts the raw on-disk forms ``[x, y]`` and ``[x, y, "CORE"]`` as well as
+    the parsed ``{"pos": ..., "type": ...}`` dicts returned by load_map_memory.
+    Unknown/legacy entries default to type "ENEMY".
+    """
+    if isinstance(item, dict):
+        pos = item.get("pos")
+        if not pos or len(pos) != 2:
+            return None
+        return (int(pos[0]), int(pos[1])), str(item.get("type") or "ENEMY").upper()
+    if isinstance(item, (list, tuple)) and len(item) >= 2:
+        etype = str(item[2]).upper() if len(item) >= 3 and item[2] else "ENEMY"
+        return (int(item[0]), int(item[1])), etype
+    return None
+
+
 def load_map_memory():
     d = _read_map_file()
     forgotten = _coord_set(d.get("forgotten_resources"))
     resources = _coord_set(d.get("resources")) - forgotten
     manual = _coord_set(d.get("manual_resources")) - forgotten
     all_res = sorted(resources | manual)
+    enemy_sightings = [
+        s for s in (_parse_enemy_sighting(item) for item in d.get("enemy_sightings", []) or [])
+        if s is not None
+    ]
+    enemy_sightings.sort(key=lambda s: s[0])
     return {
         "obstacles": sorted(_coord_set(d.get("obstacles"))),
         "resources": all_res,
         "manual_resources": sorted(manual),
         "forgotten_resources": sorted(forgotten),
-        "enemy_sightings": sorted(_coord_set(d.get("enemy_sightings"))),
+        "enemy_sightings": [
+            {"pos": pos, "type": etype} for pos, etype in enemy_sightings
+        ],
         "obstacle_count": d.get("obstacle_count", len(d.get("obstacles", []) or [])),
         "resource_count": len(all_res),
         "manual_count": len(manual),
@@ -1009,7 +1054,10 @@ def _collect_points(rec, mm):
         if len(p) == 2: pts.append((int(p[0]), int(p[1])))
     for p in mm.get("obstacles", []): pts.append((int(p[0]), int(p[1])))
     for p in mm.get("resources", []): pts.append((int(p[0]), int(p[1])))
-    for p in mm.get("enemy_sightings", []): pts.append((int(p[0]), int(p[1])))
+    for s in mm.get("enemy_sightings", []):
+        parsed = _parse_enemy_sighting(s)
+        if parsed is not None:
+            pts.append(parsed[0])
     bp = rec.get("beacon_pos")
     if bp and len(bp) == 2: pts.append((int(bp[0]), int(bp[1])))
     return pts
@@ -1110,14 +1158,37 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
         a(f'<circle data-cat="ore" cx="{cxr}" cy="{cyr}" r="6.5" fill="#ffc857" filter="url(#glow)"/>')
         a(f'<circle data-cat="ore" cx="{cxr}" cy="{cyr}" r="2.8" fill="#fff3c4"/>')
 
-    # enemy sightings (remembered, last-known positions)
-    ex_sightings = {(int(a), int(b)) for a, b in mm.get("enemy_sightings", [])}
-    for ex, ey in ex_sightings:
-        if not (xmin <= ex <= xmax and ymin <= ey <= ymax): continue
+    # Enemy sightings (remembered, last-known positions).  Each marker carries
+    # the unit type last seen there so an out-of-vision CORE (总部) can be told
+    # from a worker scout without re-scouting.  The dashed ring + dim fill mark
+    # it as last-known (possibly moved).  Live visible enemies are skipped so
+    # the brighter unit marker on top is not duplicated underneath.
+    visible_enemy_positions = {
+        tuple(int(c) for c in (e.get("pos") or []))
+        for e in rec.get("enemies", [])
+        if len(e.get("pos") or []) == 2
+    }
+    for sighting in mm.get("enemy_sightings", []):
+        parsed = _parse_enemy_sighting(sighting)
+        if parsed is None:
+            continue
+        ex, ey = parsed[0]
+        if (ex, ey) in visible_enemy_positions:
+            continue
+        if not (xmin <= ex <= xmax and ymin <= ey <= ymax):
+            continue
+        etype = parsed[1]
+        color = _enemy_type_color(etype)
+        label = _enemy_type_char(etype)
         x, y = to_xy(ex, ey)
         cxr, cyr = x + cell / 2, y + cell / 2
-        a(f'<circle data-cat="enemy-trace" cx="{cxr}" cy="{cyr}" r="5" fill="#ff6464" opacity="0.40"/>')
-        a(f'<circle data-cat="enemy-trace" cx="{cxr}" cy="{cyr}" r="2" fill="#ff9b9b" opacity="0.75"/>')
+        a(f'<circle data-cat="enemy-trace" cx="{cxr}" cy="{cyr}" r="9" fill="{color}" opacity="0.14"/>')
+        a(f'<circle data-cat="enemy-trace" cx="{cxr}" cy="{cyr}" r="6.5" fill="{color}" opacity="0.5"/>')
+        a(f'<circle data-cat="enemy-trace" cx="{cxr}" cy="{cyr}" r="6.5" fill="none" '
+          f'stroke="{color}" stroke-width="1.2" stroke-dasharray="3 3" opacity="0.95"/>')
+        a(f'<text data-cat="enemy-trace" x="{cxr}" y="{cyr + 2.2}" text-anchor="middle" '
+          f'font-size="7.5" font-family="Segoe UI, Microsoft YaHei, sans-serif" '
+          f'font-weight="700" fill="#0b1020" opacity="0.9">{label}</text>')
 
     # Worker routes and targets are generated by the same planner that moves them.
     route_colors = (
@@ -3464,7 +3535,11 @@ def build_parts():
     # Enemy sightings — separate card below ore panel
     ex_sightings = mm.get("enemy_sightings", [])
     if ex_sightings:
-        ex_chips = "".join(f'<span class="chip enemy-chip">{fmt_pos(p)}</span>' for p in ex_sightings[:30])
+        ex_chips = "".join(
+            f'<span class="chip enemy-chip" title="{html.escape(str(s.get("type") or "ENEMY"))}">'
+            f'{_enemy_type_char(s.get("type"))}{fmt_pos(s.get("pos"))}</span>'
+            for s in ex_sightings[:30]
+        )
         enemy_html = f'<div class="res-section"><h4>敌人踪迹</h4><div class="chip-row">{ex_chips}</div></div>'
     else:
         enemy_html = '<div class="muted">暂无敌人踪迹</div>'
