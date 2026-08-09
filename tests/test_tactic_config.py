@@ -32,6 +32,7 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(config["attack_target_y"], 0)
         self.assertEqual(config["attack_mode"], "coords")
         self.assertEqual(config["combat_heal_hp_threshold"], 2)
+        self.assertEqual(config["combat_heal_return_limit"], 1)
 
     def test_combat_heal_threshold_validation(self) -> None:
         # 0 disables the home-team retreat-to-heal; 1..4 pick the HP cutoff.
@@ -47,6 +48,15 @@ class TacticConfigTests(unittest.TestCase):
             validate_config({"combat_heal_hp_threshold": -1})
         with self.assertRaises(ConfigValidationError):
             validate_config({"combat_heal_hp_threshold": 5})
+        # 回撤名额: 0 = 不限, 1..19 stagger the peel; outside range rejected.
+        self.assertEqual(
+            validate_config({"combat_heal_return_limit": 0})["combat_heal_return_limit"],
+            0,
+        )
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"combat_heal_return_limit": -1})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"combat_heal_return_limit": 20})
 
     def test_attack_mode_rejects_unknown_values(self) -> None:
         with self.assertRaises(ConfigValidationError):

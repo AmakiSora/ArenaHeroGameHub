@@ -3828,6 +3828,38 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             spawn_cost = UNIT_SPAWN_COSTS.get(spawn_type, 0)
         heal_budget -= spawn_cost
 
+    # 错峰回撤: cap how many home-squad units may start marching back to the
+    # Core this Tick, so the defense line peels off one by one instead of
+    # emptying at once. Limited slots go to the most-damaged units first; ties
+    # go to whoever is already closer to the Core, so an in-flight return keeps
+    # re-claiming its slot and never stalls behind a fresh casualty. When the
+    # limit is 0, every eligible unit returns (no stagger).
+    heal_return_limit = int(config.get("combat_heal_return_limit", 1))
+    heal_return_allowed: set[str] | None = None  # None = unlimited
+    if heal_return_limit > 0:
+        eligible: list[tuple[int, int, str]] = []
+        for unit in turn.units:
+            if unit.unit_type not in (UnitType.VANGUARD, UnitType.RANGER):
+                continue
+            unit_name = _object_name(
+                unit.id, _UNIT_NAME_PREFIX.get(unit.unit_type, "U")
+            )
+            if not _unit_should_return_to_heal(
+                unit,
+                config,
+                core_pos=core_pos,
+                core_moving=core_moving,
+                team=_combat_team_for(unit_name, config),
+            ):
+                continue
+            eligible.append((
+                int(getattr(unit, "hp", 0) or 0),
+                _manhattan(tuple(unit.position), core_pos),
+                unit_name,
+            ))
+        eligible.sort()
+        heal_return_allowed = {name for _, _, name in eligible[:heal_return_limit]}
+
     commanded_self_destructs: set[str] = set()
     for unit in turn.units:
         uid = str(unit.id)[:8]
@@ -3864,6 +3896,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 core_moving=core_moving,
                 team=_combat_team_for(name, config),
             )
+            and (heal_return_allowed is None or name in heal_return_allowed)
         ):
             moved = _move_towards(
                 unit,

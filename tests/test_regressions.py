@@ -3240,24 +3240,29 @@ class HomeHealReturnTests(unittest.TestCase):
             self._should_return(self._unit(hp=1, unit_type=UnitType.WORKER))
         )
 
-    def test_home_ranger_actually_marches_home_in_choose_actions(self) -> None:
-        """The user-visible bug: a 1-HP home ranger off the Core now issues a
-        MOVE toward the Core instead of keeping up its patrol/roam."""
+    @staticmethod
+    def _make_ranger(uid, pos, hp):
+        ranger = SimpleNamespace(
+            id=uid, unit_type=UnitType.RANGER, position=pos, hp=hp,
+        )
+        ranger.move = lambda direction: None
+        ranger.wait = lambda: None
+        return ranger
+
+    def _run_choose_actions(self, combat_units, *, config, limit=None, home_team=None):
+        """Run choose_actions against the given combat units; return the
+        per-unit actions dict. Names are deterministic (R1, R2, … / V1, V2…)."""
+        rangers = tuple(u for u in combat_units if u.unit_type == UnitType.RANGER)
+        vanguards = tuple(u for u in combat_units if u.unit_type == UnitType.VANGUARD)
+        if home_team is not None:
+            config["home_team"] = home_team
         prev_names = dict(tactic._object_names)
         prev_counters = dict(tactic._object_name_counters)
         prev_resource_space = tactic.turn_context.resource_space
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
-            # Name the ranger deterministically and pin it to the home roster.
             tactic._object_names.clear()
             tactic._object_name_counters.clear()
-            ranger = SimpleNamespace(
-                id="ranger-1", unit_type=UnitType.RANGER,
-                position=(10, 0), hp=1,
-                action=None, direction=None,
-            )
-            ranger.move = lambda direction: setattr(ranger, "direction", direction)
-            ranger.wait = lambda: None
             core = SimpleNamespace(
                 id="core", position=(0, 0), hp=5, shield=10,
                 view=SimpleNamespace(state=SimpleNamespace(value="ALIVE")),
@@ -3271,10 +3276,10 @@ class HomeHealReturnTests(unittest.TestCase):
             )
             turn = SimpleNamespace(
                 tick=1,
-                units=(ranger,),
+                units=rangers + vanguards,
                 workers=(),
-                vanguards=(),
-                rangers=(ranger,),
+                vanguards=vanguards,
+                rangers=rangers,
                 visible_enemies=(),
                 core=core,
                 resources=50,
@@ -3285,8 +3290,8 @@ class HomeHealReturnTests(unittest.TestCase):
                 events=(),
                 obstacle_cells=frozenset(),
             )
-            config = default_config()
-            config["home_team"] = "R1"
+            if limit is not None:
+                config["combat_heal_return_limit"] = limit
             with patch.object(tactic, "load_config", return_value=config), \
                  patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
                  patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
@@ -3295,16 +3300,66 @@ class HomeHealReturnTests(unittest.TestCase):
                  patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"):
                 tactic._map_dirty = False
                 try:
-                    core_action, actions = tactic.choose_actions(turn)
+                    _, actions = tactic.choose_actions(turn)
                 finally:
                     tactic._object_names.clear()
                     tactic._object_names.update(prev_names)
                     tactic._object_name_counters.clear()
                     tactic._object_name_counters.update(prev_counters)
                     tactic.turn_context.resource_space = prev_resource_space
+        return actions
 
+    def test_home_ranger_actually_marches_home_in_choose_actions(self) -> None:
+        """The user-visible bug: a 1-HP home ranger off the Core now issues a
+        MOVE toward the Core instead of keeping up its patrol/roam."""
+        config = default_config()
+        ranger = self._make_ranger("ranger-1", (10, 0), 1)
+        actions = self._run_choose_actions((ranger,), config=config, home_team="R1")
         self.assertIn("ranger-1", actions)
         self.assertIn("home-heal-return", actions["ranger-1"])
+
+    def test_stagger_limit_one_sends_only_most_damaged_home(self) -> None:
+        """Two 1-HP home rangers: the per-Tick cap of 1 peels off only one;
+        the closer one wins the single slot and the other keeps defending."""
+        config = default_config()
+        rangers = (
+            self._make_ranger("ranger-a", (10, 0), 1),
+            self._make_ranger("ranger-b", (12, 0), 1),
+        )
+        actions = self._run_choose_actions(rangers, config=config, limit=1, home_team="R1, R2")
+        returning = [k for k, v in actions.items() if "home-heal-return" in v]
+        self.assertEqual(returning, ["ranger-a"])
+
+    def test_stagger_limit_zero_sends_all_home(self) -> None:
+        """Limit 0 (不限) keeps the original behavior: every eligible unit
+        returns in the same Tick."""
+        config = default_config()
+        rangers = (
+            self._make_ranger("ranger-a", (10, 0), 1),
+            self._make_ranger("ranger-b", (12, 0), 1),
+        )
+        actions = self._run_choose_actions(rangers, config=config, limit=0, home_team="R1, R2")
+        returning = [k for k, v in actions.items() if "home-heal-return" in v]
+        self.assertEqual(len(returning), 2)
+
+    def test_stagger_prefers_lowest_hp_over_distance(self) -> None:
+        """Scarce slots go to the most-damaged unit first, even when a less
+        damaged one is much closer to the Core."""
+        config = default_config()
+        config["combat_heal_hp_threshold"] = 3  # both 2-HP and 1-HP eligible
+        ranger = self._make_ranger("ranger-a", (100, 0), 1)   # 1 HP, far away
+        vanguard = SimpleNamespace(
+            id="vanguard-a", unit_type=UnitType.VANGUARD,
+            position=(5, 0), hp=2,  # 2 HP, near the Core
+        )
+        vanguard.move = lambda direction: None
+        vanguard.wait = lambda: None
+        actions = self._run_choose_actions(
+            (ranger, vanguard), config=config, limit=1, home_team="R1, V1",
+        )
+        # The 1-HP ranger wins the single slot over the 2-HP vanguard.
+        returning = [k for k, v in actions.items() if "home-heal-return" in v]
+        self.assertEqual(returning, ["ranger-a"])
 
 
 class ManualWaypointTests(unittest.TestCase):
