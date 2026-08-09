@@ -310,6 +310,13 @@ def _dead_component(
     return frozenset(seen)
 
 
+# Cached (obstacles | dead-end) union per obstacle map: rebuilding this
+# thousands-of-cells frozenset on every _path_blockers call was the main
+# replan cost. Same identity/equality discipline as _get_dead_ends.
+_path_blockers_union_key: frozenset[tuple[int, int]] | None = None
+_path_blockers_union: frozenset[tuple[int, int]] = frozenset()
+
+
 def _path_blockers(
     obstacles: frozenset[tuple[int, int]],
     *,
@@ -323,12 +330,23 @@ def _path_blockers(
     dead = _get_dead_ends(obstacles)
     if not dead:
         return obstacles
+    global _path_blockers_union_key, _path_blockers_union
+    if obstacles is _path_blockers_union_key or obstacles == _path_blockers_union_key:
+        union = _path_blockers_union
+    else:
+        union = obstacles | dead
+        _path_blockers_union_key = obstacles
+        _path_blockers_union = union
     allowed: set[tuple[int, int]] = set()
     if start is not None and start in dead:
         allowed |= _dead_component(start, dead)
     if goal is not None and goal in dead:
         allowed |= _dead_component(goal, dead)
-    return obstacles | (dead - allowed)
+    if not allowed:
+        return union
+    # allowed ⊆ dead and dead cells are free by construction, so subtracting
+    # it from the union equals obstacles | (dead - allowed).
+    return union - allowed
 
 
 def _is_dead_end_step(
@@ -419,6 +437,24 @@ def _direction_for_step(
         if direction.delta == delta:
             return direction
     return None
+
+
+def _path_index(
+    path: list[tuple[int, int]],
+    pos: tuple[int, int],
+    hint: int = -1,
+) -> int:
+    """Index of pos on path, trusting the cached cursor when it still matches.
+
+    Units advance one cell per Tick, so the cursor almost always hits and the
+    O(len(path)) list scan is skipped; a mismatch falls back to the scan.
+    """
+    if 0 <= hint < len(path) and path[hint] == pos:
+        return hint
+    try:
+        return path.index(pos)
+    except ValueError:
+        return -1
 
 
 _object_names: dict[tuple[str, str], str] = {}
@@ -741,9 +777,8 @@ def _worker_cached_path_step(
     if pos == goal:
         _worker_path_cache.pop(uid, None)
         return None
-    try:
-        k = path.index(pos)
-    except ValueError:
+    k = _path_index(path, pos, cached.get("index", -1))
+    if k < 0:
         # Unit is not on the cached path (blocked or diverted last tick).
         return None
     if k + 1 >= len(path):
@@ -770,6 +805,7 @@ def _worker_cached_path_step(
     if len(recent) > 6:
         recent.pop(0)
     _worker_recent[uid] = recent
+    cached["index"] = k + 1
     _set_worker_route(worker, tuple(goal), path, complete=True)
     return ("MOVE", f"{bfs_dir.name} -> {goal}")
 
@@ -1237,6 +1273,8 @@ def _plan_worker(
             _worker_path_cache[uid] = {
                 "goal": tuple(goal),
                 "path": path,
+                # Cursor of the unit on the path — path[0] is the current cell.
+                "index": 0,
                 # Debug only — never compared for cache validity.
                 "obstacles_used": bfs_obs,
             }
@@ -1616,27 +1654,23 @@ def _move_towards(
     path: list[tuple[int, int]] | None = None
     if cached is not None and cached.get("goal") == goal:
         cached_path = cached.get("path") or []
-        try:
-            index = cached_path.index(pos)
-        except ValueError:
-            index = -1
+        index = _path_index(cached_path, pos, cached.get("index", -1))
         if index >= 0 and index + 1 < len(cached_path):
             next_cell = cached_path[index + 1]
             if next_cell not in obstacle_cells and not _is_dead_end_step(
                 next_cell, obstacle_cells, allow=(goal,),
             ):
                 path = cached_path
+                cached["index"] = index
     if path is None:
         _combat_path_cache.pop(uid, None)
         path = _bfs_path(pos, goal, obstacle_cells, max_steps=2500)
         if path and len(path) > 1:
-            _combat_path_cache[uid] = {"goal": goal, "path": path}
+            _combat_path_cache[uid] = {"goal": goal, "path": path, "index": 0}
 
     if path and len(path) > 1:
-        try:
-            index = path.index(pos)
-        except ValueError:
-            index = -1
+        entry = _combat_path_cache.get(uid)
+        index = _path_index(path, pos, entry.get("index", -1) if entry else -1)
         next_cell = path[index + 1] if 0 <= index + 1 < len(path) else None
         direction = _direction_for_step(pos, next_cell) if next_cell else None
         if direction is not None and _try_move(
@@ -1647,6 +1681,8 @@ def _move_towards(
             avoid_dead_ends=True,
             allow=(goal,),
         ):
+            if entry is not None:
+                entry["index"] = index + 1
             _set_unit_route(unit, goal, path, complete=True)
             return ("MOVE", f"{direction.name} {detail_prefix} {goal}")
 
@@ -2877,7 +2913,8 @@ def _prune_waypoint_targets(
 # Signature cache for waypoints.json, keyed by path: the file only changes
 # when the dashboard sets a target or a unit reaches one, so an unchanged file
 # must not cost a cross-process lock + full read every Tick. Pruning against
-# the changing alive set still runs in memory on the cached copy.
+# the changing alive set runs in memory on the cached copy, and is persisted
+# the moment it actually drops something (a unit with a target died).
 _waypoints_sig_cache: dict[str, tuple[int, int] | None] = {}
 _waypoints_cached: dict[str, dict[str, tuple[int, int]]] = {}
 
@@ -2887,13 +2924,11 @@ def _load_and_prune_waypoints(alive_names: set[str]) -> dict[str, tuple[int, int
     key = str(WAYPOINTS_PATH)
     sig = _file_signature(WAYPOINTS_PATH)
     if key in _waypoints_sig_cache and sig == _waypoints_sig_cache[key]:
-        pruned = {
-            name: target
-            for name, target in _waypoints_cached.get(key, {}).items()
-            if name in alive_names
-        }
-        _waypoints_cached[key] = pruned
-        return dict(pruned)
+        cached = _waypoints_cached.get(key, {})
+        if all(name in alive_names for name in cached):
+            return dict(cached)  # steady state: unchanged file, nothing stale
+        # A unit with a manual target died: fall through and persist the prune
+        # so the dashboard — and a restart's name re-use — never see it again.
     with file_lock(WAYPOINTS_PATH):
         targets = _load_waypoints()
         if _prune_waypoint_targets(targets, alive_names):
@@ -2946,9 +2981,11 @@ def _load_and_prune_self_destructs(alive_names: set[str]) -> set[str]:
     key = str(SELF_DESTRUCT_PATH)
     sig = _file_signature(SELF_DESTRUCT_PATH)
     if key in _self_destruct_sig_cache and sig == _self_destruct_sig_cache[key]:
-        remaining = {n for n in _self_destruct_cached.get(key, set()) if n in alive_names}
-        _self_destruct_cached[key] = remaining
-        return set(remaining)
+        cached = _self_destruct_cached.get(key, set())
+        if not cached or cached <= alive_names:
+            return set(cached)  # steady state: unchanged file, all pending alive
+        # A pending command targets a dead unit: fall through and persist the
+        # prune so a restart's name re-use can never inherit a stale command.
     with file_lock(SELF_DESTRUCT_PATH):
         pending = _load_self_destructs_unlocked()
         remaining = {n for n in pending if n in alive_names}

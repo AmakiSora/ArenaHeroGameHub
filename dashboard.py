@@ -119,6 +119,29 @@ def _trend_points(records: list[dict], max_points: int = 240) -> list[dict]:
     return points
 
 
+# /api/trends is polled every 2 s; re-parsing up to 2000 full tick records per
+# poll is pure overhead while the log file has not grown. Cache the compact
+# series by (log mtime+size, window) — same heuristic as the tactic's file
+# signatures; every appended tick bumps mtime and invalidates the entry.
+_trends_cache: dict[tuple[int, int, int], list[dict]] = {}
+
+
+def _trends_points(window: int) -> list[dict]:
+    try:
+        stat = os.stat(LOG_FILE)
+    except OSError:
+        return []
+    key = (stat.st_mtime_ns, stat.st_size, window)
+    cached = _trends_cache.get(key)
+    if cached is not None:
+        return cached
+    points = _trend_points(read_history(window))
+    # Keep only the newest entry so an old window or rotated log frees memory.
+    _trends_cache.clear()
+    _trends_cache[key] = points
+    return points
+
+
 # ── Categorized battle log (「战斗日志」panel below the config) ──────────────
 # The tactic process appends discovery/combat/economy/failure rows each tick;
 # the dashboard process appends config-change rows on save.  Filter chips in
@@ -4118,8 +4141,7 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 window = 400
             window = max(50, min(2000, window))
-            history = read_history(window)
-            points = _trend_points(history)
+            points = _trends_points(window)
             self._send_json(200, {
                 "ok": True,
                 "window": window,
