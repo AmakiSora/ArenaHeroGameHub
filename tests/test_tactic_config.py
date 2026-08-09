@@ -31,6 +31,22 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(config["attack_target_x"], 0)
         self.assertEqual(config["attack_target_y"], 0)
         self.assertEqual(config["attack_mode"], "coords")
+        self.assertEqual(config["combat_heal_hp_threshold"], 2)
+
+    def test_combat_heal_threshold_validation(self) -> None:
+        # 0 disables the home-team retreat-to-heal; 1..4 pick the HP cutoff.
+        self.assertEqual(
+            validate_config({"combat_heal_hp_threshold": 0})["combat_heal_hp_threshold"],
+            0,
+        )
+        self.assertEqual(
+            validate_config({"combat_heal_hp_threshold": 4})["combat_heal_hp_threshold"],
+            4,
+        )
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"combat_heal_hp_threshold": -1})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"combat_heal_hp_threshold": 5})
 
     def test_attack_mode_rejects_unknown_values(self) -> None:
         with self.assertRaises(ConfigValidationError):
@@ -124,6 +140,9 @@ class TacticConfigTests(unittest.TestCase):
             if field.group in ("combat", "production"):
                 continue
             self.assertIn(f'name="{field.key}"', panel)
+        # combat_heal_hp_threshold is a combat behavior, but not one of the
+        # dedicated team-settings fields, so it renders in the generic panel.
+        self.assertIn('name="combat_heal_hp_threshold"', panel)
         for key, current_id in (
             ("target_workers", "prodCurrentWorkers"),
             ("target_vanguards", "prodCurrentVanguards"),

@@ -3167,6 +3167,146 @@ class HealingPlannerTests(unittest.TestCase):
         self.assertFalse(tactic._core_should_heal(self._core(hp=3), 2, config))
 
 
+class HomeHealReturnTests(unittest.TestCase):
+    """守家队主动回核心回血: only the home squad marches back to heal."""
+
+    @staticmethod
+    def _unit(*, pos=(10, 0), hp=1, unit_type=UnitType.RANGER):
+        return SimpleNamespace(position=pos, hp=hp, unit_type=unit_type)
+
+    def _should_return(self, unit, *, team="home", config=None, core_moving=False):
+        cfg = config or default_config()
+        return tactic._unit_should_return_to_heal(
+            unit,
+            cfg,
+            core_pos=(0, 0),
+            core_moving=core_moving,
+            team=team,
+        )
+
+    def test_home_ranger_at_one_hp_returns(self) -> None:
+        self.assertTrue(self._should_return(self._unit(hp=1, unit_type=UnitType.RANGER)))
+
+    def test_home_vanguard_below_threshold_returns(self) -> None:
+        # Threshold 2 ("HP 低于阈值就回"): a 3/4 vanguard stays out; only a
+        # 1/4 vanguard comes home. Raising the threshold brings back 2/4 too.
+        self.assertFalse(self._should_return(self._unit(hp=3, unit_type=UnitType.VANGUARD)))
+        self.assertFalse(self._should_return(self._unit(hp=2, unit_type=UnitType.VANGUARD)))
+        self.assertTrue(self._should_return(self._unit(hp=1, unit_type=UnitType.VANGUARD)))
+
+    def test_full_hp_does_not_return(self) -> None:
+        self.assertFalse(self._should_return(self._unit(hp=2, unit_type=UnitType.RANGER)))
+
+    def test_attack_team_never_returns(self) -> None:
+        self.assertFalse(
+            self._should_return(self._unit(hp=1), team="attack")
+        )
+        self.assertFalse(
+            self._should_return(self._unit(hp=1), team="guerrilla")
+        )
+        self.assertFalse(
+            self._should_return(self._unit(hp=1), team="unassigned")
+        )
+
+    def test_threshold_zero_disables_retreat(self) -> None:
+        config = default_config()
+        config["combat_heal_hp_threshold"] = 0
+        self.assertFalse(
+            self._should_return(self._unit(hp=1), config=config)
+        )
+
+    def test_threshold_raises_returns_full_vanguard(self) -> None:
+        config = default_config()
+        config["combat_heal_hp_threshold"] = 4
+        self.assertTrue(
+            self._should_return(
+                self._unit(hp=3, unit_type=UnitType.VANGUARD), config=config,
+            )
+        )
+
+    def test_on_core_cell_left_to_heal_branch(self) -> None:
+        self.assertFalse(self._should_return(self._unit(pos=(0, 0), hp=1)))
+
+    def test_moving_core_does_not_chase(self) -> None:
+        self.assertFalse(self._should_return(self._unit(hp=1), core_moving=True))
+
+    def test_heal_disabled_no_retreat(self) -> None:
+        config = default_config()
+        config["heal_enabled"] = False
+        self.assertFalse(self._should_return(self._unit(hp=1), config=config))
+
+    def test_worker_never_returns(self) -> None:
+        self.assertFalse(
+            self._should_return(self._unit(hp=1, unit_type=UnitType.WORKER))
+        )
+
+    def test_home_ranger_actually_marches_home_in_choose_actions(self) -> None:
+        """The user-visible bug: a 1-HP home ranger off the Core now issues a
+        MOVE toward the Core instead of keeping up its patrol/roam."""
+        prev_names = dict(tactic._object_names)
+        prev_counters = dict(tactic._object_name_counters)
+        prev_resource_space = tactic.turn_context.resource_space
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            # Name the ranger deterministically and pin it to the home roster.
+            tactic._object_names.clear()
+            tactic._object_name_counters.clear()
+            ranger = SimpleNamespace(
+                id="ranger-1", unit_type=UnitType.RANGER,
+                position=(10, 0), hp=1,
+                action=None, direction=None,
+            )
+            ranger.move = lambda direction: setattr(ranger, "direction", direction)
+            ranger.wait = lambda: None
+            core = SimpleNamespace(
+                id="core", position=(0, 0), hp=5, shield=10,
+                view=SimpleNamespace(state=SimpleNamespace(value="ALIVE")),
+                spawn=lambda unit_type: None,
+                heal=lambda: None,
+                repair_shield=lambda: None,
+                move=lambda *args, **kwargs: None,
+            )
+            beacon = SimpleNamespace(
+                position=None, status=SimpleNamespace(name="GROUND"),
+            )
+            turn = SimpleNamespace(
+                tick=1,
+                units=(ranger,),
+                workers=(),
+                vanguards=(),
+                rangers=(ranger,),
+                visible_enemies=(),
+                core=core,
+                resources=50,
+                resource_cells=frozenset(),
+                resource_space=0,
+                beacon=beacon,
+                state=SimpleNamespace(population=8),
+                events=(),
+                obstacle_cells=frozenset(),
+            )
+            config = default_config()
+            config["home_team"] = "R1"
+            with patch.object(tactic, "load_config", return_value=config), \
+                 patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
+                 patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
+                 patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"), \
+                 patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"), \
+                 patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"):
+                tactic._map_dirty = False
+                try:
+                    core_action, actions = tactic.choose_actions(turn)
+                finally:
+                    tactic._object_names.clear()
+                    tactic._object_names.update(prev_names)
+                    tactic._object_name_counters.clear()
+                    tactic._object_name_counters.update(prev_counters)
+                    tactic.turn_context.resource_space = prev_resource_space
+
+        self.assertIn("ranger-1", actions)
+        self.assertIn("home-heal-return", actions["ranger-1"])
+
+
 class ManualWaypointTests(unittest.TestCase):
     """Per-unit manual target coordinates (dashboard ⌖) — march, then resume."""
 

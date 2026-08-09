@@ -3441,6 +3441,46 @@ def _core_should_heal(core: Any, resources: int, config: dict) -> bool:
     )
 
 
+def _unit_should_return_to_heal(
+    unit: Any,
+    config: dict[str, Any],
+    *,
+    core_pos: tuple[int, int],
+    core_moving: bool,
+    team: str,
+) -> bool:
+    """True when a 守家队 combat unit should march back to the Core to heal.
+
+    Only the home squad returns to heal — attack / guerrilla / unassigned units
+    keep fighting damaged, since the passive HEAL branch in choose_actions only
+    fires when a unit is already standing on the Core cell. The march is gated
+    on the Core being stationary and healing enabled so units don't chase a
+    moving Core; the actual HEAL still resolves against the real resource pool
+    (1 HP = 1 resource) and fails privately if it can't.
+    """
+    if team != "home":
+        return False
+    if unit.unit_type not in (UnitType.VANGUARD, UnitType.RANGER):
+        return False
+    if not bool(config.get("heal_enabled", True)):
+        return False
+    if core_moving:
+        return False
+    threshold = int(config.get("combat_heal_hp_threshold", 2))
+    if threshold < 1:
+        return False
+    hp = int(getattr(unit, "hp", 0) or 0)
+    if hp <= 0:
+        return False
+    if hp >= _unit_max_hp(unit):
+        return False
+    if hp >= threshold:
+        return False
+    if tuple(unit.position) == tuple(core_pos):
+        return False  # already on the Core cell -> the HEAL branch handles it
+    return True
+
+
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
     """Queue actions, return (core_action_name, {unit_id: action_detail})."""
     unit_actions_detail: dict[str, str] = {}
@@ -3811,6 +3851,30 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             unit.heal()
             unit_actions_detail[uid] = "HEAL"
             continue
+        # 守家队主动回撤回血: a home-squad Vanguard/Ranger below the
+        # combat_heal_hp_threshold marches back to the Core; the HEAL branch
+        # above picks it up once it arrives. Attack / guerrilla squads never
+        # give up field presence to heal.
+        if (
+            unit.unit_type in (UnitType.VANGUARD, UnitType.RANGER)
+            and _unit_should_return_to_heal(
+                unit,
+                config,
+                core_pos=core_pos,
+                core_moving=core_moving,
+                team=_combat_team_for(name, config),
+            )
+        ):
+            moved = _move_towards(
+                unit,
+                tuple(unit.position),
+                core_pos,
+                obstacle_cells,
+                detail_prefix="home-heal-return",
+            )
+            if moved is not None:
+                unit_actions_detail[uid] = f"MOVE:{moved[1]}[heal-return]"
+                continue
         # Manual per-unit waypoint: march to the configured coordinate, then
         # resume the normal planner once it is reached.
         wp = waypoints.get(name)
