@@ -3601,6 +3601,9 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         bool(config.get("worker_explore_when_full", False))
         and turn_context.resource_space == 0
     )
+    # Defined in both branches below: the core-movement heuristic reads it even
+    # in full-explore mode, so it must never be left undefined.
+    all_resources: list = []
     if gold_full_explore:
         _resource_assignments.clear()
     else:

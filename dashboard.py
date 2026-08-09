@@ -1248,6 +1248,9 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
     )
 
     def _draw_route(unit_data, name, color, css_class=""):
+        # Unit names ultimately come from the game server (enemy names are
+        # opponent-controlled), so escape before interpolating into attributes.
+        safe_name = html.escape(str(name), quote=True)
         # Trim the already-walked segment: the planner logs the full A* polyline
         # every tick while a unit advances along it, so without this the map
         # keeps showing ground the unit has already crossed.
@@ -1260,7 +1263,7 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
                 route_points.append(f"{x + cell / 2:.1f},{y + cell / 2:.1f}")
             points_attr = " ".join(route_points)
             dash = "" if unit_data.get("path_complete") else ' stroke-dasharray="5 4"'
-            a(f'<polyline class="{css_class}" data-cat="route" data-unit="{name}" '
+            a(f'<polyline class="{css_class}" data-cat="route" data-unit="{safe_name}" '
               f'points="{points_attr}" fill="none" stroke="{color}" '
               f'stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" '
               f'opacity="0.82"{dash}/>')
@@ -1269,7 +1272,7 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
             if xmin <= tx <= xmax and ymin <= ty <= ymax:
                 x, y = to_xy(tx, ty)
                 cx, cy = x + cell / 2, y + cell / 2
-                a(f'<circle class="{css_class}-target" data-cat="target" data-unit="{name}" cx="{cx}" cy="{cy}" '
+                a(f'<circle class="{css_class}-target" data-cat="target" data-unit="{safe_name}" cx="{cx}" cy="{cy}" '
                   f'r="8" fill="none" stroke="{color}" stroke-width="1.8" opacity="0.9"/>')
                 a(f'<circle data-cat="target" cx="{cx}" cy="{cy}" r="2" fill="{color}"/>')
 
@@ -1297,8 +1300,10 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
         font_size = 6 if len(str(label)) > 2 else 7
         a(f'<circle data-cat="{cat}" cx="{ux}" cy="{uy}" r="{unit_radius}" fill="{color}" filter="url(#glow)" '
           f'stroke="rgba(255,255,255,0.65)" stroke-width="1.2"/>')
+        # Enemy labels are opponent-controlled: escape before embedding as text.
         a(f'<text data-cat="{cat}" x="{ux}" y="{uy+2.5}" text-anchor="middle" font-size="{font_size}" '
-          f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#0b1020">{label}</text>')
+          f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#0b1020">'
+          f'{html.escape(str(label))}</text>')
 
     for index, w in enumerate(rec.get("workers", [])):
         c = bool(w.get("cargo"))
@@ -1351,7 +1356,7 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
           f'stroke-width="1.4" filter="url(#glow)"/>')
         a(f'<text data-cat="core" x="{core_cx}" y="{core_cy+3}" text-anchor="middle" font-size="8" '
           f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#081018">'
-          f'{rec.get("core_name") or "C1"}</text>')
+          f'{html.escape(str(rec.get("core_name") or "C1"))}</text>')
 
     # Beacon
     bp = rec.get("beacon_pos")
@@ -2524,7 +2529,10 @@ JS = r"""
         try{
           const res = await fetch('/api/enemy/clear', {method:'POST'});
           const data = await res.json();
-          if(data.ok) refresh();
+          if(data.ok){
+            lastTick = null;
+            softRefresh();
+          }
         }catch(e){}
       });
     }
@@ -3803,7 +3811,7 @@ def build_parts():
 
     left_html = (
         f'<section class="panel left-rail-panel core-summary"><div class="panel-title">'
-        f'<span class="rail-title"><i class="rail-mark">◆</i>核心 · {rec.get("core_name") or "C1"}</span>'
+        f'<span class="rail-title"><i class="rail-mark">◆</i>核心 · {html.escape(str(rec.get("core_name") or "C1"))}</span>'
         f'<span class="count">{rec.get("core_state") or "—"}</span></div>{left_core}</section>'
         f'<section class="panel left-rail-panel resource-summary"><div class="panel-title">'
         f'<span class="rail-title"><i class="rail-mark">⬡</i>资源</span><span class="count">采集态势</span></div>{left_res}</section>'
