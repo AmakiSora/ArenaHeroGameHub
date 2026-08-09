@@ -1872,6 +1872,268 @@ class DeadEndCacheTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
 
+class IncrementalDeadEndTests(unittest.TestCase):
+    """Equivalence of the persistent incremental dead-end structure vs the batch.
+
+    Mirrors the session's 300-random-map equivalence check: the incremental
+    wall-add path (_dead_add_walls) and the extras derivation must produce the
+    same dead-end set as a full from-scratch _dead_end_cells. Saves/restores the
+    persistent-structure globals so tests never leak state across methods.
+    """
+
+    GLOBALS = (
+        "_dead_obstacles", "_dead_open_count", "_dead_set", "_dead_view",
+        "_dead_structure_built", "_known_obstacles", "_obstacle_memory",
+        "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
+        "_path_blockers_union",
+    )
+
+    def _snapshot(self) -> dict:
+        return {name: getattr(tactic, name) for name in self.GLOBALS}
+
+    def _restore(self, snap: dict) -> None:
+        for name, val in snap.items():
+            setattr(tactic, name, val)
+
+    def setUp(self) -> None:
+        self._snap = self._snapshot()
+
+    def tearDown(self) -> None:
+        self._restore(self._snap)
+
+    def _fresh_map(self, walls: set) -> None:
+        """Reset the persistent structure to cover exactly `walls`."""
+        tactic._obstacle_memory = set(walls)
+        tactic._known_obstacles = frozenset()
+        tactic._reset_dead_structure(frozenset())
+        tactic._dead_end_cache_key = None
+        tactic._dead_end_cache = frozenset()
+        tactic._path_blockers_union_key = None
+        tactic._path_blockers_union = frozenset()
+
+    def test_incremental_wall_add_matches_batch(self) -> None:
+        import random
+        random.seed(42)
+        walls: set = set()
+        self._fresh_map(walls)
+        for step in range(200):
+            for _ in range(random.randint(1, 3)):
+                walls.add((random.randint(-15, 15), random.randint(-15, 15)))
+            known = tactic._update_obstacle_memory(
+                SimpleNamespace(obstacle_cells=walls)
+            )
+            inc = tactic._get_dead_ends(known)
+            batch = tactic._dead_end_cells(frozenset(walls))
+            self.assertEqual(inc, batch,
+                             f"step {step}: incremental != batch "
+                             f"(only_inc={len(inc - batch)} only_batch={len(batch - inc)})")
+
+    def test_incremental_wall_add_lands_on_dead_end_matches_batch(self) -> None:
+        """Walls landing on existing free dead-end cells exercise the was_dead path."""
+        import random
+        random.seed(99)
+        walls: set = set()
+        self._fresh_map(walls)
+        for step in range(120):
+            for _ in range(8):
+                walls.add((random.randint(-8, 8), random.randint(-8, 8)))
+            dead_now = tactic._get_dead_ends(
+                tactic._known_obstacles
+            ) if tactic._known_obstacles else frozenset()
+            for c in list(dead_now)[:2]:
+                walls.add(c)  # a wall lands where a dead-end free cell was
+            known = tactic._update_obstacle_memory(
+                SimpleNamespace(obstacle_cells=walls)
+            )
+            inc = tactic._get_dead_ends(known)
+            batch = tactic._dead_end_cells(frozenset(walls))
+            self.assertEqual(inc, batch, f"step {step}: was_dead path diverged")
+
+    def test_extras_derivation_matches_batch(self) -> None:
+        import random
+        random.seed(7)
+        walls: set = set()
+        for _ in range(300):
+            walls.add((random.randint(-15, 15), random.randint(-15, 15)))
+        self._fresh_map(walls)
+        tactic._update_obstacle_memory(SimpleNamespace(obstacle_cells=walls))
+        for _ in range(150):
+            extras = {
+                (random.randint(-15, 15), random.randint(-15, 15))
+                for _ in range(random.randint(1, 40))
+            }
+            inc = tactic._get_dead_ends(
+                tactic._known_obstacles, extras=frozenset(extras)
+            )
+            batch = tactic._dead_end_cells(frozenset(walls) | frozenset(extras))
+            self.assertEqual(inc, batch,
+                             f"extras derivation != batch "
+                             f"(only_inc={len(inc - batch)} only_batch={len(batch - inc)})")
+
+    def test_extras_does_not_mutate_persistent_structure(self) -> None:
+        walls = {(1, 0), (2, 0), (0, 1), (3, 0)}
+        self._fresh_map(walls)
+        tactic._update_obstacle_memory(SimpleNamespace(obstacle_cells=walls))
+        tactic._get_dead_ends(tactic._known_obstacles)  # build structure
+        view_before = tactic._dead_view
+        oc_before = dict(tactic._dead_open_count)
+        tactic._get_dead_ends(
+            tactic._known_obstacles, extras=frozenset({(0, 0), (1, 1)})
+        )
+        self.assertIs(tactic._dead_view, view_before,
+                      "extras call mutated the cached _dead_view")
+        self.assertEqual(tactic._dead_open_count, oc_before,
+                         "extras call mutated _dead_open_count")
+
+    def test_bfs_path_extras_equals_folded_union(self) -> None:
+        import random
+        random.seed(11)
+        walls: set = set()
+        for _ in range(200):
+            walls.add((random.randint(-15, 15), random.randint(-15, 15)))
+        self._fresh_map(walls)
+        tactic._update_obstacle_memory(SimpleNamespace(obstacle_cells=walls))
+        known = tactic._known_obstacles
+        mism = 0
+        for _ in range(120):
+            extras = {
+                (random.randint(-15, 15), random.randint(-15, 15))
+                for _ in range(random.randint(0, 12))
+            }
+            start = (random.randint(-12, 12), random.randint(-12, 12))
+            goal = (random.randint(-12, 12), random.randint(-12, 12))
+            if goal in extras:
+                continue
+            p1 = tactic._bfs_path(start, goal, known, extras=frozenset(extras))
+            p2 = tactic._bfs_path(start, goal, known | frozenset(extras))
+            self.assertEqual(p1 or [], p2 or [], f"extras != folded for {start}->{goal}")
+            mism += 1
+        self.assertGreater(mism, 0)
+
+    def test_goal_in_extras_stays_blocked(self) -> None:
+        walls = {(1, 0), (2, 0), (0, 1)}
+        self._fresh_map(walls)
+        tactic._update_obstacle_memory(SimpleNamespace(obstacle_cells=walls))
+        known = tactic._known_obstacles
+        # goal cell is occupied by an "other" unit this tick: must not be entered
+        for goal in ((0, 0), (0, -1), (1, 1)):
+            p1 = tactic._bfs_path((2, 2), goal, known, extras=frozenset({goal}))
+            p2 = tactic._bfs_path((2, 2), goal, known | frozenset({goal}))
+            self.assertEqual(p1 or [], p2 or [],
+                             f"goal {goal} in extras: extras path != folded union")
+
+    def test_known_obstacles_stable_and_self_healing(self) -> None:
+        walls = {(-1, 0), (0, 1), (1, 0)}
+        self._fresh_map(walls)
+        t = SimpleNamespace(obstacle_cells=walls)
+        known1 = tactic._update_obstacle_memory(t)
+        known2 = tactic._update_obstacle_memory(t)
+        self.assertIs(known1, known2, "no-growth tick must return the same object")
+        # Same-cardinality out-of-band replacement must self-heal on next call.
+        # The old length-only check missed this and kept the cul-de-sac at (0, 0).
+        replacement = {(10, 10), (20, 20), (30, 30)}
+        tactic._obstacle_memory.clear()
+        tactic._obstacle_memory.update(replacement)
+        known3 = tactic._update_obstacle_memory(
+            SimpleNamespace(obstacle_cells=replacement)
+        )
+        self.assertEqual(known3, frozenset(replacement))
+        self.assertEqual(tactic._get_dead_ends(known3),
+                         tactic._dead_end_cells(frozenset(replacement)))
+        self.assertNotIn((0, 0), tactic._get_dead_ends(known3))
+
+    def test_load_map_memory_resets_structure(self) -> None:
+        walls = {(0, 1), (1, 0), (1, 1), (2, 0)}
+        self._fresh_map(walls)
+        tactic._update_obstacle_memory(SimpleNamespace(obstacle_cells=walls))
+        tactic._get_dead_ends(tactic._known_obstacles)
+        self.assertEqual(tactic._dead_obstacles, tactic._known_obstacles)
+        # simulate a load of a different wall set from a real map_memory.json
+        new_walls = {(5, 5), (5, 6), (6, 5)}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            path.write_text(json.dumps({
+                "obstacles": [list(p) for p in sorted(new_walls)],
+                "resources": [],
+                "manual_resources": [],
+                "forgotten_resources": [],
+                "enemy_sightings": [],
+                "enemy_clear_seq": 0,
+            }), encoding="utf-8")
+            with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._load_map_memory()
+        self.assertEqual(tactic._known_obstacles, frozenset(new_walls))
+        self.assertEqual(tactic._get_dead_ends(tactic._known_obstacles),
+                         tactic._dead_end_cells(frozenset(new_walls)))
+        self.assertEqual(tactic._dead_obstacles, tactic._known_obstacles)
+
+
+class PlanProfileTests(unittest.TestCase):
+    PROFILE_FIELDS = (
+        "plan_phase_ms", "plan_pathfind_calls", "plan_pathfind_expansions",
+        "plan_pathfind_ms", "plan_dead_end_ms", "plan_dead_end_runs",
+    )
+
+    def test_respawn_tick_replaces_stale_profile(self) -> None:
+        previous = {
+            name: getattr(tactic.turn_context, name)
+            for name in self.PROFILE_FIELDS
+        }
+        tactic.turn_context.plan_phase_ms = {"stale": 9999.0}
+        tactic.turn_context.plan_pathfind_calls = 77
+        tactic.turn_context.plan_pathfind_expansions = 888
+        tactic.turn_context.plan_pathfind_ms = 999.0
+        tactic.turn_context.plan_dead_end_ms = 555.0
+        tactic.turn_context.plan_dead_end_runs = 44
+        turn = SimpleNamespace(
+            tick=123,
+            core=None,
+            units=(),
+            workers=(),
+            vanguards=(),
+            rangers=(),
+            visible_enemies=(),
+            obstacle_cells=frozenset(),
+        )
+
+        patches = (
+            patch.object(tactic, "load_config", return_value=default_config()),
+            patch.object(tactic, "_resolve_shadow_predictions", return_value=[]),
+            patch.object(tactic, "_update_enemy_motion_tracks"),
+            patch.object(tactic, "_load_and_prune_waypoints", return_value={}),
+            patch.object(tactic, "_load_and_prune_self_destructs", return_value=set()),
+            patch.object(tactic, "_prune_dead_unit_bookkeeping"),
+            patch.object(tactic, "_apply_dashboard_map_edits"),
+            patch.object(tactic, "_update_obstacle_memory", return_value=frozenset()),
+            patch.object(tactic, "_update_resource_memory"),
+            patch.object(tactic, "_update_enemy_sightings"),
+            patch.object(tactic, "_save_map_memory"),
+            patch.object(tactic, "_battle_log_entries", return_value=[]),
+            patch.object(tactic.game_stats, "record_prediction_results"),
+            patch.object(tactic.game_stats, "sync_units"),
+            patch.object(tactic.game_stats, "record_events"),
+            patch.object(tactic.game_stats, "sampled"),
+            patch.object(tactic.game_stats, "maybe_save"),
+        )
+        try:
+            with contextlib.ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+                action, unit_actions = tactic.choose_actions(turn)
+
+            self.assertEqual((action, unit_actions), ("RESPAWN", {}))
+            self.assertNotIn("stale", tactic.turn_context.plan_phase_ms)
+            self.assertIn("prediction", tactic.turn_context.plan_phase_ms)
+            self.assertEqual(tactic.turn_context.plan_pathfind_calls, 0)
+            self.assertEqual(tactic.turn_context.plan_pathfind_expansions, 0)
+            self.assertEqual(tactic.turn_context.plan_pathfind_ms, 0.0)
+            self.assertEqual(tactic.turn_context.plan_dead_end_runs, 0)
+            self.assertEqual(tactic.turn_context.plan_dead_end_ms, 0.0)
+        finally:
+            for name, value in previous.items():
+                setattr(tactic.turn_context, name, value)
+
+
 class WorkerPathCacheTests(unittest.TestCase):
     class Worker:
         def __init__(self, worker_id: str, position: tuple[int, int]) -> None:

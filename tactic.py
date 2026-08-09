@@ -61,6 +61,13 @@ LOG_MAX_BYTES = int(os.environ.get("ARENA_LOG_MAX_MB", "20")) * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 # Shutdown summary only reads this many of the newest tick records.
 _SUMMARY_TAIL_RECORDS = 10000
+# Print a per-Tick phase breakdown here when planning+submit crossed this many
+# ms, so multi-second spikes (the source of ticks that look "stuck" on the live
+# server) get attributed to a phase without re-running offline. Override with
+# the ARENA_SLOW_PLAN_THRESHOLD_MS env var; 0 always prints.
+_SLOW_PLAN_THRESHOLD_MS = float(
+    os.environ.get("ARENA_SLOW_PLAN_THRESHOLD_MS", "3000")
+)
 
 # Enemy motion is sampled in shadow mode only. Three consecutive steps are
 # required before a lead shot becomes eligible; two consecutive zero-steps
@@ -226,6 +233,20 @@ _CARDINAL_DELTAS: tuple[tuple[int, int], ...] = ((0, -1), (1, 0), (0, 1), (-1, 0
 _dead_end_cache_key: frozenset[tuple[int, int]] | None = None
 _dead_end_cache: frozenset[tuple[int, int]] = frozenset()
 
+# Persistent incremental dead-end structure for the permanent obstacle memory.
+# _dead_obstacles is the exact obstacle set the structure covers — the same
+# object as _known_obstacles in the normal flow, so the wall fast-path is an
+# O(1) identity hit. Maintained add-only by _dead_add_walls(); extras
+# (transient occupied cells) are derived on a scratch copy, never here.
+_dead_obstacles: frozenset[tuple[int, int]] = frozenset()
+_dead_open_count: dict[tuple[int, int], int] = {}   # candidate free cell -> open degree
+_dead_set: set[tuple[int, int]] = set()             # current wall dead ends
+_dead_view: frozenset[tuple[int, int]] = frozenset()  # cached frozenset(_dead_set)
+_dead_structure_built: bool = False
+# Stable per-tick view of _obstacle_memory: the same frozenset object across
+# ticks unless walls actually grew (see _update_obstacle_memory).
+_known_obstacles: frozenset[tuple[int, int]] = frozenset()
+
 
 def _neighbor_cells(pos: tuple[int, int]) -> tuple[tuple[int, int], ...]:
     x, y = pos
@@ -240,6 +261,142 @@ def _open_degree(
     return sum(1 for n in _neighbor_cells(pos) if n not in blocked)
 
 
+class _PhaseTimer:
+    """Per-Tick wall-clock profiler for choose_actions, broken into named phases.
+
+    Zero-overhead when idle: phases only call time.monotonic() once at start
+    and once at stop, so the hot unit loop stays cheap. Accumulated phase
+    times flow into the structured log (phase_ms) and a stdout summary line
+    is printed only when planning is slow, so healthy ticks emit nothing
+    extra. Used to localize the multi-second planning spikes seen on the
+    live server (see analyze_latency.py / diag_remote6.py).
+    """
+
+    def __init__(self) -> None:
+        self.phases: dict[str, float] = {}
+        self._start: float | None = None
+        self._phase: str | None = None
+
+    def start(self, name: str) -> None:
+        # Stop the previous phase implicitly so wraps don't lose time.
+        if self._phase is not None:
+            self.stop()
+        self._phase = name
+        self._start = time.monotonic()
+
+    def stop(self) -> None:
+        if self._start is None or self._phase is None:
+            return
+        self.phases[self._phase] = self.phases.get(self._phase, 0.0) + (
+            time.monotonic() - self._start
+        )
+        self._phase = None
+        self._start = None
+
+    def total_ms(self) -> float:
+        return round(1000.0 * sum(self.phases.values()), 1)
+
+    def as_ms(self) -> dict[str, float]:
+        return {k: round(1000.0 * v, 1) for k, v in self.phases.items()}
+
+
+# ── Pathfinding instrumentation (reset every Tick by choose_actions) ────────
+# Counts A* invocations and node expansions across one Tick so the summary
+# line can attribute slow ticks to "many calls" vs "one huge search". A
+# per-call overhead floor and the bfs_call counter live here rather than inside
+# _bfs_path's hot loop to keep the search itself allocation-light.
+_pathfind_calls: int = 0
+_pathfind_expansions: int = 0
+_pathfind_ms: float = 0.0
+# Dead-end recomputation telemetry (the O(candidates×dead) cost that runs on
+# every cache miss — once per tick while walls grow). Reset per tick alongside
+# the pathfind counters.
+_dead_end_ms: float = 0.0
+_dead_end_runs: int = 0
+
+
+def _reset_pathfind_counters() -> None:
+    global _pathfind_calls, _pathfind_expansions, _pathfind_ms
+    global _dead_end_ms, _dead_end_runs
+    _pathfind_calls = 0
+    _pathfind_expansions = 0
+    _pathfind_ms = 0.0
+    _dead_end_ms = 0.0
+    _dead_end_runs = 0
+
+
+def _bfs_path_snapshot() -> tuple[int, int, float]:
+    """Return (calls, expansions, ms) since the last reset."""
+    return _pathfind_calls, _pathfind_expansions, round(_pathfind_ms, 1)
+
+
+def _dead_end_snapshot() -> tuple[int, float]:
+    """Return (runs, ms) of _dead_end_cells since the last reset."""
+    return _dead_end_runs, round(_dead_end_ms, 1)
+
+
+def _reset_plan_profile_context() -> None:
+    """Clear profiler output before planning a new Tick."""
+    turn_context.plan_phase_ms = {}
+    turn_context.plan_pathfind_calls = 0
+    turn_context.plan_pathfind_expansions = 0
+    turn_context.plan_pathfind_ms = 0.0
+    turn_context.plan_dead_end_ms = 0.0
+    turn_context.plan_dead_end_runs = 0
+
+
+def _publish_plan_profile(phase: _PhaseTimer) -> None:
+    """Publish this Tick's completed planning telemetry to ``turn_context``."""
+    phase.stop()
+    turn_context.plan_phase_ms = phase.as_ms()
+    pf_calls, pf_expansions, pf_ms = _bfs_path_snapshot()
+    turn_context.plan_pathfind_calls = pf_calls
+    turn_context.plan_pathfind_expansions = pf_expansions
+    turn_context.plan_pathfind_ms = pf_ms
+    de_runs, de_ms = _dead_end_snapshot()
+    turn_context.plan_dead_end_ms = de_ms
+    turn_context.plan_dead_end_runs = de_runs
+
+
+def _dead_end_cells_batch(
+    obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]],
+) -> tuple[set[tuple[int, int]], dict[tuple[int, int], int]]:
+    """Dead-end closure + final open-count, computed from scratch (batch).
+
+    Returns (dead, open_count) where open_count[c] = number of neighbors of c
+    that are free (not obstacle, not currently marked dead). The persistent
+    incremental structure consumes both artifacts: the batch result seeds it,
+    and incremental wall-adds reuse/mutate open_count.
+
+    Cascade parity invariant: the cascade only propagates through *candidate*
+    cells (free cells adjacent to at least one obstacle). A free cell adjacent
+    to no obstacle is never a candidate and is never touched.
+    """
+    obs = frozenset(obstacles)
+    candidates: set[tuple[int, int]] = set()
+    for cell in obs:
+        for n in _neighbor_cells(cell):
+            if n not in obs:
+                candidates.add(n)
+    open_count: dict[tuple[int, int], int] = {
+        c: sum(1 for n in _neighbor_cells(c) if n not in obs)
+        for c in candidates
+    }
+    dead: set[tuple[int, int]] = set()
+    work = deque(c for c in candidates if open_count[c] <= 1)
+    while work:
+        cell = work.popleft()
+        if cell in dead or open_count[cell] > 1:
+            continue
+        dead.add(cell)
+        for n in _neighbor_cells(cell):
+            if n in open_count and n not in dead:
+                open_count[n] -= 1
+                if open_count[n] <= 1:
+                    work.append(n)
+    return dead, open_count
+
+
 def _dead_end_cells(
     obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]],
 ) -> frozenset[tuple[int, int]]:
@@ -248,39 +405,216 @@ def _dead_end_cells(
     Seed candidates are free cells adjacent to any known obstacle. A candidate
     is a dead end when it has at most one free neighbor. Marked dead ends are
     then treated as blocked so one-wide corridors collapse inward.
+
+    Algorithm: a single work-list pass. A cell's open-degree only changes when a
+    NEIGHBOR is newly marked dead, so we only re-check the neighbors of a cell
+    just marked — not all candidates every iteration (the old re-scan-all loop
+    was O(dead × candidates), the proven cause of multi-second ticks once the
+    wall memory passed ~18k cells; see analyze_phase_latency.py).
     """
+    global _dead_end_ms, _dead_end_runs
     if not obstacles:
         return frozenset()
-    obs = frozenset(obstacles)
-    candidates: set[tuple[int, int]] = set()
-    for cell in obs:
-        for n in _neighbor_cells(cell):
-            if n not in obs:
-                candidates.add(n)
+    _dt0 = time.monotonic()
+    _dead_end_runs += 1
+    dead, _ = _dead_end_cells_batch(obstacles)
+    _dead_end_ms += (time.monotonic() - _dt0) * 1000.0
+    return frozenset(dead)
 
-    dead: set[tuple[int, int]] = set()
-    changed = True
-    while changed:
-        changed = False
-        blocked = obs | dead
-        for cell in candidates:
-            if cell in dead:
+
+def _ensure_dead_structure() -> None:
+    """Build the incremental structure for _dead_obstacles if absent."""
+    global _dead_open_count, _dead_set, _dead_view, _dead_structure_built
+    if _dead_structure_built:
+        return
+    _dt0 = time.monotonic()
+    _dead_set, _dead_open_count = _dead_end_cells_batch(_dead_obstacles)
+    _dead_view = frozenset(_dead_set)
+    _dead_structure_built = True
+    # Count the batch build as a dead-end run for telemetry so the first call of
+    # a fresh map is not silently invisible in the phase breakdown.
+    global _dead_end_ms, _dead_end_runs
+    _dead_end_runs += 1
+    _dead_end_ms += (time.monotonic() - _dt0) * 1000.0
+
+
+def _reset_dead_structure(obstacles: frozenset) -> None:
+    """Rebase after a wholesale obstacle reload (_load_map_memory / out-of-band
+    test mutation). The batch build is deferred to the next _ensure_dead_structure."""
+    global _dead_obstacles, _dead_open_count, _dead_set, _dead_view, \
+        _dead_structure_built
+    _dead_obstacles = obstacles
+    _dead_open_count = {}
+    _dead_set = set()
+    _dead_view = frozenset()
+    _dead_structure_built = False
+
+
+def _dead_add_walls(new_walls) -> None:
+    """Incrementally fold newly-discovered walls into the persistent structure.
+
+    Walls only ever grow (a new wall can reduce a neighbor's open-degree to <=1,
+    making it dead; it can never raise an open-degree), so this is add-only —
+    a cell that is a dead end stays a dead end. Two subtle cases:
+
+    - A newly-discovered wall `w` might itself have been a *marked dead-end free
+      cell* (a unit sat in an alcove the server later reports as rock). `w` must
+      leave the dead-set (walls are not dead ends), but its neighbors must NOT be
+      decremented again — they were already decremented when `w` died. Guarded by
+      the `was_dead` set.
+    - Two new walls adjacent to one fresh candidate: the fresh count is computed
+      against `new_obs` (all new walls folded in), and `touched` prevents the
+      second wall from double-subtracting.
+    """
+    global _dead_obstacles, _dead_open_count, _dead_set, _dead_view, \
+        _dead_structure_built
+    if not new_walls:
+        return
+    _ensure_dead_structure()
+    new_obs = _dead_obstacles | frozenset(new_walls)
+    work: deque = deque()
+    touched: set[tuple[int, int]] = set()
+    was_dead: set[tuple[int, int]] = set()
+    for w in new_walls:
+        if w in _dead_set:
+            was_dead.add(w)
+        _dead_open_count.pop(w, None)
+        _dead_set.discard(w)
+    for w in new_walls:
+        for n in _neighbor_cells(w):
+            if n in new_obs or n in _dead_set or n in touched:
                 continue
-            if _open_degree(cell, blocked) <= 1:
-                dead.add(cell)
-                changed = True
+            if n in _dead_open_count:
+                if w not in was_dead:
+                    cnt = _dead_open_count[n] - 1
+                    _dead_open_count[n] = cnt
+                    if cnt <= 1:
+                        work.append(n)
+            else:
+                cnt = sum(
+                    1 for m in _neighbor_cells(n)
+                    if m not in new_obs and m not in _dead_set
+                )
+                _dead_open_count[n] = cnt
+                touched.add(n)
+                if cnt <= 1:
+                    work.append(n)
+            # else: n already excludes w (w was a marked dead end) — no change.
+    while work:
+        cell = work.popleft()
+        if cell in new_obs or cell in _dead_set or _dead_open_count.get(cell, 0) > 1:
+            continue
+        _dead_set.add(cell)
+        for n in _neighbor_cells(cell):
+            if n in new_obs or n in _dead_set:
+                continue
+            if n not in _dead_open_count:
+                continue  # batch parity: cascade only propagates through candidates
+            _dead_open_count[n] -= 1
+            if _dead_open_count[n] <= 1:
+                work.append(n)
+    _dead_obstacles = new_obs
+    _dead_view = frozenset(_dead_set)
+
+
+def _dead_ends_with_extras(obstacles, extras) -> frozenset[tuple[int, int]]:
+    """dead(O ∪ X) derived from the persistent wall structure on a scratch copy.
+
+    `extras` are transient occupied cells (fellow units + visible enemies) that
+    the caller unions into its search's obstacle set. Treating them as walls can
+    collapse corridors only *this* tick, so the result must be recomputed per
+    tick — but from the cached wall base, never from scratch. Works on a copy of
+    the structure so the persistent wall cache is untouched.
+
+    If `obstacles` is not the persistent wall set (a caller built a different
+    obstacle set, e.g. the rare core-cell-as-obstacle case), fall back to the
+    batch `_dead_end_cells(obstacles | extras)` — exactly today's behavior.
+    """
+    global _dead_end_ms, _dead_end_runs
+    if obstacles is not _dead_obstacles:
+        return _dead_end_cells(obstacles | extras)
+    if not extras:
+        _ensure_dead_structure()
+        return _dead_view
+    _ensure_dead_structure()
+    _dt0 = time.monotonic()
+    _dead_end_runs += 1
+    oc = dict(_dead_open_count)
+    dead = set(_dead_set)
+    union = _dead_obstacles | extras
+    touched: set[tuple[int, int]] = set()
+    work: deque = deque()
+    was_dead: set[tuple[int, int]] = set()
+    for x in extras:
+        if x in _dead_obstacles:
+            continue  # already a permanent wall — blocked in every count already
+        if x in dead:
+            was_dead.add(x)
+        oc.pop(x, None)
+        dead.discard(x)
+    for x in extras:
+        if x in _dead_obstacles:
+            continue
+        for n in _neighbor_cells(x):
+            if n in union or n in dead or n in touched:
+                continue
+            if n in oc:
+                if x not in was_dead:
+                    cnt = oc[n] - 1
+                    oc[n] = cnt
+                    if cnt <= 1:
+                        work.append(n)
+            else:
+                cnt = sum(
+                    1 for m in _neighbor_cells(n)
+                    if m not in union and m not in dead
+                )
+                oc[n] = cnt
+                touched.add(n)
+                if cnt <= 1:
+                    work.append(n)
+    while work:
+        cell = work.popleft()
+        if cell in union or cell in dead or oc.get(cell, 0) > 1:
+            continue
+        dead.add(cell)
+        for n in _neighbor_cells(cell):
+            if n in union or n in dead:
+                continue
+            if n not in oc:
+                continue
+            oc[n] -= 1
+            if oc[n] <= 1:
+                work.append(n)
+    _dead_end_ms += (time.monotonic() - _dt0) * 1000.0
     return frozenset(dead)
 
 
 def _get_dead_ends(
     obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]],
+    *,
+    extras: frozenset[tuple[int, int]] = frozenset(),
 ) -> frozenset[tuple[int, int]]:
-    """Cached dead-end set for the current known obstacle map."""
+    """Cached dead-end set for the current known obstacle map.
+
+    Wall fast path: the persistent structure covers the stable `_known_obstacles`
+    object, so a call with that exact object is an O(1) identity hit. `extras`
+    (transient occupied cells) derive dead(O ∪ X) on a scratch copy. Any other
+    obstacle set (tests, one-off callers) falls through to the legacy
+    identity/equality cache.
+    """
     global _dead_end_cache_key, _dead_end_cache
-    # Callers always pass a frozenset (and share one object across a tick), so
-    # use it directly as the cache key instead of rebuilding frozenset(obstacles)
-    # — an O(n) copy on every _is_dead_end_step call. frozenset == short-circuits
-    # on length, so a growing obstacle set is an O(1) miss during exploration.
+    if extras:
+        return _dead_ends_with_extras(obstacles, extras)
+    if obstacles is _dead_obstacles:
+        _ensure_dead_structure()
+        return _dead_view
+    # Legacy identity/equality cache for arbitrary obstacle sets (tests, one-off
+    # callers). Callers always pass a frozenset (and share one object across a
+    # tick), so use it directly as the cache key instead of rebuilding
+    # frozenset(obstacles) — an O(n) copy on every _is_dead_end_step call.
+    # frozenset == short-circuits on length, so a growing obstacle set is an
+    # O(1) miss during exploration.
     if obstacles is _dead_end_cache_key:
         return _dead_end_cache
     if isinstance(obstacles, frozenset) and obstacles == _dead_end_cache_key:
@@ -323,20 +657,28 @@ def _path_blockers(
     start: tuple[int, int] | None = None,
     goal: tuple[int, int] | None = None,
     avoid_dead_ends: bool = True,
+    extras: frozenset[tuple[int, int]] = frozenset(),
 ) -> frozenset[tuple[int, int]]:
-    """Obstacles plus dead ends, keeping corridors that contain start/goal."""
+    """Obstacles plus dead ends, keeping corridors that contain start/goal.
+
+    `extras` are transient occupied cells the caller treats as blocked this tick
+    but which must not defeat the wall dead-end cache: dead-ends are computed
+    from `obstacles` (cached) and `extras` are unioned in as plain blockers.
+    """
     if not avoid_dead_ends:
-        return obstacles
-    dead = _get_dead_ends(obstacles)
+        return obstacles | extras
+    dead = _get_dead_ends(obstacles, extras=extras)
     if not dead:
-        return obstacles
+        return obstacles | extras
     global _path_blockers_union_key, _path_blockers_union
-    if obstacles is _path_blockers_union_key or obstacles == _path_blockers_union_key:
+    if not extras and (obstacles is _path_blockers_union_key
+                       or obstacles == _path_blockers_union_key):
         union = _path_blockers_union
     else:
-        union = obstacles | dead
-        _path_blockers_union_key = obstacles
-        _path_blockers_union = union
+        union = obstacles | extras | dead
+        if not extras:
+            _path_blockers_union_key = obstacles
+            _path_blockers_union = union
     allowed: set[tuple[int, int]] = set()
     if start is not None and start in dead:
         allowed |= _dead_component(start, dead)
@@ -370,6 +712,7 @@ def _bfs_path(
     max_steps: int = 2500,
     *,
     avoid_dead_ends: bool = True,
+    extras: frozenset[tuple[int, int]] = frozenset(),
 ) -> list[tuple[int, int]] | None:
     """Return a short grid path including start and goal, or None.
 
@@ -379,17 +722,26 @@ def _bfs_path(
     When avoid_dead_ends is True, 凸-shaped cul-de-sacs and one-wide corridors
     that only lead into them are treated as blocked, unless start or goal lies
     inside such a pocket (so units can still exit or reach a resource there).
+
+    `extras` are transient occupied cells (other units / enemies) treated as
+    blocked this tick but excluded from the wall dead-end cache key; see
+    _path_blockers.
     """
     if start == goal:
         return [start]
+    global _pathfind_calls, _pathfind_expansions, _pathfind_ms
+    _pathfind_calls += 1
+    _pf_t0 = time.monotonic()
     blocked = _path_blockers(
         obstacles,
         start=start,
         goal=goal,
         avoid_dead_ends=avoid_dead_ends,
+        extras=extras,
     )
-    # Goal itself must remain enterable even if classified as a dead end.
-    if goal in blocked and goal not in obstacles:
+    # Goal itself must remain enterable even if classified as a dead end, but
+    # NOT if it is an obstacle or occupied-by-other this tick (extras).
+    if goal in blocked and goal not in obstacles and goal not in extras:
         blocked = blocked - {goal}
 
     # A*: f = g + h. tie-break on h so we bias toward the goal.
@@ -410,6 +762,9 @@ def _bfs_path(
             while cursor is not None:
                 path.append(cursor)
                 cursor = parents[cursor]
+            _pathfind_expansions += expansions
+            # monotonic() is in seconds; convert to ms (see the cap-hit return).
+            _pathfind_ms += (time.monotonic() - _pf_t0) * 1000.0
             return list(reversed(path))
         expansions += 1
         x, y = current
@@ -425,6 +780,12 @@ def _bfs_path(
             h = _manhattan(next_pos, goal)
             counter += 1
             heappush(open_heap, (tentative + h, h, counter, tentative, next_pos))
+    # Hit the max_steps cap or exhausted the open set: still account the work.
+    _pathfind_expansions += expansions
+    # time.monotonic() returns SECONDS; convert to ms so pathfind_ms is in the
+    # same unit as latency_ms (a missing *1000 here made A* look ~1000x cheaper
+    # than it really was — see analyze_latency.py / diag_remote6.py).
+    _pathfind_ms += (time.monotonic() - _pf_t0) * 1000.0
     return None
 
 
@@ -534,6 +895,14 @@ class TickRecord:
     plan_core_action: str | None = None
     accepted: bool = False
     latency_ms: float = 0.0
+    # Per-Tick planning profiler: name → wall-clock ms for each choose_actions
+    # phase. Absent on old log segments (added for the latency investigation).
+    phase_ms: dict[str, float] = field(default_factory=dict)
+    pathfind_calls: int = 0
+    pathfind_expansions: int = 0
+    pathfind_ms: float = 0.0
+    dead_end_runs: int = 0
+    dead_end_ms: float = 0.0
 
 
 class TacticLogger:
@@ -621,6 +990,12 @@ class TacticLogger:
         unit_actions: dict[str, str] | None = None,
         accepted: bool = False,
         latency_ms: float = 0.0,
+        phase_ms: dict[str, float] | None = None,
+        pathfind_calls: int = 0,
+        pathfind_expansions: int = 0,
+        pathfind_ms: float = 0.0,
+        dead_end_runs: int = 0,
+        dead_end_ms: float = 0.0,
     ) -> TickRecord:
         """Record a single Tick's state and decisions."""
         now = time.monotonic()
@@ -649,6 +1024,13 @@ class TacticLogger:
         rec.shot_prediction_results = list(turn_context.shot_prediction_results)
         rec.accepted = accepted
         rec.latency_ms = round(latency_ms, 1)
+        if phase_ms:
+            rec.phase_ms = phase_ms
+        rec.pathfind_calls = pathfind_calls
+        rec.pathfind_expansions = pathfind_expansions
+        rec.pathfind_ms = round(pathfind_ms, 1)
+        rec.dead_end_runs = dead_end_runs
+        rec.dead_end_ms = round(dead_end_ms, 1)
 
         if core:
             rec.core_name = _object_name(core.id, "C")
@@ -1259,15 +1641,32 @@ def _plan_worker(
 
         # Workers can walk onto the core cell; the game may report it as an
         # obstacle so temporarily exclude it from the pathfinding obstacle set.
-        # Other units are real blockers and stay in the obstacle set.
-        bfs_obs = obstacle_cells | others
+        # Other units are real blockers and stay in the obstacle set. Split into
+        # wall `obstacles` (cached dead-end base) + transient `extras` (occupied
+        # cells), so the wall dead-end cache is not defeated per worker.
+        obstacles_here = obstacle_cells
+        extras_here = others
         if goal == core_pos:
-            bfs_obs = bfs_obs - {goal}
+            if goal in obstacle_cells:
+                # Rare: the Core cell itself is in the wall memory. Must exclude
+                # it from the wall set (new frozenset -> batch dead-end fallback,
+                # unavoidable but rare). Set-algebra keeps the blocked set
+                # identical to the old (obstacle_cells | others) - {goal}.
+                obstacles_here = obstacle_cells - {goal}
+                extras_here = others - {goal}
+            elif goal in others:
+                # Goal (Core) occupied by a unit this tick: keep the stable wall
+                # object so dead-ends come from the cached base, and just drop
+                # the goal from the transient blockers so it stays enterable.
+                # dead((O | X) - {g}) == dead(O | (X - {g})) when g not in O,
+                # so the blocked set is byte-identical — but no new frozenset.
+                extras_here = others - {goal}
         path = _bfs_path(
             pos,
             goal,
-            bfs_obs,
+            obstacles_here,
             max_steps=int(config["bfs_max_steps"]),
+            extras=extras_here,
         )
         if path and len(path) > 1:
             _worker_path_cache[uid] = {
@@ -1276,7 +1675,7 @@ def _plan_worker(
                 # Cursor of the unit on the path — path[0] is the current cell.
                 "index": 0,
                 # Debug only — never compared for cache validity.
-                "obstacles_used": bfs_obs,
+                "obstacles_used": obstacles_here | extras_here,
             }
         else:
             _worker_path_cache.pop(uid, None)
@@ -2613,7 +3012,7 @@ def _enemy_sightings_from_payload(raw) -> tuple[set[tuple[int, int]], dict[tuple
 def _load_map_memory() -> None:
     """Load permanent obstacle/resource/enemy memory from disk."""
     global _resource_memory, _obstacle_memory, _enemy_memory, _enemy_memory_types, \
-        _enemy_clear_seq, _last_dashboard_map_sig
+        _enemy_clear_seq, _last_dashboard_map_sig, _known_obstacles
     if not MAP_MEMORY_PATH.exists():
         return
     try:
@@ -2630,6 +3029,10 @@ def _load_map_memory() -> None:
         )
         _enemy_clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
         _last_dashboard_map_sig = _dashboard_map_sig(data)
+        # Wholesale reload: rebase the stable obstacle view and defer the batch
+        # dead-end build to the first _ensure_dead_structure() of the next tick.
+        _known_obstacles = frozenset(_obstacle_memory)
+        _reset_dead_structure(_known_obstacles)
         print(
             f"[map] loaded obstacles={len(_obstacle_memory)} resources={len(_resource_memory)} "
             f"manual={len(manual - forgotten)} forgotten={len(forgotten)} "
@@ -3016,14 +3419,35 @@ def _remove_self_destructs(names: set[str]) -> None:
 
 
 def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
-    """Accumulate permanent obstacles. Returns full known obstacle set."""
-    global _obstacle_memory, _map_dirty
+    """Accumulate permanent obstacles. Returns the stable known-obstacle set.
+
+    The returned frozenset is the SAME object across ticks unless walls actually
+    grew (only `_obstacle_memory.add` exists — walls never shrink). New walls
+    are folded into the persistent dead-end structure incrementally, so the
+    wall-only dead-end fast-path in _get_dead_ends is an O(1) identity hit on
+    no-growth ticks and a tiny incremental update on growth ticks.
+    """
+    global _obstacle_memory, _map_dirty, _known_obstacles
     before = len(_obstacle_memory)
+    if len(_known_obstacles) != before or _known_obstacles != _obstacle_memory:
+        # _obstacle_memory changed outside this function (tests clear/restore it
+        # directly): rebase the incremental structure before accumulating. The
+        # equality check also catches a same-cardinality coordinate replacement;
+        # length alone cannot distinguish that from an unchanged map.
+        _known_obstacles = frozenset(_obstacle_memory)
+        _reset_dead_structure(_known_obstacles)
+        _ensure_dead_structure()
+    added: list[tuple[int, int]] = []
     for p in turn.obstacle_cells:
-        _obstacle_memory.add(tuple(p) if not isinstance(p, tuple) else p)
-    if len(_obstacle_memory) > before:
+        q = tuple(p) if not isinstance(p, tuple) else p
+        if q not in _obstacle_memory:
+            _obstacle_memory.add(q)
+            added.append(q)
+    if added:
         _map_dirty = True
-    return frozenset(_obstacle_memory)
+        _dead_add_walls(added)
+        _known_obstacles = _dead_obstacles
+    return _known_obstacles
 
 
 def _forget_resource(position: tuple[int, int]) -> None:
@@ -3299,6 +3723,15 @@ turn_context = type(
         "attack_forbidden_targets": frozenset(),
         "shot_predictions": [],
         "shot_prediction_results": [],
+        # Per-Tick planning profiler output (filled by choose_actions, read by
+        # play() and forwarded to record_tick). Held on turn_context so
+        # choose_actions keeps its single-arg signature.
+        "plan_phase_ms": {},
+        "plan_pathfind_calls": 0,
+        "plan_pathfind_expansions": 0,
+        "plan_pathfind_ms": 0.0,
+        "plan_dead_end_ms": 0.0,
+        "plan_dead_end_runs": 0,
     },
 )()
 
@@ -3483,6 +3916,9 @@ def _unit_should_return_to_heal(
 
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
     """Queue actions, return (core_action_name, {unit_id: action_detail})."""
+    _phase = _PhaseTimer()
+    _reset_pathfind_counters()
+    _reset_plan_profile_context()
     unit_actions_detail: dict[str, str] = {}
     core_action_name = "WAIT"
     config = load_config()
@@ -3490,6 +3926,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
     turn_context.shot_predictions = []
+    _phase.start("prediction")
     turn_context.shot_prediction_results = _resolve_shadow_predictions(
         turn, turn_context.tick,
     )
@@ -3497,10 +3934,12 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         _game_stats, turn_context.shot_prediction_results,
     )
     _update_enemy_motion_tracks(turn.visible_enemies, turn_context.tick)
+    _phase.stop()
 
     # Manual per-unit targets set from the dashboard (display-name keyed).
     # Prune targets whose unit no longer exists — names are computed BEFORE the
     # dead-unit cleanup below so a just-died unit's name is never re-issued.
+    _phase.start("bookkeeping")
     alive_names = {
         _object_name(u.id, _UNIT_NAME_PREFIX.get(u.unit_type, "U"))
         for u in turn.units
@@ -3526,9 +3965,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     game_stats.record_events(_game_stats, turn, turn_context.tick)
     game_stats.sampled(_game_stats, turn_context.tick)
     game_stats.maybe_save(_game_stats, turn_context.tick)
+    _phase.stop()
 
     # ── Update permanent map memory ────────────────────────────────────
     # Honor dashboard clears before we re-accumulate or plan against memory.
+    _phase.start("map_memory")
     _apply_dashboard_map_edits()
     known_obstacles = _update_obstacle_memory(turn)
     res_before = set(_resource_memory)
@@ -3539,11 +3980,13 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         tick=getattr(turn, "tick", None),
         save_interval_ticks=int(config["map_save_interval_ticks"]),
     )
+    _phase.stop()
 
     # ── Categorized battle log (discoveries + resolution events) ────────
     # Best-effort: a log write must never break the game loop, so failures
     # are swallowed.  New discoveries are diffed from the memory updates above;
     # combat/economy/warn rows come from this Tick's resolution events.
+    _phase.start("battle_log")
     battle_entries = _battle_log_entries(
         turn,
         new_resources=set(_resource_memory) - res_before,
@@ -3554,11 +3997,14 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             append_jsonl(BATTLE_LOG_PATH, battle_entries)
         except OSError:
             pass
+    _phase.stop()
 
     # ── Lifecycle guard ─────────────────────────────────────────────────
     if turn.core is None:
+        _publish_plan_profile(_phase)
         return ("RESPAWN", {})
 
+    _phase.start("core_setup")
     # Newly produced (or previously unassigned) combat units join 守家队.
     config = _auto_enlist_new_combat_units(turn, config)
 
@@ -3634,9 +4080,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             and event.position
         ):
             depleted.add(event.position)
+    _phase.stop()  # core_setup
 
     # 金币满仓 + 开启"满仓探索"时，不给工人派矿点：空载工人失去目标后自然进入
     # 探索分支，去各处侦察。仓库一旦有空位，下一 tick 恢复派矿。
+    _phase.start("resource_assign")
     gold_full_explore = (
         bool(config.get("worker_explore_when_full", False))
         and turn_context.resource_space == 0
@@ -3693,8 +4141,10 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             wid = closest[0]
             _resource_assignments[wid] = res
             available.remove(closest)
+    _phase.stop()  # resource_assign
 
     # ── Core action ─────────────────────────────────────────────────────
+    _phase.start("core_action")
     core_done = False
 
     if beacon_on_ground_here:
@@ -3797,12 +4247,14 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     if not core_done:
         core.wait()
         core_action_name = "WAIT"
+    _phase.stop()  # core_action
 
     # Occupied cells this tick (every friendly unit + visible enemies). Workers
     # use this to avoid hammering blocked cells — the main cause of the core-ring
     # deadlock where full workers wedge in place and the economy stalls. The core
     # cell itself is deliberately NOT included: a worker may step onto it to
     # unload, so it only counts as occupied when another unit is standing there.
+    _phase.start("unit_setup")
     occupied: frozenset[tuple[int, int]] = frozenset(
         {tuple(w.position) for w in turn.workers}
         | {tuple(v.position) for v in getattr(turn, "vanguards", ()) or ()}
@@ -3859,7 +4311,13 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             ))
         eligible.sort()
         heal_return_allowed = {name for _, _, name in eligible[:heal_return_limit]}
+    _phase.stop()  # unit_setup
 
+    # Per-unit planner wall-clock, broken down by unit type so the summary can
+    # attribute a slow tick to "workers" vs "vanguards" vs "rangers". Each is the
+    # sum over every unit of that type this Tick.
+    unit_phase_ms: dict[str, float] = {"worker": 0.0, "vanguard": 0.0, "ranger": 0.0,
+                                       "other": 0.0}
     commanded_self_destructs: set[str] = set()
     for unit in turn.units:
         uid = str(unit.id)[:8]
@@ -3925,6 +4383,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             unit_actions_detail[uid] = f"{action}:{detail}[waypoint]"
             continue
         if unit.unit_type == UnitType.WORKER:
+            _ut0 = time.monotonic()
             action, detail = _plan_worker(
                 unit, core,
                 resource_cells=resource_cells,
@@ -3934,9 +4393,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 occupied=occupied,
                 enemies=enemies,
             )
+            unit_phase_ms["worker"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = f"{action}:{detail}"
         elif unit.unit_type == UnitType.VANGUARD:
             team = _combat_team_for(name, config)
+            _ut0 = time.monotonic()
             action, detail = _plan_vanguard(
                 unit,
                 enemies,
@@ -3945,9 +4406,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 core_pos=tuple(core_pos),
                 team=team,
             )
+            unit_phase_ms["vanguard"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
         elif unit.unit_type == UnitType.RANGER:
             team = _combat_team_for(name, config)
+            _ut0 = time.monotonic()
             action, detail = _plan_ranger(
                 unit,
                 enemies,
@@ -3956,12 +4419,21 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 core_pos=tuple(core_pos),
                 team=team,
             )
+            unit_phase_ms["ranger"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
 
     # Ack the dashboard's 自裁 commands we just issued; concurrent new commands
     # added while planning stay pending for the next Tick.
     if commanded_self_destructs:
         _remove_self_destructs(commanded_self_destructs)
+
+    # Fold the per-unit-type wall-clock into the named phases so the structured
+    # log shows unit_loop broken down by planner. Surfaced to record_tick via
+    # turn_context (play() is the caller) so choose_actions keeps its signature.
+    _phase.phases["unit:worker"] = unit_phase_ms["worker"]
+    _phase.phases["unit:vanguard"] = unit_phase_ms["vanguard"]
+    _phase.phases["unit:ranger"] = unit_phase_ms["ranger"]
+    _publish_plan_profile(_phase)
 
     return core_action_name, unit_actions_detail
 
@@ -4009,7 +4481,9 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             )
                             continue
                         try:
+                            _submit_t0 = time.monotonic()
                             accepted = turn.submit()
+                            _submit_ms = (time.monotonic() - _submit_t0) * 1000
                         except APIError as e:
                             # 409 TICK_MISMATCH: the server rejects every tick of
                             # a desynced session. A fresh connection normally
@@ -4054,12 +4528,25 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                         plan_actions: dict[str, str] = {}
                         for uid, detail in unit_actions.items():
                             plan_actions[uid] = detail
+                        phase_ms = dict(getattr(turn_context, "plan_phase_ms", {}) or {})
+                        phase_ms["submit"] = round(_submit_ms, 1)
+                        pf_calls = int(getattr(turn_context, "plan_pathfind_calls", 0))
+                        pf_exp = int(getattr(turn_context, "plan_pathfind_expansions", 0))
+                        pf_ms = float(getattr(turn_context, "plan_pathfind_ms", 0.0))
+                        de_runs = int(getattr(turn_context, "plan_dead_end_runs", 0))
+                        de_ms = float(getattr(turn_context, "plan_dead_end_ms", 0.0))
                         logger.record_tick(
                             turn,
                             core_action=core_action,
                             unit_actions=plan_actions,
                             accepted=accepted.accepted,
                             latency_ms=latency,
+                            phase_ms=phase_ms,
+                            pathfind_calls=pf_calls,
+                            pathfind_expansions=pf_exp,
+                            pathfind_ms=pf_ms,
+                            dead_end_runs=de_runs,
+                            dead_end_ms=de_ms,
                         )
                         print(
                             f"tick={accepted.tick} "
@@ -4073,6 +4560,27 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             f"walls={len(_obstacle_memory)}",
                             flush=True,
                         )
+                        # Slow-tick phase breakdown: only when planning crossed
+                        # the threshold so healthy ticks stay one-liners. The
+                        # dominant phase is surfaced first so a glance tells you
+                        # whether the tick died on pathfinding, the unit loop, or
+                        # map memory. Phases under 5% of total are folded to keep
+                        # the line readable.
+                        if latency >= _SLOW_PLAN_THRESHOLD_MS and phase_ms:
+                            total = sum(phase_ms.values()) or latency
+                            items = sorted(
+                                phase_ms.items(), key=lambda kv: kv[1], reverse=True,
+                            )
+                            shown = [
+                                f"{k}={v:.0f}ms" for k, v in items if v >= 0.05 * total
+                            ]
+                            print(
+                                f"  [plan] tick={accepted.tick} latency={latency:.0f}ms "
+                                f"pf(calls={pf_calls} exp={pf_exp} {pf_ms:.0f}ms) "
+                                f"deadend(runs={de_runs} {de_ms:.0f}ms) "
+                                + " ".join(shown),
+                                flush=True,
+                            )
             except KeyboardInterrupt:
                 raise
             except (ProtocolError, TransportError, OSError, ConnectionError, TimeoutError) as e:
