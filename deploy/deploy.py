@@ -97,6 +97,8 @@ EXCLUDE_PATTERNS = [
     r"^tactic_config\.json$",
     r"^tactic_log\.jsonl$",
     r"^tactic_play\.log$",
+    r"^battle_log\.jsonl$",
+    r"^battle_log\.jsonl\.lock$",
     r"^_.*\.py$",
     r"^fix_.*\.py$",
     r"^watchdog\.py$",
