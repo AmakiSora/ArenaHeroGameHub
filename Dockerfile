@@ -5,7 +5,15 @@ WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
-    PORT=4399
+    PORT=4399 \
+    TZ=Asia/Shanghai
+
+# tzdata gives the container a real timezone database so time.strftime /
+# time.localtime render Beijing time, not UTC. Without it, the battle-log
+# panel and entrypoint log stamps would be 8 hours behind local time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

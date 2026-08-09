@@ -10,6 +10,8 @@ services:
       ARENA_HERO_API_KEY: ${ARENA_HERO_API_KEY:?Set ARENA_HERO_API_KEY in .env}
       DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:?Set DASHBOARD_TOKEN in .env}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Local timezone for log stamps; overridable via TZ in the server .env.
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "4399:4399"
     volumes:
