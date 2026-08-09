@@ -1671,6 +1671,8 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-chip:active{cursor:grabbing}
 .team-chip.dragging{opacity:.45}
 .team-chip .glyph{width:100%;height:100%;display:grid;place-items:center;font:800 12px Consolas,monospace;color:#081018;border-radius:10px}
+.team-chip .glyph.sm{font-size:9.5px}
+.team-chip .glyph.xs{font-size:8px}
 .team-chip.kind-VANGUARD .glyph{background:#ff8c42}
 .team-chip.kind-RANGER .glyph{background:#b38cff}
 .team-chip.kind-COMBAT .glyph{background:#6ea8ff}
@@ -2888,7 +2890,12 @@ JS = r"""
       chip.title = unit.name + ' · ' + teamMetaLine(unit) + '（拖到其他队伍）';
       const glyph = document.createElement('span');
       glyph.className = 'glyph';
-      glyph.textContent = String(unit.name || '?').slice(0, 2);
+      // Show the full name so W10 is not collapsed into an ambiguous W1;
+      // longer names get a smaller glyph font to keep the 34px chip tidy.
+      const glyphLabel = String(unit.name || '?');
+      glyph.textContent = glyphLabel;
+      if (glyphLabel.length > 3) glyph.classList.add('xs');
+      else if (glyphLabel.length === 3) glyph.classList.add('sm');
       const pulse = document.createElement('span');
       pulse.className = 'pulse';
       chip.append(glyph, pulse);
