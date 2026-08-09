@@ -218,6 +218,13 @@ class ConfiguredPlannerTests(unittest.TestCase):
         worker = Worker()
         stale_resource = worker.position
         config = default_config()
+
+        # Keep the worker off the Core cell so the new vacate-the-chute branch
+        # (an empty worker standing on the Core steps off first) does not
+        # short-circuit the stale-target / explore path under test.
+        class CoreOff:
+            position = (9, 9)
+
         original_memory = set(tactic._resource_memory)
         original_tombstones = set(tactic._resource_tombstones)
         original_dirty = tactic._map_dirty
@@ -228,7 +235,7 @@ class ConfiguredPlannerTests(unittest.TestCase):
         try:
             action, detail = tactic._plan_worker(
                 worker,
-                Core(),
+                CoreOff(),
                 resource_cells=frozenset(),
                 obstacle_cells=frozenset(),
                 depleted=set(),
@@ -264,12 +271,18 @@ class ConfiguredPlannerTests(unittest.TestCase):
         worker = Worker()
         config = default_config()
         config["bfs_max_steps"] = 1250
+
+        # Worker off the Core cell so the vacate-the-chute branch does not
+        # pre-empt the BFS path under test.
+        class CoreOff:
+            position = (9, 9)
+
         tactic._resource_assignments[str(worker.id)] = (2, 0)
         try:
             with patch.object(tactic, "_bfs_path", return_value=[(0, 0), (1, 0), (2, 0)]) as bfs:
                 action, _ = tactic._plan_worker(
                     worker,
-                    Core(),
+                    CoreOff(),
                     resource_cells=frozenset({(2, 0)}),
                     obstacle_cells=frozenset(),
                     depleted=set(),
@@ -2386,7 +2399,7 @@ class WorkerCongestionTests(unittest.TestCase):
         action, detail = self._plan(worker, occupied=occupied)
 
         self.assertEqual(action, "MOVE")
-        self.assertIn("core-retreat", detail)
+        self.assertIn("core-queue-backoff", detail)
         # Must move away from the core, never into the occupied core cell.
         self.assertGreater(
             tactic._manhattan(worker.position, (28, -20)),
@@ -2404,6 +2417,32 @@ class WorkerCongestionTests(unittest.TestCase):
         self.assertEqual(action, "WAIT")
         self.assertIn("core-congested", detail)
         self.assertEqual(worker.position, (27, -20))
+
+    def test_full_worker_holds_at_distance_two_when_core_occupied(self) -> None:
+        # Chute coordination: a cargo worker already at Manhattan distance >= 2
+        # must hold position (not creep back onto the ring) while the core cell
+        # is occupied, so the on-core worker keeps a free neighbour to vacate.
+        worker = self.Worker("w-hold", (30, -20))  # distance 2 from core (28,-20)
+        worker.cargo = 2
+        occupied = frozenset({(28, -20), (30, -20)})
+
+        action, detail = self._plan(worker, occupied=occupied)
+
+        self.assertEqual(action, "WAIT")
+        self.assertIn("core-queue-hold", detail)
+        self.assertEqual(worker.position, (30, -20))
+
+    def test_full_worker_enters_core_when_chute_free(self) -> None:
+        # With the core cell empty, a cargo worker on the ring steps in to
+        # unload — the queue-hold must not block normal deposit flow.
+        worker = self.Worker("w-enter", (29, -20))  # adjacent to core (28,-20)
+        worker.cargo = 2
+        occupied = frozenset({(29, -20)})  # core cell itself is free
+
+        action, detail = self._plan(worker, occupied=occupied)
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(worker.position, (28, -20))
 
     def test_empty_worker_vacates_core_when_goal_blocked(self) -> None:
         worker = self.Worker("w-core", (28, -20))

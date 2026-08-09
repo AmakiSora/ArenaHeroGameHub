@@ -7,7 +7,6 @@ Records every Tick's decisions into a JSONL log file for later analysis.
 from __future__ import annotations
 
 import json
-import math
 import os
 import time
 import traceback
@@ -54,7 +53,6 @@ _UNIT_NAME_PREFIX = {
     UnitType.VANGUARD: "V",
     UnitType.RANGER: "R",
 }
-_DIRECTION_BY_NAME = {d.name: d for d in Direction}
 
 # Rotate tactic_log.jsonl when it exceeds this size and keep at most N backups.
 LOG_MAX_BYTES = int(os.environ.get("ARENA_LOG_MAX_MB", "20")) * 1024 * 1024
@@ -1572,10 +1570,67 @@ def _plan_worker(
         _set_worker_route(worker, tuple(core.position), [tuple(pos)], complete=True)
         return ("DEPOSIT", f"at_core cargo={worker.cargo}")
 
+    # ── Vacate the core cell promptly ────────────────────────────────────
+    # The core cell holds at most two entities (the Core + one Unit), so it is
+    # the single unloading chute for the whole fleet. An empty worker lingering
+    # on it — freshly spawned, or just finished depositing — blocks every
+    # cargo worker trying to unload, and the surrounding ring then deadlocks
+    # (the on-core worker cannot leave because the ring is full, the ring
+    # cannot advance because the chute is occupied). Step off to any free
+    # neighbour immediately instead of waiting for the normal goal/BFS flow to
+    # maybe move it. A carrying worker was already handled by DEPOSIT above, so
+    # only empty workers reach this. If every neighbour is blocked this tick we
+    # fall through and let the normal logic retry next tick.
+    if pos == core_pos and not carrying:
+        vacate = _retreat_from(pos, core_pos, obstacle_cells, others)
+        if vacate is not None:
+            npos = (pos[0] + vacate.delta[0], pos[1] + vacate.delta[1])
+            worker.move(vacate)
+            _worker_last_pos[uid] = pos
+            recent = _worker_recent.get(uid, [])
+            recent.append(pos)
+            if len(recent) > 6:
+                recent.pop(0)
+            _worker_recent[uid] = recent
+            _set_worker_route(worker, npos, [tuple(pos), npos], complete=False)
+            return ("MOVE", f"{vacate.name} vacate-core")
+
     if pos in resource_cells and pos not in depleted and not carrying and not explore_mode:
         worker.harvest()
         _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
         return ("HARVEST", f"on_resource {pos}")
+
+    # ── Unloading-chute coordination ─────────────────────────────────────
+    # The core cell is the single unloading chute (capacity 2: Core + one
+    # Unit). While another unit occupies it, a cargo worker must NOT crowd the
+    # immediate ring: the on-core worker can only vacate into a free neighbour,
+    # so a ring packed with waiting cargo workers deadlocks the chute (the
+    # insider has nowhere to step, the outsiders never let go). Hold back at
+    # Manhattan distance >= 2 until the chute frees up; only step in once it is
+    # actually empty. The closest waiting worker naturally wins the race into
+    # the freed cell, so throughput stays one deposit per tick without any
+    # cross-worker negotiation.
+    if carrying and pos != core_pos and core_pos in others:
+        dist_core = _manhattan(pos, core_pos)
+        if dist_core <= 1:
+            # On the ring: back out to distance 2 so the insider can vacate.
+            retreat = _retreat_from(pos, core_pos, obstacle_cells, others)
+            if retreat is not None:
+                npos = (pos[0] + retreat.delta[0], pos[1] + retreat.delta[1])
+                worker.move(retreat)
+                _worker_last_pos[uid] = pos
+                recent = _worker_recent.get(uid, [])
+                recent.append(pos)
+                if len(recent) > 6:
+                    recent.pop(0)
+                _worker_recent[uid] = recent
+                _set_worker_route(worker, core_pos, [tuple(pos), npos], complete=False)
+                return ("MOVE", f"{retreat.name} core-queue-backoff")
+        else:
+            # Already at distance >= 2: hold position and wait for the chute.
+            worker.wait()
+            _set_worker_route(worker, core_pos, [tuple(pos)], complete=False)
+            return ("WAIT", "core-queue-hold")
 
     goal: tuple[int, int] | None = None
     if not explore_mode:

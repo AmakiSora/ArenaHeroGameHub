@@ -77,9 +77,36 @@ def read_latest():
     return (history[0] if history else None), os.path.getmtime(LOG_FILE)
 
 
+def _log_signature() -> tuple[int, int] | None:
+    """(mtime_ns, size) signature for the tactic log, or None when unreadable.
+
+    Same mtime+size heuristic as the tactic's file signatures: every appended
+    tick bumps both, so an unchanged file is detected with a single stat().
+    """
+    try:
+        stat = os.stat(LOG_FILE)
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+# build_parts() runs on every /api/state poll (every 2s per client) and always
+# asks for the newest 40 tick records. Between polls with no new tick the log
+# file is unchanged, so re-reading + re-parsing those 40 (large) records is pure
+# overhead. Cache the result by (log signature, ticks); a single appended tick
+# bumps the signature and invalidates the entry.
+_history_cache: dict[tuple[int, int, int], list[dict]] = {}
+
+
 def read_history(ticks: int = 40):
     if ticks <= 0 or not os.path.exists(LOG_FILE):
         return []
+    sig = _log_signature()
+    key = (sig[0], sig[1], ticks) if sig is not None else None
+    if key is not None:
+        cached = _history_cache.get(key)
+        if cached is not None:
+            return [dict(rec) for rec in cached]
     out = []
     for line in _iter_log_lines_reverse(LOG_FILE):
         try:
@@ -90,6 +117,10 @@ def read_history(ticks: int = 40):
             out.append(rec)
             if len(out) >= ticks:
                 break
+    if key is not None:
+        # Keep only the newest entry so an old window or rotated log frees memory.
+        _history_cache.clear()
+        _history_cache[key] = [dict(rec) for rec in out]
     return out
 
 
@@ -310,7 +341,27 @@ def _parse_enemy_sighting(item) -> tuple[tuple[int, int], str] | None:
     return None
 
 
+# load_map_memory() parses the full map_memory.json on every poll. The file only
+# changes when the tactic saves new discoveries or the dashboard edits it, so an
+# unchanged file (single stat()) must not cost a full re-parse. Cache by file
+# signature; mutations below bump the mtime and invalidate the entry.
+_map_memory_cache: dict[tuple[int, int], dict] = {}
+
+
+def _map_file_signature() -> tuple[int, int] | None:
+    try:
+        stat = os.stat(MAP_FILE)
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
 def load_map_memory():
+    sig = _map_file_signature()
+    if sig is not None:
+        cached = _map_memory_cache.get(sig)
+        if cached is not None:
+            return cached
     d = _read_map_file()
     forgotten = _coord_set(d.get("forgotten_resources"))
     resources = _coord_set(d.get("resources")) - forgotten
@@ -321,7 +372,7 @@ def load_map_memory():
         if s is not None
     ]
     enemy_sightings.sort(key=lambda s: s[0])
-    return {
+    result = {
         "obstacles": sorted(_coord_set(d.get("obstacles"))),
         "resources": all_res,
         "manual_resources": sorted(manual),
@@ -335,6 +386,11 @@ def load_map_memory():
         "enemy_clear_seq": int(d.get("enemy_clear_seq", 0) or 0),
         "updated_tick": d.get("updated_tick"),
     }
+    if sig is not None:
+        # Keep only the newest entry so a rewritten map frees the stale parse.
+        _map_memory_cache.clear()
+        _map_memory_cache[sig] = result
+    return result
 
 
 @_map_mutation
@@ -473,6 +529,47 @@ def clear_enemy_sightings() -> dict:
 
 
 # ── manual per-unit waypoints (⌖ map pick) ──────────────────────────────────
+
+# SVG render cache for build_parts: keyed on everything that can change the
+# map — the newest tick record, the map file, the waypoints file, and the
+# config markers (attack/core target) drawn onto the map. A hit skips the
+# full obstacle/route re-render; any change bumps a signature and re-renders.
+_svg_cache: dict[tuple, str] = {}
+
+
+def _file_sig(path: str) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _render_svg_cached(rec: dict, mm: dict, waypoints: dict) -> str:
+    config = load_config(CONFIG_PATH)
+    marker_sig = (
+        str(config.get("attack_mode", "coords")),
+        int(config.get("attack_target_x", 0)),
+        int(config.get("attack_target_y", 0)),
+        bool(config.get("core_target_enabled", False)),
+        int(config.get("core_target_x", 0)),
+        int(config.get("core_target_y", 0)),
+    )
+    key = (
+        rec.get("tick"),
+        _file_sig(MAP_FILE),
+        _file_sig(WAYPOINTS_FILE),
+        marker_sig,
+    )
+    cached = _svg_cache.get(key)
+    if cached is not None:
+        return cached
+    svg = render_svg(rec, mm, config=config, waypoints=waypoints)
+    # Keep only the newest entry so a moved map frees the stale render.
+    _svg_cache.clear()
+    _svg_cache[key] = svg
+    return svg
+
 
 def _read_waypoints_file() -> dict:
     try:
@@ -3469,7 +3566,11 @@ def build_parts():
     rcells = rec.get("resource_cells", [])
     mm = load_map_memory()
     waypoints = load_waypoints()
-    svg = render_svg(rec, mm, waypoints=waypoints)
+    # render_svg redraws every known obstacle/resource/route on each poll. The
+    # output only changes with the newest tick record, the map file, the
+    # waypoints file, or the few config markers drawn on the map — so cache it
+    # by those signatures and skip the 4ms re-render when nothing moved.
+    svg = _render_svg_cached(rec, mm, waypoints)
     running = age < 30
     status_cls = "ok" if running else "down"
     status_text = "运行中" if running else "已停止"
