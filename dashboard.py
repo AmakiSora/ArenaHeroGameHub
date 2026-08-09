@@ -676,6 +676,11 @@ def _team_of_name(name: str, config: dict) -> str:
     return "unassigned"
 
 
+# Max HP per combat kind (game rule, mirrored from tactic._UNIT_MAX_HP).
+# The segmented health bars on the team board get one segment per point.
+_COMBAT_MAX_HP = {"VANGUARD": 4, "RANGER": 2, "COMBAT": 2}
+
+
 def collect_combat_units(rec: dict | None = None, config: dict | None = None) -> list[dict]:
     """Merge live combat units with configured roster names for the drag board."""
     rec = rec or {}
@@ -698,6 +703,7 @@ def collect_combat_units(rec: dict | None = None, config: dict | None = None) ->
             "team": _team_of_name(key, config),
         }
         item["kind"] = kind or item.get("kind") or ("VANGUARD" if key.startswith("V") else "RANGER")
+        item["max_hp"] = _COMBAT_MAX_HP.get(item["kind"], 2)
         item["team"] = _team_of_name(key, config)
         if unit:
             uid = str(unit.get("id") or "")
@@ -1705,6 +1711,9 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-chip.kind-RANGER .glyph{background:#b38cff}
 .team-chip.kind-COMBAT .glyph{background:#6ea8ff}
 .team-chip.ghost{opacity:.5;border-style:dashed}
+.team-chip .hpbar{position:absolute;left:50%;bottom:3px;transform:translateX(-50%);display:flex;gap:1px;width:22px;height:3px;pointer-events:none}
+.team-chip .hpbar .seg{flex:1;min-width:0;border-radius:1px;background:rgba(0,0,0,.35);box-shadow:inset 0 0 0 1px rgba(255,255,255,.22)}
+.team-chip .hpbar .seg.on{background:#57d6a3;box-shadow:inset 0 0 0 1px rgba(0,20,10,.35)}
 .team-chip .pulse{position:absolute;right:-2px;top:-2px;width:8px;height:8px;border-radius:50%;background:#57d6a3;box-shadow:0 0 0 3px rgba(87,214,163,.12)}
 .team-chip.ghost .pulse{background:#7f8eab;box-shadow:none}
 .team-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}
@@ -2929,7 +2938,18 @@ JS = r"""
       else if (glyphLabel.length === 3) glyph.classList.add('sm');
       const pulse = document.createElement('span');
       pulse.className = 'pulse';
-      chip.append(glyph, pulse);
+      // Segmented health bar under the icon: one green segment per max HP point.
+      const hpbar = document.createElement('span');
+      hpbar.className = 'hpbar';
+      hpbar.setAttribute('aria-hidden', 'true');
+      const maxHp = unit.max_hp || 2;
+      const curHp = unit.alive && unit.hp != null ? Math.max(0, unit.hp) : 0;
+      for(let i = 0; i < maxHp; i++){
+        const seg = document.createElement('i');
+        seg.className = 'seg' + (i < curHp ? ' on' : '');
+        hpbar.appendChild(seg);
+      }
+      chip.append(glyph, hpbar, pulse);
       chip.addEventListener('dragstart', function(e){
         dragUnitName = unit.name;
         chip.classList.add('dragging');
