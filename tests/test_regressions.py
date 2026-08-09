@@ -3839,6 +3839,7 @@ class BattleLogTests(unittest.TestCase):
         self.assertIn("discover", cats)
         self.assertIn("economy", cats)
         self.assertTrue(all(e["tick"] == 42 for e in entries))
+        self.assertTrue(all(isinstance(e.get("ts"), (int, float)) for e in entries))
         self.assertTrue(any("(3,4)" in e["msg"] for e in entries))
         self.assertTrue(any("(7,8)" in e["msg"] for e in entries))
 
@@ -3873,6 +3874,27 @@ class BattleLogTests(unittest.TestCase):
         self.assertIn('data-cat="kill"', html)
         self.assertIn("发现矿点", html)
         self.assertIn("tick 1", html)
+
+    def test_log_panel_html_shows_time_beside_tick(self) -> None:
+        """Rows carrying both tick and ts render the wall-clock time next to
+        the tick label (config rows already render ts-only as a time)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "battle_log.jsonl"
+            path.write_text(
+                json.dumps({"tick": 5, "ts": 1234567890.0, "cat": "economy", "msg": "挖矿"})
+                + "\n" + json.dumps({"ts": 1234567890.0, "cat": "config", "msg": "配置调整"}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
+                html, count = dashboard._battle_log_html()
+        self.assertEqual(count, 2)
+        self.assertIn("tick 5", html)
+        # The wall-clock time must be shown next to the tick, not dropped.
+        self.assertIn(" · ", html)
+        expected_time = dashboard.time.strftime(
+            "%H:%M:%S", dashboard.time.localtime(1234567890.0)
+        )
+        self.assertIn(expected_time, html)
 
     def test_log_panel_is_present_below_config(self) -> None:
         page = dashboard.generate_html()

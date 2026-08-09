@@ -186,12 +186,12 @@ def _battle_log_html() -> tuple[str, int]:
     for e in entries:
         tick = e.get("tick")
         ts = e.get("ts")
+        label_parts = []
         if tick is not None:
-            tick_label = f"tick {tick}"
-        elif ts:
-            tick_label = time.strftime("%H:%M:%S", time.localtime(float(ts)))
-        else:
-            tick_label = ""
+            label_parts.append(f"tick {tick}")
+        if ts:
+            label_parts.append(time.strftime("%H:%M:%S", time.localtime(float(ts))))
+        tick_label = " · ".join(label_parts)
         rows.append(
             f'<div class="log-row" data-cat="{html.escape(str(e.get("cat", "")))}">'
             f'<span class="log-tick">{html.escape(tick_label)}</span>'
@@ -1716,7 +1716,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .log-list{display:grid;gap:2px;max-height:46vh;overflow:auto;padding-right:4px}
 .log-row{display:flex;align-items:baseline;gap:8px;padding:4px 8px;border-radius:8px;font-size:11.5px;line-height:1.45}
 .log-row:nth-child(odd){background:rgba(255,255,255,.025)}
-.log-tick{flex:0 0 64px;color:#7f8eab;font-family:Consolas,monospace;font-size:10.5px}
+.log-tick{flex:0 0 132px;color:#7f8eab;font-family:Consolas,monospace;font-size:10.5px;white-space:nowrap}
 .log-msg{color:#c7d1e5;word-break:break-word}
 .log-row[data-cat="discover"] .log-msg{color:#ffe08a}
 .log-row[data-cat="kill"] .log-msg{color:#ff9b9b}

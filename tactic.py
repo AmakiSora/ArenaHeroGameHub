@@ -3133,20 +3133,21 @@ def _battle_log_entries(
     """Build the categorized log rows for one Tick (discoveries + events)."""
     entries: list[dict] = []
     tick = turn_context.tick
+    ts = time.time()  # wall-clock stamp so the panel shows when each batch happened
     for pos in sorted(new_resources):
         entries.append({
-            "tick": tick, "cat": "discover",
+            "tick": tick, "ts": ts, "cat": "discover",
             "msg": f"发现新矿点 ({pos[0]},{pos[1]})",
         })
     for pos in sorted(new_enemy_sightings):
         entries.append({
-            "tick": tick, "cat": "discover",
+            "tick": tick, "ts": ts, "cat": "discover",
             "msg": f"发现敌人踪迹 ({pos[0]},{pos[1]})",
         })
     for event in getattr(turn, "events", ()) or ():
         cat, msg = _classify_battle_event(turn, event)
         if cat and msg:
-            entries.append({"tick": tick, "cat": cat, "msg": msg})
+            entries.append({"tick": tick, "ts": ts, "cat": cat, "msg": msg})
     return entries
 
 
