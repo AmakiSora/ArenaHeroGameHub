@@ -1488,6 +1488,16 @@ def _ensure_home_team_membership(
         for raw_name in unit_names
         if str(raw_name).strip()
     }
+    # Fast path: every living unit already sits in some roster, so the
+    # cross-process config lock is never touched — the hot case every Tick
+    # once the army is complete.
+    assigned = (
+        _parse_team_names(config.get("home_team", ""))
+        | _parse_team_names(config.get("attack_team", ""))
+        | _parse_team_names(config.get("guerrilla_team", ""))
+    )
+    if not (normalized_names - assigned):
+        return config
     added: list[str] = []
 
     def apply(latest: dict[str, int | bool | str]) -> dict[str, Any] | None:
@@ -1526,6 +1536,16 @@ def _auto_enlist_new_combat_units(turn: Any, config: dict[str, Any]) -> dict[str
 
     alive = {n.upper() for n in names}
     config = _ensure_home_team_membership(config, names)
+
+    # Fast path: no dead name in any roster — skip the per-Tick lock pass
+    # entirely (rosters only change when a unit dies or the dashboard edits).
+    rosters = (
+        _parse_team_names(config.get("home_team", "")),
+        _parse_team_names(config.get("attack_team", "")),
+        _parse_team_names(config.get("guerrilla_team", "")),
+    )
+    if not any(roster - alive for roster in rosters):
+        return config
 
     # Prune dead units from the latest config under the same cross-process lock
     # used by dashboard saves.
@@ -2595,6 +2615,28 @@ def _dashboard_map_sig(data: dict) -> tuple:
     return (forgotten, manual, resources, enemies, clear_seq)
 
 
+def _file_signature(path: Path) -> tuple[int, int] | None:
+    """(mtime_ns, size) signature for cheap unchanged-file detection.
+
+    Same mtime+size heuristic as tactic_config._path_signature: a rewrite with
+    an identical size landing in the same st_mtime_ns tick would be missed —
+    acceptable for these small dashboard-owned JSON files, where a content
+    change almost always changes the size too.
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+# Last seen file signature of map_memory.json, keyed by path. The dashboard
+# rarely edits the map, yet the edit-sync used to json.loads the whole
+# (ever-growing) file twice per Tick; an unchanged file is now skipped with a
+# single stat().
+_map_file_sig_cache: dict[str, tuple[int, int]] = {}
+
+
 def _apply_dashboard_map_edits() -> None:
     """Pull dashboard deletions/additions into process memory before planning/saving.
 
@@ -2610,10 +2652,16 @@ def _apply_dashboard_map_edits() -> None:
         _map_dirty, _last_dashboard_map_sig
     if not MAP_MEMORY_PATH.exists():
         return
+    file_sig = _file_signature(MAP_MEMORY_PATH)
+    cache_key = str(MAP_MEMORY_PATH)
+    if file_sig is not None and file_sig == _map_file_sig_cache.get(cache_key):
+        return  # unchanged since the last sync — skip the full re-parse
     try:
         data = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
     except Exception:
         return
+    if file_sig is not None:
+        _map_file_sig_cache[cache_key] = file_sig
 
     sig = _dashboard_map_sig(data)
     if sig == _last_dashboard_map_sig:
@@ -2740,6 +2788,11 @@ def _save_map_memory(
     atomic_write_text(MAP_MEMORY_PATH, json.dumps(payload, ensure_ascii=False))
     _map_dirty = False
     _last_dashboard_map_sig = _dashboard_map_sig(payload)
+    # The file we just wrote is in sync — seed its signature so the next
+    # Tick's edit-sync skips the full re-read entirely.
+    written_sig = _file_signature(MAP_MEMORY_PATH)
+    if written_sig is not None:
+        _map_file_sig_cache[str(MAP_MEMORY_PATH)] = written_sig
     if tick is not None:
         _last_map_save_tick = tick
 
@@ -2804,6 +2857,8 @@ def _remove_waypoint(
             ):
                 del targets[name]
                 _write_waypoints_unlocked(targets)
+            # No per-Tick cache refresh here: the write bumps mtime, so the
+            # next Tick's signature check misses and reloads from disk anyway.
     except Exception:
         pass
 
@@ -2819,12 +2874,33 @@ def _prune_waypoint_targets(
     return bool(stale)
 
 
+# Signature cache for waypoints.json, keyed by path: the file only changes
+# when the dashboard sets a target or a unit reaches one, so an unchanged file
+# must not cost a cross-process lock + full read every Tick. Pruning against
+# the changing alive set still runs in memory on the cached copy.
+_waypoints_sig_cache: dict[str, tuple[int, int] | None] = {}
+_waypoints_cached: dict[str, dict[str, tuple[int, int]]] = {}
+
+
 def _load_and_prune_waypoints(alive_names: set[str]) -> dict[str, tuple[int, int]]:
     """Load and prune targets as one transaction with dashboard writers."""
+    key = str(WAYPOINTS_PATH)
+    sig = _file_signature(WAYPOINTS_PATH)
+    if key in _waypoints_sig_cache and sig == _waypoints_sig_cache[key]:
+        pruned = {
+            name: target
+            for name, target in _waypoints_cached.get(key, {}).items()
+            if name in alive_names
+        }
+        _waypoints_cached[key] = pruned
+        return dict(pruned)
     with file_lock(WAYPOINTS_PATH):
         targets = _load_waypoints()
         if _prune_waypoint_targets(targets, alive_names):
             _write_waypoints_unlocked(targets)
+            sig = _file_signature(WAYPOINTS_PATH)
+        _waypoints_sig_cache[key] = sig
+        _waypoints_cached[key] = dict(targets)
         return targets
 
 
@@ -2856,16 +2932,31 @@ def _write_self_destructs_unlocked(names: set[str]) -> None:
     atomic_write_text(SELF_DESTRUCT_PATH, json.dumps(payload, ensure_ascii=False))
 
 
+# Same signature cache for self_destruct.json — dashboard commands are rare,
+# so the per-Tick lock + read is pure overhead in the steady state.
+_self_destruct_sig_cache: dict[str, tuple[int, int] | None] = {}
+_self_destruct_cached: dict[str, set[str]] = {}
+
+
 def _load_and_prune_self_destructs(alive_names: set[str]) -> set[str]:
     """Load pending self-destruct names, dropping units already gone.
 
     Returns the names still alive that the planner should command this Tick.
     """
+    key = str(SELF_DESTRUCT_PATH)
+    sig = _file_signature(SELF_DESTRUCT_PATH)
+    if key in _self_destruct_sig_cache and sig == _self_destruct_sig_cache[key]:
+        remaining = {n for n in _self_destruct_cached.get(key, set()) if n in alive_names}
+        _self_destruct_cached[key] = remaining
+        return set(remaining)
     with file_lock(SELF_DESTRUCT_PATH):
         pending = _load_self_destructs_unlocked()
         remaining = {n for n in pending if n in alive_names}
         if remaining != pending:
             _write_self_destructs_unlocked(remaining)
+            sig = _file_signature(SELF_DESTRUCT_PATH)
+        _self_destruct_sig_cache[key] = sig
+        _self_destruct_cached[key] = set(remaining)
         return remaining
 
 
@@ -2880,6 +2971,8 @@ def _remove_self_destructs(names: set[str]) -> None:
             pending.difference_update(names)
             if len(pending) != before:
                 _write_self_destructs_unlocked(pending)
+                # No per-Tick cache refresh here: the write bumps mtime, so the
+                # next Tick's signature check misses and reloads from disk.
     except Exception:
         pass
 
