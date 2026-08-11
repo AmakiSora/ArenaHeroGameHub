@@ -4916,6 +4916,31 @@ class BattleLogTests(unittest.TestCase):
             self.assertIn(f'data-log-cat="{cat}"', page)
         self.assertGreater(page.index('id="logPanel"'), page.index('id="tacticConfigForm"'))
 
+    def test_log_panel_has_time_window_buttons(self) -> None:
+        """The battle-log panel offers time-window filters (presets + custom)
+        that replace the fixed newest-200 view."""
+        page = dashboard.generate_html()
+        for seconds in ("600", "1800", "3600", "21600"):
+            self.assertIn(f'data-log-window="{seconds}"', page)
+        self.assertIn('data-log-window="all"', page)
+        self.assertIn('id="logWindowMinutes"', page)
+        self.assertIn('id="logWindowCustomApply"', page)
+
+    def test_battle_log_rows_carry_ts_for_time_filtering(self) -> None:
+        """Each rendered row carries its wall-clock ts so the client can hide
+        rows older than the selected time window."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "battle_log.jsonl"
+            path.write_text(
+                json.dumps({"tick": 7, "ts": 1234567890.0, "cat": "warn", "msg": "告警"}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
+                html, _count = dashboard._battle_log_html()
+        self.assertIn('data-ts="1234567890.0"', html)
+        # Time is shown first, tick second.
+        self.assertLess(html.find(":"), html.index("tick 7"))
+
 
 class DashboardVisualSystemTests(unittest.TestCase):
     def test_major_panels_share_visual_system_tokens(self) -> None:
@@ -4960,6 +4985,70 @@ class TrendPanelTests(unittest.TestCase):
     def test_chart_series_names_match_trend_point_keys(self) -> None:
         for key in ("r", "c", "w", "v", "g", "e"):
             self.assertIn(f"{key}:     {{ key: '{key}'", dashboard.JS)
+
+    def test_window_buttons_use_time_seconds_not_ticks(self) -> None:
+        page = dashboard.generate_html()
+        for seconds, label in (("600", "10分钟"), ("1800", "30分钟"), ("3600", "1小时")):
+            self.assertIn(f'data-trend-window="{seconds}">{label}', page)
+        self.assertIn("最近", page)
+        self.assertNotIn('data-trend-window="400"', page)
+
+
+class TrendTimeWindowTests(unittest.TestCase):
+    """The trend series is laid out by wall-clock time, not tick index."""
+
+    def test_parse_iso_ts_handles_utc_and_z(self) -> None:
+        dt = dashboard.datetime(2026, 8, 12, 3, 14, 30, 123456, tzinfo=dashboard.timezone.utc)
+        self.assertAlmostEqual(
+            dashboard._parse_iso_ts("2026-08-12T03:14:30.123456+00:00"),
+            dt.timestamp(),
+            places=2,
+        )
+        self.assertAlmostEqual(
+            dashboard._parse_iso_ts("2026-08-12T03:14:30Z"),
+            dashboard.datetime(2026, 8, 12, 3, 14, 30, tzinfo=dashboard.timezone.utc).timestamp(),
+            places=2,
+        )
+        self.assertIsNone(dashboard._parse_iso_ts("not-a-date"))
+        self.assertIsNone(dashboard._parse_iso_ts(""))
+        self.assertIsNone(dashboard._parse_iso_ts(None))
+
+    def test_trend_points_use_epoch_time_and_drop_untimestamped(self) -> None:
+        base = 1760000000.0
+        records = [
+            {"tick": 3, "plan_unit_actions": {}, "_ts": base + 40,
+             "resources": 8, "resource_capacity": 50, "workers": [], "vanguards": [], "rangers": [], "visible_enemies": 0},
+            {"tick": 2, "plan_unit_actions": {}, "_ts": None,
+             "resources": 9, "resource_capacity": 50, "workers": [{"id": "w"}], "vanguards": [], "rangers": [], "visible_enemies": 2},
+            {"tick": 1, "plan_unit_actions": {}, "_ts": base + 10,
+             "resources": 5, "resource_capacity": 50, "workers": [{"id": "a"}, {"id": "b"}], "vanguards": [], "rangers": [{"id": "r"}], "visible_enemies": 1},
+        ]
+        points = dashboard._trend_points(records)
+        # Chronological order; the untimestamped middle record is dropped.
+        self.assertEqual([p["t"] for p in points], [base + 10, base + 40])
+        self.assertEqual(points[0]["w"], 2)
+        self.assertEqual(points[1]["e"], 0)
+
+    def test_read_tick_records_since_stops_at_oldest_in_window(self) -> None:
+        now = dashboard.time.time()
+        # The tactic log appends chronologically (oldest tick first); reverse
+        # iteration yields newest-first, so the reader must stop at the first
+        # record older than the window cutoff.
+        lines = [
+            json.dumps({"tick": 1, "plan_unit_actions": {},
+                        "timestamp": dashboard.datetime.fromtimestamp(now - 600, dashboard.timezone.utc).isoformat()}),
+            json.dumps({"tick": 2, "plan_unit_actions": {},
+                        "timestamp": dashboard.datetime.fromtimestamp(now - 40, dashboard.timezone.utc).isoformat()}),
+            json.dumps({"tick": 3, "plan_unit_actions": {},
+                        "timestamp": dashboard.datetime.fromtimestamp(now - 5, dashboard.timezone.utc).isoformat()}),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tactic_log.jsonl"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            with patch.object(dashboard, "LOG_FILE", str(path)):
+                records = dashboard._read_tick_records_since(now - 60)
+        self.assertEqual([r["tick"] for r in records], [3, 2])
+        self.assertTrue(all(r["_ts"] is not None for r in records))
 
 
 class UnitTabsTests(unittest.TestCase):

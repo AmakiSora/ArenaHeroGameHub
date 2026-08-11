@@ -10,6 +10,7 @@ import os
 import re
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from functools import wraps
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -124,13 +125,66 @@ def read_history(ticks: int = 40):
     return out
 
 
+def _parse_iso_ts(value) -> float | None:
+    """Parse a tactic-log ``timestamp`` (ISO string) to wall-clock epoch seconds.
+
+    Returns None when absent or unparseable so a record can't be placed on the
+    time axis.  Handles both the tactic's ``+00:00`` suffix and a trailing ``Z``;
+    a bare datetime is treated as UTC.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    s = value
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _read_tick_records_since(cutoff: float | None, max_records: int = 30000) -> list[dict]:
+    """Return newest-first tick records with parsed wall-clock ``_ts``.
+
+    The tactic log is time-ordered, so reverse iteration can stop at the first
+    record older than ``cutoff`` (records after it are older still) — a time
+    window reads only as many lines as it needs.  ``max_records`` bounds the
+    read for very sparse logs.  Records without a parseable timestamp are
+    skipped without stopping the scan.
+    """
+    out = []
+    for line in _iter_log_lines_reverse(LOG_FILE):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not (isinstance(rec, dict) and "tick" in rec and "plan_unit_actions" in rec):
+            continue
+        ts = _parse_iso_ts(rec.get("timestamp"))
+        rec["_ts"] = ts
+        if ts is None:
+            continue
+        if cutoff is not None and ts < cutoff:
+            break
+        out.append(rec)
+        if len(out) >= max_records:
+            break
+    return out
+
+
 def _trend_points(records: list[dict], max_points: int = 240) -> list[dict]:
     """Flatten newest-first tick records into a chronological compact series.
 
-    Each point carries the metrics the trend charts plot.  Missing fields are
-    treated as 0 so both old (v2) and current (v3) log lines chart correctly.
-    Long windows are downsampled by a stride so the JSON payload stays small.
+    Each point carries the metrics the trend charts plot.  ``t`` is the wall-clock
+    epoch of the record so the charts lay out by real time; records without a
+    parseable timestamp are dropped.  Missing metric fields are treated as 0 so
+    both old (v2) and current (v3) log lines chart correctly.  Long windows are
+    downsampled by a stride so the JSON payload stays small.
     """
+    records = [rec for rec in records if rec.get("_ts") is not None]
     if not records:
         return []
     if len(records) > max_points:
@@ -139,7 +193,7 @@ def _trend_points(records: list[dict], max_points: int = 240) -> list[dict]:
     points = []
     for rec in reversed(records):
         points.append({
-            "t": int(rec.get("tick") or 0),
+            "t": rec["_ts"],
             "r": int(rec.get("resources") or 0),
             "c": int(rec.get("resource_capacity") or 0),
             "w": len(rec.get("workers") or []),
@@ -150,23 +204,24 @@ def _trend_points(records: list[dict], max_points: int = 240) -> list[dict]:
     return points
 
 
-# /api/trends is polled every 2 s; re-parsing up to 2000 full tick records per
-# poll is pure overhead while the log file has not grown. Cache the compact
-# series by (log mtime+size, window) — same heuristic as the tactic's file
+# /api/trends is polled every 2 s; re-parsing full tick records per poll is pure
+# overhead while the log file has not grown. Cache the compact series by
+# (log mtime+size, window-seconds) — same heuristic as the tactic's file
 # signatures; every appended tick bumps mtime and invalidates the entry.
 _trends_cache: dict[tuple[int, int, int], list[dict]] = {}
 
 
-def _trends_points(window: int) -> list[dict]:
+def _trends_points(window_seconds: int) -> list[dict]:
     try:
         stat = os.stat(LOG_FILE)
     except OSError:
         return []
-    key = (stat.st_mtime_ns, stat.st_size, window)
+    key = (stat.st_mtime_ns, stat.st_size, window_seconds)
     cached = _trends_cache.get(key)
     if cached is not None:
         return cached
-    points = _trend_points(read_history(window))
+    cutoff = time.time() - window_seconds
+    points = _trend_points(_read_tick_records_since(cutoff))
     # Keep only the newest entry so an old window or rotated log frees memory.
     _trends_cache.clear()
     _trends_cache[key] = points
@@ -241,13 +296,14 @@ def _battle_log_html() -> tuple[str, int]:
         tick = e.get("tick")
         ts = e.get("ts")
         label_parts = []
-        if tick is not None:
-            label_parts.append(f"tick {tick}")
         if ts:
             label_parts.append(time.strftime("%H:%M:%S", time.localtime(float(ts))))
+        if tick is not None:
+            label_parts.append(f"tick {tick}")
         tick_label = " · ".join(label_parts)
+        ts_attr = f' data-ts="{ts}"' if ts is not None else ""
         rows.append(
-            f'<div class="log-row" data-cat="{html.escape(str(e.get("cat", "")))}">'
+            f'<div class="log-row" data-cat="{html.escape(str(e.get("cat", "")))}"{ts_attr}>'
             f'<span class="log-tick">{html.escape(tick_label)}</span>'
             f'<span class="log-msg">{html.escape(str(e.get("msg", "")))}</span></div>'
         )
@@ -1054,11 +1110,11 @@ def render_trends_panel() -> str:
         '<div class="trend-toolbar">'
         '<span class="trend-window-label">窗口</span>'
         + "".join(
-            f'<button type="button" class="trend-window-btn{" active" if n == 400 else ""}" '
-            f'data-trend-window="{n}">{n}</button>'
-            for n in (100, 400, 1000, 2000)
+            f'<button type="button" class="trend-window-btn{" active" if sec == 600 else ""}" '
+            f'data-trend-window="{sec}">{label}</button>'
+            for sec, label in ((600, "10分钟"), (1800, "30分钟"), (3600, "1小时"))
         )
-        + '<span class="trend-window-hint">Tick</span>'
+        + '<span class="trend-window-hint">最近</span>'
         '</div>'
         '<div class="trend-charts">'
         + figure("res", "资源") + figure("pop", "人口") + figure("enemy", "敌人")
@@ -1854,6 +1910,15 @@ body{margin:0;min-height:100vh;color:var(--text);
 .log-filter:hover{color:#eef3ff;border-color:rgba(255,255,255,.22)}
 .log-filter.on{background:rgba(110,168,255,.16);border-color:rgba(110,168,255,.4);color:#cfe6ff}
 .log-filter.off{opacity:.35;text-decoration:line-through}
+.log-time-filters{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-bottom:8px}
+.log-time-btn{appearance:none;font:inherit;font-size:11px;color:var(--muted);padding:3px 11px;border-radius:999px;
+ background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);cursor:pointer;transition:.12s}
+.log-time-btn:hover{color:#eef3ff;border-color:rgba(255,255,255,.22)}
+.log-time-btn.on{background:rgba(110,168,255,.16);border-color:rgba(110,168,255,.4);color:#cfe6ff}
+.log-time-custom{display:inline-flex;align-items:center;gap:5px}
+.log-time-custom input{width:88px;padding:3px 8px;border:1px solid rgba(255,255,255,.12);border-radius:999px;
+ background:#0b1222;color:var(--text);font:11px Consolas,monospace;outline:none}
+.log-time-custom input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
 .log-list{display:grid;gap:2px;max-height:46vh;overflow:auto;padding-right:4px}
 .log-row{display:flex;align-items:baseline;gap:8px;padding:4px 8px;border-radius:8px;font-size:11.5px;line-height:1.45}
 .log-row:nth-child(odd){background:rgba(255,255,255,.025)}
@@ -2123,13 +2188,18 @@ JS = r"""
   const LOG_CATS = ['discover','kill','defeat','combat','economy','config','warn'];
   // Noisy categories default off so the panel starts readable.
   const LOG_CATS_DEFAULT_OFF = ['combat','economy'];
+  // Battle-log time window: seconds into the past, or 'all' for every row.
+  const LOG_WINDOW_KEY = 'arenaLogWindow.v1';
+  let logWindow = 'all';
+  const LOG_WINDOWS = {600: '10分钟', 1800: '30分钟', 3600: '1小时', 21600: '6小时', all: '全部'};
 
-  // 历史趋势 panel: window persisted, tick-deduped like softRefresh.
-  const TREND_WINDOW_KEY = 'arenaTrendWindow.v1';
-  let trendWindow = 400;
-  let lastTrendTick = null;
+  // 历史趋势 panel: time-window (seconds) persisted, deduped on the newest
+  // point's wall-clock ts like softRefresh.
+  const TREND_WINDOW_KEY = 'arenaTrendWindow.v2';
+  let trendWindow = 600;
+  let lastTrendTs = null;
   let trendPoints = [];
-  const TREND_WINDOWS = [100, 400, 1000, 2000];
+  const TREND_WINDOWS = [600, 1800, 3600];
   const TREND_CHART_STATE = {};
   const TREND_CHARTS = {
     res:   { keys: ['r', 'c'], label: '资源' },
@@ -2506,10 +2576,18 @@ JS = r"""
     const list = document.getElementById('logSection');
     if(!list) return;
     logFilters = logFilters || loadLogFilters();
+    if(logWindow == null) logWindow = loadLogWindow();
+    // Rows older than the selected time window are hidden. 'all' disables it.
+    const cutoff = logWindow === 'all' ? null : (Date.now() / 1000 - logWindow);
     const rows = list.querySelectorAll('.log-row');
     for(let i = 0; i < rows.length; i++){
       const cat = rows[i].getAttribute('data-cat') || '';
-      rows[i].style.display = logFilters[cat] === false ? 'none' : '';
+      let visible = logFilters[cat] !== false;
+      if(visible && cutoff !== null){
+        const ts = parseFloat(rows[i].getAttribute('data-ts'));
+        visible = !isNaN(ts) && ts >= cutoff;
+      }
+      rows[i].style.display = visible ? '' : 'none';
     }
     const btns = document.querySelectorAll('.log-filter[data-log-cat]');
     for(let i = 0; i < btns.length; i++){
@@ -2517,6 +2595,7 @@ JS = r"""
       btns[i].classList.toggle('on', logFilters[cat] !== false);
       btns[i].classList.toggle('off', logFilters[cat] === false);
     }
+    updateLogTimeButtons();
   }
   function bindLogFilters(){
     const btns = document.querySelectorAll('.log-filter[data-log-cat]');
@@ -2529,6 +2608,69 @@ JS = r"""
         applyLogFilters();
       });
     }
+  }
+
+  // ── Battle-log time-window filter ───────────────────────────────────────
+  function loadLogWindow(){
+    let w = 'all';
+    try{
+      const raw = localStorage.getItem(LOG_WINDOW_KEY);
+      if(raw === 'all') w = 'all';
+      else if(raw !== null){
+        const n = Number(raw);
+        if(!isNaN(n) && n >= 1) w = n;
+      }
+    }catch(e){}
+    return w;
+  }
+  function persistLogWindow(){
+    try{ localStorage.setItem(LOG_WINDOW_KEY, String(logWindow)); }catch(e){}
+  }
+  function updateLogTimeButtons(){
+    const btns = document.querySelectorAll('.log-time-btn[data-log-window]');
+    for(let i = 0; i < btns.length; i++){
+      const w = btns[i].getAttribute('data-log-window');
+      const active = w === 'all' ? logWindow === 'all'
+        : (logWindow !== 'all' && Number(w) === logWindow);
+      btns[i].classList.toggle('on', active);
+    }
+    // A custom (non-preset) window is echoed back into the minutes input.
+    const input = document.getElementById('logWindowMinutes');
+    if(input && logWindow !== 'all' && !(String(logWindow) in LOG_WINDOWS)){
+      input.value = String(Math.round(logWindow / 60));
+    }
+  }
+  function bindLogTimeFilters(){
+    const panel = document.getElementById('logPanel');
+    if(!panel || panel._timeBound) return;
+    panel._timeBound = true;
+    logWindow = loadLogWindow();
+    const btns = document.querySelectorAll('.log-time-btn[data-log-window]');
+    for(let i = 0; i < btns.length; i++){
+      btns[i].addEventListener('click', function(){
+        const w = btns[i].getAttribute('data-log-window');
+        logWindow = w === 'all' ? 'all' : Number(w);
+        persistLogWindow();
+        updateLogTimeButtons();
+        applyLogFilters();
+      });
+    }
+    const input = document.getElementById('logWindowMinutes');
+    const applyBtn = document.getElementById('logWindowCustomApply');
+    function applyCustom(){
+      const v = parseInt(input.value, 10);
+      if(!isNaN(v) && v >= 1){
+        logWindow = v * 60;
+        persistLogWindow();
+        updateLogTimeButtons();
+        applyLogFilters();
+      }
+    }
+    if(applyBtn) applyBtn.addEventListener('click', applyCustom);
+    if(input){
+      input.addEventListener('keydown', function(e){ if(e.key === 'Enter') applyCustom(); });
+    }
+    updateLogTimeButtons();
   }
 
   // ── Right-sidebar unit tabs (工人 / 先锋 / 游侠) ──────────────────────
@@ -3273,6 +3415,11 @@ JS = r"""
 
   // ── 历史趋势 panel ──────────────────────────────────────────────────
   function trendNum(v){ return (v == null) ? 0 : Number(v); }
+  function trendTimeLabel(t){
+    const d = new Date(t * 1000);
+    const p = function(n){ return String(n).padStart(2, '0'); };
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
   function trendNiceStep(maxVal){
     if(!(maxVal > 0)) return 4;
     const mag = Math.pow(10, Math.floor(Math.log10(maxVal)));
@@ -3306,7 +3453,9 @@ JS = r"""
     const yMax = trendNiceStep(maxVal);
     const W = 400, H = 160, PL = 30, PR = 10, PT = 8, PB = 18;
     const PW = W - PL - PR, PH = H - PT - PB;
-    const x = function(i){ return PL + (points.length === 1 ? PW / 2 : (i / (points.length - 1)) * PW); };
+    // Lay out by real wall-clock time so uneven tick cadence is visible.
+    const t0 = points[0].t, tN = points[points.length - 1].t;
+    const x = function(t){ return (tN === t0) ? (PL + PW / 2) : (PL + ((t - t0) / (tN - t0)) * PW); };
     const y = function(v){ return PT + (1 - v / yMax) * PH; };
 
     let grid = '';
@@ -3320,21 +3469,22 @@ JS = r"""
               'font-size="8" fill="#7f8eab">' + Math.round(val) + '</text>';
     }
     let xlabels = '';
-    [0, Math.floor((points.length - 1) / 2), points.length - 1]
-      .filter(function(v, i, a){ return a.indexOf(v) === i; })
-      .forEach(function(i){
-        xlabels += '<text x="' + x(i).toFixed(2) + '" y="' + (H - 4) + '" text-anchor="middle" ' +
-                   'font-size="8" fill="#7f8eab">' + points[i].t + '</text>';
-      });
+    const tMid = t0 + (tN - t0) / 2;
+    const labelTs = [];
+    [t0, tMid, tN].forEach(function(tv){ if(labelTs.indexOf(tv) === -1) labelTs.push(tv); });
+    labelTs.forEach(function(tv){
+      xlabels += '<text x="' + x(tv).toFixed(2) + '" y="' + (H - 4) + '" text-anchor="middle" ' +
+                 'font-size="8" fill="#7f8eab">' + trendTimeLabel(tv) + '</text>';
+    });
 
     let lines = '';
     series.forEach(function(s){
-      const pts = points.map(function(p, i){
-        return x(i).toFixed(2) + ',' + y(trendNum(p[s.key])).toFixed(2);
+      const pts = points.map(function(p){
+        return x(p.t).toFixed(2) + ',' + y(trendNum(p[s.key])).toFixed(2);
       }).join(' ');
       lines += '<polyline class="t-line' + (s.dash ? ' dash' : '') + '" points="' + pts + '" stroke="' + s.color + '"/>';
       const last = points[points.length - 1];
-      lines += '<circle cx="' + x(points.length - 1).toFixed(2) + '" cy="' + y(trendNum(last[s.key])).toFixed(2) +
+      lines += '<circle cx="' + x(last.t).toFixed(2) + '" cy="' + y(trendNum(last[s.key])).toFixed(2) +
                '" r="3" fill="' + s.color + '" stroke="#0b1222" stroke-width="1.5"/>';
     });
 
@@ -3354,13 +3504,21 @@ JS = r"""
     if(!st || !st.points.length) return;
     const fig = document.querySelector('.trend-figure[data-trend-chart="' + name + '"]');
     const rect = st.svg.getBoundingClientRect();
-    const t = (e.clientX - rect.left) / rect.width;
-    let idx = Math.round(t * (st.points.length - 1));
-    idx = Math.max(0, Math.min(st.points.length - 1, idx));
+    const frac = (e.clientX - rect.left) / rect.width;
+    // Points are spaced by wall-clock time, so invert the pixel x-fraction
+    // back to a time and pick the nearest point.
+    const pts = st.points;
+    const t0 = pts[0].t, tN = pts[pts.length - 1].t;
+    const time = t0 + frac * (tN - t0);
+    let idx = 0, best = Infinity;
+    pts.forEach(function(p, i){
+      const d = Math.abs(p.t - time);
+      if(d < best){ best = d; idx = i; }
+    });
     const line = st.svg.querySelector('.t-crosshair');
     if(line){
-      line.setAttribute('x1', st.x(idx).toFixed(2));
-      line.setAttribute('x2', st.x(idx).toFixed(2));
+      line.setAttribute('x1', st.x(pts[idx].t).toFixed(2));
+      line.setAttribute('x2', st.x(pts[idx].t).toFixed(2));
       line.setAttribute('visibility', 'visible');
     }
     const tip = fig.querySelector('[data-trend-tooltip]');
@@ -3368,7 +3526,7 @@ JS = r"""
     tip.innerHTML = '';
     const tick = document.createElement('div');
     tick.className = 'tt-tick';
-    tick.textContent = 'tick ' + st.points[idx].t;
+    tick.textContent = trendTimeLabel(pts[idx].t);
     tip.appendChild(tick);
     st.series.forEach(function(s){
       const row = document.createElement('div');
@@ -3404,7 +3562,7 @@ JS = r"""
     const rows = points.slice(-30).reverse();
     const table = document.createElement('table');
     const hr = document.createElement('tr');
-    ['tick', '资源', '容量', '工人', '先锋', '游侠', '敌人'].forEach(function(h){
+    ['时间', '资源', '容量', '工人', '先锋', '游侠', '敌人'].forEach(function(h){
       const th = document.createElement('th');
       th.textContent = h;
       hr.appendChild(th);
@@ -3415,7 +3573,8 @@ JS = r"""
     const tb = document.createElement('tbody');
     rows.forEach(function(p){
       const tr = document.createElement('tr');
-      [p.t, p.r, p.c, p.w, p.v, p.g, p.e].forEach(function(v){
+      const cells = [trendTimeLabel(p.t), p.r, p.c, p.w, p.v, p.g, p.e];
+      cells.forEach(function(v){
         const td = document.createElement('td');
         td.textContent = String(v);
         tr.appendChild(td);
@@ -3439,19 +3598,20 @@ JS = r"""
     const panel = document.getElementById('trendsPanel');
     if(!panel) return;
     try{
-      const res = await fetch('/api/trends?ticks=' + trendWindow + '&ts=' + Date.now(), {cache: 'no-store'});
+      const res = await fetch('/api/trends?seconds=' + trendWindow + '&ts=' + Date.now(), {cache: 'no-store'});
       if(!res.ok) return;
       const data = await res.json();
       if(!data || !data.points) return;
-      if(lastTrendTick !== null && data.lastTick === lastTrendTick) return;
-      lastTrendTick = data.lastTick;
+      if(lastTrendTs !== null && data.lastTs === lastTrendTs) return;
+      lastTrendTs = data.lastTs;
       trendPoints = data.points;
       renderTrendCharts();
       buildTrendTable(data.points);
       const range = panel.querySelector('[data-trend-range]');
       if(range){
         range.textContent = data.points.length
-          ? (data.points.length + ' 点 · ' + data.points[0].t + ' → ' + data.points[data.points.length - 1].t)
+          ? (data.points.length + ' 点 · ' + trendTimeLabel(data.points[0].t) +
+             ' → ' + trendTimeLabel(data.points[data.points.length - 1].t))
           : '—';
       }
     }catch(e){}
@@ -3476,7 +3636,7 @@ JS = r"""
           trendWindow = Number(btn.getAttribute('data-trend-window'));
           updateTrendWindowButtons();
           try{ localStorage.setItem(TREND_WINDOW_KEY, String(trendWindow)); }catch(e){}
-          lastTrendTick = null;
+          lastTrendTs = null;
           loadTrends();
         });
       });
@@ -3498,6 +3658,7 @@ JS = r"""
   bindWaypointPanel();
   bindMapFilters();
   bindLogFilters();
+  bindLogTimeFilters();
   bindUnitTabs();
   // ── per-unit 自裁 (self-destruct) buttons ─────────────────────────────
   // Cards are re-rendered on every soft refresh, so bind once on the document
@@ -4133,6 +4294,18 @@ def generate_html() -> str:
           <button type="button" class="log-filter" data-log-cat="config">配置</button>
           <button type="button" class="log-filter" data-log-cat="warn">异常</button>
         </div>
+        <div class="log-time-filters" id="logTimeFilters">
+          <button type="button" class="log-time-btn" data-log-window="600">10分钟</button>
+          <button type="button" class="log-time-btn" data-log-window="1800">30分钟</button>
+          <button type="button" class="log-time-btn" data-log-window="3600">1小时</button>
+          <button type="button" class="log-time-btn" data-log-window="21600">6小时</button>
+          <button type="button" class="log-time-btn" data-log-window="all">全部</button>
+          <span class="log-time-custom">
+            <input type="number" id="logWindowMinutes" min="1" step="1" placeholder="自定义分钟"
+                   aria-label="自定义时间窗口分钟数">
+            <button type="button" class="log-time-btn" id="logWindowCustomApply">应用</button>
+          </span>
+        </div>
         <div class="log-list" id="logSection">{parts['logHtml']}</div>
       </section>
       <div id="issuesSection" style="display:none">{parts['issuesHtml']}</div>
@@ -4272,17 +4445,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/trends":
             query = parse_qs(urlsplit(self.path).query)
-            raw = query.get("ticks", ["400"])[0]
+            raw = query.get("seconds", query.get("ticks", ["600"]))[0]
             try:
                 window = int(raw)
             except (TypeError, ValueError):
-                window = 400
-            window = max(50, min(2000, window))
+                window = 600
+            window = max(60, min(21600, window))
             points = _trends_points(window)
             self._send_json(200, {
                 "ok": True,
                 "window": window,
-                "lastTick": points[-1]["t"] if points else None,
+                "lastTs": points[-1]["t"] if points else None,
                 "points": points,
             })
             return
