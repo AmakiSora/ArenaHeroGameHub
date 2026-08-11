@@ -28,6 +28,8 @@ deploy/.env.deploy
 
 # Temp scripts
 _*.py
+_*.jsonl
+_*.txt
 fix_*.py
 _dash*.py
 _patch*.py

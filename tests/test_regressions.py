@@ -2519,6 +2519,429 @@ class WorkerCongestionTests(unittest.TestCase):
         self.assertNotIn("w-frozen", tactic._resource_assignments)
 
 
+class DeliveryLeaseTests(unittest.TestCase):
+    """Delivery lease: serialize cargo traffic through the core-cell chute.
+
+    Without the lease every carrier races for the single chute each tick;
+    losers get CELL_UNIT_LIMIT rejections and the ring oscillates forever.
+    """
+
+    class Worker:
+        def __init__(self, worker_id: str, position: tuple[int, int]) -> None:
+            self.id = worker_id
+            self.position = position
+            self.cargo = 0
+            self.direction = None
+
+        def move(self, direction) -> None:
+            self.direction = direction
+            self.position = (
+                self.position[0] + direction.delta[0],
+                self.position[1] + direction.delta[1],
+            )
+
+        def wait(self) -> None:
+            self.direction = None
+
+    class Core:
+        position = (28, -20)
+
+    def setUp(self) -> None:
+        self._lease = tactic._delivery_lease_uid
+        self._next = tactic._delivery_next_uid
+        self._stuck = dict(tactic._worker_stuck_ticks)
+        self._stall = dict(tactic._delivery_stall)
+        self._qstall = dict(tactic._delivery_holder_queue_stall)
+        self._yield = tactic._delivery_lease_yield
+        self._vacating = tactic._chute_vacating_this_tick
+        self._adjacent = tactic._lease_holder_adjacent
+        self._demand = tactic._chute_in_demand
+        self._next_pos = tactic._delivery_next_pos
+        self._at_chute = tactic._carrier_at_chute
+        self._assignments = dict(tactic._resource_assignments)
+        self._memory = set(tactic._resource_memory)
+        tactic._delivery_lease_uid = None
+        tactic._delivery_next_uid = None
+        tactic._worker_stuck_ticks.clear()
+        tactic._delivery_stall.clear()
+        tactic._delivery_holder_queue_stall.clear()
+        tactic._delivery_lease_yield = False
+        tactic._chute_vacating_this_tick = False
+        tactic._lease_holder_adjacent = False
+        tactic._chute_in_demand = False
+        tactic._delivery_next_pos = None
+        tactic._carrier_at_chute = False
+        tactic._worker_path_cache.clear()
+
+    def tearDown(self) -> None:
+        tactic._delivery_lease_uid = self._lease
+        tactic._delivery_next_uid = self._next
+        tactic._worker_stuck_ticks.clear()
+        tactic._worker_stuck_ticks.update(self._stuck)
+        tactic._delivery_stall.clear()
+        tactic._delivery_stall.update(self._stall)
+        tactic._delivery_holder_queue_stall.clear()
+        tactic._delivery_holder_queue_stall.update(self._qstall)
+        tactic._delivery_lease_yield = self._yield
+        tactic._chute_vacating_this_tick = self._vacating
+        tactic._lease_holder_adjacent = self._adjacent
+        tactic._chute_in_demand = self._demand
+        tactic._delivery_next_pos = self._next_pos
+        tactic._carrier_at_chute = self._at_chute
+        tactic._resource_assignments.clear()
+        tactic._resource_assignments.update(self._assignments)
+        tactic._resource_memory.clear()
+        tactic._resource_memory.update(self._memory)
+        tactic._worker_path_cache.clear()
+
+    def _plan(self, worker, *, lease_uid, occupied=frozenset(), next_uid=None):
+        return tactic._plan_worker(
+            worker,
+            self.Core(),
+            resource_cells=frozenset(),
+            obstacle_cells=frozenset(),
+            depleted=set(),
+            config=default_config(),
+            occupied=occupied,
+            lease_uid=lease_uid,
+            next_uid=next_uid,
+        )
+
+    def test_lease_goes_to_closest_carrier(self) -> None:
+        near = SimpleNamespace(id="w-near", position=(30, -20), cargo=1)
+        far = SimpleNamespace(id="w-far", position=(40, -20), cargo=2)
+        empty = SimpleNamespace(id="w-empty", position=(29, -20), cargo=0)
+
+        self.assertEqual(
+            tactic._assign_delivery_lease((far, near, empty), (28, -20)),
+            "w-near",
+        )
+        self.assertIsNone(tactic._assign_delivery_lease((empty,), (28, -20)))
+
+    def test_lease_tie_prefers_current_holder(self) -> None:
+        a = SimpleNamespace(id="w-a", position=(30, -20), cargo=1)
+        b = SimpleNamespace(id="w-b", position=(28, -22), cargo=1)  # both dist 2
+        tactic._delivery_lease_uid = "w-b"
+
+        self.assertEqual(tactic._assign_delivery_lease((a, b), (28, -20)), "w-b")
+
+    def test_lease_is_sticky_against_closer_rival(self) -> None:
+        # The holder keeps the lease while still closing in, even when another
+        # carrier is currently closer — equidistant flip-flop was the cause of
+        # ring oscillation (several carriers racing the same cell each tick).
+        holder = SimpleNamespace(id="w-holder", position=(33, -20), cargo=1)
+        closer = SimpleNamespace(id="w-closer", position=(30, -20), cargo=1)
+        tactic._delivery_lease_uid = "w-holder"
+
+        self.assertEqual(
+            tactic._assign_delivery_lease((holder, closer), (28, -20)),
+            "w-holder",
+        )
+
+    def test_lease_rotates_when_holder_stalls_far(self) -> None:
+        # A holder beyond queue range that stops making progress (fleeing /
+        # wedged) must yield the lease after the stall limit, or the queue
+        # starves behind it.
+        holder = SimpleNamespace(id="w-holder", position=(33, -20), cargo=1)
+        closer = SimpleNamespace(id="w-closer", position=(30, -20), cargo=1)
+        tactic._delivery_lease_uid = "w-holder"
+        stall = tactic._DELIVERY_STALL_LIMIT
+        tactic._delivery_stall["w-holder"] = (5, stall)
+
+        self.assertEqual(
+            tactic._assign_delivery_lease((holder, closer), (28, -20)),
+            "w-closer",
+        )
+
+    def test_lease_holder_in_queue_range_never_stalls_out(self) -> None:
+        # Waiting at distance <= 2 is legitimate queueing, not stalling: the
+        # stall counter must never evict a holder already in queue range.
+        holder = SimpleNamespace(id="w-holder", position=(30, -20), cargo=1)
+        rival = SimpleNamespace(id="w-rival", position=(31, -20), cargo=1)
+        tactic._delivery_lease_uid = "w-holder"
+        stall = tactic._DELIVERY_STALL_LIMIT
+        tactic._delivery_stall["w-holder"] = (2, stall * 10)
+
+        self.assertEqual(
+            tactic._assign_delivery_lease((holder, rival), (28, -20)),
+            "w-holder",
+        )
+
+    def test_lease_rotates_away_from_stuck_holder(self) -> None:
+        # Beyond queue range the lease rotates after _DELIVERY_STUCK_LIMIT
+        # frozen ticks (rejected moves count as no progress).
+        stuck = SimpleNamespace(id="w-stuck", position=(31, -20), cargo=1)  # dist 3
+        other = SimpleNamespace(id="w-other", position=(30, -20), cargo=1)
+        tactic._delivery_lease_uid = "w-stuck"
+        tactic._worker_stuck_ticks["w-stuck"] = tactic._DELIVERY_STUCK_LIMIT
+
+        self.assertEqual(
+            tactic._assign_delivery_lease((stuck, other), (28, -20)),
+            "w-other",
+        )
+
+    def test_lease_grace_for_queue_range_holder(self) -> None:
+        # In queue range the same freeze is usually a legitimate wait for the
+        # enter/deposit/vacate cycle, so the holder gets double grace before
+        # the lease churns away.
+        stuck = SimpleNamespace(id="w-stuck", position=(29, -20), cargo=1)  # dist 1
+        other = SimpleNamespace(id="w-other", position=(31, -20), cargo=1)
+        tactic._delivery_lease_uid = "w-stuck"
+        tactic._worker_stuck_ticks["w-stuck"] = tactic._DELIVERY_STUCK_LIMIT
+
+        self.assertEqual(
+            tactic._assign_delivery_lease((stuck, other), (28, -20)),
+            "w-stuck",
+        )
+
+    def test_queued_carrier_holds_at_distance_two(self) -> None:
+        # Chute is FREE but reserved for the lease holder — the queued carrier
+        # must hold at distance 2 instead of racing in.
+        worker = self.Worker("w-queue", (30, -20))
+        worker.cargo = 2
+
+        action, detail = self._plan(
+            worker, lease_uid="w-other", occupied=frozenset({(30, -20)}),
+        )
+
+        self.assertEqual(action, "WAIT")
+        self.assertIn("core-queue-hold", detail)
+        self.assertEqual(worker.position, (30, -20))
+
+    def test_queued_carrier_backs_off_the_ring(self) -> None:
+        worker = self.Worker("w-ring", (29, -20))
+        worker.cargo = 2
+
+        action, detail = self._plan(
+            worker, lease_uid="w-other", occupied=frozenset({(29, -20)}),
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("core-queue-backoff", detail)
+        self.assertGreater(
+            tactic._manhattan(worker.position, (28, -20)),
+            tactic._manhattan((29, -20), (28, -20)),
+        )
+
+    def test_queued_carrier_far_still_marches_home(self) -> None:
+        # Beyond the queue radius the lease must not stop the march home.
+        worker = self.Worker("w-march", (32, -20))
+        worker.cargo = 2
+
+        action, _detail = self._plan(
+            worker, lease_uid="w-other", occupied=frozenset({(32, -20)}),
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertLess(
+            tactic._manhattan(worker.position, (28, -20)),
+            tactic._manhattan((32, -20), (28, -20)),
+        )
+
+    def test_lease_holder_enters_free_chute(self) -> None:
+        worker = self.Worker("w-lease", (29, -20))
+        worker.cargo = 2
+
+        action, _detail = self._plan(
+            worker, lease_uid="w-lease", occupied=frozenset({(29, -20)}),
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(worker.position, (28, -20))
+
+    def test_boxed_in_holder_makes_queue_yield(self) -> None:
+        # A holder frozen in queue range for _DELIVERY_HOLDER_YIELD_AFTER
+        # ticks is boxed in by the queue itself: queued carriers must
+        # sidestep instead of holding their slots.
+        holder = SimpleNamespace(id="w-holder", position=(30, -20), cargo=1)
+        queued = self.Worker("w-queued", (28, -22))
+        queued.cargo = 1
+        for _ in range(tactic._DELIVERY_HOLDER_YIELD_AFTER + 1):
+            tactic._assign_delivery_lease((holder, queued), (28, -20))
+        self.assertTrue(tactic._delivery_lease_yield)
+
+        action, detail = self._plan(
+            queued, lease_uid="w-holder", occupied=frozenset({(28, -22)}),
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("core-queue-yield", detail)
+        # Sidestep never steps closer to the chute when another cell exists.
+        self.assertGreaterEqual(
+            tactic._manhattan(queued.position, (28, -20)), 2,
+        )
+
+    def test_moving_holder_keeps_queue_holding(self) -> None:
+        # No freeze, no yield: queued carriers keep holding their slots.
+        holder = SimpleNamespace(id="w-holder", position=(30, -20), cargo=1)
+        queued = self.Worker("w-queued", (28, -22))
+        queued.cargo = 1
+        tactic._assign_delivery_lease((holder, queued), (28, -20))
+        self.assertFalse(tactic._delivery_lease_yield)
+
+        action, detail = self._plan(
+            queued, lease_uid="w-holder", occupied=frozenset({(28, -22)}),
+        )
+
+        self.assertEqual(action, "WAIT")
+        self.assertIn("core-queue-hold", detail)
+        self.assertEqual(queued.position, (28, -22))
+
+    def test_next_is_second_closest_carrier_and_sticky(self) -> None:
+        # The next-in-line slot goes to the closest carrier after the lease
+        # holder, and ties keep the current next (no flip-flop on the ring).
+        a = SimpleNamespace(id="w-a", position=(30, -20), cargo=1)   # dist 2
+        b = SimpleNamespace(id="w-b", position=(31, -20), cargo=1)   # dist 3
+        c = SimpleNamespace(id="w-c", position=(28, -22), cargo=1)   # dist 2
+
+        tactic._assign_delivery_lease((a, b, c), (28, -20))
+        self.assertEqual(tactic._delivery_lease_uid, "w-a")
+        self.assertEqual(tactic._delivery_next_uid, "w-c")
+
+        # Equidistant rivals: keep the incumbent next.
+        b2 = SimpleNamespace(id="w-b", position=(28, -23), cargo=1)  # dist 3
+        tactic._delivery_next_uid = "w-b"
+        tactic._assign_delivery_lease((a, b2, c), (28, -20))
+        self.assertEqual(tactic._delivery_next_uid, "w-c")  # c is closer
+        c2 = SimpleNamespace(id="w-c", position=(31, -21), cargo=1)  # dist 4
+        tactic._assign_delivery_lease((a, b2, c2), (28, -20))
+        self.assertEqual(tactic._delivery_next_uid, "w-b")  # b is closer
+        b3 = SimpleNamespace(id="w-b", position=(30, -22), cargo=1)  # dist 4
+        c3 = SimpleNamespace(id="w-c", position=(29, -23), cargo=1)  # dist 4
+        tactic._delivery_next_uid = "w-c"
+        tactic._assign_delivery_lease((a, b3, c3), (28, -20))
+        self.assertEqual(tactic._delivery_next_uid, "w-c")  # sticky tie
+
+    def test_next_chains_into_vacating_chute(self) -> None:
+        # The occupant leaves this tick: the next carrier adjacent to the
+        # chute steps onto the core cell in the SAME tick — the server chains
+        # the entry behind the departure (one out, one in).
+        worker = self.Worker("w-next", (29, -20))
+        worker.cargo = 2
+        tactic._chute_vacating_this_tick = True
+
+        action, _detail = self._plan(
+            worker, lease_uid="w-insider", next_uid="w-next",
+            occupied=frozenset({(28, -20), (29, -20)}),
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(worker.position, (28, -20))
+
+    def test_next_holds_adjacent_while_insider_deposits(self) -> None:
+        # Insider still carrying on the chute (deposits and stays this tick):
+        # the next carrier must hold its adjacent slot, not squeeze in.
+        worker = self.Worker("w-next", (29, -20))
+        worker.cargo = 2
+
+        action, detail = self._plan(
+            worker, lease_uid="w-insider", next_uid="w-next",
+            occupied=frozenset({(28, -20), (29, -20)}),
+        )
+
+        self.assertEqual(action, "WAIT")
+        self.assertIn("core-next-hold", detail)
+        self.assertEqual(worker.position, (29, -20))
+
+    def test_next_yields_entry_to_adjacent_holder(self) -> None:
+        # Chute free but the lease holder is already adjacent and entering
+        # this tick: the next carrier must not race for the same cell.
+        worker = self.Worker("w-next", (28, -21))
+        worker.cargo = 2
+        tactic._lease_holder_adjacent = True
+
+        action, detail = self._plan(
+            worker, lease_uid="w-insider", next_uid="w-next",
+            occupied=frozenset({(28, -21)}),
+        )
+
+        self.assertEqual(action, "WAIT")
+        self.assertIn("core-next-hold", detail)
+        self.assertEqual(worker.position, (28, -21))
+
+    def test_next_enters_free_chute_when_holder_far(self) -> None:
+        # Chute free and the lease holder out of reach (fleeing/marching):
+        # the adjacent next carrier takes the slot instead of waiting.
+        worker = self.Worker("w-next", (29, -20))
+        worker.cargo = 2
+
+        action, _detail = self._plan(
+            worker, lease_uid="w-insider", next_uid="w-next",
+            occupied=frozenset({(29, -20)}),
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(worker.position, (28, -20))
+
+    def test_empty_worker_routes_around_core_under_delivery_pressure(self) -> None:
+        # While carriers are delivering, an empty worker's path must not cut
+        # through the chute: it just vacated and would otherwise step right
+        # back on, squat-looping and blocking the one-out-one-in hand-off.
+        worker = self.Worker("w-empty", (29, -20))  # adjacent, east of core
+        tactic._chute_in_demand = True
+        tactic._resource_assignments["w-empty"] = (27, -20)  # west of core
+        tactic._resource_memory.add((27, -20))
+
+        action, _detail = self._plan(
+            worker, lease_uid="w-other", occupied=frozenset({(29, -20)}),
+        )
+
+        self.assertEqual(action, "MOVE")
+        # Must NOT step onto the core cell even though it is the straight way.
+        self.assertNotEqual(worker.position, (28, -20))
+
+    def test_vacate_swaps_with_next_carrier_on_packed_ring(self) -> None:
+        # Every free ring cell is taken: the empty worker on the chute must
+        # swap slots with the incoming next carrier (server chains the entry
+        # behind the departure) instead of WAIT-ing and deadlocking the line.
+        worker = self.Worker("w-core", (28, -20))
+        tactic._delivery_next_pos = (29, -20)
+        occupied = frozenset({
+            (28, -20), (29, -20),        # core + next carrier
+            (28, -19), (28, -21), (27, -20),  # other ring cells packed
+        })
+
+        action, detail = self._plan(worker, lease_uid="w-other", occupied=occupied)
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("vacate-core", detail)
+        self.assertEqual(worker.position, (29, -20))
+
+    def test_vacate_swaps_with_ring_occupant_without_next(self) -> None:
+        # Single-carrier fleet (no next-in-line picked): the packed-ring swap
+        # must still fire while the delivery line is in demand, otherwise the
+        # empty worker squats on the chute and the lone carrier waits forever.
+        worker = self.Worker("w-core", (28, -20))
+        tactic._delivery_next_pos = None
+        tactic._chute_in_demand = True
+        occupied = frozenset({
+            (28, -20), (28, -21), (29, -20), (28, -19), (27, -20),
+        })
+
+        action, detail = self._plan(worker, lease_uid="w-other", occupied=occupied)
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("vacate-core", detail)
+        self.assertEqual(worker.position, (28, -21))
+
+    def test_tail_fallback_releases_core_cell(self) -> None:
+        # Every exit blocked, no delivery line active: the last-resort block
+        # before WAIT:no_action must still swap the empty worker off the
+        # chute — a parked worker there stalls every future delivery.
+        worker = self.Worker("w-core", (28, -20))
+        tactic._delivery_next_pos = None
+        tactic._chute_in_demand = False
+        occupied = frozenset({
+            (28, -20), (28, -21), (29, -20), (28, -19), (27, -20),
+        })
+
+        action, detail = self._plan(worker, lease_uid=None, occupied=occupied)
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("vacate-core", detail)
+        self.assertNotEqual(worker.position, (28, -20))
+
+
 class DemandSpawnTests(unittest.TestCase):
     """Demand-based production: fill each type up to its config target."""
 

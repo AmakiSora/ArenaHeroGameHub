@@ -1165,9 +1165,13 @@ def _worker_cached_path_step(
         _worker_path_cache.pop(uid, None)
         return None
     next_cell = path[k + 1]
-    # The goal cell may be stepped on only while it is actually free; any other
-    # occupied cell invalidates the cached step (server rejects the move).
-    if next_cell in others:
+    # The goal cell may be stepped on only while it is actually free — except
+    # during a chute hand-off: when the occupant vacates this tick the entry
+    # chains behind its departure ("one out, one in"). Any other occupied
+    # cell invalidates the cached step (server rejects the move).
+    if next_cell in others and not (
+        next_cell == goal and _chute_vacating_this_tick
+    ):
         return None
     valid = next_cell == goal or (
         next_cell not in obstacle_cells
@@ -1497,6 +1501,158 @@ def _plan_waypoint(
     return ("WAIT", f"waypoint-blocked {target}")
 
 
+def _assign_delivery_lease(workers: Any, core_pos: tuple[int, int]) -> str | None:
+    """Grant the core-cell delivery lease to exactly one carrier.
+
+    The core cell is the single unloading chute (capacity: Core + one unit).
+    When every cargo worker races for it each tick, only one squeeze-in
+    succeeds and the rest get CELL_UNIT_LIMIT rejections while the ring
+    oscillates approach/backoff forever (observed: 6 deposits per 87 ticks,
+    145 rejected moves). Serializing the chute fixes it: all carriers except
+    the lease holder queue at Manhattan distance 2, so entry is uncontested
+    and the deposit rhythm settles at the enter/deposit/vacate cycle.
+
+    The lease is STICKY: the current holder keeps it while carrying and either
+    in queue range or still closing in, so equidistant carriers never flip the
+    lease every tick (the flip let several carriers sit on the ring at once
+    and race the same cell). It rotates away only when the holder drops its
+    cargo, is stuck _DELIVERY_STUCK_LIMIT ticks (rejected moves = no progress),
+    or stalls _DELIVERY_STALL_LIMIT ticks without getting closer while still
+    beyond queue range (fleeing/wedged courier must not starve the queue).
+    """
+    global _delivery_lease_uid, _delivery_next_uid
+    carriers = [w for w in workers if int(getattr(w, "cargo", 0) or 0) > 0]
+    carrier_by_uid = {str(w.id): w for w in carriers}
+
+    if not carriers:
+        _delivery_lease_uid = None
+        _delivery_next_uid = None
+        _delivery_next_pos = None
+        _delivery_stall.clear()
+        return None
+
+    def _dist(w: Any) -> int:
+        return _manhattan(tuple(w.position), core_pos)
+
+    def _pick_next(lease: str) -> None:
+        # Next-in-line: the closest other carrier pre-positions adjacent to
+        # the chute and chains in the tick the occupant leaves. Sticky on
+        # ties so the waiting slot does not flip every tick.
+        global _delivery_next_uid, _delivery_next_pos
+        rest = [w for w in carriers if str(w.id) != lease]
+        if not rest:
+            _delivery_next_uid = None
+            _delivery_next_pos = None
+            return
+
+        def _nkey(w: Any) -> tuple[int, int]:
+            return (_dist(w), 0 if str(w.id) == _delivery_next_uid else 1)
+
+        chosen = min(rest, key=_nkey)
+        _delivery_next_uid = str(chosen.id)
+        _delivery_next_pos = tuple(chosen.position)
+
+    # Stall watchdog: ticks without closing in on the chute.
+    current = _delivery_lease_uid
+    if current in carrier_by_uid:
+        d = _dist(carrier_by_uid[current])
+        prev_d, n = _delivery_stall.get(current, (d, 0))
+        _delivery_stall[current] = (d, 0 if d < prev_d else n + 1)
+    else:
+        current = None
+    for wuid in [k for k in _delivery_stall if k not in carrier_by_uid]:
+        _delivery_stall.pop(wuid, None)
+
+    if current is not None:
+        holder = carrier_by_uid[current]
+        d = _dist(holder)
+        _d_prev, stall_n = _delivery_stall.get(current, (d, 0))
+        holder_stuck = (
+            _worker_stuck_ticks.get(current, 0) >= _stuck_limit_at(d)
+        )
+        keeps_lease = not holder_stuck and (d <= 2 or stall_n < _DELIVERY_STALL_LIMIT)
+        if keeps_lease:
+            # Livelock watch: a holder parked in queue range that stops moving
+            # at all is boxed in by the queue itself — flag yield so the other
+            # queued carriers sidestep instead of holding their slots.
+            hpos = tuple(holder.position)
+            last_pos, n = _delivery_holder_queue_stall.get(current, (hpos, 0))
+            frozen = n + 1 if hpos == last_pos else 0
+            _delivery_holder_queue_stall[current] = (hpos, frozen)
+            global _delivery_lease_yield
+            _delivery_lease_yield = d <= 2 and frozen >= _DELIVERY_HOLDER_YIELD_AFTER
+            _pick_next(current)
+            return current
+    _delivery_lease_yield = False
+
+    def _key(w: Any) -> tuple[bool, int, int]:
+        wuid = str(w.id)
+        stuck = _worker_stuck_ticks.get(wuid, 0) >= _stuck_limit_at(_dist(w))
+        return (stuck, _dist(w), 0 if wuid == current else 1)
+
+    _delivery_lease_uid = str(min(carriers, key=_key).id)
+    _delivery_stall.pop(_delivery_lease_uid, None)
+    _pick_next(_delivery_lease_uid)
+    return _delivery_lease_uid
+
+
+def _stuck_limit_at(dist: int) -> int:
+    """Stuck tolerance before the lease rotates, by distance to the chute.
+
+    In queue range (<= 2) a frozen holder is usually just waiting out the
+    enter/deposit/vacate cycle or the yield dance, so it gets double the
+    grace before the lease churns away from it; rotating too eagerly makes
+    several blocked carriers pass the lease around without anyone entering.
+    """
+    return _DELIVERY_STUCK_LIMIT if dist > 2 else _DELIVERY_STUCK_LIMIT * 2
+
+
+def _queue_sidestep(
+    worker,
+    uid: str,
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    others: frozenset[tuple[int, int]],
+) -> tuple[str, str]:
+    """Step off the queue lane so the boxed-in lease holder can pass.
+
+    Prefers a free, non-dead-end cell that does not get closer to the core
+    (sideways first, outward second); falls back to any free cell, and only
+    waits when nothing is free this tick.
+    """
+    prev = _worker_last_pos.get(uid)
+    recent_set = set(_worker_recent.get(uid, []))
+    here = _manhattan(pos, core_pos)
+    candidates: list[tuple[int, int, Direction, tuple[int, int]]] = []
+    for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+        npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+        if npos in obstacle_cells or npos in others:
+            continue
+        if _is_dead_end_step(npos, obstacle_cells):
+            continue
+        nd = _manhattan(npos, core_pos)
+        closer = 1 if nd < here else 0
+        backtrack = 1 if prev and npos == prev else 0
+        revisit = 1 if npos in recent_set else 0
+        candidates.append((closer, backtrack, revisit, d, npos))
+    candidates.sort()
+    if candidates:
+        _closer, _backtrack, _revisit, d, npos = candidates[0]
+        worker.move(d)
+        _worker_last_pos[uid] = pos
+        recent = _worker_recent.get(uid, [])
+        recent.append(pos)
+        if len(recent) > 6:
+            recent.pop(0)
+        _worker_recent[uid] = recent
+        _set_worker_route(worker, core_pos, [tuple(pos), npos], complete=False)
+        return ("MOVE", f"{d.name} core-queue-yield")
+    worker.wait()
+    _set_worker_route(worker, core_pos, [tuple(pos)], complete=False)
+    return ("WAIT", "core-queue-yield-boxed")
+
+
 def _plan_worker(
     worker,
     core,
@@ -1507,8 +1663,16 @@ def _plan_worker(
     config: dict[str, int | bool],
     occupied: frozenset[tuple[int, int]] = frozenset(),
     enemies: tuple = (),
+    lease_uid: str | None = None,
+    next_uid: str | None = None,
 ) -> tuple[str, str]:
-    """Return (action_name, detail)."""
+    """Return (action_name, detail).
+
+    ``lease_uid`` names the single carrier allowed to contest the core cell
+    this tick (see _assign_delivery_lease); ``next_uid`` the carrier that
+    waits adjacent and chains in the tick the chute empties. None disables
+    the queue — used by unit tests and any call outside choose_actions.
+    """
     pos = worker.position
     uid = str(worker.id)
     # Cells taken by other units this tick. Workers cannot move into them, so
@@ -1524,6 +1688,11 @@ def _plan_worker(
     # wedging the worker on the mine at partial cargo. Such a worker returns
     # home to deposit what it carries; only empty workers mine.
     carrying = worker.cargo > 0
+    # While carriers are delivering, the chute is reserved: empty workers must
+    # not route through the core cell (they would step back onto it the tick
+    # after vacating and block the one-out-one-in hand-off).
+    if not carrying and _chute_in_demand and pos != core_pos:
+        others = others | {core_pos}
 
     # 金币满仓 + 配置开启 → 工人进入探索模式（仅工人）。仓库放不下更多金币时，
     # 工人不再挖矿/围在核心转圈，而是散开去探索；空载与载货都探索。仓库一旦有
@@ -1583,6 +1752,27 @@ def _plan_worker(
     # fall through and let the normal logic retry next tick.
     if pos == core_pos and not carrying:
         vacate = _retreat_from(pos, core_pos, obstacle_cells, others)
+        if vacate is None and (_delivery_next_pos is not None or _chute_in_demand):
+            # Ring fully packed: swap slots with an adjacent carrier — it
+            # chains into the chute while this worker takes its cell. Prefer
+            # the designated next-in-line, else any unit on the ring
+            # (local view of the occupied ring beats the global pick).
+            swap_target = None
+            if (
+                _delivery_next_pos is not None
+                and abs(_delivery_next_pos[0] - pos[0])
+                + abs(_delivery_next_pos[1] - pos[1])
+                == 1
+            ):
+                swap_target = _delivery_next_pos
+            else:
+                for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+                    npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+                    if npos in others and npos not in obstacle_cells:
+                        swap_target = npos
+                        break
+            if swap_target is not None:
+                vacate = _direction_for_step(pos, swap_target)
         if vacate is not None:
             npos = (pos[0] + vacate.delta[0], pos[1] + vacate.delta[1])
             worker.move(vacate)
@@ -1600,17 +1790,88 @@ def _plan_worker(
         _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
         return ("HARVEST", f"on_resource {pos}")
 
+    # ── Delivery lease queue ─────────────────────────────────────────────
+    # The lease (see _assign_delivery_lease) lets exactly one carrier contest
+    # the chute; every other carrier queues at Manhattan distance 2 and waits
+    # its turn instead of racing in and bouncing on CELL_UNIT_LIMIT. Queued
+    # workers beyond distance 2 keep marching toward the queue area.
+    chute_reserved = (
+        carrying
+        and not explore_mode
+        and lease_uid is not None
+        and uid != lease_uid
+        and uid != next_uid
+        and pos != core_pos
+    )
+    if chute_reserved:
+        dist_core = _manhattan(pos, core_pos)
+        if _delivery_lease_yield and dist_core <= 2:
+            # The lease holder is boxed in by the queue itself: sidestep.
+            return _queue_sidestep(worker, uid, pos, core_pos, obstacle_cells, others)
+        if dist_core <= 1:
+            # On the ring: back out to distance 2 so the insider can vacate.
+            retreat = _retreat_from(pos, core_pos, obstacle_cells, others)
+            if retreat is not None:
+                npos = (pos[0] + retreat.delta[0], pos[1] + retreat.delta[1])
+                worker.move(retreat)
+                _worker_last_pos[uid] = pos
+                recent = _worker_recent.get(uid, [])
+                recent.append(pos)
+                if len(recent) > 6:
+                    recent.pop(0)
+                _worker_recent[uid] = recent
+                _set_worker_route(worker, core_pos, [tuple(pos), npos], complete=False)
+                return ("MOVE", f"{retreat.name} core-queue-backoff")
+        elif dist_core == 2:
+            # Queue slot: hold position until the lease rotates to this worker.
+            worker.wait()
+            _set_worker_route(worker, core_pos, [tuple(pos)], complete=False)
+            return ("WAIT", "core-queue-hold")
+        # dist >= 3: fall through and keep marching toward the queue area.
+
+    # ── Next-in-line delivery pipeline ───────────────────────────────────
+    # Unit moves resolve as one global dependency graph, so the next carrier
+    # may step onto the core cell the same tick the occupant steps off
+    # ("one out, one in"). It therefore camps adjacent (distance 1) instead
+    # of two cells out, cutting the enter delay from two ticks to zero.
+    if (
+        carrying
+        and not explore_mode
+        and uid == next_uid
+        and pos != core_pos
+    ):
+        dist_core = _manhattan(pos, core_pos)
+        if (
+            dist_core == 1
+            and not _chute_vacating_this_tick
+            and (core_pos in others or _lease_holder_adjacent)
+        ):
+            # Insider still unloading inside (or the holder entering this
+            # tick): hold the adjacent slot.
+            worker.wait()
+            _set_worker_route(worker, core_pos, [tuple(pos)], complete=False)
+            return ("WAIT", "core-next-hold")
+        # Chute free or vacating this tick, or still marching in from afar:
+        # fall through so BFS targets the core cell; the goal is exempted
+        # from the transient blockers below, and the server chains the entry
+        # behind the occupant's departure when it is still occupied.
+
     # ── Unloading-chute coordination ─────────────────────────────────────
     # The core cell is the single unloading chute (capacity 2: Core + one
-    # Unit). While another unit occupies it, a cargo worker must NOT crowd the
-    # immediate ring: the on-core worker can only vacate into a free neighbour,
-    # so a ring packed with waiting cargo workers deadlocks the chute (the
-    # insider has nowhere to step, the outsiders never let go). Hold back at
-    # Manhattan distance >= 2 until the chute frees up; only step in once it is
-    # actually empty. The closest waiting worker naturally wins the race into
-    # the freed cell, so throughput stays one deposit per tick without any
-    # cross-worker negotiation.
-    if carrying and pos != core_pos and core_pos in others:
+    # Unit). While another unit occupies it, the lease holder (or any carrier
+    # when no queue is active) must NOT crowd the immediate ring: the on-core
+    # worker can only vacate into a free neighbour, so a ring packed with
+    # waiting cargo workers deadlocks the chute. Hold back at Manhattan
+    # distance >= 2 until the chute frees up; only step in once it is actually
+    # empty. Non-lease carriers are governed by the lease queue above, so this
+    # branch never parks them far from home while the chute cycles.
+    if (
+        carrying
+        and pos != core_pos
+        and core_pos in others
+        and (lease_uid is None or uid == lease_uid)
+        and not _chute_vacating_this_tick
+    ):
         dist_core = _manhattan(pos, core_pos)
         if dist_core <= 1:
             # On the ring: back out to distance 2 so the insider can vacate.
@@ -1738,8 +1999,13 @@ def _plan_worker(
         if bfs_dir is not None:
             nx, ny = pos[0] + bfs_dir.delta[0], pos[1] + bfs_dir.delta[1]
             npos = (nx, ny)
-            # Step only into a free cell (the goal cell itself counts only when free).
-            if (npos not in obstacle_cells or npos == goal) and npos not in others:
+            # Step only into a free cell (the goal cell itself counts only
+            # when free — or when its occupant vacates this tick, so the
+            # entry chains behind the departure: "one out, one in").
+            if (npos not in obstacle_cells or npos == goal) and (
+                npos not in others
+                or (npos == goal and _chute_vacating_this_tick)
+            ):
                 worker.move(bfs_dir)
                 _worker_last_pos[uid] = pos
                 recent = _worker_recent.get(uid, [])
@@ -1895,6 +2161,26 @@ def _plan_worker(
                     complete=False,
                 )
                 return ("MOVE", f"{direction.name} -> {goal}")
+
+    if pos == core_pos and not carrying:
+        # Last-resort chute release: every exit was blocked above, but the
+        # core cell must never hold an empty worker while carriers queue.
+        # Swap with any adjacent occupant (friendly swaps are legal), and if
+        # even that is unavailable wait with a flag so diagnostics catch it.
+        for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+            npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+            if npos in obstacle_cells:
+                continue
+            if npos in others:
+                worker.move(d)
+                _worker_last_pos[uid] = pos
+                _set_worker_route(worker, npos, [tuple(pos), npos], complete=False)
+                return ("MOVE", f"{d.name} vacate-core-swap")
+            if not _is_dead_end_step(npos, obstacle_cells):
+                worker.move(d)
+                _worker_last_pos[uid] = pos
+                _set_worker_route(worker, npos, [tuple(pos), npos], complete=False)
+                return ("MOVE", f"{d.name} vacate-core")
 
     worker.wait()
     _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
@@ -2616,6 +2902,20 @@ def _plan_home_combat(
         if moved is not None:
             return moved
 
+    # Delivery pipeline: the cells adjacent to the chute are the next-in-line
+    # pre-position slots. While carriers queue, a defender camped there blocks
+    # the one-out-one-in hand-off, so take one step outward.
+    if _chute_in_demand and dist_home == 1:
+        for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+            npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+            if npos in obstacle_cells:
+                continue
+            if _manhattan(npos, core_pos) <= dist_home:
+                continue
+            unit.move(d)
+            _set_unit_route(unit, npos, [pos, npos], complete=False)
+            return ("MOVE", f"{d.name} chute-clear")
+
     goal = _home_patrol_goal(str(unit.id), core_pos, radius)
     # Already on/near the assigned slot: hold instead of micro-stepping.
     if _manhattan(pos, goal) <= 1 and dist_home <= return_radius:
@@ -3024,6 +3324,49 @@ _combat_path_cache: dict[str, dict] = {}
 _worker_stuck_ticks: dict[str, int] = {}
 _worker_stuck_pos: dict[str, tuple[int, int]] = {}
 _STUCK_THRESHOLD = 8
+# Delivery lease: uid of the single carrier allowed to contest the core cell
+# (unloading chute) this tick; recomputed every Tick by _assign_delivery_lease.
+# None when no carrier exists (or planning runs outside choose_actions).
+_delivery_lease_uid: str | None = None
+# Second role of the delivery pipeline: the carrier that pre-positions one
+# cell from the chute and chains in the same tick the current occupant steps
+# out. Recomputed by _assign_delivery_lease.
+_delivery_next_uid: str | None = None
+# True when the unit standing on the core cell this tick is going to leave it
+# (empty worker -> vacate-core, healer/non-carrier -> yield-chute). The server
+# resolves moves as one global dependency graph, so a carrier may enter the
+# occupied chute in that same tick — its move chains behind the departure.
+_chute_vacating_this_tick = False
+# True when the lease holder stands adjacent (distance <= 1) to the chute, so
+# the next-in-line yields the entry slot instead of racing for the same cell.
+_lease_holder_adjacent = False
+# True while any carrier is hauling cargo: empty workers must then route
+# AROUND the core cell instead of through it, or a just-vacated worker steps
+# right back onto the chute next tick and ping-pongs there forever
+# (observed: 15-tick squat loop that shut the whole delivery line).
+_chute_in_demand = False
+# Position of the next-in-line carrier (recomputed by _assign_delivery_lease).
+# A worker vacating the chute prefers stepping toward it so the one-out-one-in
+# hand-off never deadlocks on a ring with no free cell.
+_delivery_next_pos: tuple[int, int] | None = None
+# True when any carrier stands adjacent to the chute: healers squatting on
+# the core cell must yield it (yield-chute) so the carrier can chain in.
+_carrier_at_chute = False
+# Lease holder frozen this many ticks (rejected moves count as no progress)
+# before the lease rotates to the next carrier.
+_DELIVERY_STUCK_LIMIT = 4
+# Stall watchdog for the lease holder: (distance_to_core, ticks_without_closer).
+# A holder far from the chute who stops making progress yields the lease; a
+# holder already in queue range (<= 2) is legitimately waiting its turn.
+_delivery_stall: dict[str, tuple[int, int]] = {}
+_DELIVERY_STALL_LIMIT = 6
+# Queue-range livelock breaker: when the lease holder sits in queue range
+# (<= 2) but cannot move for _DELIVERY_HOLDER_YIELD_AFTER ticks — typically
+# because queued workers camp the very cells its only path uses — everyone
+# else in the queue must sidestep instead of holding until the way clears.
+_delivery_holder_queue_stall: dict[str, tuple[tuple[int, int], int]] = {}
+_DELIVERY_HOLDER_YIELD_AFTER = 2
+_delivery_lease_yield = False
 # Consecutive ticks a unit fails to get closer to its manual waypoint before the
 # waypoint auto-clears and the unit resumes its normal program. (An obstacle
 # target never resolves to entry — being adjacent counts as arrival instead.)
@@ -4162,7 +4505,6 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             _resource_memory,
             depleted,
         )
-        resource_set = set(all_resources)
 
         # Workers ignore mines farther than this Manhattan distance from the core —
         # a far deposit round-trip wastes more ticks than it earns, and a worker
@@ -4173,6 +4515,23 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 r for r in all_resources
                 if _manhattan(tuple(r), core_pos) <= mine_max_distance
             ]
+
+        # A mine adjacent to a visible enemy is a contested cell: both sides
+        # race for it every tick, lose to MOVE_CONTESTED, and the worker
+        # freezes in a forever head-on (observed: 25+ ticks wedged). Skip
+        # those deposits while the enemy stands there.
+        enemy_cells = {tuple(e.position) for e in enemies}
+        if enemy_cells:
+            all_resources = [
+                r for r in all_resources
+                if not any(
+                    _manhattan(tuple(r), ec) <= 1 for ec in enemy_cells
+                )
+            ]
+
+        # Sticky validation must use the filtered set, otherwise a worker keeps
+        # its old assignment to a mine that just became contested/out of range.
+        resource_set = set(all_resources)
 
         sticky: dict[str, tuple[int, int]] = {}
         claimed_resources: set[tuple[int, int]] = set()
@@ -4317,6 +4676,18 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         | {tuple(e.position) for e in enemies}
     )
 
+    # Serialize core deliveries: exactly one carrier may contest the chute
+    # this tick; the rest queue at distance 2 (see _assign_delivery_lease).
+    delivery_lease = _assign_delivery_lease(turn.workers, core_pos)
+
+    # Is the lease holder already adjacent to the chute? Then the next-in-line
+    # must yield the entry slot instead of racing for the same cell.
+    global _lease_holder_adjacent
+    _lease_holder_adjacent = any(
+        str(w.id) == delivery_lease and _manhattan(tuple(w.position), core_pos) <= 1
+        for w in turn.workers
+    ) if delivery_lease else False
+
     # ── Unit actions ────────────────────────────────────────────────────
     # Healing budget: leftover resources after reserve + this Tick's spawn cost,
     # so healing never starves production. Unit heals resolve before the Core
@@ -4343,7 +4714,50 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     # limit is 0, every eligible unit returns (no stagger).
     heal_return_limit = int(config.get("combat_heal_return_limit", 1))
     heal_return_allowed: set[str] | None = None  # None = unlimited
-    if heal_return_limit > 0:
+    # Delivery pressure: the core cell doubles as the healing spot, and a
+    # healer squatting on it shuts the unloading chute. When a real carrier
+    # queue has formed, stop NEW heal-return marches; healers already on the
+    # core cell step aside below before the unit loop.
+    _queue_carriers = sum(1 for w in turn.workers if int(getattr(w, "cargo", 0) or 0) > 0)
+    heal_return_gate = _queue_carriers >= 2
+
+    # Delivery line active: empty workers route around the chute (see
+    # _chute_in_demand).
+    global _chute_in_demand
+    _chute_in_demand = _queue_carriers > 0
+
+    # A carrier already adjacent to the chute: healers on the core cell must
+    # yield it even when the queue behind is still thin.
+    global _carrier_at_chute
+    _carrier_at_chute = any(
+        int(getattr(w, "cargo", 0) or 0) > 0
+        and _manhattan(tuple(w.position), core_pos) == 1
+        for w in turn.workers
+    )
+
+    # Chute pipeline flag: will the unit standing on the core cell leave it
+    # this tick? A cargo worker deposits and stays; an empty worker vacates
+    # (vacate-core) and a healer yields when a carrier queue has formed
+    # (yield-chute). When True, the next carrier may chain INTO the still
+    # occupied cell in this very tick ("one out, one in").
+    global _chute_vacating_this_tick
+    _chute_vacating_this_tick = False
+    for _occ in getattr(turn, "units", ()) or ():
+        if tuple(_occ.position) != core_pos:
+            continue
+        _occ_carrying = (
+            _occ.unit_type == UnitType.WORKER
+            and int(getattr(_occ, "cargo", 0) or 0) > 0
+        )
+        if _occ_carrying:
+            break  # deposits this tick, stays on the chute
+        if _occ.unit_type == UnitType.WORKER:
+            _chute_vacating_this_tick = True  # just unloaded -> vacate-core
+        else:
+            # yield-chute fires for a formed queue or an adjacent carrier
+            _chute_vacating_this_tick = heal_return_gate or _carrier_at_chute
+        break
+    if heal_return_limit > 0 and not heal_return_gate:
         eligible: list[tuple[int, int, str]] = []
         for unit in turn.units:
             if unit.unit_type not in (UnitType.VANGUARD, UnitType.RANGER):
@@ -4366,6 +4780,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             ))
         eligible.sort()
         heal_return_allowed = {name for _, _, name in eligible[:heal_return_limit]}
+    elif heal_return_gate:
+        heal_return_allowed = set()
     _phase.stop()  # unit_setup
 
     # Per-unit planner wall-clock, broken down by unit type so the summary can
@@ -4384,6 +4800,24 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             unit_actions_detail[uid] = "SELF_DESTRUCT:manual"
             commanded_self_destructs.add(name)
             continue
+        # Delivery priority: a healer (or any idle unit) squatting on the core
+        # cell blocks the unloading chute. While cargo workers are queued up,
+        # step off for one tick so the lease holder can deposit; only a loaded
+        # worker stays (it deposits this very tick). Resume healing next tick
+        # if the queue has drained.
+        if (
+            tuple(unit.position) == core_pos
+            and (heal_return_gate or _carrier_at_chute)
+            and not (
+                unit.unit_type == UnitType.WORKER
+                and int(getattr(unit, "cargo", 0) or 0) > 0
+            )
+        ):
+            step_aside = _retreat_from(tuple(unit.position), core_pos, obstacle_cells, occupied)
+            if step_aside is not None:
+                unit.move(step_aside)
+                unit_actions_detail[uid] = f"MOVE:{step_aside.name} yield-chute"
+                continue
         # Post-combat healing: a damaged Unit on the Core cell with a stationary
         # Core spends its whole action recovering HP (1 resource / 1 HP).
         if _unit_needs_heal(
@@ -4447,6 +4881,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 config=config,
                 occupied=occupied,
                 enemies=enemies,
+                lease_uid=delivery_lease,
+                next_uid=_delivery_next_uid,
             )
             unit_phase_ms["worker"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = f"{action}:{detail}"
