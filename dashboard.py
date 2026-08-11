@@ -710,13 +710,14 @@ def request_self_destruct(name: str) -> dict:
 TEAM_BOARD_KEYS = ("unassigned", "home", "attack", "guerrilla")
 TEAM_BOARD_META = {
     "unassigned": {"label": "待命池", "hint": "未编队", "tone": "idle"},
-    "home": {"label": "守家队", "hint": "核心半径巡逻", "tone": "home"},
+    "home": {"label": "守家队", "hint": "巡逻+迎击驱赶", "tone": "home"},
     "attack": {"label": "进攻队", "hint": "集体推进接战", "tone": "attack"},
     "guerrilla": {"label": "游击队", "hint": "八向分散袭扰", "tone": "guerrilla"},
 }
 TEAM_ROSTER_FIELDS = ("home_team", "attack_team", "guerrilla_team")
 TEAM_SETTING_FIELDS = (
     "home_patrol_radius",
+    "home_engage_radius",
     "attack_target_x",
     "attack_target_y",
     "attack_mode",
@@ -973,6 +974,10 @@ def render_teams_panel() -> str:
         '<label>守家半径'
         f'<input id="teamHomeRadius" name="home_patrol_radius" type="number" min="1" max="30" '
         f'step="1" value="{config["home_patrol_radius"]}"></label>'
+        '<label>守家迎击半径(0=关)'
+        f'<input id="teamHomeEngageRadius" name="home_engage_radius" type="number" min="0" max="30" '
+        f'step="1" value="{config["home_engage_radius"]}"'
+        ' title="守家队主动迎击驱赶半径（0=关闭迎击）"></label>'
         '<label>进攻 X'
         f'<span class="coord-input"><input id="teamAttackX" name="attack_target_x" type="number" min="-500" max="500" '
         f'step="1" value="{config["attack_target_x"]}"{coords_locked}>'
@@ -2937,6 +2942,7 @@ JS = r"""
     const modeEl = document.querySelector('input[name="attack_mode"]:checked');
     return {
       home_patrol_radius: Number((document.getElementById('teamHomeRadius') || {}).value || 5),
+      home_engage_radius: Number((document.getElementById('teamHomeEngageRadius') || {}).value || 0),
       attack_target_x: Number((document.getElementById('teamAttackX') || {}).value || 0),
       attack_target_y: Number((document.getElementById('teamAttackY') || {}).value || 0),
       attack_mode: (modeEl && modeEl.value) || 'coords',
@@ -2960,6 +2966,7 @@ JS = r"""
     if(!config) return;
     const map = {
       home_patrol_radius: 'teamHomeRadius',
+      home_engage_radius: 'teamHomeEngageRadius',
       attack_target_x: 'teamAttackX',
       attack_target_y: 'teamAttackY',
       ranger_attack_range: 'teamRangerRange',
@@ -2999,6 +3006,7 @@ JS = r"""
       attack_team: rosterFromUnits('attack'),
       guerrilla_team: rosterFromUnits('guerrilla'),
       home_patrol_radius: settings.home_patrol_radius,
+      home_engage_radius: settings.home_engage_radius,
       attack_target_x: settings.attack_target_x,
       attack_target_y: settings.attack_target_y,
       attack_mode: settings.attack_mode,
@@ -3154,7 +3162,7 @@ JS = r"""
         moveUnitToTeam(name, team);
       });
     });
-    ['teamHomeRadius','teamAttackX','teamAttackY','teamRangerRange','teamRetreatRadius'].forEach(function(id){
+    ['teamHomeRadius','teamHomeEngageRadius','teamAttackX','teamAttackY','teamRangerRange','teamRetreatRadius'].forEach(function(id){
       const el = document.getElementById(id);
       if(!el) return;
       el.addEventListener('change', function(){

@@ -2860,6 +2860,10 @@ def _plan_home_combat(
     # Hysteresis: only force a return when clearly outside the ring. A one-cell
     # band stops home-return / home-patrol A-B-A flipping on the perimeter.
     return_radius = radius + 1
+    # Engage radius lets defenders sally out past the patrol ring to drive off
+    # threats (0 = disabled, falls back to the legacy return_radius chase).
+    # Initialized before every branch so no path hits an unbound name.
+    engage_radius = max(int(config.get("home_engage_radius", 10) or 0), return_radius)
 
     if unit_kind == "vanguard":
         sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
@@ -2877,19 +2881,32 @@ def _plan_home_combat(
         if shot is not None:
             return shot
 
-    # Only chase enemies that are already inside the home perimeter.
+    # Chase enemies inside the engage radius. Hysteresis (same one-cell-band
+    # pattern as return_radius above): a pursued target only drops once it
+    # clears engage_radius + 1, so defenders don't A-B-A flip on the ring
+    # perimeter. Inner threats take priority over the borderline straggler.
     local_enemies = [
         enemy for enemy in enemies
-        if _manhattan(core_pos, enemy.position) <= return_radius
+        if _manhattan(core_pos, enemy.position) <= engage_radius
     ]
+    if not local_enemies and engage_radius > return_radius:
+        local_enemies = [
+            enemy for enemy in enemies
+            if _manhattan(core_pos, enemy.position) <= engage_radius + 1
+        ]
     if local_enemies:
         nearest = min(local_enemies, key=lambda e: _manhattan(pos, e.position))
+        prefix = (
+            "home-engage"
+            if _manhattan(core_pos, nearest.position) <= return_radius
+            else "home-intercept"
+        )
         moved = _move_towards(
             unit,
             pos,
             tuple(nearest.position),
             obstacle_cells,
-            detail_prefix="home-engage",
+            detail_prefix=prefix,
         )
         if moved is not None:
             return moved

@@ -1052,6 +1052,98 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertNotIn("home-return", detail)
         self.assertIn(action, {"MOVE", "WAIT"})
 
+    def test_home_team_intercepts_enemy_outside_patrol_ring(self) -> None:
+        # Enemy 6 cells out: beyond return_radius (3+1) but inside the
+        # engage radius -> defender sallies out with the home-intercept label.
+        unit = self.CombatUnit("v-sally", (0, 0))
+        self.config["home_patrol_radius"] = 3
+        self.config["home_engage_radius"] = 10
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(self.Enemy((6, 0)),),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="home",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("home-intercept", detail)
+        self.assertEqual(unit.arg.name, "RIGHT")
+
+    def test_home_team_ignores_enemy_beyond_engage_radius(self) -> None:
+        # Enemy beyond engage_radius + 1 -> no sally; fall back to patrol.
+        unit = self.CombatUnit("v-far", (0, 0))
+        self.config["home_patrol_radius"] = 3
+        self.config["home_engage_radius"] = 10
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(self.Enemy((12, 0)),),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="home",
+        )
+
+        self.assertNotIn("home-intercept", detail)
+        self.assertNotIn("home-engage", detail)
+        self.assertIn(action, {"MOVE", "WAIT"})
+
+    def test_home_engage_radius_zero_keeps_legacy_behavior(self) -> None:
+        # 0 disables the intercept: an out-of-ring enemy is ignored exactly
+        # like the old return_radius-only chase.
+        unit = self.CombatUnit("v-off", (0, 0))
+        self.config["home_patrol_radius"] = 3
+        self.config["home_engage_radius"] = 0
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(self.Enemy((6, 0)),),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="home",
+        )
+
+        self.assertNotIn("home-intercept", detail)
+        self.assertNotIn("home-engage", detail)
+        self.assertIn(action, {"MOVE", "WAIT"})
+
+    def test_home_intercept_hysteresis_no_boundary_flip(self) -> None:
+        # Enemies exactly on engage_radius and one cell past it (the abandon
+        # threshold) both keep the chase; only beyond engage_radius + 1 drops
+        # it, so no A-B-A flip on the ring boundary.
+        self.config["home_patrol_radius"] = 3
+        self.config["home_engage_radius"] = 10
+
+        for offset in (10, 11):
+            unit = self.CombatUnit(f"v-band-{offset}", (0, 0))
+            tactic._combat_path_cache.clear()
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(self.Enemy((offset, 0)),),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="home",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("home-intercept", detail)
+
+        tactic._combat_path_cache.clear()
+        unit = self.CombatUnit("v-past", (0, 0))
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(self.Enemy((12, 0)),),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="home",
+        )
+        self.assertNotIn("home-intercept", detail)
+
     def test_attack_team_marches_to_configured_target(self) -> None:
         unit = self.CombatUnit("v-attack", (0, 0))
         self.config["attack_target_x"] = 5
