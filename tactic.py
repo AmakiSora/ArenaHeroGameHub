@@ -6,12 +6,13 @@ Records every Tick's decisions into a JSONL log file for later analysis.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
 import traceback
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from functools import wraps
@@ -1112,20 +1113,42 @@ def _retreat_from(
     core_pos: tuple[int, int],
     obstacle_cells: frozenset[tuple[int, int]],
     others: frozenset[tuple[int, int]],
+    cell_counts: Mapping | None = None,
+    *,
+    force: bool = False,
 ) -> Direction | None:
     """Pick a direction that moves away from core_pos, if any is free.
 
     Used to back a full worker out of the core's immediate ring so the core cell
     can free up for unloading. Prefers the direction that increases distance to
-    the core the most; skips obstacles, occupied cells and dead ends.
+    the core the most; skips obstacles, blocked cells and dead ends.
+
+    Capacity awareness: the server allows _CELL_UNIT_LIMIT (2) stacked units on
+    one cell. When ``cell_counts`` (this tick's friendly unit count per cell)
+    is given, a neighbour is enterable while its count stays below the limit —
+    ``others`` then lists only hard-blocked cells (enemies). Without counts the
+    legacy "any occupied cell is fully blocked" view applies. Regression: the
+    fully-blocked view let a healed healer sit forever on the core cell of a
+    narrow-mouth base because its only squeeze exit was "occupied" by a single
+    carrier, sealing the unloading chute (observed 95+ ticks).
+
+    ``force`` skips dead-end avoidance: the last-resort evacuation of a unit
+    squatting on the chute must not fail on style grounds.
     """
     best: Direction | None = None
     best_dist = -1
     for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
         npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
-        if npos in obstacle_cells or npos in others:
+        if npos in obstacle_cells:
             continue
-        if _is_dead_end_step(npos, obstacle_cells):
+        if cell_counts is not None:
+            if npos in others:
+                continue
+            if cell_counts.get(npos, 0) >= _CELL_UNIT_LIMIT:
+                continue
+        elif npos in others:
+            continue
+        if not force and _is_dead_end_step(npos, obstacle_cells):
             continue
         dist = _manhattan(npos, core_pos)
         if dist > best_dist:
@@ -1665,6 +1688,7 @@ def _plan_worker(
     enemies: tuple = (),
     lease_uid: str | None = None,
     next_uid: str | None = None,
+    cell_counts: Mapping | None = None,
 ) -> tuple[str, str]:
     """Return (action_name, detail).
 
@@ -1672,6 +1696,10 @@ def _plan_worker(
     this tick (see _assign_delivery_lease); ``next_uid`` the carrier that
     waits adjacent and chains in the tick the chute empties. None disables
     the queue — used by unit tests and any call outside choose_actions.
+
+    ``cell_counts`` (friendly unit count per cell) enables capacity-aware
+    retreats: a neighbour with one occupant is squeezable (server limit 2).
+    Without it, retreats keep the legacy fully-blocked view.
     """
     pos = worker.position
     uid = str(worker.id)
@@ -1693,6 +1721,21 @@ def _plan_worker(
     # after vacating and block the one-out-one-in hand-off).
     if not carrying and _chute_in_demand and pos != core_pos:
         others = others | {core_pos}
+
+    # Retreat view: with per-cell counts the friendly units are judged by
+    # capacity (< _CELL_UNIT_LIMIT is squeezable) and only enemy cells stay
+    # hard-blocked; the core-cell mirroring above carries over so an adjacent
+    # retreat never steps back onto the chute mid-delivery. Without counts the
+    # legacy `others` set blocks every occupied cell outright.
+    if cell_counts is not None:
+        _retreat_blocked = frozenset(tuple(e.position) for e in enemies) | (
+            {core_pos} if not carrying and _chute_in_demand and pos != core_pos
+            else frozenset()
+        )
+        _retreat_counts: Mapping | None = cell_counts
+    else:
+        _retreat_blocked = others
+        _retreat_counts = None
 
     # 金币满仓 + 配置开启 → 工人进入探索模式（仅工人）。仓库放不下更多金币时，
     # 工人不再挖矿/围在核心转圈，而是散开去探索；空载与载货都探索。仓库一旦有
@@ -1751,7 +1794,7 @@ def _plan_worker(
     # only empty workers reach this. If every neighbour is blocked this tick we
     # fall through and let the normal logic retry next tick.
     if pos == core_pos and not carrying:
-        vacate = _retreat_from(pos, core_pos, obstacle_cells, others)
+        vacate = _retreat_from(pos, core_pos, obstacle_cells, _retreat_blocked, _retreat_counts)
         if vacate is None and (_delivery_next_pos is not None or _chute_in_demand):
             # Ring fully packed: swap slots with an adjacent carrier — it
             # chains into the chute while this worker takes its cell. Prefer
@@ -1810,7 +1853,7 @@ def _plan_worker(
             return _queue_sidestep(worker, uid, pos, core_pos, obstacle_cells, others)
         if dist_core <= 1:
             # On the ring: back out to distance 2 so the insider can vacate.
-            retreat = _retreat_from(pos, core_pos, obstacle_cells, others)
+            retreat = _retreat_from(pos, core_pos, obstacle_cells, _retreat_blocked, _retreat_counts)
             if retreat is not None:
                 npos = (pos[0] + retreat.delta[0], pos[1] + retreat.delta[1])
                 worker.move(retreat)
@@ -1875,7 +1918,7 @@ def _plan_worker(
         dist_core = _manhattan(pos, core_pos)
         if dist_core <= 1:
             # On the ring: back out to distance 2 so the insider can vacate.
-            retreat = _retreat_from(pos, core_pos, obstacle_cells, others)
+            retreat = _retreat_from(pos, core_pos, obstacle_cells, _retreat_blocked, _retreat_counts)
             if retreat is not None:
                 npos = (pos[0] + retreat.delta[0], pos[1] + retreat.delta[1])
                 worker.move(retreat)
@@ -2037,7 +2080,7 @@ def _plan_worker(
                 return ("MOVE", f"{d.name} vacate-core")
         if carrying and goal == core_pos and core_pos in others:
             if pos != core_pos and _manhattan(pos, core_pos) <= 1:
-                retreat = _retreat_from(pos, core_pos, obstacle_cells, others)
+                retreat = _retreat_from(pos, core_pos, obstacle_cells, _retreat_blocked, _retreat_counts)
                 if retreat is not None:
                     worker.move(retreat)
                     _worker_last_pos[uid] = pos
@@ -2784,7 +2827,7 @@ def _scout_cardinal(
     label: str,
 ) -> tuple[str, str]:
     prev = _worker_last_pos.get(str(unit.id))
-    idx = hash(str(unit.id)) % 4
+    idx = _stable_slot_index(str(unit.id), 4)
     base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
     rotated = base[idx:] + base[:idx]
 
@@ -2823,6 +2866,13 @@ def _scout_cardinal(
     return ("WAIT", "no_way")
 
 
+def _stable_slot_index(text: str, modulo: int) -> int:
+    """Restart-safe slot pick: builtin hash() is salted per process
+    (PYTHONHASHSEED), which reshuffled patrol slots on every restart."""
+    digest = hashlib.md5(str(text).encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % modulo
+
+
 def _home_patrol_goal(
     unit_id: str,
     core_pos: tuple[int, int],
@@ -2830,18 +2880,38 @@ def _home_patrol_goal(
 ) -> tuple[int, int]:
     """Pick a stable perimeter offset around the Core for this unit."""
     radius = max(1, int(radius))
-    # Eight slots around the ring keep multiple defenders spread out.
-    slots = (
-        (0, -radius),
-        (radius, -radius),
-        (radius, 0),
-        (radius, radius),
-        (0, radius),
-        (-radius, radius),
-        (-radius, 0),
-        (-radius, -radius),
-    )
-    slot = slots[hash(str(unit_id)) % len(slots)]
+    if radius >= 2:
+        # Eight slots around the ring keep multiple defenders spread out.
+        # Axial slots sit exactly `radius` out; diagonal slots are pulled in
+        # to Manhattan distance `radius` (ceil/floor split) so defenders can
+        # actually reach and hold them — the old (±r, ±r) corners sat at 2r,
+        # past the return_radius=r+1 line, ping-ponging home-return/patrol.
+        half = radius - radius // 2  # ceil(radius/2)
+        other = radius // 2          # floor(radius/2)
+        slots = (
+            (0, -radius),
+            (half, -other),
+            (radius, 0),
+            (half, other),
+            (0, radius),
+            (-half, other),
+            (-radius, 0),
+            (-half, -other),
+        )
+    else:
+        # Radius 1 has only 4 cells within distance 1; keep the full 8-slot
+        # ring (corners at distance 2) for spread.
+        slots = (
+            (0, -radius),
+            (radius, -radius),
+            (radius, 0),
+            (radius, radius),
+            (0, radius),
+            (-radius, radius),
+            (-radius, 0),
+            (-radius, -radius),
+        )
+    slot = slots[_stable_slot_index(unit_id, len(slots))]
     return (core_pos[0] + slot[0], core_pos[1] + slot[1])
 
 
@@ -2853,6 +2923,7 @@ def _plan_home_combat(
     obstacle_cells: frozenset[tuple[int, int]],
     core_pos: tuple[int, int],
     config: dict[str, Any],
+    cell_counts: Mapping | None = None,
 ) -> tuple[str, str]:
     """Defend near the Core: engage nearby threats, otherwise patrol the ring."""
     pos = tuple(unit.position)
@@ -2895,7 +2966,18 @@ def _plan_home_combat(
             if _manhattan(core_pos, enemy.position) <= engage_radius + 1
         ]
     if local_enemies:
+        # A fresh visible threat supersedes any remembered chase target.
+        _home_engage_target.pop(str(unit.id), None)
         nearest = min(local_enemies, key=lambda e: _manhattan(pos, e.position))
+        # Target lock: remember this foe so a brief vision loss (a tick or
+        # two) does not flip the defender straight back into patrol.
+        engage_memory_ticks = max(
+            int(config.get("home_engage_memory_ticks", 4) or 0), 0,
+        )
+        if engage_memory_ticks > 0:
+            _home_engage_target[str(unit.id)] = (
+                str(nearest.id), turn_context.tick,
+            )
         prefix = (
             "home-engage"
             if _manhattan(core_pos, nearest.position) <= return_radius
@@ -2910,6 +2992,44 @@ def _plan_home_combat(
         )
         if moved is not None:
             return moved
+    else:
+        # Target lock fallback: the chased enemy slipped out of vision — keep
+        # marching on its last-known position (from the motion tracks) for
+        # home_engage_memory_ticks instead of A-B-A flipping into patrol.
+        remembered = _home_engage_target.get(str(unit.id))
+        if remembered is not None:
+            enemy_id, last_seen = remembered
+            engage_memory_ticks = max(
+                int(config.get("home_engage_memory_ticks", 4) or 0), 0,
+            )
+            track = _enemy_motion_tracks.get(enemy_id)
+            last_pos = track[-1][1] if track else None
+            stale = (
+                engage_memory_ticks <= 0
+                or turn_context.tick - last_seen > engage_memory_ticks
+                or last_pos is None
+                or _manhattan(core_pos, last_pos) > engage_radius + 1
+            )
+            if stale:
+                _home_engage_target.pop(str(unit.id), None)
+            elif pos == last_pos:
+                # Caught up with the remembered foe: treat the chase as done
+                # so no single-cell A-B-A remains against home-return.
+                _home_engage_target.pop(str(unit.id), None)
+            else:
+                # Delivery pipeline first: on the core ring while carriers
+                # queue, yield to chute-clear — the lock survives the yield
+                # and the chase resumes next tick while memory holds.
+                if not (_chute_in_demand and _manhattan(pos, core_pos) == 1):
+                    moved = _move_towards(
+                        unit,
+                        pos,
+                        last_pos,
+                        obstacle_cells,
+                        detail_prefix="home-intercept",
+                    )
+                    if moved is not None:
+                        return moved
 
     dist_home = _manhattan(pos, core_pos)
     if dist_home > return_radius:
@@ -2921,13 +3041,19 @@ def _plan_home_combat(
 
     # Delivery pipeline: the cells adjacent to the chute are the next-in-line
     # pre-position slots. While carriers queue, a defender camped there blocks
-    # the one-out-one-in hand-off, so take one step outward.
+    # the one-out-one-in hand-off, so take one step outward. Pre-check the
+    # target cell's occupancy first: pushing into an already-packed cell
+    # (server limit _CELL_UNIT_LIMIT) is rejected every tick and the defender
+    # keeps hammering the same dead move (observed in the core-ring deadlock).
     if _chute_in_demand and dist_home == 1:
+        _clear_counts = cell_counts or {}
         for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
             npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
             if npos in obstacle_cells:
                 continue
             if _manhattan(npos, core_pos) <= dist_home:
+                continue
+            if _clear_counts.get(npos, 0) >= _CELL_UNIT_LIMIT:
                 continue
             unit.move(d)
             _set_unit_route(unit, npos, [pos, npos], complete=False)
@@ -3210,6 +3336,7 @@ def _plan_vanguard(
     *,
     core_pos: tuple[int, int],
     team: str,
+    cell_counts: Mapping | None = None,
 ) -> tuple[str, str]:
     """Dispatch a Vanguard according to its combat team assignment."""
     if team == "home":
@@ -3220,6 +3347,7 @@ def _plan_vanguard(
             obstacle_cells=obstacle_cells,
             core_pos=core_pos,
             config=config,
+            cell_counts=cell_counts,
         )
     if team == "attack":
         return _plan_attack_combat(
@@ -3256,6 +3384,7 @@ def _plan_ranger(
     *,
     core_pos: tuple[int, int],
     team: str,
+    cell_counts: Mapping | None = None,
 ) -> tuple[str, str]:
     """Dispatch a Ranger according to its combat team assignment."""
     if team == "home":
@@ -3266,6 +3395,7 @@ def _plan_ranger(
             obstacle_cells=obstacle_cells,
             core_pos=core_pos,
             config=config,
+            cell_counts=cell_counts,
         )
     if team == "attack":
         return _plan_attack_combat(
@@ -3318,6 +3448,10 @@ _enemy_memory_types: dict[tuple[int, int], str] = {}
 # Consecutive visible positions keyed by full enemy UUID. This is intentionally
 # in-memory only; reconnects must rebuild confidence from fresh observations.
 _enemy_motion_tracks: dict[str, list[tuple[int, tuple[int, int]]]] = {}
+# Home-team intercept target lock: unit id -> (enemy id, last-visible tick).
+# Keeps a defender chasing a foe that slipped out of vision for a few ticks
+# instead of flipping back into patrol the instant it disappears.
+_home_engage_target: dict[str, tuple[str, int]] = {}
 _pending_shot_predictions: list[dict[str, Any]] = []
 # Last applied dashboard enemy-clear sequence from map_memory.json.
 _enemy_clear_seq: int = 0
@@ -3369,6 +3503,27 @@ _delivery_next_pos: tuple[int, int] | None = None
 # True when any carrier stands adjacent to the chute: healers squatting on
 # the core cell must yield it (yield-chute) so the carrier can chain in.
 _carrier_at_chute = False
+# Carriers already in the chute's immediate queue (Manhattan distance to the
+# Core <= _HEAL_GATE_QUEUE_RADIUS). Only these physically compete for the
+# core cell this tick; carriers still mining far away must not gate healing.
+_HEAL_GATE_QUEUE_RADIUS = 3
+# Names of units commanded HEAL last Tick: while still damaged they keep the
+# core cell for one more Tick so their heal finishes before yield-chute.
+_healing_units_prev: set[str] = set()
+# Names of units commanded a heal-return march last Tick: while still below
+# the heal threshold they keep re-claiming their stagger slot in flight.
+_heal_return_inflight: set[str] = set()
+# Server-side stacking rule: at most 2 units share one cell (CELL_UNIT_LIMIT).
+# Retreat/yield decisions squeeze into a cell with 1 occupant instead of
+# treating it as fully blocked.
+_CELL_UNIT_LIMIT = 2
+# Consecutive-Tick CELL_UNIT_LIMIT move rejections per unit id. A unit that
+# keeps bouncing on the same packed cell re-tries deterministically forever;
+# after _CELL_LIMIT_DETOUR_AFTER such ticks it is forced one sidestep to
+# break the loop. Rebuilt from scratch each Tick (only units that failed
+# again survive), so it can neither grow unbounded nor go stale.
+_cell_limit_streak: dict[str, int] = {}
+_CELL_LIMIT_DETOUR_AFTER = 3
 # Lease holder frozen this many ticks (rejected moves count as no progress)
 # before the lease rotates to the next carrier.
 _DELIVERY_STUCK_LIMIT = 4
@@ -4228,6 +4383,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _worker_path_cache.pop(dead_id, None)
     for dead_id in set(_combat_path_cache) - alive_ids:
         _combat_path_cache.pop(dead_id, None)
+    for dead_id in set(_home_engage_target) - alive_ids:
+        _home_engage_target.pop(dead_id, None)
     for dead_id in set(_worker_stuck_ticks) - alive_ids:
         _worker_stuck_ticks.pop(dead_id, None)
     for dead_id in set(_worker_stuck_pos) - alive_ids:
@@ -4692,6 +4849,39 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         | {tuple(r.position) for r in getattr(turn, "rangers", ()) or ()}
         | {tuple(e.position) for e in enemies}
     )
+    # Per-cell friendly unit multiplicity this tick: the server stacks up to
+    # _CELL_UNIT_LIMIT units on one cell, so yield/retreat/chute-clear
+    # decisions judge a cell by count, not mere presence. Enemy cells are kept
+    # separately — they stay hard-blocked (never squeeze onto an enemy).
+    friendly_cell_counts: dict[tuple[int, int], int] = {}
+    for _u_list in (
+        turn.workers,
+        getattr(turn, "vanguards", ()) or (),
+        getattr(turn, "rangers", ()) or (),
+    ):
+        for _u in _u_list:
+            _p = tuple(_u.position)
+            friendly_cell_counts[_p] = friendly_cell_counts.get(_p, 0) + 1
+    enemy_cells: frozenset[tuple[int, int]] = frozenset(
+        tuple(e.position) for e in enemies
+    )
+
+    # CELL_UNIT_LIMIT retry breaker bookkeeping: count consecutive Ticks each
+    # unit was rejected for moving onto a packed cell. The dict is rebuilt
+    # from scratch every Tick (only repeat offenders survive), so it stays
+    # bounded by the unit count and never carries stale entries.
+    global _cell_limit_streak, _healing_units_prev, _heal_return_inflight
+    _failed_again: set[str] = set()
+    for _ev in getattr(turn, "events", ()) or ():
+        if (
+            getattr(_ev, "event_type", "") == "UNIT_MOVE_FAILED"
+            and getattr(_ev, "reason_code", None) == "CELL_UNIT_LIMIT"
+            and getattr(_ev, "actor_id", None) is not None
+        ):
+            _failed_again.add(str(_ev.actor_id))
+    _cell_limit_streak = {
+        _key: _cell_limit_streak.get(_key, 0) + 1 for _key in _failed_again
+    }
 
     # Serialize core deliveries: exactly one carrier may contest the chute
     # this tick; the rest queue at distance 2 (see _assign_delivery_lease).
@@ -4732,16 +4922,28 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     heal_return_limit = int(config.get("combat_heal_return_limit", 1))
     heal_return_allowed: set[str] | None = None  # None = unlimited
     # Delivery pressure: the core cell doubles as the healing spot, and a
-    # healer squatting on it shuts the unloading chute. When a real carrier
-    # queue has formed, stop NEW heal-return marches; healers already on the
-    # core cell step aside below before the unit loop.
-    _queue_carriers = sum(1 for w in turn.workers if int(getattr(w, "cargo", 0) or 0) > 0)
+    # healer squatting on it shuts the unloading chute. Only carriers already
+    # queued at the chute (Manhattan distance <= _HEAL_GATE_QUEUE_RADIUS)
+    # physically compete for the core cell this tick — counting every carrier
+    # on the map kept the gate shut whenever the economy was healthy and
+    # starved healing entirely. When a real queue has formed, stop NEW
+    # heal-return marches; healers already on the core cell step aside below
+    # before the unit loop.
+    _carrying_workers = sum(
+        1 for w in turn.workers if int(getattr(w, "cargo", 0) or 0) > 0
+    )
+    _queue_carriers = sum(
+        1 for w in turn.workers
+        if int(getattr(w, "cargo", 0) or 0) > 0
+        and _manhattan(tuple(w.position), core_pos) <= _HEAL_GATE_QUEUE_RADIUS
+    )
     heal_return_gate = _queue_carriers >= 2
 
     # Delivery line active: empty workers route around the chute (see
-    # _chute_in_demand).
+    # _chute_in_demand). Any hauling carrier anywhere keeps detours on, even
+    # when it is still far from the chute.
     global _chute_in_demand
-    _chute_in_demand = _queue_carriers > 0
+    _chute_in_demand = _carrying_workers > 0
 
     # A carrier already adjacent to the chute: healers on the core cell must
     # yield it even when the queue behind is still thin.
@@ -4751,6 +4953,18 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         and _manhattan(tuple(w.position), core_pos) == 1
         for w in turn.workers
     )
+
+    # A healer commanded HEAL last Tick that is still damaged keeps the core
+    # cell while its heal can proceed this Tick (HEAL outranks yield-chute;
+    # the carrier deposits the tick after the heal finishes).
+    def _healer_holds_core(u: Any, u_name: str) -> bool:
+        return (
+            u_name in _healing_units_prev
+            and heal_enabled
+            and not core_moving
+            and heal_budget >= 1
+            and int(getattr(u, "hp", 0) or 0) < _unit_max_hp(u)
+        )
 
     # Chute pipeline flag: will the unit standing on the core cell leave it
     # this tick? A cargo worker deposits and stays; an empty worker vacates
@@ -4771,10 +4985,44 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         if _occ.unit_type == UnitType.WORKER:
             _chute_vacating_this_tick = True  # just unloaded -> vacate-core
         else:
-            # yield-chute fires for a formed queue or an adjacent carrier
-            _chute_vacating_this_tick = heal_return_gate or _carrier_at_chute
+            # yield-chute fires for a formed queue or an adjacent carrier,
+            # unless the healer is mid-heal and holds the cell one more tick
+            _occ_name = _object_name(
+                _occ.id, _UNIT_NAME_PREFIX.get(_occ.unit_type, "U")
+            )
+            _chute_vacating_this_tick = (
+                (heal_return_gate or _carrier_at_chute)
+                and not _healer_holds_core(_occ, _occ_name)
+            )
         break
-    if heal_return_limit > 0 and not heal_return_gate:
+    # Heal-spot capacity control: while a healer still sits on the core cell —
+    # mid-heal (commanded HEAL last Tick and still damaged) or a heal-return
+    # marcher that already arrived but has not healed and left yet — admit no
+    # new casualty. Narrow-mouth bases have only one or two ring exits; a
+    # second returnee stacking up behind a blocked heal spot deadlocked the
+    # chute (observed 95+ ticks). The spot frees the tick the healer finishes
+    # (full HP → yield-chute/forced evacuation below moves it along).
+    heal_spot_busy = False
+    for _occ in getattr(turn, "units", ()) or ():
+        if tuple(_occ.position) != core_pos:
+            continue
+        if _occ.unit_type == UnitType.WORKER:
+            continue
+        _occ_name = _object_name(
+            _occ.id, _UNIT_NAME_PREFIX.get(_occ.unit_type, "U")
+        )
+        if _occ_name in _heal_return_inflight:
+            heal_spot_busy = True
+            break
+        if (
+            _occ_name in _healing_units_prev
+            and int(getattr(_occ, "hp", 0) or 0) < _unit_max_hp(_occ)
+        ):
+            heal_spot_busy = True
+            break
+    if heal_return_gate or heal_spot_busy:
+        heal_return_allowed = set()
+    elif heal_return_limit > 0:
         eligible: list[tuple[int, int, str]] = []
         for unit in turn.units:
             if unit.unit_type not in (UnitType.VANGUARD, UnitType.RANGER):
@@ -4796,9 +5044,17 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 unit_name,
             ))
         eligible.sort()
-        heal_return_allowed = {name for _, _, name in eligible[:heal_return_limit]}
-    elif heal_return_gate:
-        heal_return_allowed = set()
+        # In-flight returns keep their slot: a unit already marching home
+        # (commanded last Tick) re-claims priority first, so the stagger limit
+        # never revokes its march tick by tick in favour of a fresh casualty.
+        heal_return_allowed = {
+            name for _, _, name in eligible if name in _heal_return_inflight
+        }
+        for _entry in eligible:
+            if len(heal_return_allowed) >= heal_return_limit:
+                break
+            heal_return_allowed.add(_entry[2])
+    # heal_return_limit == 0 (no stagger) keeps heal_return_allowed = None.
     _phase.stop()  # unit_setup
 
     # Per-unit planner wall-clock, broken down by unit type so the summary can
@@ -4807,6 +5063,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     unit_phase_ms: dict[str, float] = {"worker": 0.0, "vanguard": 0.0, "ranger": 0.0,
                                        "other": 0.0}
     commanded_self_destructs: set[str] = set()
+    healed_names: set[str] = set()
+    heal_return_names: set[str] = set()
     for unit in turn.units:
         uid = str(unit.id)[:8]
         name = _object_name(unit.id, _UNIT_NAME_PREFIX.get(unit.unit_type, "U"))
@@ -4829,11 +5087,32 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 unit.unit_type == UnitType.WORKER
                 and int(getattr(unit, "cargo", 0) or 0) > 0
             )
+            and not _healer_holds_core(unit, name)
         ):
-            step_aside = _retreat_from(tuple(unit.position), core_pos, obstacle_cells, occupied)
+            step_aside = _retreat_from(
+                tuple(unit.position), core_pos, obstacle_cells, enemy_cells,
+                friendly_cell_counts,
+            )
             if step_aside is not None:
                 unit.move(step_aside)
                 unit_actions_detail[uid] = f"MOVE:{step_aside.name} yield-chute"
+                continue
+            # Forced evacuation fallback: the capacity-aware retreat found no
+            # exit only when every non-wall neighbour is at the cell limit or
+            # dead-end filtered — a squatter must still leave the chute, so
+            # take ANY under-limit non-wall neighbour (dead ends included).
+            # Without this the unit falls into home-patrol, re-targets the
+            # same packed cell every tick and seals the chute permanently
+            # (the narrow-mouth core deadlock).
+            forced_aside = _retreat_from(
+                tuple(unit.position), core_pos, obstacle_cells, enemy_cells,
+                friendly_cell_counts, force=True,
+            )
+            if forced_aside is not None:
+                unit.move(forced_aside)
+                unit_actions_detail[uid] = (
+                    f"MOVE:{forced_aside.name} yield-chute-forced"
+                )
                 continue
         # Post-combat healing: a damaged Unit on the Core cell with a stationary
         # Core spends its whole action recovering HP (1 resource / 1 HP).
@@ -4846,6 +5125,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         ):
             unit.heal()
             unit_actions_detail[uid] = "HEAL"
+            healed_names.add(name)
             continue
         # 守家队主动回撤回血: a home-squad Vanguard/Ranger below the
         # combat_heal_hp_threshold marches back to the Core; the HEAL branch
@@ -4871,6 +5151,34 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             )
             if moved is not None:
                 unit_actions_detail[uid] = f"MOVE:{moved[1]}[heal-return]"
+                heal_return_names.add(name)
+                continue
+        # CELL_UNIT_LIMIT retry breaker: rejected 3+ consecutive Ticks means
+        # the planner deterministically re-issues the same blocked move. Force
+        # one sidestep into any under-limit non-wall neighbour to break the
+        # loop; normal planning resumes once the unit stops being rejected.
+        # Workers are exempt: the delivery lease already rotates stuck
+        # carriers and a forced detour would derail the chute pipeline.
+        if (
+            unit.unit_type != UnitType.WORKER
+            and _cell_limit_streak.get(str(unit.id), 0)
+            >= _CELL_LIMIT_DETOUR_AFTER
+        ):
+            _dpos = tuple(unit.position)
+            _detour_dir: Direction | None = None
+            for _d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+                _npos = (_dpos[0] + _d.delta[0], _dpos[1] + _d.delta[1])
+                if _npos in obstacle_cells or _npos in enemy_cells:
+                    continue
+                if friendly_cell_counts.get(_npos, 0) >= _CELL_UNIT_LIMIT:
+                    continue
+                _detour_dir = _d
+                break
+            if _detour_dir is not None:
+                unit.move(_detour_dir)
+                unit_actions_detail[uid] = (
+                    f"MOVE:{_detour_dir.name} cell-limit-detour"
+                )
                 continue
         # Manual per-unit waypoint: march to the configured coordinate, then
         # resume the normal planner once it is reached.
@@ -4900,6 +5208,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 enemies=enemies,
                 lease_uid=delivery_lease,
                 next_uid=_delivery_next_uid,
+                cell_counts=friendly_cell_counts,
             )
             unit_phase_ms["worker"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = f"{action}:{detail}"
@@ -4913,6 +5222,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 config,
                 core_pos=tuple(core_pos),
                 team=team,
+                cell_counts=friendly_cell_counts,
             )
             unit_phase_ms["vanguard"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
@@ -4926,6 +5236,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 config,
                 core_pos=tuple(core_pos),
                 team=team,
+                cell_counts=friendly_cell_counts,
             )
             unit_phase_ms["ranger"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
@@ -4942,6 +5253,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     _phase.phases["unit:vanguard"] = unit_phase_ms["vanguard"]
     _phase.phases["unit:ranger"] = unit_phase_ms["ranger"]
     _publish_plan_profile(_phase)
+
+    # Remember this Tick's heal decisions so next Tick can keep an in-flight
+    # heal-return slot and let a mid-heal unit hold the core cell.
+    _healing_units_prev = healed_names
+    _heal_return_inflight = heal_return_names
 
     return core_action_name, unit_actions_detail
 

@@ -86,6 +86,16 @@ CONFIG_FIELDS = (
     ),
     ConfigField("home_patrol_radius", "守家巡逻半径", "combat", "integer", 5, 1, 30, 1),
     ConfigField("home_engage_radius", "守家迎击半径(0=关)", "combat", "integer", 10, 0, 30, 1),
+    ConfigField(
+        "home_engage_memory_ticks",
+        "守家迎击目标记忆 Tick(0=关)",
+        "combat",
+        "integer",
+        4,
+        0,
+        20,
+        1,
+    ),
     ConfigField("attack_target_x", "进攻目标 X", "combat", "integer", 0, -500, 500, 1),
     ConfigField("attack_target_y", "进攻目标 Y", "combat", "integer", 0, -500, 500, 1),
     ConfigField(

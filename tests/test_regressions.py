@@ -952,8 +952,14 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.config = default_config()
         self._prev_last_pos = dict(tactic._worker_last_pos)
         self._prev_combat_paths = dict(tactic._combat_path_cache)
+        self._prev_engage_target = dict(tactic._home_engage_target)
+        self._prev_motion_tracks = {
+            key: list(value) for key, value in tactic._enemy_motion_tracks.items()
+        }
         tactic._worker_last_pos.clear()
         tactic._combat_path_cache.clear()
+        tactic._home_engage_target.clear()
+        tactic._enemy_motion_tracks.clear()
         tactic.turn_context.tick = 0
         tactic.turn_context.beacon_pos = None
         tactic.turn_context.core_pos = None
@@ -964,6 +970,10 @@ class CombatTeamPlannerTests(unittest.TestCase):
         tactic._worker_last_pos.update(self._prev_last_pos)
         tactic._combat_path_cache.clear()
         tactic._combat_path_cache.update(self._prev_combat_paths)
+        tactic._home_engage_target.clear()
+        tactic._home_engage_target.update(self._prev_engage_target)
+        tactic._enemy_motion_tracks.clear()
+        tactic._enemy_motion_tracks.update(self._prev_motion_tracks)
         tactic.turn_context.beacon_pos = None
         tactic.turn_context.core_pos = None
         tactic.turn_context.attack_squad_pos = None
@@ -1143,6 +1153,187 @@ class CombatTeamPlannerTests(unittest.TestCase):
             team="home",
         )
         self.assertNotIn("home-intercept", detail)
+
+    def test_home_patrol_slots_stay_inside_radius(self) -> None:
+        # All 8 slots must be distinct and reachable: Manhattan distance
+        # <= radius (the return line sits at radius+1, so anything farther
+        # ping-pongs home-return/home-patrol and is never reached).
+        core = (0, 0)
+        for radius in range(2, 9):
+            goals = {
+                tactic._home_patrol_goal(f"probe-{i}", core, radius)
+                for i in range(400)
+            }
+            self.assertEqual(len(goals), 8, f"radius={radius}")
+            for goal in goals:
+                self.assertLessEqual(
+                    tactic._manhattan(goal, core), radius, f"radius={radius}",
+                )
+        # Radius 1 cannot host 8 distinct cells within distance 1; the ring
+        # keeps 8 distinct slots (corners at distance 2) there.
+        goals = {
+            tactic._home_patrol_goal(f"probe-{i}", core, 1) for i in range(400)
+        }
+        self.assertEqual(len(goals), 8)
+
+    def test_home_patrol_diagonal_slot_reachable_and_holds(self) -> None:
+        # Regression: diagonal slots used to sit at Manhattan distance 2r,
+        # past return_radius r+1 — defenders ping-ponged home-return/patrol
+        # forever. A diagonal-slot defender must now walk in and settle into
+        # home-hold without ever triggering home-return.
+        radius = self.config["home_patrol_radius"]
+        core = (0, 0)
+        uid = None
+        for i in range(400):
+            cand = f"probe-{i}"
+            goal = tactic._home_patrol_goal(cand, core, radius)
+            if goal[0] != core[0] and goal[1] != core[1]:
+                uid = cand
+                break
+        self.assertIsNotNone(uid, "no diagonal-slot unit id found")
+
+        unit = self.CombatUnit(uid, core)
+        for _ in range(4 * radius + 4):
+            tactic._combat_path_cache.clear()
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=core,
+                team="home",
+            )
+            self.assertNotIn("home-return", detail)
+            if action == "WAIT" and "home-hold" in detail:
+                break
+            self.assertEqual(action, "MOVE", detail)
+            dx, dy = unit.arg.delta
+            unit.position = (unit.position[0] + dx, unit.position[1] + dy)
+        else:
+            self.fail("diagonal-slot defender never reached home-hold")
+
+    def test_home_intercept_memory_holds_target_after_vision_loss(self) -> None:
+        # A chased enemy slipping out of vision for a couple of ticks must
+        # not flip the defender back to patrol; the target lock survives
+        # home_engage_memory_ticks and only then expires.
+        self.config["home_patrol_radius"] = 3
+        self.config["home_engage_radius"] = 10
+        self.config["home_engage_memory_ticks"] = 4
+        core = (0, 0)
+
+        tactic.turn_context.tick = 0
+        unit = self.CombatUnit("v-lock", (0, 0))
+        enemy = self.Enemy((6, 0))
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(enemy,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=core,
+            team="home",
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("home-intercept", detail)
+        # Simulate the sighting feeding the motion tracks, then vision loss.
+        tactic._update_enemy_motion_tracks((enemy,), 0)
+
+        for tick in (1, 2, 4):
+            tactic.turn_context.tick = tick
+            tactic._combat_path_cache.clear()
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=core,
+                team="home",
+            )
+            self.assertEqual(action, "MOVE", f"tick={tick}: {detail}")
+            self.assertIn("home-intercept", detail, f"tick={tick}")
+
+        # Memory window expired -> the chase drops and patrol resumes.
+        tactic.turn_context.tick = 5
+        tactic._combat_path_cache.clear()
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=core,
+            team="home",
+        )
+        self.assertNotIn("home-intercept", detail)
+        self.assertNotIn("home-engage", detail)
+        self.assertIn(action, {"MOVE", "WAIT"})
+
+    def test_home_intercept_memory_yields_to_chute_clear(self) -> None:
+        # Delivery pipeline priority: on the core ring while carriers queue,
+        # the remembered-chase fallback must yield to chute-clear; the lock
+        # survives the yield so the chase resumes once the lane is clear.
+        self.config["home_patrol_radius"] = 3
+        self.config["home_engage_radius"] = 10
+        self.config["home_engage_memory_ticks"] = 4
+        core = (0, 0)
+
+        tactic.turn_context.tick = 0
+        unit = self.CombatUnit("v-yield", (1, 0))
+        enemy = self.Enemy((6, 0))
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(enemy,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=core,
+            team="home",
+        )
+        self.assertIn("home-intercept", detail)
+        tactic._update_enemy_motion_tracks((enemy,), 0)
+
+        tactic.turn_context.tick = 1
+        tactic._combat_path_cache.clear()
+        prev_flag = tactic._chute_in_demand
+        tactic._chute_in_demand = True
+        try:
+            action, detail = tactic._plan_home_combat(
+                unit,
+                unit_kind="vanguard",
+                enemies=(),
+                obstacle_cells=frozenset(),
+                core_pos=core,
+                config=self.config,
+                cell_counts={},
+            )
+        finally:
+            tactic._chute_in_demand = prev_flag
+        self.assertEqual(action, "MOVE")
+        self.assertIn("chute-clear", detail)
+        # Memory survives the yield: chase resumes while the window holds.
+        self.assertIn("v-yield", tactic._home_engage_target)
+
+    def test_home_intercept_memory_drops_on_catchup(self) -> None:
+        # Reaching the remembered last-known cell ends the lock (no residual
+        # single-cell A-B-A vs. home-return beyond the return line).
+        self.config["home_patrol_radius"] = 3
+        self.config["home_engage_radius"] = 10
+        self.config["home_engage_memory_ticks"] = 4
+        core = (0, 0)
+        tactic._home_engage_target["v-catch"] = ("enemy-5-0", 0)
+        tactic._enemy_motion_tracks["enemy-5-0"] = [(0, (5, 0))]
+
+        tactic.turn_context.tick = 1
+        unit = self.CombatUnit("v-catch", (5, 0))
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=core,
+            team="home",
+        )
+        self.assertNotIn("home-intercept", detail)
+        self.assertNotIn("home-engage", detail)
+        self.assertNotIn("v-catch", tactic._home_engage_target)
+        self.assertIn(action, {"MOVE", "WAIT"})
 
     def test_attack_team_marches_to_configured_target(self) -> None:
         unit = self.CombatUnit("v-attack", (0, 0))
@@ -4065,7 +4256,10 @@ class HomeHealReturnTests(unittest.TestCase):
         ranger.wait = lambda: None
         return ranger
 
-    def _run_choose_actions(self, combat_units, *, config, limit=None, home_team=None):
+    def _run_choose_actions(
+        self, combat_units, *, config, limit=None, home_team=None, workers=(),
+        obstacle_cells=frozenset(), events=(),
+    ):
         """Run choose_actions against the given combat units; return the
         per-unit actions dict. Names are deterministic (R1, R2, … / V1, V2…)."""
         rangers = tuple(u for u in combat_units if u.unit_type == UnitType.RANGER)
@@ -4075,6 +4269,9 @@ class HomeHealReturnTests(unittest.TestCase):
         prev_names = dict(tactic._object_names)
         prev_counters = dict(tactic._object_name_counters)
         prev_resource_space = tactic.turn_context.resource_space
+        prev_healing_prev = set(tactic._healing_units_prev)
+        prev_inflight = set(tactic._heal_return_inflight)
+        prev_streak = dict(tactic._cell_limit_streak)
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             tactic._object_names.clear()
@@ -4086,6 +4283,7 @@ class HomeHealReturnTests(unittest.TestCase):
                 heal=lambda: None,
                 repair_shield=lambda: None,
                 move=lambda *args, **kwargs: None,
+                wait=lambda: None,
             )
             beacon = SimpleNamespace(
                 position=None, status=SimpleNamespace(name="GROUND"),
@@ -4093,7 +4291,7 @@ class HomeHealReturnTests(unittest.TestCase):
             turn = SimpleNamespace(
                 tick=1,
                 units=rangers + vanguards,
-                workers=(),
+                workers=tuple(workers),
                 vanguards=vanguards,
                 rangers=rangers,
                 visible_enemies=(),
@@ -4103,8 +4301,8 @@ class HomeHealReturnTests(unittest.TestCase):
                 resource_space=0,
                 beacon=beacon,
                 state=SimpleNamespace(population=8),
-                events=(),
-                obstacle_cells=frozenset(),
+                events=tuple(events),
+                obstacle_cells=frozenset(obstacle_cells),
             )
             if limit is not None:
                 config["combat_heal_return_limit"] = limit
@@ -4123,6 +4321,9 @@ class HomeHealReturnTests(unittest.TestCase):
                     tactic._object_name_counters.clear()
                     tactic._object_name_counters.update(prev_counters)
                     tactic.turn_context.resource_space = prev_resource_space
+                    tactic._healing_units_prev = prev_healing_prev
+                    tactic._heal_return_inflight = prev_inflight
+                    tactic._cell_limit_streak = prev_streak
         return actions
 
     def test_home_ranger_actually_marches_home_in_choose_actions(self) -> None:
@@ -4176,6 +4377,225 @@ class HomeHealReturnTests(unittest.TestCase):
         # The 1-HP ranger wins the single slot over the 2-HP vanguard.
         returning = [k for k, v in actions.items() if "home-heal-return" in v]
         self.assertEqual(returning, ["ranger-a"])
+
+
+class HealReturnGateTests(HomeHealReturnTests):
+    """heal_return_gate only counts carriers queued at the chute (≤ 3 cells).
+
+    Regression: the gate used to count EVERY carrying worker on the map, so a
+    healthy economy kept it shut 100% of ticks and healing never fired.
+    """
+
+    @staticmethod
+    def _carrier(uid, pos, cargo=1):
+        return SimpleNamespace(id=uid, position=pos, cargo=cargo)
+
+    def test_far_carriers_do_not_block_heal_return(self) -> None:
+        """Two carrying workers exist but both mine far away (> 3 cells from
+        the Core): the gate stays open and the 1-HP home ranger marches home
+        to heal instead of being sent to SHOOT/patrol."""
+        config = default_config()
+        ranger = self._make_ranger("ranger-1", (10, 0), 1)
+        carriers = (self._carrier("w1", (20, 0)), self._carrier("w2", (25, 0)))
+        actions = self._run_choose_actions(
+            (ranger,), config=config, home_team="R1", workers=carriers,
+        )
+        self.assertIn("ranger-1", actions)
+        detail = actions["ranger-1"]
+        self.assertTrue(
+            "[heal-return]" in detail or detail == "HEAL",
+            f"expected heal-return/HEAL, got {detail!r}",
+        )
+
+    def test_queue_at_core_keeps_gate_closed(self) -> None:
+        """Two carrying workers queued right at the Core (≤ 3 cells): the gate
+        shuts and the low-HP ranger keeps defending — delivery priority."""
+        config = default_config()
+        ranger = self._make_ranger("ranger-1", (10, 0), 1)
+        carriers = (self._carrier("w1", (1, 0)), self._carrier("w2", (2, 0)))
+        actions = self._run_choose_actions(
+            (ranger,), config=config, home_team="R1", workers=carriers,
+        )
+        self.assertIn("ranger-1", actions)
+        detail = actions["ranger-1"]
+        self.assertNotIn("[heal-return]", detail)
+        self.assertNotEqual(detail, "HEAL")
+
+    def test_inflight_return_keeps_slot_over_fresh_casualty(self) -> None:
+        """A unit already marching home (commanded last Tick) keeps its
+        stagger slot; a fresh casualty does not revoke it."""
+        config = default_config()
+        rangers = (
+            self._make_ranger("ranger-a", (10, 0), 1),  # R1, fresh casualty
+            self._make_ranger("ranger-b", (4, 0), 1),    # R2, in flight
+        )
+        tactic._heal_return_inflight = {"R2"}
+        try:
+            actions = self._run_choose_actions(
+                rangers, config=config, limit=1, home_team="R1, R2",
+            )
+        finally:
+            tactic._heal_return_inflight = set()
+        returning = [k for k, v in actions.items() if "home-heal-return" in v]
+        self.assertEqual(returning, ["ranger-b"])
+
+    def test_mid_heal_unit_holds_core_cell_for_heal(self) -> None:
+        """A healer that HEALed last Tick and is still damaged keeps the core
+        cell and heals again even while a carrier waits adjacent (no
+        yield-chute eviction before the HEAL resolves)."""
+        config = default_config()
+        ranger = self._make_ranger("ranger-1", (0, 0), 1)
+        ranger.heal = lambda: None
+        carrier = self._carrier("w1", (1, 0))
+        tactic._healing_units_prev = {"R1"}
+        try:
+            actions = self._run_choose_actions(
+                (ranger,), config=config, home_team="R1", workers=(carrier,),
+            )
+        finally:
+            tactic._healing_units_prev = set()
+        self.assertEqual(actions.get("ranger-1"), "HEAL")
+
+
+class CoreChokeDeadlockTests(HomeHealReturnTests):
+    """窄口地形核心霸格死锁回归（线上核心两面是墙、仅 2 个出入口）.
+
+    Regression: a fully-healed healer on the core cell could not leave
+    because _retreat_from treated every occupied neighbour as fully blocked
+    (server cell limit is 2) and home-patrol re-targeted the same packed
+    cell every tick — sealing the unloading chute for 95+ ticks.
+    """
+
+    # Core at (0,0); two adjacent walls leave exactly two ring exits.
+    _WALLS = frozenset({(-1, 0), (0, -1)})
+
+    @staticmethod
+    def _carrier(uid, pos, cargo=1):
+        return SimpleNamespace(id=uid, position=pos, cargo=cargo)
+
+    def _recording_ranger(self, uid, pos, hp):
+        ranger = self._make_ranger(uid, pos, hp)
+        moves: list = []
+        ranger.move = lambda direction: moves.append(direction)
+        return ranger, moves
+
+    def test_healed_healer_escapes_narrow_core_ring(self) -> None:
+        """(a) Deadlock repro: full-HP healer on the core cell, exit 1 holds a
+        single carrier (count 1 < limit 2), exit 2 is packed (2 units = the
+        server cell limit). The healer must leave the core cell THIS tick
+        into the under-limit exit — not stay, not ram the packed cell."""
+        config = default_config()
+        healed, moves = self._recording_ranger("ranger-1", (0, 0), 2)
+        r2 = self._make_ranger("ranger-2", (0, 1), 2)
+        r3 = self._make_ranger("ranger-3", (0, 1), 2)  # exit 2 at the limit
+        carrier = self._carrier("w1", (1, 0))           # exit 1: squeezable
+        actions = self._run_choose_actions(
+            (healed, r2, r3), config=config, home_team="R1, R2, R3",
+            workers=(carrier,), obstacle_cells=self._WALLS,
+        )
+        detail = actions["ranger-1"]
+        self.assertTrue(detail.startswith("MOVE:"), detail)
+        self.assertEqual(len(moves), 1, detail)
+        target = (moves[0].delta[0], moves[0].delta[1])
+        self.assertNotIn(target, self._WALLS)
+        self.assertNotEqual(target, (0, 0))
+        self.assertNotEqual(target, (0, 1))  # never into the packed exit
+        self.assertEqual(target, (1, 0))     # squeeze beside the lone carrier
+
+    def test_cell_squatter_fallback_keeps_delivery_priority(self) -> None:
+        """(b) With carrying workers queued at the core the mid-heal healer
+        keeps the core cell (HEAL, no forced evacuation): the squatter
+        fallback never overrides the heal-hold, delivery priority intact."""
+        config = default_config()
+        healer, moves = self._recording_ranger("ranger-1", (0, 0), 1)
+        healer.heal = lambda: None
+        carriers = (self._carrier("w1", (1, 0)), self._carrier("w2", (2, 0)))
+        tactic._healing_units_prev = {"R1"}
+        try:
+            actions = self._run_choose_actions(
+                (healer,), config=config, home_team="R1",
+                workers=carriers, obstacle_cells=self._WALLS,
+            )
+        finally:
+            tactic._healing_units_prev = set()
+        self.assertEqual(actions.get("ranger-1"), "HEAL")
+        self.assertEqual(moves, [])
+
+    def test_busy_heal_spot_blocks_new_heal_return(self) -> None:
+        """(c) Heal-return capacity control: a mid-heal (still damaged)
+        healer on the core cell keeps the gate shut for fresh casualties —
+        the second returnee must not stack up behind a blocked heal spot."""
+        config = default_config()
+        healer = self._make_ranger("ranger-1", (0, 0), 1)
+        healer.heal = lambda: None
+        casualty = self._make_ranger("ranger-2", (10, 0), 1)
+        tactic._healing_units_prev = {"R1"}
+        try:
+            actions = self._run_choose_actions(
+                (healer, casualty), config=config, home_team="R1, R2",
+            )
+        finally:
+            tactic._healing_units_prev = set()
+        self.assertEqual(actions.get("ranger-1"), "HEAL")
+        detail = actions["ranger-2"]
+        self.assertNotIn("heal-return", detail)
+        self.assertNotEqual(detail, "HEAL")
+
+    def test_chute_clear_never_pushes_into_packed_cell(self) -> None:
+        """(d) chute-clear occupancy pre-check: the only outward cell is at
+        the server limit, so the defender must not issue a chute-clear push
+        into it (it would bounce on CELL_UNIT_LIMIT every tick). Without the
+        pre-check the same setup deterministically returned a chute-clear
+        MOVE into the packed cell."""
+        config = default_config()
+        config["home_patrol_radius"] = 1
+        core_pos = (0, 0)
+        packed = (1, -1)  # the only outward neighbour, at the cell limit
+        # A unit id whose patrol slot is its own cell, so the fall-through
+        # after the blocked chute-clear ends in a hold, not a re-target.
+        uid = next(
+            f"probe-{i}" for i in range(200)
+            if tactic._home_patrol_goal(f"probe-{i}", core_pos, 1) == (1, 0)
+        )
+        unit = SimpleNamespace(id=uid, position=(1, 0), hp=2)
+        moves: list = []
+        unit.move = lambda d: moves.append(d)
+        unit.wait = lambda: None
+        walls = frozenset({(2, 0), (1, 1)})
+        cell_counts = {packed: tactic._CELL_UNIT_LIMIT}
+        prev_flag = tactic._chute_in_demand
+        tactic._chute_in_demand = True  # carriers queuing at the chute
+        try:
+            action, detail = tactic._plan_home_combat(
+                unit, unit_kind="ranger", enemies=(), obstacle_cells=walls,
+                core_pos=core_pos, config=config, cell_counts=cell_counts,
+            )
+        finally:
+            tactic._chute_in_demand = prev_flag
+        self.assertNotIn("chute-clear", detail)
+        for m in moves:
+            self.assertNotEqual((1 + m.delta[0], m.delta[1]), packed)
+
+    def test_cell_limit_streak_forces_detour(self) -> None:
+        """Retry breaker: 3+ consecutive Ticks of CELL_UNIT_LIMIT rejections
+        force one sidestep (cell-limit-detour) instead of the same blocked
+        move; the streak is seeded by last Tick's count + this Tick's event."""
+        config = default_config()
+        ranger, moves = self._recording_ranger("ranger-1", (5, 0), 2)
+        tactic._cell_limit_streak = {"ranger-1": 2}
+        events = (SimpleNamespace(
+            event_type="UNIT_MOVE_FAILED", reason_code="CELL_UNIT_LIMIT",
+            actor_id="ranger-1", target_id=None, position=None,
+            resource_amount=None,
+        ),)
+        try:
+            actions = self._run_choose_actions(
+                (ranger,), config=config, home_team="R1", events=events,
+            )
+        finally:
+            tactic._cell_limit_streak = {}
+        self.assertIn("cell-limit-detour", actions["ranger-1"])
+        self.assertEqual(len(moves), 1)
 
 
 class ManualWaypointTests(unittest.TestCase):

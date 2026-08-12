@@ -29,6 +29,7 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(config["guerrilla_team"], "")
         self.assertEqual(config["home_patrol_radius"], 5)
         self.assertEqual(config["home_engage_radius"], 10)
+        self.assertEqual(config["home_engage_memory_ticks"], 4)
         self.assertEqual(config["attack_target_x"], 0)
         self.assertEqual(config["attack_target_y"], 0)
         self.assertEqual(config["attack_mode"], "coords")
