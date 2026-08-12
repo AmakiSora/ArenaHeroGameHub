@@ -1639,6 +1639,125 @@ class CombatTeamPlannerTests(unittest.TestCase):
             tactic.turn_context.core_pos = None
             tactic.turn_context.attack_squad_pos = None
 
+    def test_attack_auto_radius_filters_target_candidates(self) -> None:
+        # radius=3、core=(0,0)：唯一目击点 (10,0) 距核心 10 格 > 3，
+        # 候选被滤空后回退静态进攻坐标。
+        tactic._enemy_memory.update({(10, 0)})
+        tactic.turn_context.core_pos = (0, 0)
+        try:
+            unit = self.CombatUnit("v-attack", (0, 0))
+            self.config["attack_mode"] = "auto"
+            self.config["attack_auto_radius"] = 3
+            self.config["attack_target_x"] = 90
+            self.config["attack_target_y"] = 90
+
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-march-auto (90, 90)", detail)
+            self.assertNotIn("attack-march-auto (10, 0)", detail)
+        finally:
+            tactic._enemy_memory.discard((10, 0))
+            tactic.turn_context.core_pos = None
+
+    def test_attack_auto_radius_keeps_in_range_candidate(self) -> None:
+        # radius=3：(10,0) 被滤掉，(2,0) 在半径内被选中。
+        tactic._enemy_memory.update({(10, 0), (2, 0)})
+        tactic.turn_context.core_pos = (0, 0)
+        try:
+            unit = self.CombatUnit("v-attack", (0, 0))
+            self.config["attack_mode"] = "auto"
+            self.config["attack_auto_radius"] = 3
+            self.config["attack_target_x"] = 90
+            self.config["attack_target_y"] = 90
+
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-march-auto (2, 0)", detail)
+            self.assertEqual(unit.arg.name, "RIGHT")
+        finally:
+            tactic._enemy_memory.discard((10, 0))
+            tactic._enemy_memory.discard((2, 0))
+            tactic.turn_context.core_pos = None
+
+    def test_attack_auto_radius_blocks_engage_outside_radius(self) -> None:
+        # radius=3、core=(0,0)：可见敌人在 (5,0)（半径外）不触发追击，
+        # 跳过接敌落入行军。
+        tactic.turn_context.core_pos = (0, 0)
+        try:
+            unit = self.CombatUnit("v-attack", (0, 0))
+            self.config["attack_mode"] = "auto"
+            self.config["attack_auto_radius"] = 3
+            self.config["attack_target_x"] = 0
+            self.config["attack_target_y"] = 5
+
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(self.Enemy((5, 0)),),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+            self.assertEqual(action, "MOVE")
+            self.assertNotIn("attack-engage", detail)
+            self.assertIn("attack-march-auto", detail)
+        finally:
+            tactic.turn_context.core_pos = None
+
+    def test_attack_auto_radius_zero_keeps_existing_behavior(self) -> None:
+        # radius=0（默认）：目标候选与沿途接敌均不受半径约束。
+        tactic._enemy_memory.update({(10, 0)})
+        tactic.turn_context.core_pos = (0, 0)
+        try:
+            self.config["attack_mode"] = "auto"
+            self.config["attack_auto_radius"] = 0
+            self.config["attack_target_x"] = 90
+            self.config["attack_target_y"] = 90
+
+            march_unit = self.CombatUnit("v-attack", (0, 0))
+            action, detail = tactic._plan_vanguard(
+                march_unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-march-auto (10, 0)", detail)
+
+            engage_unit = self.CombatUnit("v-engage", (0, 0))
+            action, detail = tactic._plan_vanguard(
+                engage_unit,
+                enemies=(self.Enemy((5, 0)),),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-engage", detail)
+        finally:
+            tactic._enemy_memory.discard((10, 0))
+            tactic.turn_context.core_pos = None
+
     def test_guerrilla_retreats_from_three_enemies(self) -> None:
         unit = self.CombatUnit("v-g", (5, 5))
         enemies = (

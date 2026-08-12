@@ -3093,10 +3093,15 @@ def _plan_attack_combat(
                   (base defense) and to the attack squad's current centroid
       - beacon -> the champion beacon's always-public position; the static
                   coordinate and auto-attack settings are ignored in this mode
+
+    attack_auto_radius (auto 模式专用，曼哈顿距离，0=不限制)：
+      约束 auto 目标候选与沿途接敌，均只保留距核心 N 格内的点/敌人；
+      不约束撤退分支（attack-retreat）。radius=0 或非 auto 模式时完全不生效。
     """
     pos = tuple(unit.position)
 
     mode = str(config.get("attack_mode", "coords"))
+    attack_radius = max(int(config.get("attack_auto_radius", 0) or 0), 0)
     # Squad-wide outnumbered-retreat verdict (set once per Tick in
     # choose_actions from the full enemy view + squad centroid). In auto mode a
     # True verdict short-circuits all engagement: the squad disengages away from
@@ -3117,6 +3122,12 @@ def _plan_attack_combat(
         core_pos = getattr(turn_context, "core_pos", None)
         squad_pos = getattr(turn_context, "attack_squad_pos", None) or pos
         candidates = set(_enemy_memory) - set(forbidden)
+        if attack_radius > 0 and core_pos is not None:
+            # 半径约束：只保留距核心 attack_radius 格（曼哈顿）内的目击点；
+            # 过滤后为空则落入下方静态进攻坐标回退。
+            candidates = {
+                p for p in candidates if _manhattan(p, core_pos) <= attack_radius
+            }
         if not candidates:
             # Everything in memory is part of the outnumbering cluster (or
             # memory only holds the cluster): regroup toward the home coords
@@ -3176,16 +3187,31 @@ def _plan_attack_combat(
             return shot
 
     if enemies:
-        nearest = min(enemies, key=lambda e: _manhattan(pos, e.position))
-        moved = _move_towards(
-            unit,
-            pos,
-            tuple(nearest.position),
-            obstacle_cells,
-            detail_prefix="attack-engage",
-        )
-        if moved is not None:
-            return moved
+        engage_pool = enemies
+        if (
+            mode == "auto"
+            and attack_radius > 0
+            and getattr(turn_context, "core_pos", None) is not None
+        ):
+            # 沿途接敌同样受半径约束：只追击距核心 N 格内的可见敌人；
+            # 子集为空则跳过接敌落入行军。radius=0 或非 auto 模式保持原逻辑。
+            engage_core = getattr(turn_context, "core_pos", None)
+            engage_pool = tuple(
+                e
+                for e in enemies
+                if _manhattan(tuple(e.position), engage_core) <= attack_radius
+            )
+        if engage_pool:
+            nearest = min(engage_pool, key=lambda e: _manhattan(pos, e.position))
+            moved = _move_towards(
+                unit,
+                pos,
+                tuple(nearest.position),
+                obstacle_cells,
+                detail_prefix="attack-engage",
+            )
+            if moved is not None:
+                return moved
 
     if pos == target:
         unit.wait()

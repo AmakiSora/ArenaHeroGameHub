@@ -33,6 +33,7 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(config["attack_target_x"], 0)
         self.assertEqual(config["attack_target_y"], 0)
         self.assertEqual(config["attack_mode"], "coords")
+        self.assertEqual(config["attack_auto_radius"], 0)
         self.assertEqual(config["combat_heal_hp_threshold"], 2)
         self.assertEqual(config["combat_heal_return_limit"], 1)
 
@@ -65,6 +66,19 @@ class TacticConfigTests(unittest.TestCase):
             validate_config({"attack_mode": "nuke"})
         with self.assertRaises(ConfigValidationError):
             validate_config({"attack_mode": True})
+
+    def test_attack_auto_radius_validation(self) -> None:
+        # 0 = 不限制（默认行为），1..30 为曼哈顿半径；越界拒绝。
+        self.assertEqual(
+            validate_config({"attack_auto_radius": 0})["attack_auto_radius"], 0
+        )
+        self.assertEqual(
+            validate_config({"attack_auto_radius": 30})["attack_auto_radius"], 30
+        )
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"attack_auto_radius": -1})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"attack_auto_radius": 31})
 
     def test_legacy_auto_attack_checkbox_migrates_to_attack_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -188,6 +202,8 @@ class TacticConfigTests(unittest.TestCase):
         self.assertIn("游击队", teams)
         self.assertIn("待命池", teams)
         self.assertIn('name="attack_mode"', teams)
+        self.assertIn('name="attack_auto_radius"', teams)
+        self.assertIn('id="teamAutoRadius"', teams)
         self.assertIn("进攻冠军信标", teams)
         self.assertIn("自动进攻", teams)
         self.assertNotIn('name="auto_attack_enabled"', teams)
