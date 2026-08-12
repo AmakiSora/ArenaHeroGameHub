@@ -106,7 +106,7 @@ CONFIG_FIELDS = (
         "coords",
         options=("coords", "auto", "beacon"),
     ),
-    ConfigField("attack_auto_radius", "自动进攻半径(0=不限)", "combat", "integer", 0, 0, 30, 1),
+    ConfigField("attack_auto_radius", "自动进攻半径(0=不限)", "combat", "integer", 100, 0, 500, 1),
     ConfigField("ranger_attack_range", "游侠开火距离", "combat", "integer", 3, 1, 3, 1),
     ConfigField(
         "attack_retreat_radius",

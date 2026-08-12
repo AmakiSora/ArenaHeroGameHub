@@ -1056,7 +1056,7 @@ def render_teams_panel() -> str:
         f'step="1" value="{config["attack_retreat_radius"]}"'
         ' title="自动进攻时，进攻半径内敌方战斗单位数≥本队则撤退另寻目标（0=关闭）"></label>'
         '<label>自动进攻半径(0=不限)'
-        f'<input id="teamAutoRadius" name="attack_auto_radius" type="number" min="0" max="30" '
+        f'<input id="teamAutoRadius" name="attack_auto_radius" type="number" min="0" max="500" '
         f'step="1" value="{config["attack_auto_radius"]}"'
         ' title="自动进攻只选择距核心 N 格内的目标并只追击该范围内的可见敌人（0=不限制）"></label>'
         '<div class="team-mode">'
