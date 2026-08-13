@@ -1036,12 +1036,12 @@ def render_teams_panel() -> str:
         f'step="1" value="{config["home_engage_radius"]}"'
         ' title="守家队主动迎击驱赶半径（0=关闭迎击）"></label>'
         '<label>进攻 X'
-        f'<span class="coord-input"><input id="teamAttackX" name="attack_target_x" type="number" min="-500" max="500" '
+        f'<span class="coord-input"><input id="teamAttackX" name="attack_target_x" type="number" min="-1000" max="1000" '
         f'step="1" value="{config["attack_target_x"]}"{coords_locked}>'
         '<button type="button" class="pick-btn" id="pickAttackBtn" '
         'title="点击地图选择进攻坐标（X 与 Y 一起填入）">⌖</button></span></label>'
         '<label>进攻 Y'
-        f'<input id="teamAttackY" name="attack_target_y" type="number" min="-500" max="500" '
+        f'<input id="teamAttackY" name="attack_target_y" type="number" min="-1000" max="1000" '
         f'step="1" value="{config["attack_target_y"]}"{coords_locked}></label>'
         '<label>游侠射程'
         f'<select id="teamRangerRange" name="ranger_attack_range" title="游侠最大开火距离（游戏规则仅允许 1–3）">'
@@ -1056,7 +1056,7 @@ def render_teams_panel() -> str:
         f'step="1" value="{config["attack_retreat_radius"]}"'
         ' title="自动进攻时，进攻半径内敌方战斗单位数≥本队则撤退另寻目标（0=关闭）"></label>'
         '<label>自动进攻半径(0=不限)'
-        f'<input id="teamAutoRadius" name="attack_auto_radius" type="number" min="0" max="500" '
+        f'<input id="teamAutoRadius" name="attack_auto_radius" type="number" min="0" max="1000" '
         f'step="1" value="{config["attack_auto_radius"]}"'
         ' title="自动进攻只选择距核心 N 格内的目标并只追击该范围内的可见敌人（0=不限制）"></label>'
         '<div class="team-mode">'
@@ -1168,8 +1168,8 @@ def render_waypoints_panel(
         f'{list_html}'
         '<div class="wp-add">'
         f'<select id="wpName" title="选择单位"><option value="">选择单位…</option>{options}</select>'
-        '<input id="wpX" type="number" step="1" min="-500" max="500" placeholder="X" required>'
-        '<input id="wpY" type="number" step="1" min="-500" max="500" placeholder="Y" required>'
+        '<input id="wpX" type="number" step="1" min="-1000" max="1000" placeholder="X" required>'
+        '<input id="wpY" type="number" step="1" min="-1000" max="1000" placeholder="Y" required>'
         '<button type="button" class="pick-btn" id="pickWpBtn" '
         'title="点击地图选择坐标（X 与 Y 一起填入）">⌖</button>'
         '<button type="button" id="wpSetBtn">设置目标</button>'
@@ -4614,8 +4614,8 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError) as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
                 return
-            x = max(-500, min(500, x))
-            y = max(-500, min(500, y))
+            x = max(-1000, min(1000, x))
+            y = max(-1000, min(1000, y))
             self._send_json(200, set_waypoint(name, x, y))
             return
 

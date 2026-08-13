@@ -68,17 +68,17 @@ class TacticConfigTests(unittest.TestCase):
             validate_config({"attack_mode": True})
 
     def test_attack_auto_radius_validation(self) -> None:
-        # 0 = 不限制，1..500 为曼哈顿半径；越界拒绝。
+        # 0 = 不限制，1..1000 为曼哈顿半径；越界拒绝。
         self.assertEqual(
             validate_config({"attack_auto_radius": 0})["attack_auto_radius"], 0
         )
         self.assertEqual(
-            validate_config({"attack_auto_radius": 500})["attack_auto_radius"], 500
+            validate_config({"attack_auto_radius": 1000})["attack_auto_radius"], 1000
         )
         with self.assertRaises(ConfigValidationError):
             validate_config({"attack_auto_radius": -1})
         with self.assertRaises(ConfigValidationError):
-            validate_config({"attack_auto_radius": 501})
+            validate_config({"attack_auto_radius": 1001})
 
     def test_legacy_auto_attack_checkbox_migrates_to_attack_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
