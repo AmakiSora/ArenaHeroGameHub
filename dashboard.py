@@ -4502,7 +4502,6 @@ def generate_html() -> str:
         <button type="button" id="focusCoreBtn">定位核心</button>
         <span id="zoomLabel">100%</span>
         <span class="coord-readout" id="mapCoordLabel">坐标 —</span>
-        <span class="hint">拖动 · 滚轮 · ⌖点选坐标 · 软刷新</span>
        </div>
        <div class="map-stage" id="mapStage">{parts['mapSvg']}</div>
        <div class="map-legend" id="mapLegend">
