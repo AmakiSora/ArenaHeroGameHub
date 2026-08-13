@@ -659,31 +659,79 @@ def _waypoint_name(raw: object) -> str:
     return name
 
 
-def load_waypoints() -> dict[str, list[int]]:
-    """Load manual per-unit targets as {display_name: [x, y]}."""
+def _normalize_wp_entry(raw: object) -> dict | None:
+    """Normalize a waypoints.json value to {"queue": [[x,y],...], "mode": str}.
+
+    Accepts both the new queue format and the legacy single-target [x, y] — a
+    legacy target becomes a one-stop walk-only (rush) queue, matching the
+    pre-queue "just march" behavior.
+    """
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        try:
+            return {"queue": [[int(raw[0]), int(raw[1])]], "mode": "rush"}
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    queue_raw = raw.get("queue")
+    queue: list[list[int]] = []
+    if isinstance(queue_raw, (list, tuple)):
+        for pos in queue_raw:
+            if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                continue
+            try:
+                queue.append([int(pos[0]), int(pos[1])])
+            except (TypeError, ValueError):
+                continue
+    mode = str(raw.get("mode") or "attack")
+    if mode not in ("attack", "rush"):
+        mode = "attack"
+    if not queue:
+        return None
+    return {"queue": queue, "mode": mode}
+
+
+def _wp_mode(raw: object) -> str:
+    mode = str(raw or "attack").strip().lower()
+    return mode if mode in ("attack", "rush") else "attack"
+
+
+def load_waypoints() -> dict[str, dict]:
+    """Load manual per-unit target queues as {name: {"queue": [...], "mode": str}}."""
     data = _read_waypoints_file()
     targets = data.get("targets") if isinstance(data, dict) else None
-    out: dict[str, list[int]] = {}
+    out: dict[str, dict] = {}
     if isinstance(targets, dict):
-        for name, pos in targets.items():
-            if (
-                isinstance(name, str)
-                and isinstance(pos, (list, tuple))
-                and len(pos) == 2
-            ):
-                try:
-                    out[_waypoint_name(name)] = [int(pos[0]), int(pos[1])]
-                except (TypeError, ValueError):
-                    continue
+        for name, raw in targets.items():
+            entry = _normalize_wp_entry(raw)
+            if entry is None:
+                continue
+            try:
+                out[_waypoint_name(name)] = entry
+            except (TypeError, ValueError):
+                continue
     return out
 
 
+def _wp_count(waypoints: dict) -> int:
+    """Total queued targets across every unit."""
+    total = 0
+    for raw in waypoints.values():
+        entry = _normalize_wp_entry(raw)
+        if entry:
+            total += len(entry["queue"])
+    return total
+
+
 @_waypoint_mutation
-def set_waypoint(name: str, x: int, y: int) -> dict:
-    """Set a manual target for one unit (display-name keyed)."""
+def set_waypoint(name: str, x: int, y: int, mode: str = "attack") -> dict:
+    """Append a target to one unit's queue and set its march mode."""
     name = _waypoint_name(name)
+    mode = _wp_mode(mode)
     targets = load_waypoints()
-    targets[name] = [int(x), int(y)]
+    entry = targets.get(name)
+    queue = (entry["queue"] if entry else []) + [[int(x), int(y)]]
+    targets[name] = {"queue": queue, "mode": mode}
     _write_waypoints_file({
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "targets": targets,
@@ -692,22 +740,55 @@ def set_waypoint(name: str, x: int, y: int) -> dict:
         "ok": True,
         "name": name,
         "pos": [int(x), int(y)],
+        "queue": [list(p) for p in queue],
+        "mode": mode,
         "waypoint_count": len(targets),
     }
 
 
 @_waypoint_mutation
-def remove_waypoint(name: str) -> dict:
+def set_waypoint_mode(name: str, mode: str) -> dict:
+    """Switch one unit's queue march mode (attack / rush)."""
     name = _waypoint_name(name)
+    mode = _wp_mode(mode)
     targets = load_waypoints()
-    if name not in targets:
+    entry = targets.get(name)
+    if entry is None:
         return {"ok": False, "error": "目标不存在"}
-    del targets[name]
+    entry = dict(entry)
+    entry["mode"] = mode
+    targets[name] = entry
     _write_waypoints_file({
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "targets": targets,
     })
-    return {"ok": True, "name": name, "waypoint_count": len(targets)}
+    return {"ok": True, "name": name, "mode": mode, "waypoint_count": len(targets)}
+
+
+@_waypoint_mutation
+def remove_waypoint(name: str, index: int | None = None) -> dict:
+    """Remove one unit's whole queue (index=None) or a single queued target."""
+    name = _waypoint_name(name)
+    targets = load_waypoints()
+    entry = targets.get(name)
+    if entry is None:
+        return {"ok": False, "error": "目标不存在"}
+    if index is None:
+        del targets[name]
+    else:
+        queue = list(entry["queue"])
+        if not 0 <= index < len(queue):
+            return {"ok": False, "error": "目标不存在"}
+        queue.pop(index)
+        if queue:
+            targets[name] = dict(entry, queue=queue)
+        else:
+            del targets[name]
+    _write_waypoints_file({
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "targets": targets,
+    })
+    return {"ok": True, "name": name, "index": index, "waypoint_count": len(targets)}
 
 
 @_waypoint_mutation
@@ -1131,12 +1212,12 @@ def render_trends_panel() -> str:
 
 
 def render_waypoints_panel(
-    waypoints: dict[str, list[int]],
+    waypoints: dict[str, dict],
     workers: list[str],
     vanguards: list[str],
     rangers: list[str],
 ) -> str:
-    """Manual per-unit target panel: list current, add one for a live unit."""
+    """Manual per-unit target queue panel: list queues, append one for a unit."""
     def _opts(label: str, names: list[str]) -> str:
         return "".join(
             f'<option value="{html.escape(n, quote=True)}">'
@@ -1149,22 +1230,40 @@ def render_waypoints_panel(
         options = '<option value="" disabled>暂无存活单位</option>'
 
     if waypoints:
-        chips = "".join(
-            f'<span class="chip removable wp-chip">{html.escape(name)} → ({x}, {y})'
-            f'<button type="button" class="chip-x" '
-            f'data-wp-remove="{html.escape(name, quote=True)}" '
-            f'aria-label="删除 {html.escape(name, quote=True)}" '
-            f'title="删除">×</button></span>'
-            for name, (x, y) in sorted(waypoints.items())
-        )
-        list_html = f'<div class="wp-list">{chips}</div>'
+        entries = []
+        for name, raw in sorted(waypoints.items()):
+            entry = _normalize_wp_entry(raw)
+            if entry is None:
+                continue
+            mode = entry["mode"]
+            mode_label = "攻击" if mode == "attack" else "赶路"
+            safe_name = html.escape(str(name), quote=True)
+            chips = "".join(
+                f'<span class="chip wp-target" title="第{idx + 1}个">'
+                f'{html.escape(f"({x}, {y})")}'
+                f'<button type="button" class="chip-x" '
+                f'data-wp-remove="{safe_name}" data-wp-index="{idx}" '
+                f'aria-label="删除 {safe_name} 第{idx + 1}个目标" title="删除">×</button></span>'
+                for idx, (x, y) in enumerate(entry["queue"])
+            )
+            entries.append(
+                '<div class="wp-entry" data-wp-unit="' + safe_name + '">'
+                '<div class="wp-entry-head">'
+                f'<span class="wp-unit-name">{html.escape(str(name))}</span>'
+                f'<button type="button" class="wp-mode-btn" data-wp-mode-toggle="{safe_name}" '
+                f'data-mode="{mode}" title="切换模式（攻击=沿途接敌 / 赶路=只行军）">{mode_label}</button>'
+                f'<button type="button" class="chip-x" data-wp-clear-unit="{safe_name}" '
+                f'title="清空 {html.escape(str(name))} 全部目标">×</button>'
+                '</div><div class="wp-targets">' + chips + '</div></div>'
+            )
+        list_html = f'<div class="wp-list">{"".join(entries)}</div>'
     else:
-        list_html = '<div class="muted">暂无手动目标 · 单位到达后自动清除</div>'
+        list_html = '<div class="muted">暂无手动目标 · 到达后自动清除</div>'
 
     return (
         '<section class="panel waypoint-panel" id="waypointPanel">'
         '<div class="panel-title"><span>手动目标</span>'
-        f'<span class="count" id="waypointCount">{len(waypoints)} 个</span></div>'
+        f'<span class="count" id="waypointCount">{_wp_count(waypoints)} 个</span></div>'
         f'{list_html}'
         '<div class="wp-add">'
         f'<select id="wpName" title="选择单位"><option value="">选择单位…</option>{options}</select>'
@@ -1172,8 +1271,11 @@ def render_waypoints_panel(
         '<input id="wpY" type="number" step="1" min="-1000" max="1000" placeholder="Y" required>'
         '<button type="button" class="pick-btn" id="pickWpBtn" '
         'title="点击地图选择坐标（X 与 Y 一起填入）">⌖</button>'
-        '<button type="button" id="wpSetBtn">设置目标</button>'
-        '<button type="button" class="secondary" id="wpClearBtn">清空</button>'
+        '<select id="wpMode" title="行军模式">'
+        '<option value="attack" selected>攻击</option>'
+        '<option value="rush">赶路</option></select>'
+        '<button type="button" id="wpSetBtn">加入队列</button>'
+        '<button type="button" class="secondary" id="wpClearBtn">清空全部</button>'
         '</div>'
         '<div class="wp-msg" id="wpMsg">到达目标后自动恢复程序行动</div>'
         '</section>'
@@ -1576,22 +1678,25 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
         _config_marker(int(config.get("core_target_x", 0)),
                        int(config.get("core_target_y", 0)), "#6ea8ff", "核", "core-target")
 
-    # Manual per-unit targets (dashboard ⌖). One marker per targeted unit.
-    for name, wp in sorted(waypoints.items()):
-        x, y = int(wp[0]), int(wp[1])
-        if not (xmin <= x <= xmax and ymin <= y <= ymax):
+    # Manual per-unit target queues (dashboard ⌖). One marker per queued point.
+    for name, raw in sorted(waypoints.items()):
+        entry = _normalize_wp_entry(raw)
+        if entry is None:
             continue
-        px, py = to_xy(x, y)
-        cx, cy = px + cell / 2, py + cell / 2
-        label = html.escape(f"{name}→({x},{y})")
-        w = 6.5 * len(label) + 12
-        a(f'<circle data-cat="wp" cx="{cx}" cy="{cy}" r="9" fill="none" stroke="#3dd6c9" '
-          f'stroke-width="1.6" stroke-dasharray="4 3" opacity="0.9"/>')
-        a(f'<circle data-cat="wp" cx="{cx}" cy="{cy}" r="2.4" fill="#3dd6c9"/>')
-        a(f'<rect data-cat="wp" x="{cx + 8}" y="{cy - 12}" width="{w:.0f}" height="16" rx="8" '
-          f'fill="#0b1222" stroke="#3dd6c9" stroke-opacity="0.55" stroke-width="1"/>')
-        a(f'<text data-cat="wp" x="{cx + 8 + w / 2:.0f}" y="{cy + 0.5}" text-anchor="middle" '
-          f'font-size="10" fill="#3dd6c9" font-family="Consolas, monospace">{label}</text>')
+        for x, y in entry["queue"]:
+            if not (xmin <= x <= xmax and ymin <= y <= ymax):
+                continue
+            px, py = to_xy(x, y)
+            cx, cy = px + cell / 2, py + cell / 2
+            label = html.escape(f"{name}→({x},{y})")
+            w = 6.5 * len(label) + 12
+            a(f'<circle data-cat="wp" cx="{cx}" cy="{cy}" r="9" fill="none" stroke="#3dd6c9" '
+              f'stroke-width="1.6" stroke-dasharray="4 3" opacity="0.9"/>')
+            a(f'<circle data-cat="wp" cx="{cx}" cy="{cy}" r="2.4" fill="#3dd6c9"/>')
+            a(f'<rect data-cat="wp" x="{cx + 8}" y="{cy - 12}" width="{w:.0f}" height="16" rx="8" '
+              f'fill="#0b1222" stroke="#3dd6c9" stroke-opacity="0.55" stroke-width="1"/>')
+            a(f'<text data-cat="wp" x="{cx + 8 + w / 2:.0f}" y="{cy + 0.5}" text-anchor="middle" '
+              f'font-size="10" fill="#3dd6c9" font-family="Consolas, monospace">{label}</text>')
 
     for x in range(xmin, xmax + 1):
         if x % step == 0:
@@ -2167,8 +2272,20 @@ body{background:
 .waypoint-panel .muted{line-height:1.5}
 .wp-add{grid-template-columns:minmax(0,1fr) 52px 52px 28px;padding:9px;border:1px solid rgba(61,214,201,.12);
  border-radius:var(--radius-block);background:rgba(7,14,29,.38)}
-.wp-add #wpSetBtn{grid-column:1/3;width:100%}
-.wp-add #wpClearBtn{grid-column:3/5;width:100%}
+.wp-add #wpMode{grid-column:1/3;width:100%}
+.wp-add #wpSetBtn{grid-column:3/4;width:100%}
+.wp-add #wpClearBtn{grid-column:4/5;width:100%}
+.wp-entry{border:1px solid rgba(61,214,201,.14);border-radius:10px;background:rgba(7,14,29,.30);
+ padding:6px 8px;margin-bottom:6px}
+.wp-entry-head{display:flex;align-items:center;gap:6px;margin-bottom:4px}
+.wp-unit-name{font-weight:700;color:#bff5ec;font-size:11px}
+.wp-mode-btn{appearance:none;border:1px solid rgba(61,214,201,.35);border-radius:999px;
+ background:rgba(61,214,201,.12);color:#bff5ec;font-size:10px;padding:2px 8px;cursor:pointer;line-height:1.4}
+.wp-mode-btn:hover{border-color:rgba(61,214,201,.6);color:#fff}
+.wp-entry-head .chip-x{margin-left:auto}
+.wp-targets{display:flex;flex-wrap:wrap;gap:4px}
+.wp-target.chip{font-size:10px}
+.wp-target.chip .chip-x{width:14px;height:14px;font-size:11px;line-height:1}
 .res-head{margin-bottom:12px}
 .res-head .add-ore-btn{width:26px;height:26px;border-radius:8px;background:rgba(255,200,87,.08);
  border-color:rgba(255,200,87,.22);color:#ffe1a1}
@@ -2985,8 +3102,8 @@ JS = r"""
   }
 
   function bindWaypointPanel(){
-    // Manual per-unit targets: add / remove / clear + ⌖ map pick. Idempotent;
-    // re-called after each soft refresh re-renders the panel.
+    // Manual per-unit target queues: append / remove / clear / mode toggle +
+    // ⌖ map pick. Idempotent; re-called after each soft refresh re-renders.
     const panel = document.getElementById('waypointPanel');
     if(!panel) return;
     bindPickButton('pickWpBtn');
@@ -2996,6 +3113,25 @@ JS = r"""
       if(m){ m.textContent = text || ''; m.className = 'wp-msg' + (kind ? ' ' + kind : ''); }
     }
 
+    function wpPost(path, payload, okMsg){
+      return fetch(path, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      })
+      .then(function(res){ return res.json(); })
+      .then(function(data){
+        if(data && data.ok){
+          if(okMsg) msg(okMsg, 'ok');
+          lastTick = null;
+          softRefresh();
+        } else {
+          msg((data && data.error) || '操作失败', 'err');
+        }
+      })
+      .catch(function(){ msg('网络错误', 'err'); });
+    }
+
     const setBtn = document.getElementById('wpSetBtn');
     if(setBtn && !setBtn._bound){
       setBtn._bound = true;
@@ -3003,9 +3139,11 @@ JS = r"""
         const nameEl = document.getElementById('wpName');
         const xEl = document.getElementById('wpX');
         const yEl = document.getElementById('wpY');
+        const modeEl = document.getElementById('wpMode');
         const name = ((nameEl && nameEl.value) || '').trim();
         const x = Number(xEl && xEl.value);
         const y = Number(yEl && yEl.value);
+        const mode = (modeEl && modeEl.value) || 'attack';
         if(!name){ msg('请先选择单位', 'err'); return; }
         if(!Number.isFinite(x) || !Number.isFinite(y)){
           msg('请输入有效整数坐标', 'err');
@@ -3015,14 +3153,15 @@ JS = r"""
           const res = await fetch('/api/waypoint/set', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({name:name, x:Math.trunc(x), y:Math.trunc(y)})
+            body: JSON.stringify({name:name, x:Math.trunc(x), y:Math.trunc(y), mode:mode})
           });
           const data = await res.json();
           if(!res.ok || !data.ok){
-            msg((data && data.error) || '设置失败', 'err');
+            msg((data && data.error) || '加入失败', 'err');
             return;
           }
-          msg(name + ' → (' + data.pos[0] + ', ' + data.pos[1] + ') 已设置', 'ok');
+          const n = (data.queue && data.queue.length) || 1;
+          msg(name + ' + (' + data.pos[0] + ', ' + data.pos[1] + ') 已加入队列（共 ' + n + ' 个）', 'ok');
           if(xEl) xEl.value = '';
           if(yEl) yEl.value = '';
           lastTick = null;
@@ -3048,28 +3187,40 @@ JS = r"""
       };
     }
 
-    if(panel){
-      panel.querySelectorAll('button[data-wp-remove]').forEach(function(btn){
-        if(btn.dataset.bound === '1') return;
-        btn.dataset.bound = '1';
-        btn.onclick = async function(){
-          const name = btn.dataset.wpRemove;
-          try{
-            const res = await fetch('/api/waypoint/remove', {
-              method:'POST',
-              headers:{'Content-Type':'application/json'},
-              body: JSON.stringify({name:name})
-            });
-            const data = await res.json();
-            if(data.ok){
-              msg(name + ' 已清除', 'ok');
-              lastTick = null;
-              softRefresh();
-            }
-          }catch(e){}
-        };
-      });
-    }
+    // Per-unit mode toggle (攻击 <-> 赶路).
+    panel.querySelectorAll('button[data-wp-mode-toggle]').forEach(function(btn){
+      if(btn.dataset.bound === '1') return;
+      btn.dataset.bound = '1';
+      btn.onclick = function(){
+        const name = btn.dataset.wpModeToggle;
+        const next = (btn.dataset.mode === 'attack') ? 'rush' : 'attack';
+        wpPost('/api/waypoint/mode',
+          {name:name, mode:next},
+          name + ' → ' + (next === 'attack' ? '攻击' : '赶路'));
+      };
+    });
+
+    // Remove one queued target by index.
+    panel.querySelectorAll('button[data-wp-remove]').forEach(function(btn){
+      if(btn.dataset.bound === '1') return;
+      btn.dataset.bound = '1';
+      btn.onclick = function(){
+        const name = btn.dataset.wpRemove;
+        const index = Number(btn.dataset.wpIndex);
+        wpPost('/api/waypoint/remove', {name:name, index:index}, name + ' 目标已删除');
+      };
+    });
+
+    // Clear one unit's whole queue.
+    panel.querySelectorAll('button[data-wp-clear-unit]').forEach(function(btn){
+      if(btn.dataset.bound === '1') return;
+      btn.dataset.bound = '1';
+      btn.onclick = function(){
+        const name = btn.dataset.wpClearUnit;
+        if(!confirm('清空 ' + name + ' 的全部手动目标？')) return;
+        wpPost('/api/waypoint/remove', {name:name}, name + ' 目标已清空');
+      };
+    });
   }
 
   let productionCounts = {workers: null, vanguards: null, rangers: null};
@@ -4659,7 +4810,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
             x = max(-1000, min(1000, x))
             y = max(-1000, min(1000, y))
-            self._send_json(200, set_waypoint(name, x, y))
+            result = set_waypoint(name, x, y, mode=data.get("mode"))
+            self._send_json(200 if result.get("ok") else 400, result)
+            return
+
+        if path == "/api/waypoint/mode":
+            try:
+                name = _waypoint_name(data.get("name"))
+                mode = _wp_mode(data.get("mode"))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            result = set_waypoint_mode(name, mode)
+            self._send_json(200 if result.get("ok") else 400, result)
             return
 
         if path == "/api/waypoint/remove":
@@ -4668,7 +4831,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
                 return
-            result = remove_waypoint(name)
+            index = data.get("index")
+            if index is not None and not isinstance(index, bool):
+                try:
+                    index = int(index)
+                except (TypeError, ValueError):
+                    index = None
+            result = remove_waypoint(name, index=index)
             self._send_json(200 if result.get("ok") else 400, result)
             return
 

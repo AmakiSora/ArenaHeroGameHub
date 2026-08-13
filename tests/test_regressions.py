@@ -4843,6 +4843,14 @@ class ManualWaypointTests(unittest.TestCase):
         def wait(self):
             self.action = "WAIT"
 
+        def sweep(self, direction):
+            self.action = "SWEEP"
+            self.arg = direction
+
+        def shoot(self, target, expected_cell=None):
+            self.action = "SHOOT"
+            self.arg = (target, expected_cell)
+
     class Enemy:
         def __init__(self, position, unit_type="VANGUARD"):
             self.position = position
@@ -4906,12 +4914,25 @@ class ManualWaypointTests(unittest.TestCase):
         self.assertNotIn("W1", remaining)
         self.assertIn("V2", remaining)
 
-    def test_worker_evades_enemy_while_marching(self) -> None:
+    def test_worker_evades_enemy_while_marching_attack_mode(self) -> None:
         unit = self.Unit("w1", (0, 0), UnitType.WORKER)
         enemy = self.Enemy((1, 0))
-        action, detail = self._plan(unit, "W1", (9, 0), enemies=(enemy,))
+        action, detail = self._plan(
+            unit, "W1", {"queue": [(9, 0)], "mode": "attack"}, enemies=(enemy,),
+        )
         self.assertEqual(action, "MOVE")
         self.assertIn("flee", detail)
+
+    def test_rush_mode_worker_ignores_enemy(self) -> None:
+        # 赶路：不管任何东西 —— 工人贴着敌人也直接行军，不回避。
+        unit = self.Unit("w1", (0, 0), UnitType.WORKER)
+        enemy = self.Enemy((1, 0))
+        action, detail = self._plan(
+            unit, "W1", {"queue": [(9, 0)], "mode": "rush"}, enemies=(enemy,),
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("waypoint", detail)
+        self.assertNotIn("flee", detail)
 
     def test_vanguard_marches_without_firing(self) -> None:
         unit = self.Unit("v1", (0, 0), UnitType.VANGUARD)
@@ -4919,6 +4940,16 @@ class ManualWaypointTests(unittest.TestCase):
         action, detail = self._plan(unit, "V1", (4, 4), enemies=(enemy,))
         self.assertEqual(action, "MOVE")
         self.assertIn("waypoint", detail)
+
+    def test_attack_mode_vanguard_engages_enemy(self) -> None:
+        # 攻击：前进道路上遇到敌人即接战 —— 相邻敌直接横扫。
+        unit = self.Unit("v1", (0, 0), UnitType.VANGUARD)
+        enemy = self.Enemy((1, 0))
+        action, detail = self._plan(
+            unit, "V1", {"queue": [(5, 0)], "mode": "attack"}, enemies=(enemy,),
+        )
+        self.assertEqual(action, "SWEEP")
+        self.assertIn("enemy", detail)
 
     def test_blocked_waits_and_keeps_target(self) -> None:
         unit = self.Unit("r1", (0, 0), UnitType.RANGER)
@@ -4940,9 +4971,15 @@ class ManualWaypointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "waypoints.json"
             with patch.object(tactic, "WAYPOINTS_PATH", path):
-                tactic._write_waypoints({"W1": (10, -20), "R3": (-5, 8)})
+                tactic._write_waypoints({
+                    "W1": {"queue": [(10, -20), (1, 1)], "mode": "attack"},
+                    "R3": {"queue": [(-5, 8)], "mode": "rush"},
+                })
                 loaded = tactic._load_waypoints()
-        self.assertEqual(loaded, {"W1": (10, -20), "R3": (-5, 8)})
+        self.assertEqual(loaded, {
+            "W1": {"queue": [(10, -20), (1, 1)], "mode": "attack"},
+            "R3": {"queue": [(-5, 8)], "mode": "rush"},
+        })
 
     def test_reaching_old_target_does_not_delete_concurrent_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4953,7 +4990,7 @@ class ManualWaypointTests(unittest.TestCase):
                 tactic._remove_waypoint("W1", expected_target=(5, 0))
                 remaining = tactic._load_waypoints()
 
-        self.assertEqual(remaining, {"W1": (9, 0)})
+        self.assertEqual(remaining, {"W1": {"queue": [(9, 0)], "mode": "rush"}})
 
     def test_obstacle_target_adjacent_counts_as_arrived(self) -> None:
         # The target cell is a wall — it can never be entered. Standing next to
@@ -5001,10 +5038,67 @@ class ManualWaypointTests(unittest.TestCase):
         unit = self.Unit("w1", (0, 0), UnitType.WORKER)
         enemy = self.Enemy((1, 0))
         tactic._waypoint_stuck["w1"] = (tactic._WAYPOINT_STUCK_THRESHOLD - 1, (9, 0))
-        action, detail = self._plan(unit, "W1", (9, 0), enemies=(enemy,))
+        action, detail = self._plan(
+            unit, "W1", {"queue": [(9, 0)], "mode": "attack"}, enemies=(enemy,),
+        )
         self.assertEqual(action, "MOVE")
         self.assertIn("flee", detail)
         self.assertNotIn("w1", tactic._waypoint_stuck)  # fleeing is not stagnation
+
+    def test_attack_mode_ranger_chases_enemy_not_target(self) -> None:
+        # 攻击：可见敌人优先于目标 —— 游侠朝最近敌人逼进而不是朝目标行军。
+        unit = self.Unit("r1", (0, 0), UnitType.RANGER)
+        enemy = self.Enemy((4, 0))  # Chebyshev 4 > range 3: 不满足开火，走追击
+        action, detail = self._plan(
+            unit, "R1", {"queue": [(9, 9)], "mode": "attack"}, enemies=(enemy,),
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("waypoint-engage", detail)
+
+    def test_queue_advances_to_next_target_after_reaching_first(self) -> None:
+        unit = self.Unit("w1", (5, 0), UnitType.WORKER)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "waypoints.json"
+            with patch.object(tactic, "WAYPOINTS_PATH", path):
+                tactic._write_waypoints({
+                    "W1": {"queue": [(5, 0), (8, 0)], "mode": "rush"},
+                })
+                action, detail = self._plan(
+                    unit, "W1", {"queue": [(5, 0), (8, 0)], "mode": "rush"},
+                )
+                remaining = tactic._load_waypoints()
+        self.assertEqual(action, "WAIT")
+        self.assertIn("waypoint-reached", detail)
+        self.assertEqual(remaining["W1"]["queue"], [(8, 0)])  # 下一目标保留
+        self.assertEqual(remaining["W1"]["mode"], "rush")
+
+    def test_unreachable_target_is_skipped_queue_continues(self) -> None:
+        # 卡死当前目标 → 跳过继续下一目标，而不是清空整条队列。
+        unit = self.Unit("w1", (0, 0), UnitType.WORKER)
+        obstacles = frozenset({(1, 0), (-1, 0), (0, 1), (0, -1)})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "waypoints.json"
+            with patch.object(tactic, "WAYPOINTS_PATH", path):
+                tactic._write_waypoints({
+                    "W1": {"queue": [(9, 0), (2, 0)], "mode": "rush"},
+                })
+                last = None
+                for _ in range(tactic._WAYPOINT_STUCK_THRESHOLD):
+                    last = self._plan(
+                        unit, "W1", {"queue": [(9, 0), (2, 0)], "mode": "rush"},
+                        obstacle_cells=obstacles,
+                    )
+                remaining = tactic._load_waypoints()
+        self.assertIn("waypoint-unreachable", last[1])
+        self.assertEqual(remaining["W1"]["queue"], [(2, 0)])  # 跳到了下一目标
+
+    def test_legacy_waypoint_normalizes_to_rush_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "waypoints.json"
+            with patch.object(tactic, "WAYPOINTS_PATH", path):
+                tactic._write_waypoints({"W1": (5, 0)})
+                loaded = tactic._load_waypoints()
+        self.assertEqual(loaded, {"W1": {"queue": [(5, 0)], "mode": "rush"}})
 
     def test_reachable_waypoint_routes_around_long_wall(self) -> None:
         unit = self.Unit("v1", (0, 0), UnitType.VANGUARD)
@@ -5036,22 +5130,47 @@ class ManualWaypointTests(unittest.TestCase):
 
 
 class DashboardWaypointTests(unittest.TestCase):
-    def test_set_remove_clear_roundtrip(self) -> None:
+    def test_set_append_remove_mode_clear_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             wp_file = Path(temp_dir) / "waypoints.json"
             with patch.object(dashboard, "WAYPOINTS_FILE", str(wp_file)):
                 self.assertTrue(dashboard.set_waypoint("W3", 10, 20)["ok"])
-                self.assertEqual(dashboard.load_waypoints(), {"W3": [10, 20]})
-                self.assertTrue(dashboard.remove_waypoint("W3")["ok"])
+                self.assertEqual(
+                    dashboard.load_waypoints(),
+                    {"W3": {"queue": [[10, 20]], "mode": "attack"}},
+                )
+                # Appending grows the queue; the given mode rides along.
+                self.assertTrue(dashboard.set_waypoint("W3", 11, 21, mode="rush")["ok"])
+                self.assertEqual(dashboard.load_waypoints(), {
+                    "W3": {"queue": [[10, 20], [11, 21]], "mode": "rush"},
+                })
+                # Remove one queued target by index.
+                self.assertTrue(dashboard.remove_waypoint("W3", index=0)["ok"])
+                self.assertEqual(
+                    dashboard.load_waypoints(),
+                    {"W3": {"queue": [[11, 21]], "mode": "rush"}},
+                )
+                # Removing the last target clears the unit entirely.
+                self.assertTrue(dashboard.remove_waypoint("W3", index=0)["ok"])
                 self.assertEqual(dashboard.load_waypoints(), {})
                 self.assertFalse(dashboard.remove_waypoint("W3")["ok"])
+                # Mode switch on an existing queue.
                 self.assertTrue(dashboard.set_waypoint("V2", -5, 8)["ok"])
+                self.assertTrue(dashboard.set_waypoint_mode("V2", "rush")["ok"])
+                self.assertEqual(
+                    dashboard.load_waypoints(),
+                    {"V2": {"queue": [[-5, 8]], "mode": "rush"}},
+                )
                 self.assertTrue(dashboard.clear_waypoints()["ok"])
                 self.assertEqual(dashboard.load_waypoints(), {})
 
     def test_render_waypoints_panel_controls(self) -> None:
         html = dashboard.render_waypoints_panel(
-            {"W3": [10, 20]}, workers=["W3"], vanguards=["V2"], rangers=[],
+            {
+                "W3": {"queue": [[10, 20], [30, 40]], "mode": "attack"},
+                "V2": {"queue": [[5, 5]], "mode": "rush"},
+            },
+            workers=["W3"], vanguards=["V2"], rangers=[],
         )
         self.assertIn('id="waypointPanel"', html)
         self.assertIn('id="wpName"', html)
@@ -5060,13 +5179,19 @@ class DashboardWaypointTests(unittest.TestCase):
         self.assertIn('id="wpX"', html)
         self.assertIn('id="wpY"', html)
         self.assertIn('id="pickWpBtn"', html)
-        # Unit selection is now the default map click — no dedicated button.
-        self.assertNotIn('id="pickWpUnitBtn"', html)
-        self.assertNotIn('wpunit', html)
         self.assertIn('id="wpSetBtn"', html)
         self.assertIn('id="wpClearBtn"', html)
-        self.assertIn("W3 → (10, 20)", html)
-        self.assertIn('data-wp-remove="W3"', html)
+        self.assertIn('id="wpMode"', html)
+        self.assertIn('<option value="attack" selected>攻击</option>', html)
+        # 每个目标一个可删 chip；每个单位一个模式切换 + 清空按钮。
+        self.assertIn('data-wp-remove="W3" data-wp-index="0"', html)
+        self.assertIn('data-wp-remove="W3" data-wp-index="1"', html)
+        self.assertIn('data-wp-mode-toggle="W3" data-mode="attack"', html)
+        self.assertIn('data-wp-mode-toggle="V2" data-mode="rush"', html)
+        self.assertIn('data-wp-clear-unit="W3"', html)
+        self.assertIn("(10, 20)", html)
+        self.assertIn("(30, 40)", html)
+        self.assertIn("赶路", html)
 
     def test_svg_draws_waypoint_marker(self) -> None:
         rec = {
@@ -5077,6 +5202,20 @@ class DashboardWaypointTests(unittest.TestCase):
         memory = {"obstacles": [], "resources": []}
         svg = dashboard.render_svg(rec, memory, waypoints={"W3": [0, 0]})
         self.assertIn("W3→(0,0)", svg)
+
+    def test_svg_draws_each_queued_target_marker(self) -> None:
+        rec = {
+            "core_pos": [0, 0],
+            "workers": [], "vanguards": [], "rangers": [], "enemies": [],
+            "resource_cells": [],
+        }
+        memory = {"obstacles": [], "resources": []}
+        svg = dashboard.render_svg(
+            rec, memory,
+            waypoints={"W3": {"queue": [[0, 0], [0, 1]], "mode": "attack"}},
+        )
+        self.assertIn("W3→(0,0)", svg)
+        self.assertIn("W3→(0,1)", svg)
 
     def test_waypoint_name_rejects_markup_and_renderer_escapes(self) -> None:
         malicious = '\"><img src=x onerror=alert(1)>'

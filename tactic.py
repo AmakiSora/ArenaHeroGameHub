@@ -1412,22 +1412,42 @@ def _plan_waypoint(
     enemies: tuple,
     core_pos: tuple[int, int],
 ) -> tuple[str, str]:
-    """March one unit to a manually set target; resume normal planning on arrival.
+    """March one unit along its manual target queue; resume planning on arrival.
 
-    Dashboard per-unit ⌖ targets are display-name keyed (W3/V2/R1). While under
-    a manual waypoint the unit only walks — no mining / depositing / firing —
-    except workers keep the enemy-evasion rule so a manual trip cannot get them
-    killed. Reaching the target deletes the waypoint; the next Tick the unit
-    falls back to its normal program behavior.
+    Dashboard per-unit targets are display-name keyed (W3/V2/R1). Each unit has
+    an ordered queue of coordinates plus a march mode:
+      - rush   -> pure march to the current target, ignoring everything — no
+                  engagement and no enemy evasion, even for workers.
+      - attack -> engage every visible enemy on the way (vanguard sweeps /
+                  ranger fires / both close on the nearest enemy), then resume
+                  the march. Workers cannot fight, so they keep the evasion
+                  rule so a manual trip cannot get them killed.
 
-    A target that is an obstacle can never be entered; standing in the cell
-    adjacent to it counts as arrival. A target that cannot be reached at all
-    (sealed off / permanently occupied) auto-clears after
-    _WAYPOINT_STUCK_THRESHOLD ticks of no progress, so the unit does not stand
-    or circle there forever.
+    Reaching the current target pops it and advances to the next one; an empty
+    queue removes the unit's entry and the unit falls back to its normal
+    program behavior. A target that is an obstacle counts as reached from the
+    cell adjacent to it. A target that cannot be reached at all (sealed off /
+    permanently occupied) is SKIPPED after _WAYPOINT_STUCK_THRESHOLD ticks of
+    no progress, so a stuck waypoint does not stall the rest of the queue.
     """
     pos = tuple(unit.position)
-    target = (int(waypoint[0]), int(waypoint[1]))
+    if (
+        isinstance(waypoint, (list, tuple))
+        and len(waypoint) == 2
+        and not isinstance(waypoint[0], (list, tuple, dict))
+    ):
+        # Legacy single-target entry {name: [x, y]}: a walk-only rush queue.
+        waypoint = {
+            "queue": [(int(waypoint[0]), int(waypoint[1]))],
+            "mode": "rush",
+        }
+    queue = [(int(x), int(y)) for x, y in waypoint["queue"]]
+    mode = str(waypoint.get("mode") or "attack")
+    if mode not in ("attack", "rush"):
+        mode = "attack"
+    if not queue:
+        return ("WAIT", "waypoint-empty")
+    target = queue[0]
     is_worker = getattr(unit, "unit_type", None) == UnitType.WORKER
     uid = str(unit.id)
 
@@ -1439,7 +1459,7 @@ def _plan_waypoint(
 
     def _finish(detail_prefix: str) -> tuple[str, str]:
         _waypoint_stuck.pop(uid, None)
-        _remove_waypoint(name, expected_target=target)
+        _pop_waypoint_target(name, expected_target=target)
         _record([tuple(pos), target], complete=True)
         return ("WAIT", f"{detail_prefix} {target}")
 
@@ -1453,34 +1473,69 @@ def _plan_waypoint(
     blocked = frozenset(obstacle_cells) | frozenset(occupied)
 
     def _count_stuck() -> bool:
-        """Return True when the unit should give up on this waypoint."""
+        """Return True when the unit should skip the current target."""
         ticks, last_target = _waypoint_stuck.get(uid, (0, target))
         new_ticks = ticks + 1 if last_target == target else 1
         _waypoint_stuck[uid] = (new_ticks, target)
         return new_ticks >= _WAYPOINT_STUCK_THRESHOLD
 
-    # Workers keep the survival rule while marching: never stop next to an
-    # attacking enemy. Fleeing is survival, not stagnation — reset the counter.
-    if is_worker:
-        threat_radius = int(config.get("enemy_threat_radius", 3))
-        combat_enemies = _combat_threats(enemies)
-        if combat_enemies and threat_radius > 0:
-            nearest = min(
-                combat_enemies, key=lambda e: _manhattan(pos, tuple(e.position))
-            )
-            if _manhattan(pos, tuple(nearest.position)) <= threat_radius:
-                _waypoint_stuck.pop(uid, None)
-                flee_blocked = blocked | {tuple(e.position) for e in enemies}
-                return _worker_flee(
+    if mode == "attack":
+        if is_worker:
+            # Workers keep the survival rule while marching: never stop next to
+            # an attacking enemy. Fleeing is survival, not stagnation — reset
+            # the stuck counter. (rush mode deliberately disables this.)
+            threat_radius = int(config.get("enemy_threat_radius", 3))
+            combat_enemies = _combat_threats(enemies)
+            if combat_enemies and threat_radius > 0:
+                nearest = min(
+                    combat_enemies, key=lambda e: _manhattan(pos, tuple(e.position))
+                )
+                if _manhattan(pos, tuple(nearest.position)) <= threat_radius:
+                    _waypoint_stuck.pop(uid, None)
+                    flee_blocked = blocked | {tuple(e.position) for e in enemies}
+                    return _worker_flee(
+                        unit,
+                        uid,
+                        pos,
+                        tuple(nearest.position),
+                        tuple(core_pos),
+                        obstacle_cells,
+                        flee_blocked,
+                        carrying=(getattr(unit, "cargo", 0) > 0),
+                    )
+        else:
+            # 攻击模式：前进道路上遇到的敌人一律接战，打完继续行军。
+            if unit.unit_type == UnitType.VANGUARD:
+                sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
+                if sweep is not None:
+                    _waypoint_stuck.pop(uid, None)
+                    return sweep
+            else:
+                shot = _ranger_best_shot(
                     unit,
-                    uid,
+                    pos,
+                    enemies,
+                    obstacle_cells,
+                    int(config.get("ranger_attack_range", 3)),
+                    lead_fire_enabled=bool(config.get("ranger_lead_fire_enabled", True)),
+                )
+                if shot is not None:
+                    _waypoint_stuck.pop(uid, None)
+                    return shot
+            if enemies:
+                nearest = min(
+                    enemies, key=lambda e: _manhattan(pos, tuple(e.position))
+                )
+                moved = _move_towards(
+                    unit,
                     pos,
                     tuple(nearest.position),
-                    tuple(core_pos),
                     obstacle_cells,
-                    flee_blocked,
-                    carrying=(getattr(unit, "cargo", 0) > 0),
+                    detail_prefix="waypoint-engage",
                 )
+                if moved is not None:
+                    _waypoint_stuck.pop(uid, None)
+                    return moved
 
     # Adjacent but the target cell itself is occupied this tick. Hold instead of
     # wandering beside it; a transient occupant may move away next tick.
@@ -3844,8 +3899,40 @@ def _save_map_memory(
 # writes are read-modify-write on the latest file so one side's change never
 # clobbers the other's (same discipline as map_memory.json).
 
-def _load_waypoints() -> dict[str, tuple[int, int]]:
-    """Read manual per-unit targets as {display_name: (x, y)}."""
+def _normalize_waypoint_entry(raw: object) -> dict | None:
+    """Return a waypoint entry {"queue": [(x,y),...], "mode": str} or None.
+
+    Accepts both the new queue format and the legacy single-target
+    {name: [x, y]} value — a legacy target becomes a one-stop walk-only
+    (rush) queue, matching the pre-queue "just march" behavior.
+    """
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        try:
+            return {"queue": [(int(raw[0]), int(raw[1]))], "mode": "rush"}
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, dict):
+        return None
+    queue_raw = raw.get("queue")
+    queue: list[tuple[int, int]] = []
+    if isinstance(queue_raw, (list, tuple)):
+        for pos in queue_raw:
+            if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                continue
+            try:
+                queue.append((int(pos[0]), int(pos[1])))
+            except (TypeError, ValueError):
+                continue
+    mode = str(raw.get("mode") or "attack")
+    if mode not in ("attack", "rush"):
+        mode = "attack"
+    if not queue:
+        return None
+    return {"queue": queue, "mode": mode}
+
+
+def _load_waypoints() -> dict[str, dict]:
+    """Read manual per-unit target queues as {name: {"queue": [...], "mode": str}}."""
     if not WAYPOINTS_PATH.exists():
         return {}
     try:
@@ -3853,30 +3940,32 @@ def _load_waypoints() -> dict[str, tuple[int, int]]:
     except Exception:
         return {}
     targets = data.get("targets") if isinstance(data, dict) else None
-    out: dict[str, tuple[int, int]] = {}
+    out: dict[str, dict] = {}
     if isinstance(targets, dict):
-        for name, pos in targets.items():
-            if (
-                isinstance(name, str)
-                and isinstance(pos, (list, tuple))
-                and len(pos) == 2
-            ):
-                try:
-                    out[name] = (int(pos[0]), int(pos[1]))
-                except (TypeError, ValueError):
-                    continue
+        for name, raw in targets.items():
+            entry = _normalize_waypoint_entry(raw)
+            if isinstance(name, str) and entry is not None:
+                out[name] = entry
     return out
 
 
-def _write_waypoints_unlocked(targets: dict[str, tuple[int, int]]) -> None:
-    payload = {
+def _write_waypoints_unlocked(targets: dict[str, dict]) -> None:
+    payload: dict[str, object] = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "targets": {name: [int(x), int(y)] for name, (x, y) in targets.items()},
+        "targets": {},
     }
+    for name, raw in targets.items():
+        entry = _normalize_waypoint_entry(raw)
+        if entry is None:
+            continue
+        payload["targets"][name] = {
+            "queue": [[int(x), int(y)] for x, y in entry["queue"]],
+            "mode": entry.get("mode", "attack"),
+        }
     atomic_write_text(WAYPOINTS_PATH, json.dumps(payload, ensure_ascii=False))
 
 
-def _write_waypoints(targets: dict[str, tuple[int, int]]) -> None:
+def _write_waypoints(targets: dict[str, dict]) -> None:
     with file_lock(WAYPOINTS_PATH):
         _write_waypoints_unlocked(targets)
 
@@ -3886,15 +3975,16 @@ def _remove_waypoint(
     *,
     expected_target: tuple[int, int] | None = None,
 ) -> None:
-    """Delete one manual target, preserving any concurrent dashboard writes."""
+    """Delete one unit's whole manual queue, preserving concurrent writes."""
     try:
         with file_lock(WAYPOINTS_PATH):
             targets = _load_waypoints()
-            if (
-                name in targets
-                and (
-                    expected_target is None
-                    or targets[name] == tuple(expected_target)
+            entry = targets.get(name)
+            if entry is not None and (
+                expected_target is None
+                or (
+                    entry["queue"]
+                    and tuple(entry["queue"][0]) == tuple(expected_target)
                 )
             ):
                 del targets[name]
@@ -3905,8 +3995,33 @@ def _remove_waypoint(
         pass
 
 
+def _pop_waypoint_target(name: str, expected_target: tuple[int, int]) -> None:
+    """Advance one unit's queue: drop the head if it still is expected_target.
+
+    Reaching a target pops it and moves on to the next; an empty queue removes
+    the unit's entry entirely. The expected_target guard preserves any
+    concurrent dashboard rewrite of the head.
+    """
+    try:
+        with file_lock(WAYPOINTS_PATH):
+            targets = _load_waypoints()
+            entry = targets.get(name)
+            if (
+                not entry
+                or not entry["queue"]
+                or tuple(entry["queue"][0]) != tuple(expected_target)
+            ):
+                return
+            entry["queue"].pop(0)
+            if not entry["queue"]:
+                del targets[name]
+            _write_waypoints_unlocked(targets)
+    except Exception:
+        pass
+
+
 def _prune_waypoint_targets(
-    targets: dict[str, tuple[int, int]],
+    targets: dict[str, dict],
     alive_names: set[str],
 ) -> bool:
     """Remove waypoints whose unit is gone; return True when anything changed."""
@@ -3922,10 +4037,10 @@ def _prune_waypoint_targets(
 # the changing alive set runs in memory on the cached copy, and is persisted
 # the moment it actually drops something (a unit with a target died).
 _waypoints_sig_cache: dict[str, tuple[int, int] | None] = {}
-_waypoints_cached: dict[str, dict[str, tuple[int, int]]] = {}
+_waypoints_cached: dict[str, dict[str, dict]] = {}
 
 
-def _load_and_prune_waypoints(alive_names: set[str]) -> dict[str, tuple[int, int]]:
+def _load_and_prune_waypoints(alive_names: set[str]) -> dict[str, dict]:
     """Load and prune targets as one transaction with dashboard writers."""
     key = str(WAYPOINTS_PATH)
     sig = _file_signature(WAYPOINTS_PATH)
@@ -5213,8 +5328,9 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                     f"MOVE:{_detour_dir.name} cell-limit-detour"
                 )
                 continue
-        # Manual per-unit waypoint: march to the configured coordinate, then
-        # resume the normal planner once it is reached.
+        # Manual per-unit waypoint queue: march through it in order (attack =
+        # engage enemies on the way, rush = ignore everything), then resume the
+        # normal planner once the queue is exhausted.
         wp = waypoints.get(name)
         if wp is not None:
             action, detail = _plan_waypoint(
