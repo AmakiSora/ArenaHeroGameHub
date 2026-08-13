@@ -2642,6 +2642,16 @@ JS = r"""
     saveView(); // 节流版：滚轮连续缩放不会每帧写
   }
 
+  // Jump the map view so the given world cell sits at the stage centre.
+  // Zoom is preserved — the user's zoom level is theirs to keep.
+  function focusWorld(wx, wy){
+    if(!svg || !view) return;
+    view.worldX = wx;
+    view.worldY = wy;
+    apply();
+    setCoordLabel('已定位 (' + Math.round(wx) + ', ' + Math.round(wy) + ')');
+  }
+
   function bindStage(){
     stage = document.getElementById('mapStage');
     svg = document.getElementById('gameMap');
@@ -3930,6 +3940,20 @@ JS = r"""
     })
     .catch(function(){});
   });
+  // ── click a unit card in the right rail → jump the map to the unit ─────
+  // Cards re-render on every soft refresh, so bind once on the document and
+  // delegate by the focus attributes each card carries.
+  document.addEventListener('click', function(e){
+    const el = e.target;
+    if(!(el instanceof Element)) return;
+    // The 自裁 button lives inside the card; that click must not move the map.
+    if(el.closest('.sd-btn')) return;
+    const card = el.closest('[data-focus-wx][data-focus-wy]');
+    if(!card) return;
+    const wx = Number(card.getAttribute('data-focus-wx'));
+    const wy = Number(card.getAttribute('data-focus-wy'));
+    if(Number.isFinite(wx) && Number.isFinite(wy)) focusWorld(wx, wy);
+  });
   bindTrends();
   loadTeams(true);
   ensureView();
@@ -4027,8 +4051,15 @@ def build_parts():
         safe_name = html.escape(str(name))
         safe_sid = html.escape(str(sid))
         safe_act = html.escape(str(act or "暂无指令"))
+        # The card carries the unit's live world position so a click can jump
+        # the map view to it (see focusWorld in the JS).
+        wpos = w.get("pos") or []
+        focus_attr = (
+            f' data-focus-wx="{int(wpos[0])}" data-focus-wy="{int(wpos[1])}"'
+            if len(wpos) == 2 else ""
+        )
         return (
-            f'<div class="unit {kind}" title="{safe_act}"><div class="unit-top">'
+            f'<div class="unit {kind}" title="{safe_act}"{focus_attr}><div class="unit-top">'
             f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
             f'<span class="unit-actions"><span class="badge {kind}">{html.escape(str(badge))}</span>'
             f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '
@@ -4072,8 +4103,14 @@ def build_parts():
         safe_name = html.escape(str(name))
         safe_sid = html.escape(str(sid))
         safe_act = html.escape(str(act or "暂无指令"))
+        # Same focus attribute as worker cards: click → map jumps to the unit.
+        upos = u.get("pos") or []
+        focus_attr = (
+            f' data-focus-wx="{int(upos[0])}" data-focus-wy="{int(upos[1])}"'
+            if len(upos) == 2 else ""
+        )
         return (
-            f'<div class="unit {color_cls}" title="{safe_act}"><div class="unit-top">'
+            f'<div class="unit {color_cls}" title="{safe_act}"{focus_attr}><div class="unit-top">'
             f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
             f'<span class="unit-actions"><span class="badge {color_cls}">{label}</span>'
             f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '

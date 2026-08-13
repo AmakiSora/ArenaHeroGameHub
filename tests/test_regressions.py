@@ -5428,6 +5428,44 @@ class DashboardSelfDestructTests(unittest.TestCase):
         self.assertIn('class="sd-btn"', parts["vgHtml"])
         self.assertIn('class="sd-btn"', parts["rgHtml"])
 
+    def test_unit_cards_carry_map_focus_coords(self) -> None:
+        """Each right-rail unit card embeds its live world position so a click
+        can jump the map view to the unit (focusWorld)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "tactic_log.jsonl"
+            rec = {
+                "tick": 1,
+                "plan_unit_actions": {},
+                "workers": [{
+                    "id": "aaaaaaaa", "name": "W1", "pos": [3, -2],
+                    "target": [3, -2], "path": [], "path_complete": True,
+                    "cargo": 0, "hp": 3,
+                }],
+                "vanguards": [{"id": "bbbbbbbb", "name": "V1", "pos": [1, 1], "hp": 5}],
+                "rangers": [{"id": "cccccccc", "name": "R1", "pos": [-4, 7], "hp": 5}],
+                "resources": 0,
+                "resource_capacity": 50,
+                "visible_enemies": 0,
+                "resource_cells": [],
+                "core_pos": [0, 0],
+                "core_name": "C1",
+            }
+            log_path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+            game_stats_path = Path(temp_dir) / "game_stats.json"
+            config_path = Path(temp_dir) / "tactic_config.json"
+            with patch.object(dashboard, "LOG_FILE", str(log_path)), \
+                 patch.object(dashboard, "MAP_FILE", str(Path(temp_dir) / "map_memory.json")), \
+                 patch.object(dashboard, "WAYPOINTS_FILE", str(Path(temp_dir) / "waypoints.json")), \
+                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")), \
+                 patch.object(game_stats, "STATS_PATH", game_stats_path), \
+                 patch.object(tactic_config, "CONFIG_PATH", config_path):
+                parts = dashboard.build_parts()
+
+        self.assertIsNotNone(parts)
+        self.assertIn('data-focus-wx="3" data-focus-wy="-2"', parts["workersHtml"])
+        self.assertIn('data-focus-wx="1" data-focus-wy="1"', parts["vgHtml"])
+        self.assertIn('data-focus-wx="-4" data-focus-wy="7"', parts["rgHtml"])
+
 
 class EnemySightingsMemoryTests(unittest.TestCase):
     """Stale enemy sightings are removed only when a friendly unit can
