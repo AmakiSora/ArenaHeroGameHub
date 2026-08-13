@@ -1172,8 +1172,6 @@ def render_waypoints_panel(
         '<input id="wpY" type="number" step="1" min="-1000" max="1000" placeholder="Y" required>'
         '<button type="button" class="pick-btn" id="pickWpBtn" '
         'title="点击地图选择坐标（X 与 Y 一起填入）">⌖</button>'
-        '<button type="button" class="pick-btn" id="pickWpUnitBtn" '
-        'title="点击地图选择单位（代替下拉框）">◉</button>'
         '<button type="button" id="wpSetBtn">设置目标</button>'
         '<button type="button" class="secondary" id="wpClearBtn">清空</button>'
         '</div>'
@@ -1865,7 +1863,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .res-add-form button.ore-pick-btn:hover{background:rgba(110,168,255,.28);border-color:rgba(110,168,255,.6);color:#fff}
 .wp-list{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
 .wp-chip{background:rgba(61,214,201,.10);border-color:rgba(61,214,201,.22);color:#7fe8dd}
-.wp-add{display:grid;grid-template-columns:1fr 56px 56px 28px 28px;gap:8px;align-items:center;margin-top:4px}
+.wp-add{display:grid;grid-template-columns:1fr 56px 56px 28px auto auto;gap:8px;align-items:center;margin-top:4px}
 .wp-add select,.wp-add input{width:100%;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#0b1222;color:var(--text);font:12px Consolas,monospace;outline:none;min-width:0}
 .wp-add select:focus,.wp-add input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
 .wp-add button:not(.pick-btn){border:1px solid rgba(61,214,201,.35);border-radius:999px;padding:7px 11px;background:rgba(61,214,201,.12);color:#bff5ec;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap}
@@ -2167,10 +2165,10 @@ body{background:
 .unit-tab{padding:5px 10px}
 .unit-tab.active{background:rgba(255,107,157,.11);border-color:rgba(255,107,157,.28);color:#ffd0df}
 .waypoint-panel .muted{line-height:1.5}
-.wp-add{grid-template-columns:minmax(0,1fr) 52px 52px 28px 28px;padding:9px;border:1px solid rgba(61,214,201,.12);
+.wp-add{grid-template-columns:minmax(0,1fr) 52px 52px 28px;padding:9px;border:1px solid rgba(61,214,201,.12);
  border-radius:var(--radius-block);background:rgba(7,14,29,.38)}
-.wp-add #wpSetBtn{grid-column:1/4;width:100%}
-.wp-add #wpClearBtn{grid-column:4/6;width:100%}
+.wp-add #wpSetBtn{grid-column:1/3;width:100%}
+.wp-add #wpClearBtn{grid-column:3/5;width:100%}
 .res-head{margin-bottom:12px}
 .res-head .add-ore-btn{width:26px;height:26px;border-radius:8px;background:rgba(255,200,87,.08);
  border-color:rgba(255,200,87,.22);color:#ffe1a1}
@@ -2268,10 +2266,9 @@ JS = r"""
     pickCoreBtn:   'core',
     pickOreBtn:    'ore',
     pickWpBtn:     'wp',
-    pickWpUnitBtn: 'wpunit',
   };
   const PICK_LABELS = {
-    attack: '进攻目标', core: '核心目标', ore: '矿点', wp: '手动目标', wpunit: '单位',
+    attack: '进攻目标', core: '核心目标', ore: '矿点', wp: '手动目标',
   };
 
   function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
@@ -2439,22 +2436,17 @@ JS = r"""
     }, 1800);
   }
 
-  function pickUnitAtPoint(clientX, clientY){
-    // Manual-target unit pick: click a unit marker on the map instead of
-    // scrolling a long dropdown. Only own units carry data-unit.
+  function pickOwnUnitAt(clientX, clientY){
+    // Default map click: if the click lands on an own unit (W/V/R) marker,
+    // select it in the manual-target dropdown — no extra button needed.
+    // Only own units carry data-unit; enemies/core never do.
     const el = document.elementFromPoint(clientX, clientY);
     const hit = el && el.closest ? el.closest('[data-unit]') : null;
-    if(!hit){
-      setCoordLabel('未点到单位：请点击地图上的己方单位（W/V/R）');
-      return;
-    }
+    if(!hit) return false;
     const name = hit.getAttribute('data-unit') || '';
-    if(!name){
-      setCoordLabel('未点到单位：请点击己方单位');
-      return;
-    }
+    if(!name) return false;
     const sel = document.getElementById('wpName');
-    if(!sel) return;
+    if(!sel) return false;
     // The dropdown lists units alive at page render; a just-spawned unit may
     // be missing from it, so fail loudly instead of submitting a phantom name.
     let matched = false;
@@ -2467,18 +2459,22 @@ JS = r"""
     }
     if(!matched){
       setCoordLabel('「' + name + '」不在可选列表，请刷新页面后再试');
-      return;
+      return true;
     }
+    // Enter coordinate pick so the next map click sets the destination.
     setPickMode('wp');
-    setCoordLabel('已选单位 ' + name + '，点击地图选目标坐标（或直接输入后设置），Esc 取消');
+    setCoordLabel('已选 ' + name + '，点击地图选目标坐标，Esc 取消');
     const wpMsg = document.getElementById('wpMsg');
-    if(wpMsg){ wpMsg.textContent = '已选 ' + name + '，再点击地图选择目标坐标'; wpMsg.className = 'wp-msg ok'; }
+    if(wpMsg){ wpMsg.textContent = '已选 ' + name + '，点击地图选择目标坐标'; wpMsg.className = 'wp-msg ok'; }
+    return true;
   }
 
   function handleStageClick(clientX, clientY){
-    if(!pickMode || !svg) return;
-    if(pickMode === 'wpunit'){
-      pickUnitAtPoint(clientX, clientY);
+    if(!svg) return;
+    // Default (no pick mode): clicking an own unit selects it for a manual
+    // target; clicking empty map / enemies / core does nothing.
+    if(!pickMode){
+      pickOwnUnitAt(clientX, clientY);
       return;
     }
     const meta = readSvgMeta(svg);

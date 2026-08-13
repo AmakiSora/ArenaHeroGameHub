@@ -5060,7 +5060,9 @@ class DashboardWaypointTests(unittest.TestCase):
         self.assertIn('id="wpX"', html)
         self.assertIn('id="wpY"', html)
         self.assertIn('id="pickWpBtn"', html)
-        self.assertIn('id="pickWpUnitBtn"', html)
+        # Unit selection is now the default map click — no dedicated button.
+        self.assertNotIn('id="pickWpUnitBtn"', html)
+        self.assertNotIn('wpunit', html)
         self.assertIn('id="wpSetBtn"', html)
         self.assertIn('id="wpClearBtn"', html)
         self.assertIn("W3 → (10, 20)", html)
