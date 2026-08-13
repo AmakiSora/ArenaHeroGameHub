@@ -5823,6 +5823,35 @@ class BattleLogTests(unittest.TestCase):
         # Time is shown first, tick second.
         self.assertLess(html.find(":"), html.index("tick 7"))
 
+    def test_battle_log_limit_controls_rows_rendered(self) -> None:
+        """The server sends only ``limit`` newest rows; larger windows ask for
+        more so "全部" can cover more history than a fixed newest-200."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "battle_log.jsonl"
+            path.write_text(
+                "".join(json.dumps({"tick": i, "cat": "warn", "msg": f"行{i}"}) + "\n"
+                        for i in range(10)),
+                encoding="utf-8",
+            )
+            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
+                html, count = dashboard._battle_log_html(limit=4)
+        self.assertEqual(count, 4)
+        # Newest four rows: ticks 9,8,7,6.
+        self.assertIn("tick 9", html)
+        self.assertIn("tick 6", html)
+        self.assertNotIn("tick 5", html)
+
+    def test_clamp_log_limit_bounds_query(self) -> None:
+        import types
+        req = types.SimpleNamespace(path="/api/state?log=999999")
+        self.assertEqual(dashboard._clamp_log_limit(req), 8000)
+        req2 = types.SimpleNamespace(path="/api/log?limit=50")
+        self.assertEqual(dashboard._clamp_log_limit(req2), 200)
+        req3 = types.SimpleNamespace(path="/api/state?log=abc")
+        self.assertEqual(dashboard._clamp_log_limit(req3), 200)
+        req4 = types.SimpleNamespace(path="/api/state")
+        self.assertEqual(dashboard._clamp_log_limit(req4), 200)
+
 
 class DashboardVisualSystemTests(unittest.TestCase):
     def test_major_panels_share_visual_system_tokens(self) -> None:

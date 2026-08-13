@@ -286,9 +286,14 @@ def append_config_log(updates: dict, *, action: str = "") -> None:
         pass
 
 
-def _battle_log_html() -> tuple[str, int]:
-    """Render the newest battle-log rows for the panel."""
-    entries = read_battle_log(200)
+def _battle_log_html(limit: int = 200) -> tuple[str, int]:
+    """Render the newest battle-log rows for the panel.
+
+    ``limit`` bounds how many rows the server sends; the client asks for more
+    when a larger time window (or 'all') is selected so the "全部" filter can
+    actually cover the full retained log instead of a fixed newest-200.
+    """
+    entries = read_battle_log(limit)
     if not entries:
         return '<div class="muted">暂无日志</div>', 0
     rows = []
@@ -309,6 +314,21 @@ def _battle_log_html() -> tuple[str, int]:
         )
     return "".join(rows), len(entries)
 
+
+
+def _clamp_log_limit(request) -> int:
+    """Parse the ``?log=`` / ``?limit=`` query into a bounded row count.
+
+    The client scales how many battle-log rows it wants by the selected time
+    window; the cap keeps a single poll from serializing the whole file (which
+    can hold tens of thousands of lines before the 2 MB trim kicks in).
+    """
+    try:
+        qs = parse_qs(urlsplit(request.path).query)
+        n = int((qs.get("log") or qs.get("limit") or ["200"])[0])
+    except (TypeError, ValueError):
+        return 200
+    return max(200, min(n, 8000))
 
 
 def _read_map_file() -> dict:
@@ -2843,6 +2863,31 @@ JS = r"""
     }catch(e){}
     return w;
   }
+  // How many rows the server should send for a given window. The window only
+  // filters rows the client already has, so bigger windows need more rows
+  // fetched, otherwise "全部" would still cap at the fixed newest-200.
+  function logLimitFor(w){
+    // Bigger windows need more rows fetched; 'all' pulls as much as the server
+    // will send (bounded by the clamp + the log file's own retention).
+    if(w === 'all') return 3000;
+    if(w >= 21600) return 2000;   // 6h
+    if(w >= 3600) return 1000;    // 1h
+    if(w >= 1800) return 600;     // 30min
+    return 300;
+  }
+  function refreshLogRows(){
+    // Re-fetch the log rows for the currently selected window immediately,
+    // without waiting for the next tick (softRefresh skips same-tick renders).
+    fetch('/api/log?limit=' + logLimitFor(logWindow) + '&ts=' + Date.now(), {cache:'no-store'})
+      .then(function(res){ return res.json(); })
+      .then(function(data){
+        if(data && data.ok && data.html){
+          const list = document.getElementById('logSection');
+          if(list){ list.innerHTML = data.html; applyLogFilters(); }
+        }
+      })
+      .catch(function(){});
+  }
   function persistLogWindow(){
     try{ localStorage.setItem(LOG_WINDOW_KEY, String(logWindow)); }catch(e){}
   }
@@ -2873,6 +2918,7 @@ JS = r"""
         persistLogWindow();
         updateLogTimeButtons();
         applyLogFilters();
+        refreshLogRows();
       });
     }
     const input = document.getElementById('logWindowMinutes');
@@ -2884,6 +2930,7 @@ JS = r"""
         persistLogWindow();
         updateLogTimeButtons();
         applyLogFilters();
+        refreshLogRows();
       }
     }
     if(applyBtn) applyBtn.addEventListener('click', applyCustom);
@@ -2928,7 +2975,7 @@ JS = r"""
     if(document.hidden || drag || refreshing) return;
     refreshing = true;
     try{
-      const res = await fetch('/api/state?ts=' + Date.now(), {cache:'no-store'});
+      const res = await fetch('/api/state?ts=' + Date.now() + '&log=' + logLimitFor(logWindow), {cache:'no-store'});
       if(res.status === 401){ location.href = '/'; return; }
       if(!res.ok) return;
       const data = await res.json();
@@ -3983,7 +4030,7 @@ JS = r"""
 """
 
 
-def build_parts():
+def build_parts(log_limit: int = 200):
     """Build all dashboard fragments + map for page and /api/state."""
     history = read_history(40)
     rec = history[0] if history else None
@@ -4257,7 +4304,7 @@ def build_parts():
         f'<div>更新于 {time.strftime("%H:%M:%S")} · Tick {rec.get("tick")}</div>'
     )
 
-    log_html, log_count = _battle_log_html()
+    log_html, log_count = _battle_log_html(log_limit)
 
 
     left_core = (
@@ -4707,12 +4754,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, generate_html().encode("utf-8"), "text/html; charset=utf-8")
             return
         if path == "/api/state":
-            parts = build_parts()
+            parts = build_parts(log_limit=_clamp_log_limit(self))
             if not parts:
                 body = json.dumps({"tick": None, "error": "no data"}, ensure_ascii=False).encode("utf-8")
             else:
                 body = json.dumps(parts, ensure_ascii=False).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8")
+            return
+        if path == "/api/log":
+            # Standalone battle-log rows for the current time window, so a
+            # window change can fetch more rows immediately without waiting for
+            # the next tick (softRefresh skips re-renders while tick is idle).
+            log_html, log_count = _battle_log_html(_clamp_log_limit(self))
+            self._send_json(200, {"ok": True, "html": log_html, "count": log_count})
             return
         if path == "/api/config":
             self._send_json(200, {"ok": True, "config": load_config(CONFIG_PATH)})
