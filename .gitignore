@@ -3,6 +3,8 @@ tactic_play.log
 tactic_log.jsonl
 tactic_log.jsonl.*
 dashboard.log
+battle_log.jsonl
+battle_log.jsonl.*
 direct_play.log
 direct_debug.json
 diagnose_*.txt
