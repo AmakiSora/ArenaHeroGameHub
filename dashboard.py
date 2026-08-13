@@ -967,7 +967,7 @@ def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) 
             f'<div class="production-target">'
             f'<label for="cfg-{key}">{label}</label>'
             f'<input id="cfg-{key}" name="{key}" type="number" data-kind="integer" '
-            f'min="0" max="19" step="1" value="{target}" required>'
+            f'min="0" max="100" step="1" value="{target}" required>'
             f'<span class="production-current">'
             f'当前 <b id="prodCurrent{suffix}">{current}</b>'
             f' / 需求 <b id="prodTarget{suffix}">{target}</b>'
