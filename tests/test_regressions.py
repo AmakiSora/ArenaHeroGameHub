@@ -1913,6 +1913,51 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(action, "SWEEP")
         self.assertIn("enemy at", detail)
 
+    def test_guerrilla_ignores_worker_escort_around_core(self) -> None:
+        """A CORE with two worker escorts counts as ONE combat threat, so the
+        squad engages the core instead of fleeing from the escort pack."""
+        unit = self.CombatUnit("v-g3", (5, 5))
+        enemies = (
+            SimpleNamespace(position=(4, 5), unit_type="CORE"),
+            SimpleNamespace(position=(6, 5), unit_type="WORKER"),
+            SimpleNamespace(position=(5, 4), unit_type="WORKER"),
+        )
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=enemies,
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="guerrilla",
+        )
+
+        self.assertEqual(action, "SWEEP")
+        self.assertIn("enemy at", detail)
+
+    def test_guerrilla_still_retreats_from_three_threats_plus_worker(self) -> None:
+        """Workers are excluded from the count, but 3 real combat threats
+        (with a worker alongside) still trigger the pack retreat."""
+        unit = self.CombatUnit("v-g4", (5, 5))
+        enemies = (
+            SimpleNamespace(position=(6, 5), unit_type="VANGUARD"),
+            SimpleNamespace(position=(5, 6), unit_type="VANGUARD"),
+            SimpleNamespace(position=(6, 6), unit_type="VANGUARD"),
+            SimpleNamespace(position=(4, 5), unit_type="WORKER"),
+        )
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=enemies,
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="guerrilla",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("guerrilla-retreat", detail)
+
 
 class SummaryTests(unittest.TestCase):
     def test_summary_reads_jsonl_tick_records(self) -> None:
@@ -1974,6 +2019,28 @@ class DashboardLogTests(unittest.TestCase):
         self.assertIn('class="worker-route-target"', svg)
         for name in ("C1", "W1", "V1", "R1", "E1"):
             self.assertIn(f">{name}</text>", svg)
+
+    def test_svg_unit_markers_carry_data_unit_only_for_own_units(self) -> None:
+        """Manual-target map-pick needs the clicked marker to identify its unit.
+        Own units (W/V/R) carry data-unit; enemies and the core must not, so a
+        stray click on them cannot pick a phantom manual-target name."""
+        rec = {
+            "core_pos": [0, 0],
+            "core_name": "C1",
+            "workers": [{"name": "W1", "pos": [0, 1]}],
+            "vanguards": [{"name": "V2", "pos": [1, 2]}],
+            "rangers": [{"name": "R3", "pos": [2, 2]}],
+            "enemies": [{"name": "E9", "pos": [3, 3]}],
+            "resource_cells": [],
+        }
+        memory = {"obstacles": [], "resources": []}
+
+        svg = dashboard.render_svg(rec, memory)
+
+        for name in ("W1", "V2", "R3"):
+            self.assertIn(f'data-unit="{name}"', svg)
+        self.assertNotIn('data-unit="E9"', svg)
+        self.assertNotIn('data-unit="C1"', svg)
 
     def test_svg_route_is_trimmed_to_unwalked_remainder(self) -> None:
         """Routes only draw the segment ahead of the unit, not the ground it
@@ -4953,6 +5020,7 @@ class DashboardWaypointTests(unittest.TestCase):
         self.assertIn('id="wpX"', html)
         self.assertIn('id="wpY"', html)
         self.assertIn('id="pickWpBtn"', html)
+        self.assertIn('id="pickWpUnitBtn"', html)
         self.assertIn('id="wpSetBtn"', html)
         self.assertIn('id="wpClearBtn"', html)
         self.assertIn("W3 → (10, 20)", html)

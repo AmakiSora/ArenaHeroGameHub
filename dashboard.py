@@ -1172,6 +1172,8 @@ def render_waypoints_panel(
         '<input id="wpY" type="number" step="1" min="-1000" max="1000" placeholder="Y" required>'
         '<button type="button" class="pick-btn" id="pickWpBtn" '
         'title="点击地图选择坐标（X 与 Y 一起填入）">⌖</button>'
+        '<button type="button" class="pick-btn" id="pickWpUnitBtn" '
+        'title="点击地图选择单位（代替下拉框）">◉</button>'
         '<button type="button" id="wpSetBtn">设置目标</button>'
         '<button type="button" class="secondary" id="wpClearBtn">清空</button>'
         '</div>'
@@ -1463,31 +1465,35 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
     for index, r in enumerate(rec.get("rangers", []) or []):
         _draw_route(r, r.get("name") or f"R{index + 1}", "#6ea8ff", "ranger-route")
 
-    def unit(pos, color, label, glow=False, ring=None, cat="unit"):
+    def unit(pos, color, label, glow=False, ring=None, cat="unit", unit_name=None):
         if not pos or len(pos) != 2: return
         px, py = int(pos[0]), int(pos[1])
         if not (xmin <= px <= xmax and ymin <= py <= ymax): return
         x, y = to_xy(px, py)
         ux, uy = x + cell / 2, y + cell / 2
-        if glow: a(f'<circle data-cat="{cat}" cx="{ux}" cy="{uy}" r="11" fill="{color}" opacity="0.18"/>')
-        if ring: a(f'<circle data-cat="{cat}" cx="{ux}" cy="{uy}" r="8.5" fill="none" stroke="{ring}" stroke-width="2"/>')
+        # data-unit lets the waypoint panel pick a unit by clicking its marker.
+        du = f' data-unit="{html.escape(str(unit_name), quote=True)}"' if unit_name else ""
+        if glow: a(f'<circle data-cat="{cat}"{du} cx="{ux}" cy="{uy}" r="11" fill="{color}" opacity="0.18"/>')
+        if ring: a(f'<circle data-cat="{cat}"{du} cx="{ux}" cy="{uy}" r="8.5" fill="none" stroke="{ring}" stroke-width="2"/>')
         unit_radius = 7.5 if len(str(label)) > 2 else 7
         font_size = 6 if len(str(label)) > 2 else 7
-        a(f'<circle data-cat="{cat}" cx="{ux}" cy="{uy}" r="{unit_radius}" fill="{color}" filter="url(#glow)" '
+        a(f'<circle data-cat="{cat}"{du} cx="{ux}" cy="{uy}" r="{unit_radius}" fill="{color}" filter="url(#glow)" '
           f'stroke="rgba(255,255,255,0.65)" stroke-width="1.2"/>')
         # Enemy labels are opponent-controlled: escape before embedding as text.
-        a(f'<text data-cat="{cat}" x="{ux}" y="{uy+2.5}" text-anchor="middle" font-size="{font_size}" '
+        a(f'<text data-cat="{cat}"{du} x="{ux}" y="{uy+2.5}" text-anchor="middle" font-size="{font_size}" '
           f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#0b1020">'
           f'{html.escape(str(label))}</text>')
 
     for index, w in enumerate(rec.get("workers", [])):
         c = bool(w.get("cargo"))
         name = w.get("name") or f"W{index + 1}"
-        unit(w.get("pos"), "#57d6a3" if c else "#8aa4ff", name, glow=c, ring="#9ef0c8" if c else None, cat="worker")
+        unit(w.get("pos"), "#57d6a3" if c else "#8aa4ff", name, glow=c, ring="#9ef0c8" if c else None, cat="worker", unit_name=name)
     for index, v in enumerate(rec.get("vanguards", [])):
-        unit(v.get("pos"), "#ff8c42", v.get("name") or f"V{index + 1}", glow=True, cat="vanguard")
+        name = v.get("name") or f"V{index + 1}"
+        unit(v.get("pos"), "#ff8c42", name, glow=True, cat="vanguard", unit_name=name)
     for index, r in enumerate(rec.get("rangers", [])):
-        unit(r.get("pos"), "#b38cff", r.get("name") or f"R{index + 1}", glow=True, cat="ranger")
+        name = r.get("name") or f"R{index + 1}"
+        unit(r.get("pos"), "#b38cff", name, glow=True, cat="ranger", unit_name=name)
     # Visible enemies are filtered per type (WORKER / VANGUARD / RANGER / CORE)
     # so the legend can show/hide each class independently.  Enemies without a
     # typed unit_type land in the generic ENEMY category.  Several enemies can
@@ -1859,7 +1865,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .res-add-form button.ore-pick-btn:hover{background:rgba(110,168,255,.28);border-color:rgba(110,168,255,.6);color:#fff}
 .wp-list{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
 .wp-chip{background:rgba(61,214,201,.10);border-color:rgba(61,214,201,.22);color:#7fe8dd}
-.wp-add{display:grid;grid-template-columns:1fr 56px 56px 28px auto auto;gap:8px;align-items:center;margin-top:4px}
+.wp-add{display:grid;grid-template-columns:1fr 56px 56px 28px 28px;gap:8px;align-items:center;margin-top:4px}
 .wp-add select,.wp-add input{width:100%;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#0b1222;color:var(--text);font:12px Consolas,monospace;outline:none;min-width:0}
 .wp-add select:focus,.wp-add input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
 .wp-add button:not(.pick-btn){border:1px solid rgba(61,214,201,.35);border-radius:999px;padding:7px 11px;background:rgba(61,214,201,.12);color:#bff5ec;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap}
@@ -2161,10 +2167,10 @@ body{background:
 .unit-tab{padding:5px 10px}
 .unit-tab.active{background:rgba(255,107,157,.11);border-color:rgba(255,107,157,.28);color:#ffd0df}
 .waypoint-panel .muted{line-height:1.5}
-.wp-add{grid-template-columns:minmax(0,1fr) 52px 52px 28px;padding:9px;border:1px solid rgba(61,214,201,.12);
+.wp-add{grid-template-columns:minmax(0,1fr) 52px 52px 28px 28px;padding:9px;border:1px solid rgba(61,214,201,.12);
  border-radius:var(--radius-block);background:rgba(7,14,29,.38)}
-.wp-add #wpSetBtn{grid-column:1/3;width:100%}
-.wp-add #wpClearBtn{grid-column:3/5;width:100%}
+.wp-add #wpSetBtn{grid-column:1/4;width:100%}
+.wp-add #wpClearBtn{grid-column:4/6;width:100%}
 .res-head{margin-bottom:12px}
 .res-head .add-ore-btn{width:26px;height:26px;border-radius:8px;background:rgba(255,200,87,.08);
  border-color:rgba(255,200,87,.22);color:#ffe1a1}
@@ -2262,9 +2268,10 @@ JS = r"""
     pickCoreBtn:   'core',
     pickOreBtn:    'ore',
     pickWpBtn:     'wp',
+    pickWpUnitBtn: 'wpunit',
   };
   const PICK_LABELS = {
-    attack: '进攻目标', core: '核心目标', ore: '矿点', wp: '手动目标',
+    attack: '进攻目标', core: '核心目标', ore: '矿点', wp: '手动目标', wpunit: '单位',
   };
 
   function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
@@ -2432,8 +2439,48 @@ JS = r"""
     }, 1800);
   }
 
+  function pickUnitAtPoint(clientX, clientY){
+    // Manual-target unit pick: click a unit marker on the map instead of
+    // scrolling a long dropdown. Only own units carry data-unit.
+    const el = document.elementFromPoint(clientX, clientY);
+    const hit = el && el.closest ? el.closest('[data-unit]') : null;
+    if(!hit){
+      setCoordLabel('未点到单位：请点击地图上的己方单位（W/V/R）');
+      return;
+    }
+    const name = hit.getAttribute('data-unit') || '';
+    if(!name){
+      setCoordLabel('未点到单位：请点击己方单位');
+      return;
+    }
+    const sel = document.getElementById('wpName');
+    if(!sel) return;
+    // The dropdown lists units alive at page render; a just-spawned unit may
+    // be missing from it, so fail loudly instead of submitting a phantom name.
+    let matched = false;
+    for(let i = 0; i < sel.options.length; i++){
+      if(sel.options[i].value === name){
+        sel.selectedIndex = i;
+        matched = true;
+        break;
+      }
+    }
+    if(!matched){
+      setCoordLabel('「' + name + '」不在可选列表，请刷新页面后再试');
+      return;
+    }
+    setPickMode('wp');
+    setCoordLabel('已选单位 ' + name + '，点击地图选目标坐标（或直接输入后设置），Esc 取消');
+    const wpMsg = document.getElementById('wpMsg');
+    if(wpMsg){ wpMsg.textContent = '已选 ' + name + '，再点击地图选择目标坐标'; wpMsg.className = 'wp-msg ok'; }
+  }
+
   function handleStageClick(clientX, clientY){
     if(!pickMode || !svg) return;
+    if(pickMode === 'wpunit'){
+      pickUnitAtPoint(clientX, clientY);
+      return;
+    }
     const meta = readSvgMeta(svg);
     const p = pixelToSvgLocal(clientX, clientY);
     if(p[0] < 0 || p[1] < 0 || p[0] > meta.width || p[1] > meta.height){
