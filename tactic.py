@@ -2297,6 +2297,9 @@ _EIGHT_WAY_DELTAS: tuple[tuple[int, int], ...] = (
     (-1, -1),  # NW
 )
 _EIGHT_WAY_LABELS: tuple[str, ...] = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+# Vision radius per guerrilla unit type (game rules; same values the
+# stale-sighting removal uses): Vanguard 4 / Ranger 5.
+_GUERRILLA_SIGHT: dict[str, int] = {"vanguard": 4, "ranger": 5}
 
 
 def _parse_team_names(raw: Any) -> set[str]:
@@ -3299,6 +3302,18 @@ def _plan_guerrilla_combat(
     # is never chased (or shot/swept) instead of the CORE it guards. Unknown
     # stubs stay counted, so missing type data fails safe toward retreating.
     enemies = _combat_threats(enemies)
+    # Local awareness per unit: react only to threats THIS unit can see (its
+    # own vision radius), not the whole team's shared view. turn.visible_enemies
+    # is the union of every teammate's sight, so a CORE one teammate spots would
+    # otherwise drag the entire squad off its bearings and onto the same target.
+    # guerrilla_engage_radius overrides the sight; 0 falls back to the unit's
+    # own vision (Vanguard 4 / Ranger 5, matching the stale-sighting removal).
+    sight = int(config.get("guerrilla_engage_radius", 0) or 0)
+    if sight <= 0:
+        sight = _GUERRILLA_SIGHT.get(unit_kind, 4)
+    enemies = tuple(
+        e for e in enemies if _manhattan(pos, tuple(e.position)) <= sight
+    )
     enemy_count = len(enemies)
 
     if enemy_count >= 3:
@@ -3346,7 +3361,9 @@ def _plan_guerrilla_combat(
             )
             if shot is not None:
                 return shot
-        nearest = enemies[0]
+        nearest = min(
+            enemies, key=lambda e: _manhattan(pos, tuple(e.position)),
+        )
         moved = _move_towards(
             unit,
             pos,

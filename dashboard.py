@@ -861,6 +861,7 @@ TEAM_SETTING_FIELDS = (
     "ranger_attack_range",
     "attack_retreat_radius",
     "attack_auto_radius",
+    "guerrilla_engage_radius",
 )
 STRATEGY_CONFIG_FIELDS = tuple(
     key
@@ -1136,6 +1137,10 @@ def render_teams_panel() -> str:
         f'<input id="teamRetreatRadius" name="attack_retreat_radius" type="number" min="0" max="30" '
         f'step="1" value="{config["attack_retreat_radius"]}"'
         ' title="仅进攻队 + 自动进攻生效：以进攻队重心为中心，半径内敌方战斗单位数 ≥ 本队则全队撤离敌群质心方向并另寻目标（0=关闭）。守家队 / 游击队不受此配置影响"></label>'
+        '<label>游击队感知半径(0=按视野)'
+        f'<input id="teamGuerrillaSight" name="guerrilla_engage_radius" type="number" min="0" max="30" '
+        f'step="1" value="{config["guerrilla_engage_radius"]}"'
+        ' title="每个游击队员只对本单位自己视野内的敌人反应（先锋4格/游侠5格，0=按单位自身视野）。队友看到的远处核心不会把全队拉过去，各打各的"></label>'
         '<label>自动进攻半径(0=不限)'
         f'<input id="teamAutoRadius" name="attack_auto_radius" type="number" min="0" max="1000" '
         f'step="1" value="{config["attack_auto_radius"]}"'

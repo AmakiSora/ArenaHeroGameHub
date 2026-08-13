@@ -1998,8 +1998,64 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(action, "MOVE")
         self.assertIn("guerrilla-retreat", detail)
 
+    def test_guerrilla_ignores_core_spotted_by_other_teammate(self) -> None:
+        """A CORE inside a teammate's vision but far outside this unit's own
+        sight must not drag this unit off its bearing — it keeps roaming."""
+        unit = self.CombatUnit("v-g-far", (0, 0))
+        enemies = (SimpleNamespace(position=(10, 0), unit_type="CORE"),)
 
-class SummaryTests(unittest.TestCase):
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=enemies,
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="guerrilla",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("guerrilla-roam", detail)
+
+    def test_guerrilla_far_pack_does_not_trigger_retreat(self) -> None:
+        """3 threats all beyond this unit's own sight do not count as a pack
+        for this unit — the retreat threshold is local, not team-wide."""
+        unit = self.CombatUnit("v-g-far2", (0, 0))
+        enemies = (
+            SimpleNamespace(position=(10, 0), unit_type="VANGUARD"),
+            SimpleNamespace(position=(10, 1), unit_type="VANGUARD"),
+            SimpleNamespace(position=(10, -1), unit_type="VANGUARD"),
+        )
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=enemies,
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="guerrilla",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("guerrilla-roam", detail)
+
+    def test_guerrilla_engage_radius_extends_sight(self) -> None:
+        """guerrilla_engage_radius lifts the per-unit sight cap, so a CORE a
+        little farther than the Vanguard's own vision still gets chased."""
+        self.config["guerrilla_engage_radius"] = 10
+        unit = self.CombatUnit("v-g-rad", (0, 0))
+        enemies = (SimpleNamespace(position=(6, 0), unit_type="CORE"),)
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=enemies,
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="guerrilla",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("guerrilla-engage", detail)
     def test_summary_reads_jsonl_tick_records(self) -> None:
         records = [
             {"_meta": "test"},
