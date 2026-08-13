@@ -1132,10 +1132,10 @@ def render_teams_panel() -> str:
             for n in (1, 2, 3)
         )
         + '</select></label>'
-        '<label>遇敌撤退半径'
+        '<label>进攻队遇敌撤退半径(仅自动)'
         f'<input id="teamRetreatRadius" name="attack_retreat_radius" type="number" min="0" max="30" '
         f'step="1" value="{config["attack_retreat_radius"]}"'
-        ' title="自动进攻时，进攻半径内敌方战斗单位数≥本队则撤退另寻目标（0=关闭）"></label>'
+        ' title="仅进攻队 + 自动进攻生效：以进攻队重心为中心，半径内敌方战斗单位数 ≥ 本队则全队撤离敌群质心方向并另寻目标（0=关闭）。守家队 / 游击队不受此配置影响"></label>'
         '<label>自动进攻半径(0=不限)'
         f'<input id="teamAutoRadius" name="attack_auto_radius" type="number" min="0" max="1000" '
         f'step="1" value="{config["attack_auto_radius"]}"'

@@ -110,7 +110,7 @@ CONFIG_FIELDS = (
     ConfigField("ranger_attack_range", "游侠开火距离", "combat", "integer", 3, 1, 3, 1),
     ConfigField(
         "attack_retreat_radius",
-        "进攻队遇敌撤退半径",
+        "进攻队遇敌撤退半径(仅进攻队·自动)",
         "combat",
         "integer",
         5,
