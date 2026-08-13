@@ -1357,11 +1357,17 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
             _, py = to_xy(xmin, y)
             a(f'<line x1="{pad}" y1="{py}" x2="{pad+cols*cell}" y2="{py}" stroke="rgba(110,168,255,0.08)"/>')
 
-    # obstacles
+    # obstacles — one <path> carrying every wall cell as a subpath. A full map
+    # can hold thousands of wall cells; a <rect> per cell turned into thousands
+    # of DOM nodes that the browser had to keep and re-layout on every pan.
+    wall_d = []
     for ox, oy in obs:
         if not (xmin <= ox <= xmax and ymin <= oy <= ymax): continue
         x, y = to_xy(ox, oy)
-        a(f'<rect data-cat="wall" x="{x+1.2}" y="{y+1.2}" width="{cell-2.4}" height="{cell-2.4}" rx="3.5" '
+        # Fits one cell with the same inset the old rects used (1.2px each side).
+        wall_d.append(f"M{x + 1.2},{y + 1.2}h{cell - 2.4}v{cell - 2.4}h-{cell - 2.4}z")
+    if wall_d:
+        a(f'<path data-cat="wall" d="{" ".join(wall_d)}" '
           f'fill="#3a455f" stroke="#7f8eab" stroke-width="1"/>')
 
     # remembered resources
@@ -1719,6 +1725,27 @@ body{margin:0;min-height:100vh;color:var(--text);
 .map-legend button.map-filter-reset{font:inherit;font-size:11px;color:var(--muted);padding:4px 10px;border-radius:999px;
  background:transparent;border:1px dashed rgba(255,255,255,.16);cursor:pointer;transition:.12s}
 .map-legend button.map-filter-reset:hover{color:#eef3ff;border-color:rgba(255,255,255,.35)}
+/* Category filters: the SVG carries a hide-<cat> class; CSS hides that whole
+   category in one pass instead of the client walking every [data-cat] node. */
+.game-map.hide-core [data-cat="core"],
+.game-map.hide-worker [data-cat="worker"],
+.game-map.hide-vanguard [data-cat="vanguard"],
+.game-map.hide-ranger [data-cat="ranger"],
+.game-map.hide-enemy-worker [data-cat="enemy-worker"],
+.game-map.hide-enemy-vanguard [data-cat="enemy-vanguard"],
+.game-map.hide-enemy-ranger [data-cat="enemy-ranger"],
+.game-map.hide-enemy-core [data-cat="enemy-core"],
+.game-map.hide-enemy [data-cat="enemy"],
+.game-map.hide-enemy-trace [data-cat="enemy-trace"],
+.game-map.hide-wall [data-cat="wall"],
+.game-map.hide-ore [data-cat="ore"],
+.game-map.hide-ore-mem [data-cat="ore-mem"],
+.game-map.hide-route [data-cat="route"],
+.game-map.hide-target [data-cat="target"],
+.game-map.hide-beacon [data-cat="beacon"],
+.game-map.hide-attack-target [data-cat="attack-target"],
+.game-map.hide-core-target [data-cat="core-target"],
+.game-map.hide-wp [data-cat="wp"]{display:none}
 .map-legend .dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 8px currentColor}
 .map-legend .dot.core{background:#6ea8ff;color:#6ea8ff;border-radius:2px}
 .map-legend .dot.worker{background:#8aa4ff;color:#8aa4ff}
@@ -2173,6 +2200,7 @@ JS = r"""
   let view = null;
   let drag = false, lx = 0, ly = 0;
   let lastTick = null;
+  let lastMapSvg = null;
   let refreshing = false;
   let configDirty = false;
   let teamsDirty = false;
@@ -2273,7 +2301,16 @@ JS = r"""
   function loadView(){
     try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch(e){ return null; }
   }
-  function saveView(){
+  let viewSaveTimer = null;
+  function saveView(force){
+    // Pan fires apply() on every pointermove; writing localStorage per frame
+    // is synchronous I/O that stalls the render loop. Throttle to at most one
+    // write per 500ms, and force a final write when the gesture ends.
+    if(force && viewSaveTimer){ clearTimeout(viewSaveTimer); viewSaveTimer = null; }
+    if(viewSaveTimer) return;
+    if(!force){
+      viewSaveTimer = setTimeout(function(){ viewSaveTimer = null; }, 500);
+    }
     try {
       localStorage.setItem(KEY, JSON.stringify({
         scale: view.scale, worldX: view.worldX, worldY: view.worldY
@@ -2436,6 +2473,7 @@ JS = r"""
     view.worldX += before[0] - after[0];
     view.worldY += before[1] - after[1];
     apply();
+    saveView(); // 节流版：滚轮连续缩放不会每帧写
   }
 
   function bindStage(){
@@ -2468,6 +2506,7 @@ JS = r"""
       drag = false;
       if(svg) svg.classList.remove('dragging');
       try { stage.releasePointerCapture(e.pointerId); } catch(err){}
+      saveView(true); // 手势结束，落盘一次视图
       if(!moved) handleStageClick(e.clientX, e.clientY);
     };
     stage.onpointercancel = function(e){
@@ -2475,6 +2514,7 @@ JS = r"""
       drag = false;
       if(svg) svg.classList.remove('dragging');
       try { stage.releasePointerCapture(e.pointerId); } catch(err){}
+      saveView(true);
     };
     stage.onpointerleave = function(){
       if(!drag) resetCoordReadout();
@@ -2532,12 +2572,11 @@ JS = r"""
   function applyMapFilters(){
     if(!svg) return;
     mapFilters = mapFilters || loadMapFilters();
-    const els = svg.querySelectorAll('[data-cat]');
-    for(let i = 0; i < els.length; i++){
-      const el = els[i];
-      const cat = el.getAttribute('data-cat');
-      el.style.display = mapFilters[cat] === false ? 'none' : '';
-    }
+    // Toggle one class per hidden category; CSS rules do the actual hiding so
+    // this never walks the SVG node list (thousands of wall cells etc).
+    MAP_CATS.forEach(function(cat){
+      svg.classList.toggle('hide-' + cat, mapFilters[cat] === false);
+    });
     const btns = document.querySelectorAll('.map-filter[data-cat]');
     for(let i = 0; i < btns.length; i++){
       const cat = btns[i].getAttribute('data-cat');
@@ -2749,10 +2788,11 @@ JS = r"""
         renderTeamBoard();
       }
 
-      if(data.mapSvg){
+      if(data.mapSvg && data.mapSvg !== lastMapSvg){
         const stageEl = document.getElementById('mapStage');
         if(stageEl){
           stageEl.innerHTML = data.mapSvg;
+          lastMapSvg = data.mapSvg;
           svg = document.getElementById('gameMap');
           if(svg){
             svg.addEventListener('dragstart', function(e){ e.preventDefault(); });
