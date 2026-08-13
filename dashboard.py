@@ -1239,7 +1239,7 @@ def render_waypoints_panel(
             mode_label = "攻击" if mode == "attack" else "赶路"
             safe_name = html.escape(str(name), quote=True)
             chips = "".join(
-                f'<span class="chip wp-target" title="第{idx + 1}个">'
+                f'<span class="chip removable wp-target" title="第{idx + 1}个">'
                 f'{html.escape(f"({x}, {y})")}'
                 f'<button type="button" class="chip-x" '
                 f'data-wp-remove="{safe_name}" data-wp-index="{idx}" '
@@ -1966,14 +1966,19 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-settings .coord-input input{flex:1;min-width:0;width:auto}
 .res-add-form button.ore-pick-btn{grid-column:1/-1;justify-self:start;width:auto;height:28px;padding:0 12px;font-size:11px;font-family:inherit;display:inline-flex;align-items:center;gap:4px;background:rgba(110,168,255,.10);border-color:rgba(110,168,255,.35);color:#a9c8ff}
 .res-add-form button.ore-pick-btn:hover{background:rgba(110,168,255,.28);border-color:rgba(110,168,255,.6);color:#fff}
-.wp-list{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+.wp-list{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
 .wp-chip{background:rgba(61,214,201,.10);border-color:rgba(61,214,201,.22);color:#7fe8dd}
-.wp-add{display:grid;grid-template-columns:1fr 56px 56px 28px auto auto;gap:8px;align-items:center;margin-top:4px}
+.wp-add{display:grid;grid-template-columns:minmax(0,1fr) 52px 52px 28px auto auto;gap:8px;align-items:center;
+ padding:9px;border:1px solid rgba(61,214,201,.12);border-radius:var(--radius-block);background:rgba(7,14,29,.38)}
 .wp-add select,.wp-add input{width:100%;padding:7px 9px;border:1px solid rgba(255,255,255,.12);border-radius:8px;background:#0b1222;color:var(--text);font:12px Consolas,monospace;outline:none;min-width:0}
 .wp-add select:focus,.wp-add input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
 .wp-add button:not(.pick-btn){border:1px solid rgba(61,214,201,.35);border-radius:999px;padding:7px 11px;background:rgba(61,214,201,.12);color:#bff5ec;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap}
 .wp-add button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}
 .wp-add button:not(.pick-btn):hover{border-color:rgba(61,214,201,.6);color:#fff}
+.wp-add #wpMode{grid-column:1/3}
+.wp-add #wpSetBtn{grid-column:3/5;background:linear-gradient(180deg,#326da8,#285b8f);
+ border-color:rgba(110,168,255,.42);color:#fff}
+.wp-add #wpClearBtn{grid-column:5/7}
 .wp-msg{min-height:15px;margin-top:8px;color:var(--muted);font-size:11px}
 .wp-msg.ok{color:#8ef0c4}
 .teams-panel{margin-top:0;overflow:hidden}
@@ -2270,21 +2275,17 @@ body{background:
 .unit-tab{padding:5px 10px}
 .unit-tab.active{background:rgba(255,107,157,.11);border-color:rgba(255,107,157,.28);color:#ffd0df}
 .waypoint-panel .muted{line-height:1.5}
-.wp-add{grid-template-columns:minmax(0,1fr) 52px 52px 28px;padding:9px;border:1px solid rgba(61,214,201,.12);
- border-radius:var(--radius-block);background:rgba(7,14,29,.38)}
-.wp-add #wpMode{grid-column:1/3;width:100%}
-.wp-add #wpSetBtn{grid-column:3/4;width:100%}
-.wp-add #wpClearBtn{grid-column:4/5;width:100%}
 .wp-entry{border:1px solid rgba(61,214,201,.14);border-radius:10px;background:rgba(7,14,29,.30);
- padding:6px 8px;margin-bottom:6px}
+ padding:6px 8px}
 .wp-entry-head{display:flex;align-items:center;gap:6px;margin-bottom:4px}
 .wp-unit-name{font-weight:700;color:#bff5ec;font-size:11px}
 .wp-mode-btn{appearance:none;border:1px solid rgba(61,214,201,.35);border-radius:999px;
  background:rgba(61,214,201,.12);color:#bff5ec;font-size:10px;padding:2px 8px;cursor:pointer;line-height:1.4}
 .wp-mode-btn:hover{border-color:rgba(61,214,201,.6);color:#fff}
-.wp-entry-head .chip-x{margin-left:auto}
+.wp-entry-head .chip-x{margin-left:auto;opacity:1;width:16px;height:16px;font-size:11px}
 .wp-targets{display:flex;flex-wrap:wrap;gap:4px}
-.wp-target.chip{font-size:10px}
+.wp-target.chip{padding:3px 8px;font-size:10px;color:#7fe8dd;background:rgba(61,214,201,.10);
+ border-color:rgba(61,214,201,.22)}
 .wp-target.chip .chip-x{width:14px;height:14px;font-size:11px;line-height:1}
 .res-head{margin-bottom:12px}
 .res-head .add-ore-btn{width:26px;height:26px;border-radius:8px;background:rgba(255,200,87,.08);
