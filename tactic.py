@@ -3237,6 +3237,13 @@ def _plan_guerrilla_combat(
 ) -> tuple[str, str]:
     """Fan out on 8 bearings; pick off singles, retreat from packs."""
     pos = tuple(unit.position)
+    # Retreat/engage thresholds count combat threats only: enemy workers (and
+    # the escorts routinely standing on their CORE's cell) must not push the
+    # squad into a retreat or a solo-chase. Filtering once also keeps the pack
+    # centroid and the single-target chase on threats alone, so a worker escort
+    # is never chased (or shot/swept) instead of the CORE it guards. Unknown
+    # stubs stay counted, so missing type data fails safe toward retreating.
+    enemies = _combat_threats(enemies)
     enemy_count = len(enemies)
 
     if enemy_count >= 3:

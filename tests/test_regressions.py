@@ -1779,6 +1779,46 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertIn("guerrilla-retreat", detail)
         self.assertEqual(unit.action, "MOVE")
 
+    def test_guerrilla_chases_core_not_adjacent_worker(self) -> None:
+        """With only the CORE as a combat threat, the squad marches on the
+        CORE even when a worker escort stands adjacent — never chases the
+        worker instead."""
+        unit = self.CombatUnit("v-g5", (5, 5))
+        enemies = (
+            SimpleNamespace(position=(7, 5), unit_type="CORE"),
+            SimpleNamespace(position=(6, 5), unit_type="WORKER"),
+        )
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=enemies,
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="guerrilla",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("guerrilla-engage", detail)
+
+    def test_guerrilla_roams_past_lone_worker(self) -> None:
+        """A worker on its own is not a threat: the squad keeps roaming
+        instead of burning a chase on a unit that cannot fight back."""
+        unit = self.CombatUnit("v-g6", (5, 5))
+        enemies = (SimpleNamespace(position=(6, 5), unit_type="WORKER"),)
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=enemies,
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="guerrilla",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("guerrilla-roam", detail)
+
     def _setup_attack_retreat(self, squad_pos, squad_size, forbidden=frozenset(),
                               cluster_centroid=None):
         tactic.turn_context.attack_squad_pos = squad_pos
