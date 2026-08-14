@@ -5973,6 +5973,37 @@ class LeftSidebarTests(unittest.TestCase):
         self.assertIn('class="rail-metric-grid"', self.page)
         self.assertIn('class="rail-activity"', self.page)
 
+    def test_core_card_has_segmented_hp_and_shield_bars(self) -> None:
+        """The left core card shows HP and shield as one cell per point."""
+        self.assertIn('class="rail-vitals"', self.page)
+        self.assertIn('class="vital-label hp">HP', self.page)
+        self.assertIn('class="vital-label sh">盾', self.page)
+
+    def test_seg_cells_one_cell_per_point_with_filled_prefix(self) -> None:
+        self.assertEqual(
+            dashboard._seg_cells(3, 5),
+            '<i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i>',
+        )
+        # Unknown / out-of-range values never overflow the bar.
+        self.assertEqual(dashboard._seg_cells(None, 5), "<i></i>" * 5)
+        self.assertEqual(dashboard._seg_cells(99, 5), '<i class="on"></i>' * 5)
+        self.assertEqual(dashboard._seg_cells(2, 0), "")
+
+    def test_core_rail_shield_cap_grows_when_beacon_is_on_core(self) -> None:
+        """No beacon → shield bar holds 5 cells; beacon on the Core → 10."""
+        base = {"core_pos": [3, 4], "core_name": "C1", "core_hp": 4,
+                "core_shield": 3, "population": 7, "core_action": "HEAL_CORE"}
+        html = dashboard._core_rail_html(base)
+        self.assertIn("4/5", html)
+        self.assertIn("3/5", html)
+        self.assertIn('class="vital-cells hp">' + '<i class="on"></i>' * 4 + "<i></i>", html)
+
+        carried = dict(base, beacon_pos=[3, 4])
+        self.assertIn("3/10", dashboard._core_rail_html(carried))
+
+        away = dict(base, beacon_pos=[0, 0])
+        self.assertIn("3/5", dashboard._core_rail_html(away))
+
 
 class TrendPanelTests(unittest.TestCase):
     def test_chart_series_names_match_trend_point_keys(self) -> None:

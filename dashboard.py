@@ -1344,6 +1344,45 @@ def fmt_pos(pos) -> str:
     return f"({int(pos[0])}, {int(pos[1])})"
 
 
+def _seg_cells(cur, total: int) -> str:
+    """One <i> per point of a segmented vitality bar; filled cells are 'on'.
+
+    Values clamp to [0, total] so a stale log (e.g. shield already above the
+    display cap) never overflows the bar. None means unknown → all cells empty.
+    """
+    total = int(total)
+    if total <= 0:
+        return ""
+    cur = 0 if cur is None else max(0, min(int(cur), total))
+    return '<i class="on"></i>' * cur + '<i></i>' * (total - cur)
+
+
+def _core_rail_html(rec: dict) -> str:
+    """Left-rail core card: position + segmented HP/shield bars + quick rows."""
+    cp = rec.get("core_pos")
+    hp = rec.get("core_hp")
+    sh = rec.get("core_shield")
+    bp = rec.get("beacon_pos")
+    hp_total = 5
+    # The Core's shield caps at 10 only while it carries the champion beacon;
+    # otherwise the game (and the repair logic) keeps it at 5.
+    sh_total = 10 if (cp and bp and int(cp[0]) == int(bp[0]) and int(cp[1]) == int(bp[1])) else 5
+    return (
+        f'<div class="rail-focus"><div class="rail-focus-main"><span class="rail-eyebrow">当前位置</span>'
+        f'<strong class="rail-value">{fmt_pos(cp)}</strong></div></div>'
+        f'<div class="rail-vitals">'
+        f'<div class="vital"><span class="vital-label hp">HP</span>'
+        f'<span class="vital-cells hp">{_seg_cells(hp, hp_total)}</span>'
+        f'<span class="vital-num">{hp if hp is not None else "?"}/{hp_total}</span></div>'
+        f'<div class="vital"><span class="vital-label sh">盾</span>'
+        f'<span class="vital-cells sh">{_seg_cells(sh, sh_total)}</span>'
+        f'<span class="vital-num">{sh if sh is not None else "?"}/{sh_total}</span></div></div>'
+        f'<div class="rail-rows"><div class="rail-row"><span>当前动作</span><b>{rec.get("core_action") or "—"}</b></div>'
+        f'<div class="rail-row"><span>人口</span><b>{rec.get("population",0)}</b></div>'
+        f'<div class="rail-row"><span>信标坐标</span><b>{fmt_pos(bp)}</b></div></div>'
+    )
+
+
 def action_kind(action: str, cargo: int = 0) -> str:
     a = action or ""
     if "DEPOSIT" in a: return "deposit"
@@ -2010,6 +2049,16 @@ body{margin:0;min-height:100vh;color:var(--text);
 .rail-metric b{color:#eef3ff;font:700 14px Consolas,monospace}
 .rail-activity{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:7px}
 .rail-activity span{padding:3px 7px;border-radius:7px;background:rgba(var(--rail-tone),.075);color:#b9c5da;font-size:10px}
+.rail-vitals{display:grid;gap:7px;margin-bottom:7px;padding:9px 11px;border-radius:12px;background:rgba(0,0,0,.16);border:1px solid rgba(255,255,255,.06)}
+.vital{display:flex;align-items:center;gap:8px}
+.vital-label{flex:0 0 26px;text-align:center;font:700 10px Consolas,monospace;letter-spacing:.5px;padding:2px 0;border-radius:6px}
+.vital-label.hp{color:#57d6a3;background:rgba(87,214,163,.12);box-shadow:inset 0 0 0 1px rgba(87,214,163,.25)}
+.vital-label.sh{color:#63d8ff;background:rgba(99,216,255,.12);box-shadow:inset 0 0 0 1px rgba(99,216,255,.25)}
+.vital-cells{flex:1;display:flex;gap:3px;min-width:0}
+.vital-cells i{flex:1;min-width:0;height:11px;border-radius:3px;background:rgba(255,255,255,.055);box-shadow:inset 0 1px 2px rgba(0,0,0,.35),inset 0 0 0 1px rgba(255,255,255,.07)}
+.vital-cells.hp i.on{background:linear-gradient(180deg,#8ef0c4,#4cc48f);box-shadow:inset 0 1px 0 rgba(255,255,255,.4),inset 0 -1px 2px rgba(0,40,20,.35),0 0 8px rgba(87,214,163,.45)}
+.vital-cells.sh i.on{background:linear-gradient(180deg,#9fe4ff,#4db8e8);box-shadow:inset 0 1px 0 rgba(255,255,255,.4),inset 0 -1px 2px rgba(0,20,45,.35),0 0 8px rgba(99,216,255,.45)}
+.vital-num{flex:0 0 auto;min-width:36px;text-align:right;color:var(--muted);font:600 10px Consolas,monospace}
 .report-panel .kv{padding:7px 2px;border:0;border-bottom:1px solid rgba(255,255,255,.055);border-radius:0;background:transparent;font-size:11px}
 .report-panel .kv b{font-size:11px;text-align:right}
 .report-panel .stat-chips .pill{padding:3px 7px;border-radius:7px;background:rgba(179,140,255,.075);font-size:10px;color:#c5bdd8}
@@ -4376,14 +4425,7 @@ def build_parts(log_limit: int = 200):
     log_html, log_count = _battle_log_html(log_limit)
 
 
-    left_core = (
-        f'<div class="rail-focus"><div class="rail-focus-main"><span class="rail-eyebrow">当前位置</span>'
-        f'<strong class="rail-value">{fmt_pos(rec.get("core_pos"))}</strong></div>'
-        f'<span class="rail-focus-meta">HP {rec.get("core_hp","?")} · 盾 {rec.get("core_shield","?")}</span></div>'
-        f'<div class="rail-rows"><div class="rail-row"><span>当前动作</span><b>{rec.get("core_action") or "—"}</b></div>'
-        f'<div class="rail-row"><span>人口</span><b>{rec.get("population",0)}</b></div>'
-        f'<div class="rail-row"><span>信标坐标</span><b>{fmt_pos(rec.get("beacon_pos"))}</b></div></div>'
-    )
+    left_core = _core_rail_html(rec)
     left_res = (
         f'<div class="rail-focus"><div class="rail-focus-main" style="flex:1"><span class="rail-eyebrow">资源库存</span>'
         f'<strong class="rail-value">{resources}<small>/ {cap}</small></strong>'
