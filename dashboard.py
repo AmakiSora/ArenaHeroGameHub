@@ -899,16 +899,10 @@ TEAM_BOARD_META = {
     "guerrilla": {"label": "游击队", "hint": "八向分散袭扰", "tone": "guerrilla"},
 }
 TEAM_ROSTER_FIELDS = ("home_team", "attack_team", "guerrilla_team")
-TEAM_SETTING_FIELDS = (
-    "home_patrol_radius",
-    "home_engage_radius",
-    "attack_target_x",
-    "attack_target_y",
-    "attack_mode",
-    "ranger_attack_range",
-    "attack_retreat_radius",
-    "attack_auto_radius",
-    "guerrilla_engage_radius",
+TEAM_SETTING_FIELDS = tuple(
+    field["key"]
+    for field in config_schema()["fields"]
+    if field["group"] == "combat" and field["key"] not in TEAM_ROSTER_FIELDS
 )
 STRATEGY_CONFIG_FIELDS = tuple(
     key
@@ -1038,11 +1032,11 @@ def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) 
     config = load_config(CONFIG_PATH)
     schema = config_schema()
     fields_by_group: dict[str, list[dict]] = defaultdict(list)
-    dedicated_fields = set(TEAM_ROSTER_FIELDS) | set(TEAM_SETTING_FIELDS)
     for field in schema["fields"]:
-        # Combat rosters + team settings live on the dedicated teams card;
-        # production targets live in the dedicated section below.
-        if field["key"] in dedicated_fields:
+        # Every combat field lives on the dedicated teams card. Filtering by
+        # schema group prevents newly added combat settings leaking back into
+        # this generic form when a hand-maintained allow-list is missed.
+        if field["group"] == "combat":
             continue
         if field["group"] == "production":
             continue
@@ -1146,80 +1140,125 @@ def render_teams_panel() -> str:
             f'<div class="team-empty">拖到这里</div></div></div>'
         )
 
+    def number_field(
+        field_id: str,
+        key: str,
+        label: str,
+        minimum: int,
+        maximum: int,
+        hint: str,
+    ) -> str:
+        return (
+            f'<label class="team-field" data-field-wrap="{key}" for="{field_id}">'
+            f'<span>{label}<small>{hint}</small></span>'
+            f'<input id="{field_id}" name="{key}" type="number" min="{minimum}" '
+            f'max="{maximum}" step="1" value="{config[key]}" required>'
+            f'<em class="team-field-error" data-field-error="{key}"></em></label>'
+        )
+
     attack_mode = str(config.get("attack_mode", "coords"))
     mode_checked = {
         "coords": " checked" if attack_mode == "coords" else "",
         "auto": " checked" if attack_mode == "auto" else "",
         "beacon": " checked" if attack_mode == "beacon" else "",
     }
-    # Attack coordinates only matter in coords mode; beacon / auto ignore them.
-    coords_locked = "" if attack_mode == "coords" else " disabled"
+    coords_hidden = "" if attack_mode == "coords" else " hidden"
+    auto_hidden = "" if attack_mode == "auto" else " hidden"
+    beacon_hidden = "" if attack_mode == "beacon" else " hidden"
+    lead_checked = " checked" if bool(config["ranger_lead_fire_enabled"]) else ""
 
-    settings = (
-        '<div class="team-settings">'
-        '<label>守家半径'
-        f'<input id="teamHomeRadius" name="home_patrol_radius" type="number" min="1" max="30" '
-        f'step="1" value="{config["home_patrol_radius"]}"></label>'
-        '<label>守家迎击半径(0=关)'
-        f'<input id="teamHomeEngageRadius" name="home_engage_radius" type="number" min="0" max="30" '
-        f'step="1" value="{config["home_engage_radius"]}"'
-        ' title="守家队主动迎击驱赶半径（0=关闭迎击）"></label>'
-        '<label>进攻 X'
-        f'<span class="coord-input"><input id="teamAttackX" name="attack_target_x" type="number" min="-1000" max="1000" '
-        f'step="1" value="{config["attack_target_x"]}"{coords_locked}>'
-        '<button type="button" class="pick-btn" id="pickAttackBtn" '
-        'title="点击地图选择进攻坐标（X 与 Y 一起填入）">⌖</button></span></label>'
-        '<label>进攻 Y'
+    home_settings = "".join([
+        number_field("teamHomeRadius", "home_patrol_radius", "巡逻半径", 1, 30, "距核心的日常巡逻范围"),
+        number_field("teamHomeEngageRadius", "home_engage_radius", "迎击半径", 0, 30, "0 表示关闭主动迎击"),
+        number_field("teamHomeMemory", "home_engage_memory_ticks", "目标记忆", 0, 20, "失去视野后保留的 Tick，0 关闭"),
+        number_field("teamHealThreshold", "combat_heal_hp_threshold", "回血阈值", 0, 4, "生命值不高于此值时回城，0 关闭"),
+        number_field("teamHealReturnLimit", "combat_heal_return_limit", "回撤名额", 0, 19, "同时回城单位上限，0 不限"),
+    ])
+    guerrilla_settings = number_field(
+        "teamGuerrillaSight",
+        "guerrilla_engage_radius",
+        "感知半径",
+        0,
+        30,
+        "0 按单位自身视野，各自响应威胁",
+    )
+    attack_coords = (
+        f'<div class="team-attack-fields" data-attack-fields="coords"{coords_hidden}>'
+        '<label class="team-field" data-field-wrap="attack_target_x" for="teamAttackX">'
+        '<span>目标坐标<small>点击地图按钮可同时填写 X / Y</small></span>'
+        '<span class="coord-input">'
+        f'<input id="teamAttackX" name="attack_target_x" type="number" min="-1000" max="1000" '
+        f'step="1" value="{config["attack_target_x"]}" required aria-label="进攻目标 X">'
+        '<span class="coord-divider">,</span>'
         f'<input id="teamAttackY" name="attack_target_y" type="number" min="-1000" max="1000" '
-        f'step="1" value="{config["attack_target_y"]}"{coords_locked}></label>'
-        '<label>游侠射程'
-        f'<select id="teamRangerRange" name="ranger_attack_range" title="游侠最大开火距离（游戏规则仅允许 1–3）">'
-        + "".join(
-            f'<option value="{n}"{" selected" if int(config["ranger_attack_range"]) == n else ""}>'
-            f'{n} 格</option>'
-            for n in (1, 2, 3)
-        )
-        + '</select></label>'
-        '<label>进攻队遇敌撤退半径(仅自动)'
-        f'<input id="teamRetreatRadius" name="attack_retreat_radius" type="number" min="0" max="30" '
-        f'step="1" value="{config["attack_retreat_radius"]}"'
-        ' title="仅进攻队 + 自动进攻生效：以进攻队重心为中心，半径内敌方战斗单位数 ≥ 本队则全队撤离敌群质心方向并另寻目标（0=关闭）。守家队 / 游击队不受此配置影响"></label>'
-        '<label>游击队感知半径(0=按视野)'
-        f'<input id="teamGuerrillaSight" name="guerrilla_engage_radius" type="number" min="0" max="30" '
-        f'step="1" value="{config["guerrilla_engage_radius"]}"'
-        ' title="每个游击队员只对本单位自己视野内的敌人反应（先锋4格/游侠5格，0=按单位自身视野）。队友看到的远处核心不会把全队拉过去，各打各的"></label>'
-        '<label>自动进攻半径(0=不限)'
-        f'<input id="teamAutoRadius" name="attack_auto_radius" type="number" min="0" max="1000" '
-        f'step="1" value="{config["attack_auto_radius"]}"'
-        ' title="自动进攻只选择距核心 N 格内的目标并只追击该范围内的可见敌人（0=不限制）"></label>'
-        '<div class="team-mode">'
-        '<span class="team-mode-title">进攻方式</span>'
-        '<div class="team-mode-opts">'
-        '<label class="team-radio"><input type="radio" name="attack_mode" value="coords"'
-        f'{mode_checked["coords"]}>进攻坐标</label>'
-        '<label class="team-radio"><input type="radio" name="attack_mode" value="auto"'
-        f'{mode_checked["auto"]}>自动进攻</label>'
-        '<label class="team-radio"><input type="radio" name="attack_mode" value="beacon"'
-        f'{mode_checked["beacon"]}>进攻冠军信标</label>'
-        '</div></div>'
-        '</div>'
+        f'step="1" value="{config["attack_target_y"]}" required aria-label="进攻目标 Y">'
+        '<button type="button" class="pick-btn" id="pickAttackBtn" '
+        'title="点击地图选择进攻坐标（X 与 Y 一起填入）">⌖</button></span>'
+        '<em class="team-field-error" data-field-error="attack_target_x"></em>'
+        '<em class="team-field-error" data-field-error="attack_target_y"></em></label></div>'
+    )
+    attack_auto = (
+        f'<div class="team-attack-fields team-field-grid" data-attack-fields="auto"{auto_hidden}>'
+        + number_field("teamAutoRadius", "attack_auto_radius", "目标范围", 0, 1000, "距核心的搜索范围，0 不限")
+        + number_field("teamRetreatRadius", "attack_retreat_radius", "撤退判定半径", 0, 30, "敌方战力不低于本队时撤离，0 关闭")
+        + '</div>'
+    )
+    attack_beacon = (
+        f'<p class="team-mode-note" data-attack-fields="beacon"{beacon_hidden}>'
+        '进攻队将以冠军信标为目标，无需额外参数。</p>'
     )
 
     return (
         '<section class="panel teams-panel" id="teamsPanel">'
         '<div class="panel-title"><span>战斗分队</span>'
-        '<span class="count" id="teamsState">拖拽编队</span></div>'
-        '<div class="teams-hero">'
-        '<div><b>把先锋 / 游侠拖进队伍</b>'
-        '<p>新单位默认进守家队；拖到待命池可暂时不参战编成。</p></div>'
-        '<div class="teams-actions">'
-        '<button type="button" class="secondary" id="teamsResetBtn">重载</button>'
-        '<button type="button" id="teamsSaveBtn">保存分队</button>'
-        '</div></div>'
+        '<span class="count" id="teamsState">已同步</span></div>'
+        '<form id="teamsForm">'
+        '<p class="teams-hint">拖动单位调整编队；虚线单位表示仅存在于配置。新单位默认进入守家队。</p>'
         f'<div class="team-board">{"".join(columns)}</div>'
-        f'{settings}'
-        '<div class="teams-message" id="teamsMessage" aria-live="polite">'
-        '拖拽单位后自动保存，下个 Tick 生效</div>'
+        '<div class="team-parameter-head"><div><b>战斗参数</b>'
+        '<span>按职责归类；无关的进攻参数会自动隐藏</span></div></div>'
+        '<div class="team-parameter-top">'
+        '<section class="team-setting-group tone-home" aria-labelledby="teamHomeTitle">'
+        '<div class="team-setting-title"><b id="teamHomeTitle">守家策略</b><span>巡逻 · 迎击 · 回城</span></div>'
+        f'<div class="team-field-grid">{home_settings}</div></section>'
+        '<div class="team-parameter-stack">'
+        '<section class="team-setting-group tone-guerrilla" aria-labelledby="teamGuerrillaTitle">'
+        '<div class="team-setting-title"><b id="teamGuerrillaTitle">游击策略</b><span>独立感知</span></div>'
+        f'<div class="team-field-grid">{guerrilla_settings}</div></section>'
+        '<section class="team-setting-group tone-common" aria-labelledby="teamCommonTitle">'
+        '<div class="team-setting-title"><b id="teamCommonTitle">通用战斗</b><span>全队生效</span></div>'
+        '<div class="team-field-grid">'
+        '<label class="team-field" data-field-wrap="ranger_attack_range" for="teamRangerRange">'
+        '<span>游侠射程<small>游戏规则允许 1–3 格</small></span>'
+        f'<select id="teamRangerRange" name="ranger_attack_range">'
+        + "".join(
+            f'<option value="{n}"{" selected" if int(config["ranger_attack_range"]) == n else ""}>{n} 格</option>'
+            for n in (1, 2, 3)
+        )
+        + '</select><em class="team-field-error" data-field-error="ranger_attack_range"></em></label>'
+        '<label class="team-switch-field" data-field-wrap="ranger_lead_fire_enabled" for="teamLeadFire">'
+        '<span>移动预判实射<small>对稳定移动目标预测下一格</small></span>'
+        f'<input id="teamLeadFire" name="ranger_lead_fire_enabled" type="checkbox"{lead_checked}>'
+        '<span class="team-switch-ui" aria-hidden="true"></span>'
+        '<em class="team-field-error" data-field-error="ranger_lead_fire_enabled"></em></label>'
+        '</div></section></div></div>'
+        '<section class="team-setting-group tone-attack team-attack-group" aria-labelledby="teamAttackTitle">'
+        '<div class="team-setting-title"><b id="teamAttackTitle">进攻策略</b><span>选择方式后只显示相关参数</span></div>'
+        '<fieldset class="team-mode"><legend>进攻方式</legend><div class="team-mode-opts">'
+        '<label class="team-radio"><input type="radio" name="attack_mode" value="coords"'
+        f'{mode_checked["coords"]}><span>坐标进攻</span></label>'
+        '<label class="team-radio"><input type="radio" name="attack_mode" value="auto"'
+        f'{mode_checked["auto"]}><span>自动进攻</span></label>'
+        '<label class="team-radio"><input type="radio" name="attack_mode" value="beacon"'
+        f'{mode_checked["beacon"]}><span>冠军信标</span></label>'
+        '</div><em class="team-field-error" data-field-error="attack_mode"></em></fieldset>'
+        f'{attack_coords}{attack_auto}{attack_beacon}</section>'
+        '<div class="teams-footer">'
+        '<span class="teams-message" id="teamsMessage" aria-live="polite">修改后统一保存，下个 Tick 生效</span>'
+        '<div class="teams-actions">'
+        '<button type="button" class="secondary" id="teamsResetBtn" disabled>放弃修改</button>'
+        '<button type="submit" id="teamsSaveBtn" disabled>保存修改</button>'
+        '</div></div></form>'
         '</section>'
     )
 
@@ -2103,8 +2142,8 @@ body{margin:0;min-height:100vh;color:var(--text);
 .pick-btn:hover{background:rgba(110,168,255,.28);border-color:rgba(110,168,255,.6);color:#fff}
 .pick-btn.active{background:#285b8f;border-color:#6ea8ff;color:#fff;box-shadow:0 0 0 2px rgba(110,168,255,.25)}
 .pick-btn:disabled{opacity:.4;cursor:not-allowed}
-.team-settings .coord-input{display:flex;gap:6px;align-items:center;min-width:0}
-.team-settings .coord-input input{flex:1;min-width:0;width:auto}
+.team-field .coord-input{display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr) 28px;gap:6px;align-items:center;min-width:0}
+.team-field .coord-input input{min-width:0;width:100%}
 .res-add-form button.ore-pick-btn{grid-column:1/-1;justify-self:start;width:auto;height:28px;padding:0 12px;font-size:11px;font-family:inherit;display:inline-flex;align-items:center;gap:4px;background:rgba(110,168,255,.10);border-color:rgba(110,168,255,.35);color:#a9c8ff}
 .res-add-form button.ore-pick-btn:hover{background:rgba(110,168,255,.28);border-color:rgba(110,168,255,.6);color:#fff}
 .wp-list{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
@@ -2122,17 +2161,11 @@ body{margin:0;min-height:100vh;color:var(--text);
 .wp-add #wpClearBtn{grid-column:5/7}
 .wp-msg{min-height:15px;margin-top:8px;color:var(--muted);font-size:11px}
 .wp-msg.ok{color:#8ef0c4}
-.teams-panel{margin-top:0;overflow:hidden}
-.teams-hero{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px;padding:14px 16px;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:
-  radial-gradient(circle at 12% 20%, rgba(87,214,163,.18), transparent 42%),
-  radial-gradient(circle at 88% 0%, rgba(255,107,157,.16), transparent 36%),
-  linear-gradient(135deg, rgba(17,28,48,.95), rgba(12,18,32,.92));}
-.teams-hero b{display:block;font-size:15px;color:#eef5ff;margin-bottom:4px}
-.teams-hero p{margin:0;color:var(--muted);font-size:12px;line-height:1.5}
-.teams-actions{display:flex;gap:8px;flex-wrap:wrap}
-.teams-actions button{appearance:none;border:1px solid rgba(110,168,255,.35);border-radius:999px;padding:8px 13px;background:#285b8f;color:#fff;font-size:12px;font-weight:700;cursor:pointer}
-.teams-actions button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}
-.teams-actions button:disabled{opacity:.55;cursor:wait}
+.teams-panel{margin-top:0;overflow:hidden;container-type:inline-size}
+.teams-hint{margin:-3px 0 12px;color:var(--muted);font-size:11px;line-height:1.5}
+.teams-state.dirty{color:#ffe08a;border-color:rgba(255,200,87,.25);background:rgba(255,200,87,.08)}
+.teams-state.busy{color:#a9c8ff;border-color:rgba(110,168,255,.25);background:rgba(110,168,255,.08)}
+.teams-state.err{color:#ff9b9b;border-color:rgba(255,100,100,.25);background:rgba(255,100,100,.08)}
 .team-board{display:grid;grid-template-columns:1fr;gap:10px}
 .team-column{min-width:0;border-radius:16px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.025);overflow:hidden;display:flex;flex-direction:row;align-items:stretch}
 .team-column.tone-idle{background:linear-gradient(90deg,rgba(148,163,184,.08),rgba(255,255,255,.02))}
@@ -2161,22 +2194,73 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-chip .hpbar .seg.on{background:#57d6a3;box-shadow:inset 0 0 0 1px rgba(0,20,10,.35)}
 .team-chip .pulse{position:absolute;right:-2px;top:-2px;width:8px;height:8px;border-radius:50%;background:#57d6a3;box-shadow:0 0 0 3px rgba(87,214,163,.12)}
 .team-chip.ghost .pulse{background:#7f8eab;box-shadow:none}
-.team-settings{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}
-.team-settings label{display:grid;gap:6px;padding:10px 12px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);color:var(--muted);font-size:11px}
-.team-settings input,.team-settings select{width:100%;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#0b1222;color:var(--text);font:13px Consolas,monospace;outline:none}
-.team-settings select{cursor:pointer}
-.team-settings select option{background:#0b1222;color:var(--text)}
-.team-settings label.team-switch{display:flex;align-items:center;gap:8px;justify-content:space-between}
-.team-settings label.team-switch input{width:16px;height:16px;accent-color:#57d6a3;cursor:pointer}
-.team-settings input:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
-.team-settings input:disabled{opacity:.4;cursor:not-allowed}
-.team-mode{grid-column:1/-1;display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;border-radius:14px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06)}
-.team-mode-title{color:var(--muted);font-size:11px}
-.team-mode-opts{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-.team-radio{display:flex;align-items:center;gap:6px;color:#d7e8ff;font-size:12px;cursor:pointer}
-.team-radio input{width:14px;height:14px;accent-color:#57d6a3;margin:0;cursor:pointer}
-.teams-message{min-height:18px;margin-top:10px;color:var(--muted);font-size:12px}
+.team-parameter-head{display:flex;align-items:end;justify-content:space-between;gap:12px;margin:18px 0 9px;padding-top:16px;border-top:1px solid var(--line)}
+.team-parameter-head>div{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+.team-parameter-head b{color:#eef3ff;font-size:14px}
+.team-parameter-head span{color:var(--muted);font-size:11px}
+.team-parameter-top{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.team-parameter-stack{display:grid;gap:9px;align-content:start}
+.team-setting-group{min-width:0;padding:12px;border:1px solid rgba(255,255,255,.07);border-radius:12px;background:rgba(7,14,29,.34)}
+.team-setting-group.tone-home{border-color:rgba(87,214,163,.18);background:linear-gradient(135deg,rgba(87,214,163,.07),rgba(7,14,29,.34) 46%)}
+.team-setting-group.tone-attack{border-color:rgba(255,107,157,.18);background:linear-gradient(135deg,rgba(255,107,157,.065),rgba(7,14,29,.34) 42%)}
+.team-setting-group.tone-guerrilla{border-color:rgba(179,140,255,.18);background:linear-gradient(135deg,rgba(179,140,255,.07),rgba(7,14,29,.34) 48%)}
+.team-setting-group.tone-common{border-color:rgba(110,168,255,.16)}
+.team-setting-title{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,.06)}
+.team-setting-title b{color:#eef3ff;font-size:12px}
+.team-setting-title span{color:var(--muted);font-size:10px;text-align:right}
+.team-field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:8px}
+.team-field{display:grid;align-content:start;gap:6px;min-width:0;color:#cbd6e8;font-size:11px}
+.team-field>span:first-child{display:grid;gap:2px}
+.team-field small,.team-switch-field small{display:block;color:var(--muted);font-size:9.5px;line-height:1.35;font-weight:400}
+.team-field input,.team-field select{width:100%;min-width:0;padding:8px 9px;border-radius:8px;border:1px solid rgba(255,255,255,.11);background:#0b1222;color:var(--text);font:12px Consolas,monospace;outline:none}
+.team-field select{cursor:pointer}
+.team-field select option{background:#0b1222;color:var(--text)}
+.team-field input:focus,.team-field select:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(110,168,255,.14)}
+.team-field.has-error input,.team-field.has-error select,.team-switch-field.has-error .team-switch-ui,.team-field .field-error-control{border-color:rgba(255,100,100,.7)}
+.team-field-error{display:none;color:#ff9b9b;font-size:10px;font-style:normal;line-height:1.35}
+.team-field-error:not(:empty){display:block}
+.team-switch-field{position:relative;display:grid;grid-template-columns:minmax(0,1fr) 38px;gap:8px;align-items:center;min-width:0;color:#cbd6e8;font-size:11px;cursor:pointer}
+.team-switch-field input{position:absolute;opacity:0;pointer-events:none}
+.team-switch-ui{display:block;width:38px;height:22px;border-radius:11px;background:#263149;border:1px solid rgba(255,255,255,.12);transition:.16s}
+.team-switch-ui::after{content:"";display:block;width:16px;height:16px;margin:2px;border-radius:50%;background:#a9b5cc;transition:.16s}
+.team-switch-field input:checked+.team-switch-ui{background:#326c5d;border-color:#57d6a3}
+.team-switch-field input:checked+.team-switch-ui::after{transform:translateX(16px);background:#b9f5dc}
+.team-switch-field input:focus-visible+.team-switch-ui{box-shadow:0 0 0 2px rgba(110,168,255,.35)}
+.team-switch-field .team-field-error{grid-column:1/-1}
+.team-attack-group{margin-top:9px}
+.team-mode{margin:0 0 10px;padding:0;border:0;min-width:0}
+.team-mode legend{margin-bottom:6px;padding:0;color:var(--muted);font-size:10px}
+.team-mode-opts{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;padding:4px;border-radius:10px;background:rgba(0,0,0,.18);border:1px solid rgba(255,255,255,.055)}
+.team-radio{display:block;min-width:0;cursor:pointer}
+.team-radio input{position:absolute;opacity:0;pointer-events:none}
+.team-radio span{display:block;padding:7px 8px;border-radius:7px;color:var(--muted);font-size:11px;text-align:center;white-space:nowrap;transition:.14s}
+.team-radio:hover span{color:#eef3ff;background:rgba(255,255,255,.04)}
+.team-radio input:checked+span{color:#fff;background:#285b8f;box-shadow:inset 0 0 0 1px rgba(110,168,255,.38)}
+.team-radio input:focus-visible+span{box-shadow:0 0 0 2px rgba(110,168,255,.5)}
+.team-attack-fields[hidden],.team-mode-note[hidden]{display:none}
+.team-attack-fields{max-width:560px}
+.team-mode-note{margin:0;padding:9px 11px;border-radius:8px;background:rgba(110,168,255,.07);color:#b9c8dc;font-size:11px}
+.coord-divider{color:var(--muted);font:12px Consolas,monospace}
+.teams-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.teams-actions{display:flex;gap:7px;flex-wrap:wrap;margin-left:auto}
+.teams-actions button{appearance:none;border:1px solid rgba(110,168,255,.35);border-radius:8px;padding:8px 13px;background:#285b8f;color:#fff;font-size:12px;font-weight:700;cursor:pointer}
+.teams-actions button.secondary{background:transparent;border-color:rgba(255,255,255,.16);color:#c7d1e5}
+.teams-actions button:disabled{opacity:.42;cursor:not-allowed}
+.teams-message{min-height:18px;color:var(--muted);font-size:11px}
 .teams-message.ok{color:#8ef0c4}.teams-message.err{color:#ff9b9b}
+@container (max-width:520px){
+  .team-parameter-top{grid-template-columns:1fr}
+  .team-field-grid{grid-template-columns:1fr 1fr}
+}
+@container (max-width:360px){
+  .team-column{display:block}
+  .team-column-head{border-right:0;border-bottom:1px solid rgba(255,255,255,.06)}
+  .team-field-grid{grid-template-columns:1fr}
+  .team-mode-opts{grid-template-columns:1fr}
+  .team-radio span{text-align:left}
+  .teams-actions{width:100%}
+  .teams-actions button{flex:1}
+}
 .config-switch{justify-self:end;position:relative;width:38px;height:22px}
 .config-switch input{position:absolute;opacity:0;pointer-events:none}
 .config-switch span{display:block;width:38px;height:22px;border-radius:11px;background:#263149;border:1px solid rgba(255,255,255,.12);cursor:pointer;transition:.16s}
@@ -2251,14 +2335,11 @@ body{margin:0;min-height:100vh;color:var(--text);
 }
 @media (max-width:1100px){
   .team-column-head{flex:0 0 88px;padding:8px 10px}
-  .team-settings{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media (max-width:680px){
   .config-groups{grid-template-columns:1fr}
   .config-message{width:100%;margin-left:0}
   .production-targets{grid-template-columns:1fr}
-  .team-settings{grid-template-columns:1fr}
-  .teams-hero{flex-direction:column}
 }
 
 /* ── 历史趋势 panel ──────────────────────────────────────────────── */
@@ -2379,21 +2460,14 @@ body{background:
 .map-legend{gap:6px}
 .map-legend button.map-filter,.log-filter,.unit-tab,.trend-window-btn{box-shadow:inset 0 1px 0 rgba(255,255,255,.025)}
 .map-legend button.map-filter{padding:4px 8px;background:rgba(255,255,255,.025);border-color:rgba(255,255,255,.055)}
-.teams-hero{margin-bottom:12px;padding:12px 14px;border-radius:var(--radius-block);background:
- radial-gradient(circle at 10% 10%,rgba(87,214,163,.11),transparent 44%),
- radial-gradient(circle at 90% 0%,rgba(179,140,255,.10),transparent 40%),
- rgba(7,14,29,.46);border-color:rgba(179,140,255,.13)}
-.teams-hero b{font-size:14px}
 .team-board{gap:8px}
 .team-column{border-radius:var(--radius-block);background:rgba(7,14,29,.34);border-color:rgba(255,255,255,.065)}
 .team-column-head{background:rgba(255,255,255,.018)}
-.team-settings{gap:8px}
-.team-settings label{border-radius:10px;background:rgba(255,255,255,.022);border-color:rgba(255,255,255,.055)}
-.team-settings input,.team-settings select,.wp-add input,.wp-add select,.res-add-form input,
+.team-field input,.team-field select,.wp-add input,.wp-add select,.res-add-form input,
 .config-row>input[type=number],.production-target>input[type=number]{
  border-radius:var(--radius-control);background:var(--control-bg);border-color:var(--control-line);
  box-shadow:inset 0 1px 4px rgba(0,0,0,.22)}
-.team-settings input:focus,.team-settings select:focus,.wp-add input:focus,.wp-add select:focus,
+.team-field input:focus,.team-field select:focus,.wp-add input:focus,.wp-add select:focus,
 .res-add-form input:focus,.config-row>input[type=number]:focus,.production-target>input[type=number]:focus{
  border-color:rgba(110,168,255,.5);box-shadow:0 0 0 2px rgba(110,168,255,.11)}
 .production-section{margin-bottom:16px;padding-bottom:16px}
@@ -2689,7 +2763,7 @@ JS = r"""
     const picked = xEl.value + ', ' + yEl.value;
     setPickMode(null);
     setCoordLabel('已拾取 (' + picked + ')');
-    // One bubbled event pair marks the owning form dirty / triggers auto-save.
+    // One bubbled event pair marks the owning form as an unsaved draft.
     xEl.dispatchEvent(new Event('input', {bubbles:true}));
     xEl.dispatchEvent(new Event('change', {bubbles:true}));
     setTimeout(function(){
@@ -3496,8 +3570,45 @@ JS = r"""
     }
     const state = document.getElementById('teamsState');
     if(state){
-      state.textContent = kind === 'err' ? '保存失败' : (kind === 'ok' ? '已同步' : (teamsDirty ? '待保存' : '拖拽编队'));
+      const stateKind = kind === 'err' ? 'err' : (teamsBusy ? 'busy' : (teamsDirty ? 'dirty' : 'ok'));
+      state.textContent = stateKind === 'err' ? '保存失败'
+        : (stateKind === 'busy' ? '保存中…' : (stateKind === 'dirty' ? '有未保存修改' : '已同步'));
+      state.className = 'count teams-state ' + stateKind;
     }
+    updateTeamsActions();
+  }
+
+  function updateTeamsActions(){
+    const saveBtn = document.getElementById('teamsSaveBtn');
+    const resetBtn = document.getElementById('teamsResetBtn');
+    if(saveBtn) saveBtn.disabled = teamsBusy || !teamsDirty;
+    if(resetBtn) resetBtn.disabled = teamsBusy || !teamsDirty;
+  }
+
+  function clearTeamFieldErrors(){
+    document.querySelectorAll('#teamsForm [data-field-error]').forEach(function(el){ el.textContent = ''; });
+    document.querySelectorAll('#teamsForm [data-field-wrap]').forEach(function(el){ el.classList.remove('has-error'); });
+    document.querySelectorAll('#teamsForm .field-error-control').forEach(function(el){
+      el.classList.remove('field-error-control');
+      el.removeAttribute('aria-invalid');
+    });
+  }
+
+  function showTeamFieldErrors(fields){
+    Object.keys(fields || {}).forEach(function(key){
+      const error = document.querySelector('#teamsForm [data-field-error="' + key + '"]');
+      const wrap = document.querySelector('#teamsForm [data-field-wrap="' + key + '"]');
+      const control = document.querySelector('#teamsForm [name="' + key + '"]');
+      if(error) error.textContent = fields[key];
+      if(wrap) wrap.classList.add('has-error');
+      if(control){ control.classList.add('field-error-control'); control.setAttribute('aria-invalid', 'true'); }
+    });
+  }
+
+  function markTeamsDirty(message){
+    teamsDirty = true;
+    clearTeamFieldErrors();
+    setTeamsMessage(message || '有未保存修改', '');
   }
 
   function currentTeamSettings(){
@@ -3505,21 +3616,27 @@ JS = r"""
     return {
       home_patrol_radius: Number((document.getElementById('teamHomeRadius') || {}).value || 5),
       home_engage_radius: Number((document.getElementById('teamHomeEngageRadius') || {}).value || 0),
+      home_engage_memory_ticks: Number((document.getElementById('teamHomeMemory') || {}).value || 0),
+      combat_heal_hp_threshold: Number((document.getElementById('teamHealThreshold') || {}).value || 0),
+      combat_heal_return_limit: Number((document.getElementById('teamHealReturnLimit') || {}).value || 0),
       attack_target_x: Number((document.getElementById('teamAttackX') || {}).value || 0),
       attack_target_y: Number((document.getElementById('teamAttackY') || {}).value || 0),
       attack_mode: (modeEl && modeEl.value) || 'coords',
       ranger_attack_range: Number((document.getElementById('teamRangerRange') || {}).value || 3),
+      ranger_lead_fire_enabled: Boolean((document.getElementById('teamLeadFire') || {}).checked),
       attack_retreat_radius: Number((document.getElementById('teamRetreatRadius') || {}).value || 5),
-      attack_auto_radius: Number((document.getElementById('teamAutoRadius') || {}).value || 0)
+      attack_auto_radius: Number((document.getElementById('teamAutoRadius') || {}).value || 0),
+      guerrilla_engage_radius: Number((document.getElementById('teamGuerrillaSight') || {}).value || 0)
     };
   }
 
-  function syncTeamModeDisabled(){
+  function syncTeamModeVisibility(){
     const modeEl = document.querySelector('input[name="attack_mode"]:checked');
     const mode = (modeEl && modeEl.value) || 'coords';
-    ['teamAttackX','teamAttackY'].forEach(function(id){
-      const el = document.getElementById(id);
-      if(el) el.disabled = (mode !== 'coords');
+    document.querySelectorAll('[data-attack-fields]').forEach(function(group){
+      const active = group.getAttribute('data-attack-fields') === mode;
+      group.hidden = !active;
+      group.querySelectorAll('input,select,button').forEach(function(el){ el.disabled = !active; });
     });
     syncPickButtonsDisabled();
     if(mode !== 'coords' && pickMode === 'attack') setPickMode(null);
@@ -3530,11 +3647,16 @@ JS = r"""
     const map = {
       home_patrol_radius: 'teamHomeRadius',
       home_engage_radius: 'teamHomeEngageRadius',
+      home_engage_memory_ticks: 'teamHomeMemory',
+      combat_heal_hp_threshold: 'teamHealThreshold',
+      combat_heal_return_limit: 'teamHealReturnLimit',
       attack_target_x: 'teamAttackX',
       attack_target_y: 'teamAttackY',
       ranger_attack_range: 'teamRangerRange',
+      ranger_lead_fire_enabled: 'teamLeadFire',
       attack_retreat_radius: 'teamRetreatRadius',
-      attack_auto_radius: 'teamAutoRadius'
+      attack_auto_radius: 'teamAutoRadius',
+      guerrilla_engage_radius: 'teamGuerrillaSight'
     };
     Object.keys(map).forEach(function(key){
       const el = document.getElementById(map[key]);
@@ -3547,7 +3669,7 @@ JS = r"""
     document.querySelectorAll('input[name="attack_mode"]').forEach(function(el){
       el.checked = (el.value === mode);
     });
-    syncTeamModeDisabled();
+    syncTeamModeVisibility();
   }
 
   function rosterFromUnits(team){
@@ -3571,12 +3693,17 @@ JS = r"""
       guerrilla_team: rosterFromUnits('guerrilla'),
       home_patrol_radius: settings.home_patrol_radius,
       home_engage_radius: settings.home_engage_radius,
+      home_engage_memory_ticks: settings.home_engage_memory_ticks,
+      combat_heal_hp_threshold: settings.combat_heal_hp_threshold,
+      combat_heal_return_limit: settings.combat_heal_return_limit,
       attack_target_x: settings.attack_target_x,
       attack_target_y: settings.attack_target_y,
       attack_mode: settings.attack_mode,
       ranger_attack_range: settings.ranger_attack_range,
+      ranger_lead_fire_enabled: settings.ranger_lead_fire_enabled,
       attack_retreat_radius: settings.attack_retreat_radius,
-      attack_auto_radius: settings.attack_auto_radius
+      attack_auto_radius: settings.attack_auto_radius,
+      guerrilla_engage_radius: settings.guerrilla_engage_radius
     };
   }
 
@@ -3657,20 +3784,17 @@ JS = r"""
       return Object.assign({}, unit, {team: team});
     });
     if(changed){
-      teamsDirty = true;
       renderTeamBoard();
-      setTeamsMessage('已调整编队，保存中…', '');
-      saveTeams(true);
+      markTeamsDirty('编队已调整，点击保存后生效');
     }
     return changed;
   }
 
-  async function saveTeams(auto){
+  async function saveTeams(){
     if(teamsBusy) return;
-    const saveBtn = document.getElementById('teamsSaveBtn');
     teamsBusy = true;
-    if(saveBtn) saveBtn.disabled = true;
-    setTeamsMessage(auto ? '自动保存中…' : '保存中…', '');
+    clearTeamFieldErrors();
+    setTeamsMessage('正在保存战斗分队…', '');
     try{
       const res = await fetch('/api/teams', {
         method:'POST',
@@ -3678,23 +3802,33 @@ JS = r"""
         body: JSON.stringify(buildTeamsPayload())
       });
       const data = await res.json();
-      if(!res.ok || !data.ok) throw new Error(data.error || '保存失败');
+      if(!res.ok || !data.ok){
+        showTeamFieldErrors(data.fields || {});
+        throw new Error(data.error || '保存失败');
+      }
       teamsConfig = data.config;
       teamsUnits = data.combat_units || teamsUnits;
       applyTeamSettings(data.config);
       teamsDirty = false;
       renderTeamBoard();
-      setTeamsMessage(auto ? '已自动保存，下个 Tick 生效' : '分队已保存，下个 Tick 生效', 'ok');
+      teamsBusy = false;
+      setTeamsMessage('已保存，下个 Tick 生效', 'ok');
     }catch(err){
       setTeamsMessage(err.message || '网络错误', 'err');
     }finally{
       teamsBusy = false;
-      if(saveBtn) saveBtn.disabled = false;
+      updateTeamsActions();
     }
   }
 
   async function loadTeams(force){
     if(!force && (teamsDirty || teamsBusy)) return;
+    if(teamsBusy) return;
+    const discardedDraft = force && teamsDirty;
+    if(discardedDraft){
+      teamsBusy = true;
+      setTeamsMessage('正在恢复服务器配置…', '');
+    }
     try{
       const res = await fetch('/api/teams?ts=' + Date.now(), {cache:'no-store'});
       const data = await res.json();
@@ -3703,9 +3837,16 @@ JS = r"""
       teamsUnits = data.combat_units || [];
       applyTeamSettings(data.config);
       teamsDirty = false;
+      clearTeamFieldErrors();
       renderTeamBoard();
-      setTeamsMessage('拖拽单位即可调整分队', '');
-    }catch(e){}
+      teamsBusy = false;
+      setTeamsMessage(discardedDraft ? '已放弃修改，恢复服务器配置' : '修改后统一保存，下个 Tick 生效', '');
+    }catch(e){
+      if(discardedDraft) setTeamsMessage('恢复失败，请稍后重试', 'err');
+    }finally{
+      teamsBusy = false;
+      updateTeamsActions();
+    }
   }
 
   function bindTeamsBoard(){
@@ -3727,27 +3868,24 @@ JS = r"""
         moveUnitToTeam(name, team);
       });
     });
-    ['teamHomeRadius','teamHomeEngageRadius','teamAttackX','teamAttackY','teamRangerRange','teamRetreatRadius','teamAutoRadius'].forEach(function(id){
-      const el = document.getElementById(id);
-      if(!el) return;
-      el.addEventListener('change', function(){
-        teamsDirty = true;
-        setTeamsMessage('参数已修改，保存中…', '');
-        saveTeams(true);
+    const form = document.getElementById('teamsForm');
+    if(form){
+      form.addEventListener('input', function(e){
+        if(e.target && e.target.name === 'attack_mode') syncTeamModeVisibility();
+        markTeamsDirty('参数已修改，点击保存后生效');
       });
-    });
-    document.querySelectorAll('input[name="attack_mode"]').forEach(function(el){
-      el.addEventListener('change', function(){
-        syncTeamModeDisabled();
-        teamsDirty = true;
-        setTeamsMessage('参数已修改，保存中…', '');
-        saveTeams(true);
+      form.addEventListener('change', function(e){
+        if(e.target && e.target.name === 'attack_mode') syncTeamModeVisibility();
       });
-    });
-    const saveBtn = document.getElementById('teamsSaveBtn');
+      form.onsubmit = function(e){
+        e.preventDefault();
+        if(!form.reportValidity()) return;
+        saveTeams();
+      };
+    }
     const resetBtn = document.getElementById('teamsResetBtn');
-    if(saveBtn) saveBtn.onclick = function(){ saveTeams(false); };
     if(resetBtn) resetBtn.onclick = function(){ loadTeams(true); };
+    updateTeamsActions();
   }
 
   function setConfigMessage(text, kind){
@@ -3788,9 +3926,6 @@ JS = r"""
         if(input.dataset.kind === 'boolean') config[input.name] = input.checked;
         else config[input.name] = Number(input.value);
       });
-      // Keep combat rosters/settings owned by the teams board.
-      const teamPayload = buildTeamsPayload();
-      Object.keys(teamPayload).forEach(function(key){ config[key] = teamPayload[key]; });
       if(saveBtn) saveBtn.disabled = true;
       setConfigMessage('保存中…', '');
       try{
@@ -3804,9 +3939,6 @@ JS = r"""
         applyConfigValues(data.config);
         configDirty = false;
         setConfigMessage('已保存，下个 Tick 生效', 'ok');
-        teamsConfig = data.config;
-        applyTeamSettings(data.config);
-        loadTeams(true);
       }catch(err){
         setConfigMessage(err.message || '网络错误', 'err');
       }finally{
@@ -3825,9 +3957,6 @@ JS = r"""
         applyConfigValues(data.config);
         configDirty = false;
         setConfigMessage('已恢复默认值', 'ok');
-        teamsConfig = data.config;
-        applyTeamSettings(data.config);
-        loadTeams(true);
       }catch(err){
         setConfigMessage(err.message || '网络错误', 'err');
       }finally{
@@ -4129,6 +4258,11 @@ JS = r"""
   applyLogFilters();
   apply();
   window.addEventListener('resize', function(){ apply(); });
+  window.addEventListener('beforeunload', function(e){
+    if(!configDirty && !teamsDirty) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
   document.addEventListener('keydown', function(e){
     if(e.key === 'Escape' && pickMode) setPickMode(null);
   });

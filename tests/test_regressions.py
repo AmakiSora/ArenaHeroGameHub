@@ -3702,9 +3702,9 @@ class ConfigClobberProtectionTests(unittest.TestCase):
             loaded = tactic_config.load_config(path)
 
         self.assertTrue(loaded["ranger_lead_fire_enabled"])
-        html = dashboard.render_config_panel()
+        html = dashboard.render_teams_panel()
         self.assertIn('name="ranger_lead_fire_enabled"', html)
-        self.assertIn("稳定移动预判实射", html)
+        self.assertIn("移动预判实射", html)
 
 
 class GameStatsTests(unittest.TestCase):

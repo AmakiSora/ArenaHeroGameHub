@@ -124,6 +124,9 @@ class TacticConfigTests(unittest.TestCase):
             config["attack_team"] = "V2"
             config["attack_mode"] = "auto"
             config["attack_target_x"] = 42
+            config["home_engage_memory_ticks"] = 9
+            config["ranger_lead_fire_enabled"] = False
+            config["combat_heal_hp_threshold"] = 4
             save_config(config, path)
 
             reset = dashboard.reset_strategy_config(path)
@@ -134,6 +137,9 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(reset["attack_team"], "V2")
         self.assertEqual(reset["attack_mode"], "auto")
         self.assertEqual(reset["attack_target_x"], 42)
+        self.assertEqual(reset["home_engage_memory_ticks"], 9)
+        self.assertFalse(reset["ranger_lead_fire_enabled"])
+        self.assertEqual(reset["combat_heal_hp_threshold"], 4)
 
     def test_invalid_and_incomplete_values_are_rejected(self) -> None:
         with self.assertRaises(ConfigValidationError):
@@ -163,12 +169,21 @@ class TacticConfigTests(unittest.TestCase):
         page = dashboard.generate_html()
 
         for field in CONFIG_FIELDS:
-            if field.group in ("combat", "production"):
+            if field.group == "combat":
+                self.assertNotIn(f'name="{field.key}"', panel)
+                if field.key not in dashboard.TEAM_ROSTER_FIELDS:
+                    self.assertIn(f'name="{field.key}"', teams)
+                continue
+            if field.group == "production":
                 continue
             self.assertIn(f'name="{field.key}"', panel)
-        # combat_heal_hp_threshold is a combat behavior, but not one of the
-        # dedicated team-settings fields, so it renders in the generic panel.
-        self.assertIn('name="combat_heal_hp_threshold"', panel)
+        combat_keys = {
+            field.key for field in CONFIG_FIELDS if field.group == "combat"
+        }
+        self.assertEqual(
+            set(dashboard.TEAM_ROSTER_FIELDS) | set(dashboard.TEAM_SETTING_FIELDS),
+            combat_keys,
+        )
         for key, current_id in (
             ("target_workers", "prodCurrentWorkers"),
             ("target_vanguards", "prodCurrentVanguards"),
@@ -204,9 +219,22 @@ class TacticConfigTests(unittest.TestCase):
         self.assertIn('name="attack_mode"', teams)
         self.assertIn('name="attack_auto_radius"', teams)
         self.assertIn('id="teamAutoRadius"', teams)
-        self.assertIn("进攻冠军信标", teams)
+        self.assertIn("冠军信标", teams)
         self.assertIn("自动进攻", teams)
         self.assertNotIn('name="auto_attack_enabled"', teams)
+        self.assertIn('name="guerrilla_engage_radius"', teams)
+        self.assertIn('name="home_engage_memory_ticks"', teams)
+        self.assertIn('name="ranger_lead_fire_enabled"', teams)
+        self.assertIn('name="combat_heal_hp_threshold"', teams)
+        self.assertIn('name="combat_heal_return_limit"', teams)
+        self.assertIn('id="teamsForm"', teams)
+        self.assertIn('id="teamsResetBtn" disabled', teams)
+        self.assertIn('id="teamsSaveBtn" disabled', teams)
+        self.assertIn('data-attack-fields="coords"', teams)
+        self.assertIn('data-attack-fields="auto"', teams)
+        self.assertIn('data-attack-fields="beacon"', teams)
+        self.assertNotIn("拖拽单位后自动保存", teams)
+        self.assertNotIn("saveTeams(true)", page)
         # 游侠射程只有 1/2/3 三档，用下拉框而不是数字输入框。
         self.assertIn('name="ranger_attack_range"', teams)
         self.assertIn('<select id="teamRangerRange"', teams)

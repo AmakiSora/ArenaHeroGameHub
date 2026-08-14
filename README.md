@@ -172,11 +172,11 @@ python status.py
 |----|----------|------|
 | **工人与寻路** | `worker_bfs_enabled`, `bfs_max_steps`, `avoid_backtracking`, `backtrack_penalty`, `enemy_threat_radius`, `worker_mine_max_distance` | A* 寻路开关、节点上限、回头规避、遇敌回避半径 |
 | **核心** | `core_movement_enabled`, `cargo_wait_distance`, `repair_enabled`, `heal_enabled`, `peace_shield_target`, `combat_shield_target`, `resource_reserve` | 核心移动、修盾目标、生产保留金币 |
-| **战斗分队** | `home_team`, `attack_team`, `guerrilla_team`, `home_patrol_radius`, `attack_target_x/y`, `attack_mode`, `ranger_attack_range`, `ranger_lead_fire_enabled` | 三队名单（V1/R2 等）、进攻方式（坐标/自动/信标三选一）、游侠射程与预判 |
+| **战斗分队** | `home_team`, `attack_team`, `guerrilla_team`, `home_patrol_radius`, `home_engage_memory_ticks`, `attack_target_x/y`, `attack_mode`, `guerrilla_engage_radius`, `ranger_attack_range`, `ranger_lead_fire_enabled` | 三队名单（V1/R2 等）、守家/进攻/游击策略、游侠射程与预判 |
 | **运行** | `map_save_interval_ticks` | 地图记忆落盘节奏 |
-| **生产** | `target_workers`, `target_vanguards`, `target_rangers` | 各兵种目标数量（0–19） |
+| **生产** | `target_workers`, `target_vanguards`, `target_rangers` | 各兵种目标数量（0–100） |
 
-配置在仪表盘的策略配置面板修改，保存即写入 `tactic_config.json`，tactic 进程下个 Tick 自动热加载。也可通过 API 直接更新：
+配置在仪表盘分区修改：战斗相关字段位于“战斗分队”，生产、工人、核心和运行字段位于“策略配置”。保存即写入 `tactic_config.json`，tactic 进程下个 Tick 自动热加载。也可通过 API 直接更新：
 
 ```bash
 # 更新部分字段（合入最新磁盘配置）
@@ -249,8 +249,8 @@ curl -X POST http://localhost:4399/api/config/reset \
 ### 主要面板
 
 - **地图舞台**：平移缩放 SVG，显示核心、工人、先锋、游侠、敌人（按兵种细分）、敌人踪迹、墙、可见/记忆矿、单位路径、目标、信标等。图例标签均为可点击开关，显示/隐藏对应类别，选择持久化在 localStorage
-- **战斗分队卡片**：四个拖拽列（待命池 / 守家 / 进攻 / 游击），直接拖动 `V1`/`R2` 芯片换队，自动保存并下 Tick 生效；下方为守家半径、进攻方式（坐标 / 自动 / 信标三选一切换后置灰对应输入）、游侠射程等参数
-- **策略配置面板**：五组所有可调字段，含范围/选项校验
+- **战斗分队卡片**：四个拖拽列（待命池 / 守家 / 进攻 / 游击）和守家、进攻、游击、通用四组参数；拖拽与参数修改先形成草稿，点击“保存修改”后统一生效。进攻方式只显示当前模式需要的字段
+- **策略配置面板**：生产需求及工人、核心、运行参数，含范围校验；不会隐式修改战斗分队
 - **战报统计面板**：经济（采集/卸货/效率）、生产（各兵种生产/自裁/阵亡）、战斗（攻击/命中/命中率/参与击杀）、移动，每单位明细
 - **历史趋势**：资源、人口、敌人三图，窗口按时间可选（最近 10 分钟 / 30 分钟 / 1 小时），横轴按真实墙钟时间排布，选择持久化
 - **战斗日志面板**：分类日志（发现 / 击杀 / 被击败 / 战斗 / 经济 / 配置 / 异常）按标签筛选，可加时间窗口（最近 10 分钟 / 30 分钟 / 1 小时 / 6 小时 / 自定义分钟数 / 全部），选择持久化
