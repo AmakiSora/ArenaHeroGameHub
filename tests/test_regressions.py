@@ -2240,6 +2240,33 @@ class DashboardLogTests(unittest.TestCase):
                 f"enemy category {cat} should be tagged",
             )
 
+        # A live enemy HQ has its own diamond silhouette, rather than looking
+        # like another circular enemy unit with only a different label.
+        self.assertIn('data-marker="enemy-core-live"', svg)
+        self.assertRegex(
+            svg,
+            r'<polygon data-cat="enemy-core" data-marker="enemy-core-live"',
+        )
+
+    def test_svg_remembered_enemy_core_uses_star_diamond_marker(self) -> None:
+        """Unknown enemy and HQ memories must remain obvious at tiny scale."""
+        rec = {
+            "core_pos": [0, 0], "core_name": "C1",
+            "workers": [], "vanguards": [], "rangers": [], "enemies": [],
+            "resource_cells": [],
+        }
+        memory = {
+            "obstacles": [], "resources": [],
+            "enemy_sightings": [[2, 0], [4, 0, "CORE"]],
+        }
+
+        svg = dashboard.render_svg(rec, memory)
+
+        self.assertIn('data-marker="enemy-core-memory"', svg)
+        self.assertIn(">★</text>", svg)
+        self.assertIn(">敌</text>", svg)
+        self.assertEqual(dashboard._enemy_type_char("CORE"), "★")
+
     def test_svg_same_cell_enemy_keeps_highest_priority_type(self) -> None:
         """When a worker stands on the enemy CORE's own cell, only the CORE
         marker is drawn there — the blue worker must not cover the enemy HQ."""
