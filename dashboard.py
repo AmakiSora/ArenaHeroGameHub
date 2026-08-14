@@ -307,12 +307,37 @@ def _battle_log_html(limit: int = 200) -> tuple[str, int]:
             label_parts.append(f"tick {tick}")
         tick_label = " · ".join(label_parts)
         ts_attr = f' data-ts="{ts}"' if ts is not None else ""
+        msg = html.escape(str(e.get("msg", "")))
         rows.append(
             f'<div class="log-row" data-cat="{html.escape(str(e.get("cat", "")))}"{ts_attr}>'
             f'<span class="log-tick">{html.escape(tick_label)}</span>'
-            f'<span class="log-msg">{html.escape(str(e.get("msg", "")))}</span></div>'
+            f'<span class="log-msg">{_log_coord_spans(msg)}</span></div>'
         )
     return "".join(rows), len(entries)
+
+
+# 消息里的 (x,y) 坐标：tactic 的发现日志与战斗事件消息都以 "(x,y)" 或
+# "(x1,y1)→(x2,y2)" 结尾（见 tactic._fmt_cell），这里把每个坐标包成可点击
+# 跳转的 span。正则跑在 html.escape 之后的字符串上，数字/括号/逗号不受转义
+# 影响，所以直接匹配即可。
+_LOG_COORD_RE = re.compile(r"\((-?\d+)\s*,\s*(-?\d+)\)")
+
+
+def _log_coord_spans(msg: str) -> str:
+    """把已转义消息里的 (x,y) 坐标包成带 data-focus 属性的可点击 span。
+
+    前端对带 data-focus-wx/wy 的元素做委托点击，调用 focusWorld 把地图视角
+    重置到该坐标（与右侧单位卡片跳转同一机制），这里只需输出属性无需额外 JS。
+    无坐标的消息原样返回。
+    """
+    return _LOG_COORD_RE.sub(
+        lambda m: (
+            f'<span class="log-coord" data-focus-wx="{m.group(1)}" '
+            f'data-focus-wy="{m.group(2)}" title="点击定位到地图">'
+            f"({m.group(1)},{m.group(2)})</span>"
+        ),
+        msg,
+    )
 
 
 
@@ -2102,6 +2127,8 @@ body{margin:0;min-height:100vh;color:var(--text);
 .log-row[data-cat="economy"] .log-msg{color:#8ef0c4}
 .log-row[data-cat="config"] .log-msg{color:#6ea8ff}
 .log-row[data-cat="warn"] .log-msg{color:#ffc857}
+.log-msg .log-coord{color:inherit;border-bottom:1px dashed rgba(255,255,255,.45);cursor:pointer;white-space:nowrap;border-radius:3px;padding:0 1px;transition:background .12s,border-color .12s}
+.log-msg .log-coord:hover{background:rgba(110,168,255,.22);border-bottom-color:#6ea8ff}
 .production-section{margin-bottom:18px;padding-bottom:18px;border-bottom:1px solid var(--line)}
 .production-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
 .production-title>div{display:flex;flex-direction:column;gap:2px}

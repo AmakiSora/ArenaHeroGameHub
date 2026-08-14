@@ -5799,6 +5799,30 @@ class BattleLogTests(unittest.TestCase):
         self.assertIn("发现矿点", html)
         self.assertIn("tick 1", html)
 
+    def test_log_panel_coords_are_clickable_map_jumps(self) -> None:
+        """日志消息里的 (x,y) 坐标渲染成带 data-focus 属性的可点击 span，
+        前端点击后调用 focusWorld 把地图视角重置到战斗发生的位置。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "battle_log.jsonl"
+            path.write_text(
+                json.dumps({"tick": 1, "cat": "kill", "msg": "W1 参与摧毁 E3 (12,-34)"}) + "\n"
+                + json.dumps({"tick": 2, "cat": "combat", "msg": "W1 击中 E3 (5,6)→(9,10)"}) + "\n"
+                + json.dumps({"tick": 3, "cat": "discover", "msg": "发现新矿点 (3,4)"}) + "\n"
+                + json.dumps({"tick": 4, "cat": "config", "msg": "配置调整"}) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
+                html, count = dashboard._battle_log_html()
+        self.assertEqual(count, 4)
+        # 每个坐标都被包成可点击 span 且携带跳转属性（负数坐标也支持）
+        self.assertIn('class="log-coord" data-focus-wx="12" data-focus-wy="-34"', html)
+        # 箭头形式的战斗事件两个坐标都能跳转
+        self.assertIn('data-focus-wx="5" data-focus-wy="6"', html)
+        self.assertIn('data-focus-wx="9" data-focus-wy="10"', html)
+        self.assertIn('data-focus-wx="3" data-focus-wy="4"', html)
+        # 无坐标的消息不生成跳转属性
+        self.assertNotIn('data-focus-wx="0"', html)
+
     def test_log_panel_html_shows_time_beside_tick(self) -> None:
         """Rows carrying both tick and ts render the wall-clock time next to
         the tick label (config rows already render ts-only as a time)."""
