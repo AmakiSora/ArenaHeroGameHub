@@ -5736,6 +5736,37 @@ class BattleLogTests(unittest.TestCase):
         self.assertTrue(any("(3,4)" in e["msg"] for e in entries))
         self.assertTrue(any("(7,8)" in e["msg"] for e in entries))
 
+    def test_event_messages_carry_coordinates(self) -> None:
+        """事件行附带坐标：双方箭头优先，其次事件结算格，最后单方格子。"""
+        turn = SimpleNamespace(
+            units=(self._unit("u1", UnitType.WORKER, (3, 4)),),
+            visible_enemies=(self._unit("e1", UnitType.RANGER, (7, 8)),),
+            core=None,
+        )
+        # 双方位置都已知且不同 → (ax,ay)→(tx,ty)
+        _cat, msg = tactic._classify_battle_event(
+            turn, self._event("SHOT_HIT", actor="u1", target="e1", values={"damage": 1}),
+        )
+        self.assertIn("(3,4)→(7,8)", msg)
+        # 事件自带结算格优先于 actor 当前格
+        _cat, msg = tactic._classify_battle_event(
+            turn,
+            self._event("HARVEST_SUCCEEDED", actor="u1", values={"amount": 2}, pos=(5, 6)),
+        )
+        self.assertIn("(5,6)", msg)
+        self.assertNotIn("(3,4)", msg)
+        # 双方同格时退化为单个坐标
+        same = SimpleNamespace(
+            units=(self._unit("u1", UnitType.WORKER, (9, 9)),),
+            visible_enemies=(self._unit("e1", UnitType.RANGER, (9, 9)),),
+            core=None,
+        )
+        _cat, msg = tactic._classify_battle_event(
+            same, self._event("SHOT_HIT", actor="u1", target="e1", values={"damage": 1}),
+        )
+        self.assertIn("(9,9)", msg)
+        self.assertNotIn("→", msg)
+
     def test_read_battle_log_returns_newest_first(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "battle_log.jsonl"

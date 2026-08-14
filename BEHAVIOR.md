@@ -309,6 +309,10 @@ tick=35060 core=MOVE_RIGHT res=9/45 pop=9 workers=7 enemies=0 resources_visible=
 - **配置**：仪表盘保存配置 / 分队调整 / 恢复默认（由 dashboard 进程写入）
 - **异常**：挖矿/卸货/生产/移动/修复失败、射击未命中等
 
+事件行附带坐标（无坐标可附时省略），优先级：双方当前格子不同 → `(ax,ay)→(tx,ty)`
+（如 `R1 击中 E3 (3,5)→(4,5)`）；否则用事件自带结算格；再回退到单方所在格。
+发现行本身已带坐标。
+
 tactic 进程每 Tick 追加发现与解析事件，dashboard 进程在保存配置时追加配置行；两者用
 文件锁并发写同一 `battle_log.jsonl`，超过 2MB 自动裁剪保留最新 500 条。筛选选择保存在
 浏览器 localStorage。

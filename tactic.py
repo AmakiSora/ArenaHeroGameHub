@@ -4338,8 +4338,42 @@ def _battle_actor_name(turn: Any, object_id: Any) -> str:
     return _object_name(object_id, "U")
 
 
-def _classify_battle_event(turn: Any, event: Any) -> tuple[str | None, str | None]:
-    """Map one resolution event to a (category, human message) log row."""
+def _battle_position_map(turn: Any) -> dict[str, tuple[int, int]]:
+    """按对象 id 收集本回合各单位/敌人/核心的格子，供战斗日志附加坐标。
+
+    事件的 actor_id / target_id 可能指向我方单位、可见敌人或核心；直接取
+    当前回合状态里的 position，保证坐标与事件行同一时刻一致。
+    """
+    out: dict[str, tuple[int, int]] = {}
+    for obj in list(getattr(turn, "units", ()) or ()) + list(getattr(turn, "visible_enemies", ()) or ()):
+        pos = getattr(obj, "position", None)
+        if getattr(obj, "id", None) is not None and pos is not None:
+            out[str(obj.id)] = (int(pos[0]), int(pos[1]))
+    core = getattr(turn, "core", None)
+    if core is not None:
+        pos = getattr(core, "position", None)
+        if getattr(core, "id", None) is not None and pos is not None:
+            out[str(core.id)] = (int(pos[0]), int(pos[1]))
+    return out
+
+
+def _fmt_cell(pos: Any) -> str:
+    """格子坐标格式化为 "(x,y)"，与发现日志的写法保持一致。"""
+    return f"({int(pos[0])},{int(pos[1])})"
+
+
+def _classify_battle_event(
+    turn: Any,
+    event: Any,
+    positions: dict[str, tuple[int, int]] | None = None,
+) -> tuple[str | None, str | None]:
+    """Map one resolution event to a (category, human message) log row.
+
+    消息末尾附带坐标（无坐标可附时保持原样），优先级：
+    1. actor 与 target 双方当前格子不同 → "(ax,ay)→(tx,ty)"（战斗事件最直观）；
+    2. 事件自带的结算格 event.position；
+    3. 回退到 actor / target 当前所在格。
+    """
     et = getattr(event, "event_type", "")
     reason = getattr(event, "reason_code", None) or ""
     actor = _battle_actor_name(turn, getattr(event, "actor_id", None))
@@ -4351,65 +4385,87 @@ def _classify_battle_event(turn: Any, event: Any) -> tuple[str | None, str | Non
     if amount is None:
         amount = values.get("amount")
 
+    # 坐标后缀：双方箭头 > 事件结算格 > actor 格 > target 格
+    if positions is None:
+        positions = _battle_position_map(turn)
+    actor_id = getattr(event, "actor_id", None)
+    target_id = getattr(event, "target_id", None)
+    actor_cell = positions.get(str(actor_id)) if actor_id is not None else None
+    target_cell = positions.get(str(target_id)) if target_id is not None else None
+    if actor_cell is not None and target_cell is not None and actor_cell != target_cell:
+        cell_suffix = f" {_fmt_cell(actor_cell)}→{_fmt_cell(target_cell)}"
+    elif getattr(event, "position", None) is not None:
+        cell_suffix = f" {_fmt_cell(event.position)}"
+    elif actor_cell is not None:
+        cell_suffix = f" {_fmt_cell(actor_cell)}"
+    elif target_cell is not None:
+        cell_suffix = f" {_fmt_cell(target_cell)}"
+    else:
+        cell_suffix = ""
+
+    def row(cat: str, msg: str) -> tuple[str, str]:
+        """返回 (分类, 消息+坐标后缀)。"""
+        return cat, f"{msg}{cell_suffix}"
+
     if et == "SHOT_HIT":
         dmg = values.get("damage")
-        return "combat", f"{actor} 击中 {target}" + (f" 造成 {dmg} 伤害" if dmg else "")
+        return row("combat", f"{actor} 击中 {target}" + (f" 造成 {dmg} 伤害" if dmg else ""))
     if et == "SWEEP_RESOLVED":
         n = values.get("targets_hit", 0)
-        return "combat", f"{actor} 横扫命中 {n} 个目标"
+        return row("combat", f"{actor} 横扫命中 {n} 个目标")
     if et == "DESTRUCTION_PARTICIPATION":
-        return "kill", f"{actor} 参与摧毁 {target}"
+        return row("kill", f"{actor} 参与摧毁 {target}")
     if et == "CORE_RESOURCES_CAPTURED":
-        return "kill", "摧毁敌方核心" + (f"，缴获 {amount} 资源" if amount else "")
+        return row("kill", "摧毁敌方核心" + (f"，缴获 {amount} 资源" if amount else ""))
     if et == "UNIT_DAMAGED":
         hp = values.get("hp")
         dmg = values.get("damage")
         if hp == 0:
-            return "defeat", f"{target} 被击败"
-        return "combat", f"{target} 受 {dmg} 伤害（HP {hp}）"
+            return row("defeat", f"{target} 被击败")
+        return row("combat", f"{target} 受 {dmg} 伤害（HP {hp}）")
     if et == "UNIT_SELF_DESTRUCTED":
-        return "defeat", f"{actor} 超编自裁"
+        return row("defeat", f"{actor} 超编自裁")
     if et == "CORE_DAMAGED":
-        return "defeat", "核心受到攻击"
+        return row("defeat", "核心受到攻击")
     if et == "CORE_DESTROYED":
-        return "defeat", "核心被摧毁"
+        return row("defeat", "核心被摧毁")
     if et == "HARVEST_SUCCEEDED":
-        return "economy", f"{actor} 挖矿 +{amount or '?'}"
+        return row("economy", f"{actor} 挖矿 +{amount or '?'}")
     if et == "DEPOSIT_SUCCEEDED":
-        return "economy", f"{actor} 卸货 +{amount or '?'}"
+        return row("economy", f"{actor} 卸货 +{amount or '?'}")
     if et == "BEACON_HARVEST_BONUS":
-        return "economy", f"{actor} 信标加成 +{amount or '?'}"
+        return row("economy", f"{actor} 信标加成 +{amount or '?'}")
     if et == "CORE_REPAIR_SUCCEEDED":
-        return "economy", "核心修盾 +1"
+        return row("economy", "核心修盾 +1")
     if et in ("CORE_HEAL_SUCCEEDED", "UNIT_HEAL_SUCCEEDED"):
         who = "核心" if et.startswith("CORE") else actor
-        return "economy", f"{who} 回血 +{amount or '?'}"
+        return row("economy", f"{who} 回血 +{amount or '?'}")
     if et == "CORE_SPAWN_SUCCEEDED":
         tname = _UNIT_TYPE_LABELS.get(str(values.get("unit_type", "")), "单位")
         cost = values.get("cost")
         suffix = f"（{cost} 资源）" if cost is not None else ""
-        return "economy", f"生产 {tname}{suffix}"
+        return row("economy", f"生产 {tname}{suffix}")
     if et == "CORE_RESOURCE_OVERFLOW_DESTROYED":
-        return "economy", f"人口下降，{amount or '?'} 资源被销毁"
+        return row("economy", f"人口下降，{amount or '?'} 资源被销毁")
 
     if et == "HARVEST_FAILED":
-        return "warn", f"{actor} 挖矿失败：{_LOG_CAT_REASONS['HARVEST_FAILED'].get(reason, reason)}"
+        return row("warn", f"{actor} 挖矿失败：{_LOG_CAT_REASONS['HARVEST_FAILED'].get(reason, reason)}")
     if et == "DEPOSIT_FAILED":
-        return "warn", f"{actor} 卸货失败：{_LOG_CAT_REASONS['DEPOSIT_FAILED'].get(reason, reason)}"
+        return row("warn", f"{actor} 卸货失败：{_LOG_CAT_REASONS['DEPOSIT_FAILED'].get(reason, reason)}")
     if et == "SHOT_MISSED":
-        return "warn", f"{actor} 射击未命中"
+        return row("warn", f"{actor} 射击未命中")
     if et in ("CORE_HEAL_FAILED", "UNIT_HEAL_FAILED", "CORE_REPAIR_FAILED"):
-        return "warn", f"修复/回血失败：{reason or '—'}"
+        return row("warn", f"修复/回血失败：{reason or '—'}")
     if et == "CORE_SPAWN_FAILED":
         why = _LOG_CAT_REASONS["CORE_SPAWN_FAILED"].get(reason, reason or "—")
-        return "warn", f"生产失败：{why}"
+        return row("warn", f"生产失败：{why}")
     if et in (
         "UNIT_MOVE_FAILED",
         "CORE_MOVE_FAILED",
         "CORE_MOVE_START_FAILED",
         "CORE_ACTION_FAILED",
     ):
-        return "warn", f"{actor} 移动/动作失败：{reason or '—'}"
+        return row("warn", f"{actor} 移动/动作失败：{reason or '—'}")
     return None, None
 
 
@@ -4433,8 +4489,10 @@ def _battle_log_entries(
             "tick": tick, "ts": ts, "cat": "discover",
             "msg": f"发现敌人踪迹 ({pos[0]},{pos[1]})",
         })
+    # 预建一次对象位置索引，避免对每个事件重复遍历单位列表
+    positions = _battle_position_map(turn)
     for event in getattr(turn, "events", ()) or ():
-        cat, msg = _classify_battle_event(turn, event)
+        cat, msg = _classify_battle_event(turn, event, positions)
         if cat and msg:
             entries.append({"tick": tick, "ts": ts, "cat": cat, "msg": msg})
     return entries
