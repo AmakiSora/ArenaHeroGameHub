@@ -3155,6 +3155,11 @@ def _plan_attack_combat(
     attack_auto_radius (auto 模式专用，曼哈顿距离，0=不限制)：
       约束 auto 目标候选与沿途接敌，均只保留距核心 N 格内的点/敌人；
       不约束撤退分支（attack-retreat）。radius=0 或非 auto 模式时完全不生效。
+
+    coords / beacon 模式的沿途接敌（优先级 2）只追"顺路"敌人：
+      到目标点的距离不超过本单位当前到目标点的距离（敌人在目标侧/前进
+      方向），反方向或偏离行军方向的可见敌人忽略。attack_march_engage_radius
+      （N>0）可再限定只追距本单位 N 格内的顺路敌人；0 = 仅顺路过滤。
     """
     pos = tuple(unit.position)
 
@@ -3258,6 +3263,20 @@ def _plan_attack_combat(
                 e
                 for e in enemies
                 if _manhattan(tuple(e.position), engage_core) <= attack_radius
+            )
+        elif mode in ("coords", "beacon"):
+            # 坐标/信标模式只接战"顺路"敌人：该敌人到目标点的距离不超过
+            # 本单位当前到目标点的距离（敌人在目标侧/前进方向）。反方向或
+            # 偏离行军方向的可见敌人一律忽略，落入行军朝目标推进。
+            # attack_march_engage_radius（N>0）额外要求敌人在本单位 N 格内，
+            # 防止为远处敌人大幅绕路；0 = 仅顺路过滤。两模式共用该配置。
+            march_leash = max(int(config.get("attack_march_engage_radius", 0) or 0), 0)
+            target_dist = _manhattan(pos, target)
+            engage_pool = tuple(
+                e
+                for e in enemies
+                if _manhattan(tuple(e.position), target) <= target_dist
+                and (march_leash <= 0 or _manhattan(pos, tuple(e.position)) <= march_leash)
             )
         if engage_pool:
             nearest = min(engage_pool, key=lambda e: _manhattan(pos, e.position))

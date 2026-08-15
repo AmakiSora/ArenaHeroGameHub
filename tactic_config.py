@@ -129,6 +129,16 @@ CONFIG_FIELDS = (
         1,
     ),
     ConfigField(
+        "attack_march_engage_radius",
+        "行军沿途接敌半径(0=仅顺路)",
+        "combat",
+        "integer",
+        0,
+        0,
+        500,
+        1,
+    ),
+    ConfigField(
         "ranger_lead_fire_enabled",
         "稳定移动预判实射",
         "combat",

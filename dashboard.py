@@ -1207,6 +1207,14 @@ def render_teams_panel() -> str:
         f'<p class="team-mode-note" data-attack-fields="beacon"{beacon_hidden}>'
         '进攻队将以冠军信标为目标，无需额外参数。</p>'
     )
+    # 坐标/信标共用：沿途接敌束带。坐标与信标模式都只追"顺路"敌人；
+    # N>0 时额外限定只追距本单位 N 格内的顺路敌人，0 = 仅顺路过滤。
+    march_leash_field = (
+        f'<div class="team-attack-fields team-field-grid" data-attack-fields="coords beacon">'
+        + number_field("teamMarchRadius", "attack_march_engage_radius", "沿途接敌半径", 0, 500,
+                       "坐标/信标只接战顺路敌人；N>0 时再限定距本单位 N 格内")
+        + '</div>'
+    )
 
     return (
         '<section class="panel teams-panel" id="teamsPanel">'
@@ -1252,7 +1260,7 @@ def render_teams_panel() -> str:
         '<label class="team-radio"><input type="radio" name="attack_mode" value="beacon"'
         f'{mode_checked["beacon"]}><span>冠军信标</span></label>'
         '</div><em class="team-field-error" data-field-error="attack_mode"></em></fieldset>'
-        f'{attack_coords}{attack_auto}{attack_beacon}</section>'
+        f'{attack_coords}{attack_auto}{attack_beacon}{march_leash_field}</section>'
         '<div class="teams-footer">'
         '<span class="teams-message" id="teamsMessage" aria-live="polite">修改后统一保存，下个 Tick 生效</span>'
         '<div class="teams-actions">'
@@ -3626,6 +3634,7 @@ JS = r"""
       ranger_lead_fire_enabled: Boolean((document.getElementById('teamLeadFire') || {}).checked),
       attack_retreat_radius: Number((document.getElementById('teamRetreatRadius') || {}).value || 5),
       attack_auto_radius: Number((document.getElementById('teamAutoRadius') || {}).value || 0),
+      attack_march_engage_radius: Number((document.getElementById('teamMarchRadius') || {}).value || 0),
       guerrilla_engage_radius: Number((document.getElementById('teamGuerrillaSight') || {}).value || 0)
     };
   }
@@ -3634,7 +3643,8 @@ JS = r"""
     const modeEl = document.querySelector('input[name="attack_mode"]:checked');
     const mode = (modeEl && modeEl.value) || 'coords';
     document.querySelectorAll('[data-attack-fields]').forEach(function(group){
-      const active = group.getAttribute('data-attack-fields') === mode;
+      const modes = (group.getAttribute('data-attack-fields') || '').split(' ');
+      const active = modes.indexOf(mode) !== -1;
       group.hidden = !active;
       group.querySelectorAll('input,select,button').forEach(function(el){ el.disabled = !active; });
     });
@@ -3656,6 +3666,7 @@ JS = r"""
       ranger_lead_fire_enabled: 'teamLeadFire',
       attack_retreat_radius: 'teamRetreatRadius',
       attack_auto_radius: 'teamAutoRadius',
+      attack_march_engage_radius: 'teamMarchRadius',
       guerrilla_engage_radius: 'teamGuerrillaSight'
     };
     Object.keys(map).forEach(function(key){
@@ -3703,6 +3714,7 @@ JS = r"""
       ranger_lead_fire_enabled: settings.ranger_lead_fire_enabled,
       attack_retreat_radius: settings.attack_retreat_radius,
       attack_auto_radius: settings.attack_auto_radius,
+      attack_march_engage_radius: settings.attack_march_engage_radius,
       guerrilla_engage_radius: settings.guerrilla_engage_radius
     };
   }

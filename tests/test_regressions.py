@@ -1353,6 +1353,112 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertIn("attack-march", detail)
         self.assertEqual(unit.arg.name, "RIGHT")
 
+    def test_attack_coords_ignores_enemy_behind_target(self) -> None:
+        # 坐标进攻只接战"顺路"敌人：反方向（比本单位更远离目标）的可见敌人
+        # 不再被追，队伍继续朝目标行军。
+        unit = self.CombatUnit("v-attack", (0, 0))
+        enemy = self.Enemy((-3, 0))
+        self.config["attack_target_x"] = 5
+        self.config["attack_target_y"] = 0
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(enemy,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="attack",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("attack-march-coords (5, 0)", detail)
+        self.assertNotIn("attack-engage", detail)
+        self.assertEqual(unit.arg.name, "RIGHT")
+
+    def test_attack_coords_engages_on_way_enemy(self) -> None:
+        # 目标侧的敌人（到目标距离 ≤ 本单位到目标距离）算"沿途"，正常追击。
+        unit = self.CombatUnit("v-attack", (0, 0))
+        enemy = self.Enemy((3, 0))
+        self.config["attack_target_x"] = 5
+        self.config["attack_target_y"] = 0
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(enemy,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="attack",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("attack-engage", detail)
+        self.assertEqual(unit.arg.name, "RIGHT")
+
+    def test_attack_coords_holds_at_target_ignores_distant_enemy(self) -> None:
+        # 已到达目标点后只打贴身/射程内敌人；远处可见敌人不再带离坐标。
+        unit = self.CombatUnit("v-attack", (5, 0))
+        enemy = self.Enemy((5, 3))
+        self.config["attack_target_x"] = 5
+        self.config["attack_target_y"] = 0
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(enemy,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="attack",
+        )
+
+        self.assertEqual(action, "WAIT")
+        self.assertIn("attack-hold-coords (5, 0)", detail)
+        self.assertNotIn("attack-engage", detail)
+
+    def test_attack_beacon_ignores_enemy_behind_beacon(self) -> None:
+        # 信标模式同样只追顺路敌人：反方向敌人忽略，继续朝信标行军。
+        tactic.turn_context.beacon_pos = (5, 0)
+        unit = self.CombatUnit("v-attack", (0, 0))
+        enemy = self.Enemy((-3, 0))
+        self.config["attack_mode"] = "beacon"
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(enemy,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="attack",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("attack-march-beacon (5, 0)", detail)
+        self.assertNotIn("attack-engage", detail)
+        self.assertEqual(unit.arg.name, "RIGHT")
+
+    def test_attack_march_leash_radius_limits_chase(self) -> None:
+        # attack_march_engage_radius=N 时，顺路但距本单位超过 N 格的敌人
+        # 也被排除，避免为远处敌人大幅绕路。
+        unit = self.CombatUnit("v-attack", (0, 0))
+        enemy = self.Enemy((4, 0))  # 顺路（距目标 1），但距本单位 4 > N=2
+        self.config["attack_target_x"] = 5
+        self.config["attack_target_y"] = 0
+        self.config["attack_march_engage_radius"] = 2
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(enemy,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="attack",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("attack-march-coords (5, 0)", detail)
+        self.assertNotIn("attack-engage", detail)
+        self.assertEqual(unit.arg.name, "RIGHT")
+
     def test_attack_team_detours_when_direct_steps_are_blocked(self) -> None:
         unit = self.CombatUnit("v-detour", (0, 0))
         self.config["attack_target_x"] = 2
