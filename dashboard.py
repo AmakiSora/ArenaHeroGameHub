@@ -358,6 +358,146 @@ def _log_coord_spans(msg: str) -> str:
     )
 
 
+# ── 战斗热点（哪里在打仗） ──────────────────────────────────────────────
+# 把"哪里发生战斗"聚合成可点击热点：地图上方告警条 + 地图脉冲光圈。
+# 三级危险度：engaged（可见敌人贴着我方单位）、recent（窗口内战斗日志
+# 行，坐标取结算目标格）、sighted（可见但未接战）。
+_HOTSPOT_ENGAGE_RADIUS = 2      # 敌我 Chebyshev 距离 ≤ 该值视为交战中
+_HOTSPOT_RECENT_WINDOW = 180.0  # 近期交火窗口（秒）
+_HOTSPOT_LEVEL_ORDER = {"engaged": 0, "recent": 1, "sighted": 2}
+
+
+def _recent_combat_cells(window: float = _HOTSPOT_RECENT_WINDOW) -> dict:
+    """Collect {cell: {ts, events}} from combat/kill/defeat rows in the window.
+
+    Scans the battle log newest-first and stops at the first row older than
+    the window (the file is time-ordered), so an idle stretch costs only the
+    newest few lines. Coordinates come from the trailing "(x,y)" /
+    "(ax,ay)→(tx,ty)" suffix the tactic appends; an arrow resolves to the
+    target cell (the last coordinate), i.e. where the hit landed.
+    """
+    if not os.path.exists(BATTLE_LOG_FILE):
+        return {}
+    cutoff = time.time() - window
+    out: dict = {}
+    for line in _iter_log_lines_reverse(BATTLE_LOG_FILE):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            ts = float(row.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if ts < cutoff:
+            break
+        if row.get("cat") not in ("combat", "kill", "defeat"):
+            continue
+        coords = _LOG_COORD_RE.findall(str(row.get("msg", "")))
+        if not coords:
+            continue
+        cell = (int(coords[-1][0]), int(coords[-1][1]))
+        info = out.get(cell)
+        if info is None:
+            out[cell] = {"ts": ts, "events": 1}
+        else:
+            info["events"] += 1
+            info["ts"] = max(info["ts"], ts)
+    return out
+
+
+def _combat_hotspots(rec: dict) -> list:
+    """Aggregate combat locations into sorted hotspot dicts.
+
+    Order: engaged > recent > sighted, then newest / most enemies first.
+    Each entry: {x, y, level, enemies, friendlies, events, last_ts, age_s}.
+    """
+    friendlies: list = []
+    core = rec.get("core_pos")
+    if core and len(core) == 2:
+        friendlies.append((int(core[0]), int(core[1])))
+    for group in ("workers", "vanguards", "rangers"):
+        for u in rec.get(group, []) or []:
+            p = u.get("pos") or []
+            if len(p) == 2:
+                friendlies.append((int(p[0]), int(p[1])))
+
+    hotspots: dict = {}
+
+    def spot(x: int, y: int, level: str) -> dict:
+        s = hotspots.get((x, y))
+        if s is None:
+            s = {"x": x, "y": y, "level": level, "enemies": 0,
+                 "friendlies": 0, "events": 0, "last_ts": None}
+            hotspots[(x, y)] = s
+        elif _HOTSPOT_LEVEL_ORDER[level] < _HOTSPOT_LEVEL_ORDER[s["level"]]:
+            s["level"] = level  # a live fight outranks a stale event cell
+        return s
+
+    for enemy in rec.get("enemies", []) or []:
+        p = enemy.get("pos") or []
+        if len(p) != 2:
+            continue
+        x, y = int(p[0]), int(p[1])
+        near = sum(
+            1 for fx, fy in friendlies
+            if max(abs(fx - x), abs(fy - y)) <= _HOTSPOT_ENGAGE_RADIUS
+        )
+        s = spot(x, y, "engaged" if near else "sighted")
+        s["enemies"] += 1
+        s["friendlies"] += near
+
+    for (x, y), info in _recent_combat_cells().items():
+        s = spot(x, y, "recent")
+        s["events"] += info["events"]
+        s["last_ts"] = info["ts"] if s["last_ts"] is None else max(s["last_ts"], info["ts"])
+
+    out = list(hotspots.values())
+    now = time.time()
+    for s in out:
+        s["age_s"] = (now - s["last_ts"]) if s["last_ts"] is not None else None
+    out.sort(key=lambda s: (
+        _HOTSPOT_LEVEL_ORDER[s["level"]],
+        -(s["last_ts"] or 0.0),
+        -s["enemies"],
+    ))
+    return out
+
+
+def _hotspots_html(hotspots: list, limit: int = 12) -> str:
+    """Render the hotspot strip above the map; chips jump the map on click.
+
+    Chips carry data-focus-wx/wy, so the existing document-level delegation
+    (focusWorld) handles the jump — no extra JS needed.
+    """
+    if not hotspots:
+        return '<span class="muted">当前无战斗 · 视野内无敌人</span>'
+    chips = []
+    for s in hotspots[:limit]:
+        level = s["level"]
+        coord = f"({s['x']},{s['y']})"
+        if level == "engaged":
+            label = f"⚔ 交战 {coord} · 敌{s['enemies']}"
+            if s["friendlies"]:
+                label += f" 我{s['friendlies']}"
+        elif level == "recent":
+            age = int(s.get("age_s") or 0)
+            ago = f"{age}秒前" if age < 60 else f"{age // 60}分钟前"
+            label = f"✦ {ago}交火 {coord}"
+        else:
+            label = f"👁 敌人 {coord}"
+            if s["enemies"] > 1:
+                label += f" ×{s['enemies']}"
+        chips.append(
+            f'<button type="button" class="hotspot {level}" data-focus-wx="{s["x"]}" '
+            f'data-focus-wy="{s["y"]}" title="点击定位到地图">{html.escape(label)}</button>'
+        )
+    extra = len(hotspots) - len(chips)
+    tail = f'<span class="hotspot-more">+{extra} 处</span>' if extra > 0 else ""
+    return "".join(chips) + tail
+
 
 def _clamp_log_limit(request) -> int:
     """Parse the ``?log=`` / ``?limit=`` query into a bounded row count.
@@ -666,7 +806,8 @@ def _file_sig(path: str) -> tuple[int, int] | None:
     return stat.st_mtime_ns, stat.st_size
 
 
-def _render_svg_cached(rec: dict, mm: dict, waypoints: dict) -> str:
+def _render_svg_cached(rec: dict, mm: dict, waypoints: dict,
+                       hotspots: list | None = None) -> str:
     config = load_config(CONFIG_PATH)
     marker_sig = (
         str(config.get("attack_mode", "coords")),
@@ -676,16 +817,22 @@ def _render_svg_cached(rec: dict, mm: dict, waypoints: dict) -> str:
         int(config.get("core_target_x", 0)),
         int(config.get("core_target_y", 0)),
     )
+    # The combat rings change with the battle log even between ticks, so the
+    # hotspot set joins the cache signature.
+    hotspot_sig = tuple(
+        (s["x"], s["y"], s["level"]) for s in (hotspots or [])
+    )
     key = (
         rec.get("tick"),
         _file_sig(MAP_FILE),
         _file_sig(WAYPOINTS_FILE),
         marker_sig,
+        hotspot_sig,
     )
     cached = _svg_cache.get(key)
     if cached is not None:
         return cached
-    svg = render_svg(rec, mm, config=config, waypoints=waypoints)
+    svg = render_svg(rec, mm, config=config, waypoints=waypoints, hotspots=hotspots)
     # Keep only the newest entry so a moved map frees the stale render.
     _svg_cache.clear()
     _svg_cache[key] = svg
@@ -1542,12 +1689,17 @@ def _collect_points(rec, mm):
 
 
 def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
-               config: dict | None = None, waypoints: dict | None = None):
+               config: dict | None = None, waypoints: dict | None = None,
+               hotspots: list | None = None):
     if config is None:
         config = load_config(CONFIG_PATH)
     if waypoints is None:
         waypoints = load_waypoints()
     pts = _collect_points(rec, mm)
+    # Hotspot cells from the battle log may sit outside the live-unit bounds
+    # (e.g. a fight where every participant died) — keep them on the canvas.
+    for s in (hotspots or []):
+        pts.append((s["x"], s["y"]))
     core = rec.get("core_pos")
     if not pts:
         return '<div class="muted">暂无地图数据</div>'
@@ -1691,6 +1843,27 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
             a(f'<text data-cat="enemy-trace" x="{cxr}" y="{cyr + 2.2}" text-anchor="middle" '
               f'font-size="7.5" font-family="Segoe UI, Microsoft YaHei, sans-serif" '
               f'font-weight="700" fill="#0b1020" opacity="0.9">{label}</text>')
+
+    # Combat hotspots: pulsing double ring where a fight is on (engaged),
+    # dashed orange ring where one just happened (recent). Drawn below
+    # routes/units so the markers stay readable on top. Sighted-only enemies
+    # already have their unit markers, no extra ring.
+    for s in (hotspots or []):
+        if s.get("level") == "sighted":
+            continue
+        hx, hy = s["x"], s["y"]
+        if not (xmin <= hx <= xmax and ymin <= hy <= ymax):
+            continue
+        x, y = to_xy(hx, hy)
+        hcx, hcy = x + cell / 2, y + cell / 2
+        if s["level"] == "engaged":
+            a(f'<circle data-cat="combat" cx="{hcx}" cy="{hcy}" r="17" fill="none" '
+              f'stroke="#ff4964" stroke-width="1.3" opacity="0.65"/>')
+            a(f'<circle data-cat="combat" class="hotspot-ring engaged" cx="{hcx}" cy="{hcy}" r="12" '
+              f'fill="rgba(255,73,100,0.15)" stroke="#ff4964" stroke-width="2"/>')
+        else:
+            a(f'<circle data-cat="combat" cx="{hcx}" cy="{hcy}" r="12" fill="none" '
+              f'stroke="#ff8c42" stroke-width="1.6" stroke-dasharray="4 3" opacity="0.85"/>')
 
     # Worker routes and targets are generated by the same planner that moves them.
     route_colors = (
@@ -2068,6 +2241,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .game-map.hide-beacon [data-cat="beacon"],
 .game-map.hide-attack-target [data-cat="attack-target"],
 .game-map.hide-core-target [data-cat="core-target"],
+.game-map.hide-combat [data-cat="combat"],
 .game-map.hide-wp [data-cat="wp"]{display:none}
 .map-legend .dot{width:10px;height:10px;border-radius:50%;box-shadow:0 0 8px currentColor}
 .map-legend .dot.core{background:#6ea8ff;color:#6ea8ff;border-radius:2px}
@@ -2089,6 +2263,25 @@ body{margin:0;min-height:100vh;color:var(--text);
 .map-legend .dot.attack-target{width:10px;height:10px;border:2px dashed #ff8c42;background:transparent;box-shadow:none;border-radius:0}
 .map-legend .dot.core-target{width:10px;height:10px;border:2px dashed #6ea8ff;background:transparent;box-shadow:none;border-radius:0}
 .map-legend .dot.wp{width:10px;height:10px;border:2px dashed #3dd6c9;background:transparent;box-shadow:none;border-radius:0}
+.map-legend .dot.combat{background:#ff4964;color:#ff4964}
+
+/* Combat hotspot strip: the loudest element on the page while a fight is on.
+   Chips are clickable (data-focus-wx/wy → focusWorld); engaged ones pulse. */
+.hotspot-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;
+ margin-bottom:10px;border-radius:10px;background:rgba(255,255,255,.028);border:1px solid rgba(255,255,255,.06)}
+.hotspot{font:inherit;font-size:12px;line-height:1;padding:6px 11px;border-radius:999px;cursor:pointer;transition:.12s}
+.hotspot:hover{filter:brightness(1.25)}
+.hotspot.engaged{background:rgba(255,73,100,.16);border:1px solid rgba(255,73,100,.6);color:#ff9db0;
+ animation:hotspot-pulse 1.6s ease-in-out infinite}
+.hotspot.recent{background:rgba(255,140,66,.13);border:1px solid rgba(255,140,66,.5);color:#ffc39a}
+.hotspot.sighted{background:rgba(138,164,255,.09);border:1px solid rgba(138,164,255,.32);color:#b7c4e8}
+.hotspot-more{font-size:11px;color:var(--muted)}
+@keyframes hotspot-pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,73,100,.45)}50%{box-shadow:0 0 0 7px rgba(255,73,100,0)}}
+.hotspot-ring.engaged{animation:ring-pulse 1.5s ease-in-out infinite}
+@keyframes ring-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@media (prefers-reduced-motion: reduce){
+ .hotspot.engaged,.hotspot-ring.engaged{animation:none}
+}
 
 .main-grid{display:grid;grid-template-columns:280px minmax(0,1fr) 320px;gap:14px;align-items:start}
 .side-col{display:grid;gap:12px;min-width:0}
@@ -2598,7 +2791,7 @@ JS = r"""
   const MAP_CATS = ['core','worker','vanguard','ranger',
                     'enemy-worker','enemy-vanguard','enemy-ranger','enemy-core','enemy',
                     'enemy-trace','wall','ore','ore-mem','route','target','beacon',
-                    'attack-target','core-target','wp'];
+                    'attack-target','core-target','combat','wp'];
   const LOG_FILTER_KEY = 'arenaLogFilters.v1';
   let logFilters = null;
   const LOG_CATS = ['discover','kill','defeat','combat','economy','config','warn'];
@@ -3271,6 +3464,7 @@ JS = r"""
       if(data.waypointHtml){ setHtml('#waypointSection', data.waypointHtml); bindWaypointPanel(); }
       if(data.enemyHtml){ setHtml('#enemySection', data.enemyHtml); }
       if(data.mapTitle) setHtml('#mapTitleCount', data.mapTitle);
+      if(data.hotspotsHtml !== undefined) setHtml('#hotspotBar', data.hotspotsHtml);
       if(data.footerHtml) setHtml('#footerSection', data.footerHtml);
       if(data.workersCount !== undefined) setText('#workersCount', data.workersCount + ' 个');
       if(data.vgCount !== undefined) setText('#vgCount', String(data.vgCount));
@@ -4407,11 +4601,15 @@ def build_parts(log_limit: int = 200):
     rcells = rec.get("resource_cells", [])
     mm = load_map_memory()
     waypoints = load_waypoints()
+    # Combat hotspots drive both the alert strip above the map and the pulse
+    # rings on it — compute once, reuse for both.
+    hotspots = _combat_hotspots(rec)
+    hotspots_html = _hotspots_html(hotspots)
     # render_svg redraws every known obstacle/resource/route on each poll. The
     # output only changes with the newest tick record, the map file, the
     # waypoints file, or the few config markers drawn on the map — so cache it
     # by those signatures and skip the 4ms re-render when nothing moved.
-    svg = _render_svg_cached(rec, mm, waypoints)
+    svg = _render_svg_cached(rec, mm, waypoints, hotspots)
     running = age < 30
     status_cls = "ok" if running else "down"
     status_text = "运行中" if running else "已停止"
@@ -4813,6 +5011,7 @@ def build_parts(log_limit: int = 200):
         "waypointHtml": waypoint_html,
         "mapSvg": svg,
         "mapTitle": map_title,
+        "hotspotsHtml": hotspots_html,
         "footerHtml": footer_html,
         "workersCount": len(workers),
         "vgCount": len(vgs),
@@ -4925,6 +5124,7 @@ def generate_html() -> str:
     <section class="center-col">
       <section class="panel map-panel">
        <div class="panel-title"><span>已知地图</span><span class="count" id="mapTitleCount">{parts['mapTitle']}</span></div>
+       <div class="hotspot-bar" id="hotspotBar">{parts['hotspotsHtml']}</div>
        <div class="map-toolbar">
         <button type="button" id="zoomOutBtn">-</button>
         <button type="button" id="zoomInBtn">+</button>
@@ -4944,6 +5144,7 @@ def generate_html() -> str:
         <button type="button" class="map-filter" data-cat="enemy-ranger"><i class="dot enemy-ranger"></i>敌·游侠</button>
         <button type="button" class="map-filter" data-cat="enemy-core"><i class="dot enemy-core"></i>敌·核心</button>
         <button type="button" class="map-filter" data-cat="enemy"><i class="dot enemy"></i>敌人(未知)</button>
+        <button type="button" class="map-filter" data-cat="combat"><i class="dot combat"></i>战斗</button>
         <button type="button" class="map-filter" data-cat="enemy-trace"><i class="dot enemy-trace"></i>敌人踪迹</button>
         <button type="button" class="map-filter" data-cat="wall"><i class="dot wall"></i>墙</button>
         <button type="button" class="map-filter" data-cat="ore"><i class="dot ore"></i>可见矿</button>

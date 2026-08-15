@@ -7,6 +7,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -6390,6 +6391,104 @@ class EntrypointRestartLogTests(unittest.TestCase):
                 self.assertIn("战术会话失同步", battle[1]["msg"])
             finally:
                 de.tactic_log.close()
+
+
+class CombatHotspotTests(unittest.TestCase):
+    """战斗热点：把"哪里在打仗"聚合成可点击跳转的告警条与地图光圈。"""
+
+    def _write_battle_log(self, path: Path, rows: list[dict]) -> None:
+        path.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+    def test_three_levels_sorted_by_severity(self) -> None:
+        now = time.time()
+        rec = {
+            "core_pos": [0, 0],
+            "workers": [{"name": "W1", "pos": [10, 10]}],
+            "vanguards": [], "rangers": [],
+            "enemies": [
+                # 贴着 W1 → engaged；远离所有我方 → sighted
+                {"name": "E1", "type": "WORKER", "pos": [11, 10]},
+                {"name": "E2", "type": "RANGER", "pos": [40, 40]},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log = Path(temp_dir) / "battle_log.jsonl"
+            # 箭头坐标取最后一个（结算目标格）；economy 行不算交火
+            self._write_battle_log(log, [
+                {"tick": 1, "ts": now - 30, "cat": "economy",
+                 "msg": "W1 挖矿 +5 (50,50)"},
+                {"tick": 2, "ts": now - 20, "cat": "combat",
+                 "msg": "W1 击中 E3 造成 3 伤害 (5,5)→(6,5)"},
+            ])
+            with patch.object(dashboard, "BATTLE_LOG_FILE", str(log)):
+                spots = dashboard._combat_hotspots(rec)
+
+        self.assertEqual(
+            [(s["x"], s["y"], s["level"]) for s in spots],
+            [(11, 10, "engaged"), (6, 5, "recent"), (40, 40, "sighted")],
+        )
+        self.assertEqual(spots[0]["enemies"], 1)
+        self.assertEqual(spots[0]["friendlies"], 1)
+        self.assertEqual(spots[1]["events"], 1)
+
+    def test_window_cutoff_and_same_cell_merge(self) -> None:
+        now = time.time()
+        rec = {
+            "core_pos": [0, 0],
+            "workers": [{"name": "W1", "pos": [10, 10]}],
+            "vanguards": [], "rangers": [],
+            "enemies": [{"name": "E1", "type": "WORKER", "pos": [11, 10]}],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log = Path(temp_dir) / "battle_log.jsonl"
+            self._write_battle_log(log, [
+                # 窗口外：不该出现
+                {"tick": 1, "ts": now - 3600, "cat": "combat",
+                 "msg": "旧战斗 (90,90)"},
+                # 与 engaged 同格：并入且保持 engaged 级别
+                {"tick": 2, "ts": now - 5, "cat": "combat",
+                 "msg": "W1 击中 E1 (10,10)→(11,10)"},
+                {"tick": 3, "ts": now - 4, "cat": "kill",
+                 "msg": "W1 参与摧毁 E1 (11,10)"},
+            ])
+            with patch.object(dashboard, "BATTLE_LOG_FILE", str(log)):
+                spots = dashboard._combat_hotspots(rec)
+
+        self.assertEqual(len(spots), 1)
+        spot = spots[0]
+        self.assertEqual((spot["x"], spot["y"], spot["level"]), (11, 10, "engaged"))
+        self.assertEqual(spot["events"], 2)
+
+    def test_hotspot_chips_are_clickable_and_empty_state(self) -> None:
+        html = dashboard._hotspots_html([
+            {"x": 11, "y": 10, "level": "engaged", "enemies": 2, "friendlies": 3,
+             "events": 0, "last_ts": None, "age_s": None},
+            {"x": 6, "y": 5, "level": "recent", "enemies": 0, "friendlies": 0,
+             "events": 1, "last_ts": time.time() - 30, "age_s": 30},
+        ])
+        self.assertIn('class="hotspot engaged"', html)
+        self.assertIn('data-focus-wx="11" data-focus-wy="10"', html)
+        self.assertIn("敌2", html)
+        self.assertIn('data-focus-wx="6" data-focus-wy="5"', html)
+        self.assertIn("30秒前交火", html)
+        self.assertIn("当前无战斗", dashboard._hotspots_html([]))
+
+    def test_svg_draws_combat_rings_only_for_engaged_and_recent(self) -> None:
+        rec = {"core_pos": [0, 0], "workers": [], "vanguards": [], "rangers": [],
+               "enemies": [], "resource_cells": []}
+        memory = {"obstacles": [], "resources": []}
+        spots = [
+            {"x": 3, "y": 3, "level": "engaged"},
+            {"x": 5, "y": 5, "level": "recent"},
+            {"x": 7, "y": 7, "level": "sighted"},
+        ]
+        svg = dashboard.render_svg(rec, memory, hotspots=spots)
+        # engaged 双环（2 个）+ recent 虚线环（1 个）；sighted 不画
+        self.assertEqual(svg.count('data-cat="combat"'), 3)
+        self.assertIn('class="hotspot-ring engaged"', svg)
 
 
 if __name__ == "__main__":
