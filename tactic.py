@@ -2304,6 +2304,63 @@ _EIGHT_WAY_LABELS: tuple[str, ...] = ("N", "NE", "E", "SE", "S", "SW", "W", "NW"
 _GUERRILLA_SIGHT: dict[str, int] = {"vanguard": 4, "ranger": 5}
 
 
+def _guerrilla_roam_goal(unit: Any, pos: tuple[int, int]) -> tuple[int, int]:
+    """Return a far, per-unit bearing goal for solo guerrilla movement.
+
+    The goal is intentionally derived only from this unit's stable ID.  A far
+    goal lets the kite scorer choose safe cells while preserving the unit's
+    bearing; diagonal bearings alternate their two component axes each Tick.
+    No squad centroid, kite target, or shared route is involved.
+    """
+    bearing = _stable_slot_index(str(unit.id), len(_EIGHT_WAY_DELTAS))
+    dx, dy = _EIGHT_WAY_DELTAS[bearing]
+    if dx and dy:
+        tick_bit = int(getattr(turn_context, "tick", 0) or 0) & 1
+        major, minor = (1000, 999) if tick_bit == 0 else (999, 1000)
+        return (pos[0] + dx * major, pos[1] + dy * minor)
+    return (pos[0] + dx * 1000, pos[1] + dy * 1000)
+
+
+def _guerrilla_roam(
+    unit: Any,
+    pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, Any],
+) -> tuple[str, str]:
+    """Take one safe step on this unit's independent eight-way bearing."""
+    bearing = _stable_slot_index(str(unit.id), len(_EIGHT_WAY_DELTAS))
+    dx, dy = _EIGHT_WAY_DELTAS[bearing]
+    label = _EIGHT_WAY_LABELS[bearing]
+    if dx and dy:
+        tick_bit = int(getattr(turn_context, "tick", 0) or 0) & 1
+        primary = (
+            (Direction.RIGHT if dx > 0 else Direction.LEFT)
+            if tick_bit == 0
+            else (Direction.DOWN if dy > 0 else Direction.UP)
+        )
+        secondary = (
+            (Direction.DOWN if dy > 0 else Direction.UP)
+            if tick_bit == 0
+            else (Direction.RIGHT if dx > 0 else Direction.LEFT)
+        )
+        candidates = (primary, secondary)
+    else:
+        candidates = (_cardinal_toward_delta(dx, dy),)
+    for avoid_dead_ends in (True, False):
+        for direction in candidates:
+            if direction is not None and _try_move(
+                unit,
+                direction,
+                pos,
+                obstacle_cells,
+                avoid_dead_ends=avoid_dead_ends,
+            ):
+                return ("MOVE", f"{direction.name} guerrilla-roam {label}")
+    return _scout_cardinal(
+        unit, pos, obstacle_cells, config, label=f"guerrilla-roam {label}",
+    )
+
+
 def _parse_team_names(raw: Any) -> set[str]:
     """Parse a comma/space/semicolon separated combat roster into unit names."""
     if not isinstance(raw, str) or not raw.strip():
@@ -3322,7 +3379,10 @@ def _kite_motion_info(
     step even when Chebyshev distance stays flat because the units are also
     vertically separated. Lateral/stationary motion remains explicit.
     """
-    history = _enemy_motion_tracks.get(str(enemy.id), [])
+    history = _enemy_motion_tracks.get(
+        str(getattr(enemy, "id", id(enemy))),
+        [],
+    )
     velocity, streak = _motion_streak(history)
     state = "unknown"
     previous = history[-2][1] if len(history) >= 2 else None
@@ -3583,7 +3643,7 @@ def _kite_log_decision(
         motion = _kite_motion_info(enemy, pos)
         predicted = motion["predicted"]
         enemy_rows.append({
-            "id": str(enemy.id)[:8],
+            "id": str(getattr(enemy, "id", id(enemy)))[:8],
             "type": _enemy_unit_type_name(enemy) or "ENEMY",
             "position": list(enemy.position),
             "motion": motion["state"],
@@ -3598,7 +3658,14 @@ def _kite_log_decision(
                 )
             ),
         })
-    turn_context.kite_decisions.append({
+    decision_store = (
+        "guerrilla_decisions" if mode == "guerrilla" else "kite_decisions"
+    )
+    decisions = getattr(turn_context, decision_store, None)
+    if decisions is None:
+        decisions = []
+        setattr(turn_context, decision_store, decisions)
+    decisions.append({
         "tick": turn_context.tick,
         "unit_id": str(unit.id)[:8],
         "unit_name": _object_name(unit.id, "V" if unit_kind == "vanguard" else "R"),
@@ -3607,7 +3674,10 @@ def _kite_log_decision(
         "hp": int(getattr(unit, "hp", 0) or 0),
         "mode": mode,
         "objective": list(objective),
-        "target_id": str(target.id)[:8] if target is not None else None,
+        "target_id": (
+            str(getattr(target, "id", id(target)))[:8]
+            if target is not None else None
+        ),
         "enemies": enemy_rows,
         "action": action,
         "reason": reason,
@@ -3856,20 +3926,41 @@ def _plan_kite_combat(
     obstacle_cells: frozenset[tuple[int, int]],
     config: dict[str, Any],
     cell_counts: Mapping | None = None,
+    solo: bool = False,
 ) -> tuple[str, str]:
-    """Fight to the end by staying outside attack zones and striking future cells."""
+    """Fight to the end by staying outside attack zones and striking future cells.
+
+    ``solo=True`` reuses the kite combat policy for a single guerrilla unit.
+    It deliberately skips kite-team directives and shared objectives: each
+    guerrilla unit selects only its own local threats and falls back to its own
+    stable roaming bearing when no threat is present.
+    """
     pos = tuple(unit.position)
-    mode, objective = _kite_mode_target(pos, config)
+    if solo:
+        mode = "guerrilla"
+        objective = _guerrilla_roam_goal(unit, pos)
+    else:
+        mode, objective = _kite_mode_target(pos, config)
     attack_range = int(config.get("ranger_attack_range", 3))
     # turn.visible_enemies is the union of the whole army's sight. "Nearby"
     # must remain per-kite-unit or one scout would make every kite unit dodge a
     # threat on the other side of the map.
-    sight = _GUERRILLA_SIGHT.get(unit_kind, attack_range + 1)
-    threats = tuple(
-        enemy for enemy in _combat_threats(enemies)
+    if solo:
+        sight = int(config.get("guerrilla_engage_radius", 0) or 0)
+        if sight <= 0:
+            sight = _GUERRILLA_SIGHT.get(unit_kind, attack_range + 1)
+    else:
+        sight = _GUERRILLA_SIGHT.get(unit_kind, attack_range + 1)
+    local_enemies = tuple(
+        enemy for enemy in enemies
         if _manhattan(pos, tuple(enemy.position)) <= sight
     )
-    directive = getattr(turn_context, "kite_directives", {}).get(str(unit.id))
+    threats = _combat_threats(local_enemies)
+    directive = (
+        None
+        if solo
+        else getattr(turn_context, "kite_directives", {}).get(str(unit.id))
+    )
     if directive is not None:
         target = directive.get("target")
         if directive["kind"] == "sweep":
@@ -3886,7 +3977,15 @@ def _plan_kite_combat(
         )
         return action, detail
 
-    engage_pool = _kite_engage_pool(pos, objective, mode, enemies, config)
+    # A solo guerrilla has no route leash or squad objective.  Its own local
+    # sightings are the complete engagement pool; otherwise the kite planner's
+    # shared mode/target would make independent guerrillas converge. As in the
+    # kite policy, workers/Cores may be attacked but never create danger zones.
+    engage_pool = (
+        local_enemies
+        if solo
+        else _kite_engage_pool(pos, objective, mode, enemies, config)
+    )
     # A kite squad may not ignore an off-route enemy that is about to enter
     # its own range: route leashes only select long-distance objectives. Keep
     # every nearby combat threat in the tactical pool for pre-fire/spacing.
@@ -3894,7 +3993,10 @@ def _plan_kite_combat(
         enemy for enemy in threats
         if _chebyshev(pos, tuple(enemy.position)) <= attack_range + 1
     )
-    pool_by_id = {str(enemy.id): enemy for enemy in (*engage_pool, *local_pool)}
+    pool_by_id = {
+        str(getattr(enemy, "id", id(enemy))): enemy
+        for enemy in (*engage_pool, *local_pool)
+    }
     combat_pool = _combat_threats(tuple(pool_by_id.values()))
     target = min(
         combat_pool or engage_pool,
@@ -4057,9 +4159,11 @@ def _plan_kite_combat(
             )
             return action, detail
 
-    # No safe/valuable attack: keep spacing while still advancing the selected
-    # coordinate/auto/beacon objective. Tactical evasion is not squad retreat;
-    # the unit never returns home and never stops fighting due to headcount.
+    # No safe/valuable attack: kite units keep advancing their squad objective;
+    # a solo guerrilla resumes its own bearing instead of converging on a
+    # shared coordinate. Tactical evasion is per-unit in both modes.
+    if solo and target is None:
+        return _guerrilla_roam(unit, pos, obstacle_cells, config)
     must_move = any(_enemy_unit_type_name(enemy) == "RANGER" for enemy in threats)
     move_goal = tuple(target.position) if target is not None else objective
     direction, assessment, candidates = _kite_choose_move(
@@ -4093,143 +4197,23 @@ def _plan_guerrilla_combat(
     enemies: tuple,
     obstacle_cells: frozenset[tuple[int, int]],
     config: dict[str, Any],
+    cell_counts: Mapping | None = None,
 ) -> tuple[str, str]:
-    """Fan out on 8 bearings; pick off singles, retreat from packs."""
-    pos = tuple(unit.position)
-    # Retreat/engage thresholds count combat threats only: enemy workers and
-    # enemy cores (which have no attack) must not push the squad into a retreat
-    # or a solo-chase. Filtering once also keeps the pack centroid and the
-    # single-target chase on threats alone. Unknown stubs stay counted, so
-    # missing type data fails safe toward retreating.
-    enemies = _combat_threats(enemies)
-    # Local awareness per unit: react only to threats THIS unit can see (its
-    # own vision radius), not the whole team's shared view. turn.visible_enemies
-    # is the union of every teammate's sight, so a CORE one teammate spots would
-    # otherwise drag the entire squad off its bearings and onto the same target.
-    # guerrilla_engage_radius overrides the sight; 0 falls back to the unit's
-    # own vision (Vanguard 4 / Ranger 5, matching the stale-sighting removal).
-    sight = int(config.get("guerrilla_engage_radius", 0) or 0)
-    if sight <= 0:
-        sight = _GUERRILLA_SIGHT.get(unit_kind, 4)
-    enemies = tuple(
-        e for e in enemies if _manhattan(pos, tuple(e.position)) <= sight
-    )
-    enemy_count = len(enemies)
+    """Run the kite combat policy independently for this one unit.
 
-    if enemy_count >= 3:
-        # Retreat away from the enemy cluster centroid.
-        cx = sum(int(e.position[0]) for e in enemies) / enemy_count
-        cy = sum(int(e.position[1]) for e in enemies) / enemy_count
-        flee_dx = pos[0] - cx
-        flee_dy = pos[1] - cy
-        if flee_dx == 0 and flee_dy == 0:
-            # Already on the centroid: pick any hashed cardinal escape.
-            direction = (
-                Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT
-            )[hash(str(unit.id)) % 4]
-        else:
-            direction = _cardinal_toward_delta(
-                1 if flee_dx > 0 else (-1 if flee_dx < 0 else 0),
-                1 if flee_dy > 0 else (-1 if flee_dy < 0 else 0),
-            )
-        if direction is not None and _try_move(unit, direction, pos, obstacle_cells):
-            return ("MOVE", f"{direction.name} guerrilla-retreat n={enemy_count}")
-        # If primary escape is blocked, try remaining cardinals.
-        for fallback in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
-            if direction is not None and fallback == direction:
-                continue
-            if _try_move(unit, fallback, pos, obstacle_cells):
-                return ("MOVE", f"{fallback.name} guerrilla-retreat n={enemy_count}")
-        unit.wait()
-        return ("WAIT", f"guerrilla-retreat-blocked n={enemy_count}")
-
-    if enemy_count == 1:
-        if unit_kind == "vanguard":
-            sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
-            if sweep is not None:
-                return sweep
-        else:
-            shot = _ranger_best_shot(
-                unit,
-                pos,
-                enemies,
-                obstacle_cells,
-                int(config["ranger_attack_range"]),
-                lead_fire_enabled=bool(
-                    config.get("ranger_lead_fire_enabled", True)
-                ),
-            )
-            if shot is not None:
-                return shot
-        nearest = min(
-            enemies, key=lambda e: _manhattan(pos, tuple(e.position)),
-        )
-        moved = _move_towards(
-            unit,
-            pos,
-            tuple(nearest.position),
-            obstacle_cells,
-            detail_prefix="guerrilla-engage",
-        )
-        if moved is not None:
-            return moved
-
-    if enemy_count == 2:
-        # Two enemies: hold position if already able to strike, else keep roaming.
-        if unit_kind == "vanguard":
-            sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
-            if sweep is not None:
-                return sweep
-        else:
-            shot = _ranger_best_shot(
-                unit,
-                pos,
-                enemies,
-                obstacle_cells,
-                int(config["ranger_attack_range"]),
-                lead_fire_enabled=bool(
-                    config.get("ranger_lead_fire_enabled", True)
-                ),
-            )
-            if shot is not None:
-                return shot
-
-    # Roam on a fixed 8-way bearing. Diagonals become alternating cardinals.
-    bearing = hash(str(unit.id)) % 8
-    dx, dy = _EIGHT_WAY_DELTAS[bearing]
-    label = _EIGHT_WAY_LABELS[bearing]
-    if dx != 0 and dy != 0:
-        # Alternate the two component axes so the path approximates the diagonal.
-        tick_bit = int(getattr(turn_context, "tick", 0) or 0) & 1
-        primary = (
-            (Direction.RIGHT if dx > 0 else Direction.LEFT)
-            if tick_bit == 0
-            else (Direction.DOWN if dy > 0 else Direction.UP)
-        )
-        secondary = (
-            (Direction.DOWN if dy > 0 else Direction.UP)
-            if tick_bit == 0
-            else (Direction.RIGHT if dx > 0 else Direction.LEFT)
-        )
-        for direction in (primary, secondary):
-            if _try_move(
-                unit, direction, pos, obstacle_cells, avoid_dead_ends=True,
-            ):
-                return ("MOVE", f"{direction.name} guerrilla-roam {label}")
-        for direction in (primary, secondary):
-            if _try_move(unit, direction, pos, obstacle_cells):
-                return ("MOVE", f"{direction.name} guerrilla-roam {label}")
-    else:
-        direction = _cardinal_toward_delta(dx, dy)
-        if direction is not None and _try_move(
-            unit, direction, pos, obstacle_cells, avoid_dead_ends=True,
-        ):
-            return ("MOVE", f"{direction.name} guerrilla-roam {label}")
-        if direction is not None and _try_move(unit, direction, pos, obstacle_cells):
-            return ("MOVE", f"{direction.name} guerrilla-roam {label}")
-
-    return _scout_cardinal(
-        unit, pos, obstacle_cells, config, label=f"guerrilla-roam {label}",
+    Unlike the kite squad, this planner never reads squad directives or a
+    shared kite objective.  The common combat policy still handles danger-zone
+    avoidance, motion prediction, pre-fire, and target selection; the fallback
+    bearing is derived separately for each unit.
+    """
+    return _plan_kite_combat(
+        unit,
+        unit_kind=unit_kind,
+        enemies=enemies,
+        obstacle_cells=obstacle_cells,
+        config=config,
+        cell_counts=cell_counts,
+        solo=True,
     )
 
 
@@ -4278,6 +4262,7 @@ def _plan_vanguard(
             enemies=enemies,
             obstacle_cells=obstacle_cells,
             config=config,
+            cell_counts=cell_counts,
         )
 
     # Unassigned units keep a conservative default: local scout only.
@@ -4335,6 +4320,7 @@ def _plan_ranger(
             enemies=enemies,
             obstacle_cells=obstacle_cells,
             config=config,
+            cell_counts=cell_counts,
         )
 
     pos = tuple(ranger.position)
@@ -5335,6 +5321,7 @@ turn_context = type(
         "kite_squad_pos": None,
         "kite_directives": {},
         "kite_decisions": [],
+        "guerrilla_decisions": [],
         "kite_ranger_range": 3,
         "kite_obstacles": frozenset(),
         "shot_predictions": [],
@@ -5545,6 +5532,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
     turn_context.shot_predictions = []
     turn_context.kite_decisions = []
+    turn_context.guerrilla_decisions = []
     _phase.start("prediction")
     turn_context.shot_prediction_results = _resolve_shadow_predictions(
         turn, turn_context.tick,
