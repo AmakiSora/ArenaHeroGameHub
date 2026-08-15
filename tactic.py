@@ -1255,20 +1255,20 @@ def _enemy_type_priority(etype: str | None) -> int:
 def _is_combat_threat(enemy: Any) -> bool:
     """True when the visible enemy can deal combat damage.
 
-    Workers have no attack. Only Vanguard melee, Ranger shots, and enemy Cores
-    can hurt a stationary friendly unit. Unknown stubs (tests / bare objects)
-    stay treated as threats so missing type data fails safe.
+    Workers and enemy Cores have no attack. Only Vanguard melee and Ranger
+    shots can hurt a friendly unit. Unknown stubs (tests / bare objects) stay
+    treated as threats so missing type data fails safe.
     """
     name = _enemy_unit_type_name(enemy)
-    if name == "WORKER":
+    if name in {"WORKER", "CORE"}:
         return False
-    if name in {"VANGUARD", "RANGER", "CORE"}:
+    if name in {"VANGUARD", "RANGER"}:
         return True
     return True
 
 
 def _combat_threats(enemies: tuple | list) -> tuple:
-    """Filter visible enemies down to units/cores that can actually attack."""
+    """Filter visible enemies down to units that can actually attack."""
     return tuple(e for e in enemies if _is_combat_threat(e))
 
 
@@ -4031,10 +4031,10 @@ def _plan_kite_combat(
         if abs(dx) + abs(dy) == 1:
             # Workers cannot retaliate; combat targets would have triggered
             # current-range evasion above (except the full-health Ranger case).
-            if etype == "WORKER":
+            if etype in {"WORKER", "CORE"}:
                 direction = _cardinal_toward_delta(dx, dy)
                 unit.sweep(direction)
-                detail = f"{direction.name} kite-safe-sweep worker={tuple(target.position)}"
+                detail = f"{direction.name} kite-safe-sweep {etype.lower()}={tuple(target.position)}"
                 _kite_log_decision(
                     unit, unit_kind, mode, objective, threats, "SWEEP", detail, target=target,
                 )
@@ -4096,12 +4096,11 @@ def _plan_guerrilla_combat(
 ) -> tuple[str, str]:
     """Fan out on 8 bearings; pick off singles, retreat from packs."""
     pos = tuple(unit.position)
-    # Retreat/engage thresholds count combat threats only: enemy workers (and
-    # the escorts routinely standing on their CORE's cell) must not push the
-    # squad into a retreat or a solo-chase. Filtering once also keeps the pack
-    # centroid and the single-target chase on threats alone, so a worker escort
-    # is never chased (or shot/swept) instead of the CORE it guards. Unknown
-    # stubs stay counted, so missing type data fails safe toward retreating.
+    # Retreat/engage thresholds count combat threats only: enemy workers and
+    # enemy cores (which have no attack) must not push the squad into a retreat
+    # or a solo-chase. Filtering once also keeps the pack centroid and the
+    # single-target chase on threats alone. Unknown stubs stay counted, so
+    # missing type data fails safe toward retreating.
     enemies = _combat_threats(enemies)
     # Local awareness per unit: react only to threats THIS unit can see (its
     # own vision radius), not the whole team's shared view. turn.visible_enemies

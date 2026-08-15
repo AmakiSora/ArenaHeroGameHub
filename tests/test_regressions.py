@@ -1888,10 +1888,8 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertIn("guerrilla-retreat", detail)
         self.assertEqual(unit.action, "MOVE")
 
-    def test_guerrilla_chases_core_not_adjacent_worker(self) -> None:
-        """With only the CORE as a combat threat, the squad marches on the
-        CORE even when a worker escort stands adjacent — never chases the
-        worker instead."""
+    def test_guerrilla_ignores_core_and_adjacent_worker(self) -> None:
+        """A core and its worker escort have no attack, so the squad roams."""
         unit = self.CombatUnit("v-g5", (5, 5))
         enemies = (
             SimpleNamespace(position=(7, 5), unit_type="CORE"),
@@ -1908,7 +1906,7 @@ class CombatTeamPlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(action, "MOVE")
-        self.assertIn("guerrilla-engage", detail)
+        self.assertIn("guerrilla-roam", detail)
 
     def test_guerrilla_roams_past_lone_worker(self) -> None:
         """A worker on its own is not a threat: the squad keeps roaming
@@ -2062,9 +2060,8 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(action, "SWEEP")
         self.assertIn("enemy at", detail)
 
-    def test_guerrilla_ignores_worker_escort_around_core(self) -> None:
-        """A CORE with two worker escorts counts as ONE combat threat, so the
-        squad engages the core instead of fleeing from the escort pack."""
+    def test_guerrilla_ignores_core_and_worker_escort_pack(self) -> None:
+        """A CORE and workers do not count as attack threats or a retreat pack."""
         unit = self.CombatUnit("v-g3", (5, 5))
         enemies = (
             SimpleNamespace(position=(4, 5), unit_type="CORE"),
@@ -2081,8 +2078,8 @@ class CombatTeamPlannerTests(unittest.TestCase):
             team="guerrilla",
         )
 
-        self.assertEqual(action, "SWEEP")
-        self.assertIn("enemy at", detail)
+        self.assertEqual(action, "MOVE")
+        self.assertIn("guerrilla-roam", detail)
 
     def test_guerrilla_still_retreats_from_three_threats_plus_worker(self) -> None:
         """Workers are excluded from the count, but 3 real combat threats
@@ -2148,8 +2145,8 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertIn("guerrilla-roam", detail)
 
     def test_guerrilla_engage_radius_extends_sight(self) -> None:
-        """guerrilla_engage_radius lifts the per-unit sight cap, so a CORE a
-        little farther than the Vanguard's own vision still gets chased."""
+        """guerrilla_engage_radius does not turn a non-attacking CORE into a
+        chase target, even when it extends the unit's local sight."""
         self.config["guerrilla_engage_radius"] = 10
         unit = self.CombatUnit("v-g-rad", (0, 0))
         enemies = (SimpleNamespace(position=(6, 0), unit_type="CORE"),)
@@ -2164,7 +2161,7 @@ class CombatTeamPlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(action, "MOVE")
-        self.assertIn("guerrilla-engage", detail)
+        self.assertIn("guerrilla-roam", detail)
     def test_summary_reads_jsonl_tick_records(self) -> None:
         records = [
             {"_meta": "test"},
@@ -2470,6 +2467,17 @@ class KiteTeamPlannerTests(unittest.TestCase):
         self.assertEqual(action, "MOVE")
         self.assertEqual(unit.arg, Direction.DOWN)
         self.assertIn("goal=(0, 4)", detail)
+
+    def test_kite_core_is_a_target_but_not_a_danger_zone(self):
+        unit = self.unit("kite-v-core", (0, 0))
+        core = self.enemy("enemy-core", (1, 0), "CORE")
+        action, detail = tactic._plan_vanguard(
+            unit, (core,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+        self.assertEqual(action, "SWEEP")
+        self.assertEqual(unit.arg, Direction.RIGHT)
+        self.assertIn("core", detail)
 
     def test_battle_log_is_contact_only_and_one_row_per_tick(self):
         no_contact = [{
