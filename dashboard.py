@@ -91,6 +91,24 @@ def _log_signature() -> tuple[int, int] | None:
     return stat.st_mtime_ns, stat.st_size
 
 
+def _stream_signature() -> tuple:
+    """Snapshot of every data file whose change should push a live refresh.
+
+    The tactic appends one tick record per server tick, map memory is re-saved
+    every ~10 ticks, and the battle log grows per game event — any of them
+    moving is worth one SSE push. Same mtime+size heuristic as the other file
+    signatures, so an idle dashboard costs a handful of stat() calls per scan.
+    """
+    def _sig(path: str):
+        try:
+            st = os.stat(path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    return tuple(_sig(p) for p in (LOG_FILE, MAP_FILE, BATTLE_LOG_FILE))
+
+
 # build_parts() runs on every /api/state poll (every 2s per client) and always
 # asks for the newest 40 tick records. Between polls with no new tick the log
 # file is unchanged, so re-reading + re-parsing those 40 (large) records is pure
@@ -1721,7 +1739,8 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
     for index, r in enumerate(rec.get("rangers", []) or []):
         _draw_route(r, r.get("name") or f"R{index + 1}", "#6ea8ff", "ranger-route")
 
-    def unit(pos, color, label, glow=False, ring=None, cat="unit", unit_name=None):
+    def unit(pos, color, label, glow=False, ring=None, cat="unit", unit_name=None,
+             anim_key=None):
         if not pos or len(pos) != 2: return
         px, py = int(pos[0]), int(pos[1])
         if not (xmin <= px <= xmax and ymin <= py <= ymax): return
@@ -1729,6 +1748,13 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
         ux, uy = x + cell / 2, y + cell / 2
         # data-unit lets the waypoint panel pick a unit by clicking its marker.
         du = f' data-unit="{html.escape(str(unit_name), quote=True)}"' if unit_name else ""
+        # data-anim + world coords give the dashboard a stable identity per
+        # marker so it can FLIP-animate units between tick positions instead
+        # of teleporting them on every SVG swap. Names are server/opponent
+        # controlled — escape before embedding.
+        if anim_key:
+            a(f'<g data-anim="{html.escape(str(anim_key), quote=True)}" '
+              f'data-wx="{px}" data-wy="{py}">')
         if glow: a(f'<circle data-cat="{cat}"{du} cx="{ux}" cy="{uy}" r="11" fill="{color}" opacity="0.18"/>')
         if ring: a(f'<circle data-cat="{cat}"{du} cx="{ux}" cy="{uy}" r="8.5" fill="none" stroke="{ring}" stroke-width="2"/>')
         unit_radius = 7.5 if len(str(label)) > 2 else 7
@@ -1739,6 +1765,8 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
         a(f'<text data-cat="{cat}"{du} x="{ux}" y="{uy+2.5}" text-anchor="middle" font-size="{font_size}" '
           f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#0b1020">'
           f'{html.escape(str(label))}</text>')
+        if anim_key:
+            a('</g>')
 
     def enemy_core(pos, label):
         """Draw a live enemy HQ with a silhouette unlike any mobile unit."""
@@ -1749,6 +1777,9 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
             return
         x, y = to_xy(px, py)
         ux, uy = x + cell / 2, y + cell / 2
+        # Same FLIP identity as mobile units (see unit() above).
+        a(f'<g data-anim="E:{html.escape(str(label), quote=True)}" '
+          f'data-wx="{px}" data-wy="{py}">')
         radius = 9.5
         points = (f"{ux},{uy-radius} {ux+radius},{uy} "
                   f"{ux},{uy+radius} {ux-radius},{uy}")
@@ -1760,17 +1791,18 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
         a(f'<text data-cat="enemy-core" x="{ux}" y="{uy+2.5}" text-anchor="middle" '
           f'font-size="7" font-family="Segoe UI, Microsoft YaHei, sans-serif" '
           f'font-weight="800" fill="#2b0710">{html.escape(str(label))}</text>')
+        a('</g>')
 
     for index, w in enumerate(rec.get("workers", [])):
         c = bool(w.get("cargo"))
         name = w.get("name") or f"W{index + 1}"
-        unit(w.get("pos"), "#57d6a3" if c else "#8aa4ff", name, glow=c, ring="#9ef0c8" if c else None, cat="worker", unit_name=name)
+        unit(w.get("pos"), "#57d6a3" if c else "#8aa4ff", name, glow=c, ring="#9ef0c8" if c else None, cat="worker", unit_name=name, anim_key=name)
     for index, v in enumerate(rec.get("vanguards", [])):
         name = v.get("name") or f"V{index + 1}"
-        unit(v.get("pos"), "#ff8c42", name, glow=True, cat="vanguard", unit_name=name)
+        unit(v.get("pos"), "#ff8c42", name, glow=True, cat="vanguard", unit_name=name, anim_key=name)
     for index, r in enumerate(rec.get("rangers", [])):
         name = r.get("name") or f"R{index + 1}"
-        unit(r.get("pos"), "#b38cff", name, glow=True, cat="ranger", unit_name=name)
+        unit(r.get("pos"), "#b38cff", name, glow=True, cat="ranger", unit_name=name, anim_key=name)
     # Visible enemies are filtered per type (WORKER / VANGUARD / RANGER / CORE)
     # so the legend can show/hide each class independently.  Enemies without a
     # typed unit_type land in the generic ENEMY category.  Several enemies can
@@ -1806,9 +1838,12 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
             cat, color, ring = "enemy-ranger", "#b38cff", None
         else:
             cat, color, ring = "enemy", "#ff6464", "#ff9b9b"
-        unit(epos, color, name, glow=True, ring=ring, cat=cat)
+        # E: prefix keeps enemy FLIP identities disjoint from own-unit names.
+        unit(epos, color, name, glow=True, ring=ring, cat=cat, anim_key="E:" + name)
 
     if core_cx is not None:
+        # Wrapped like the unit markers so core migration glides too.
+        a(f'<g data-anim="__core__" data-wx="{int(core[0])}" data-wy="{int(core[1])}">')
         a(f'<circle data-cat="core" cx="{core_cx}" cy="{core_cy}" r="15" fill="url(#coreGlow)"/>')
         a(f'<rect data-cat="core" x="{core_cx-6.5}" y="{core_cy-6.5}" width="13" height="13" rx="3" '
           f'transform="rotate(45 {core_cx} {core_cy})" fill="#6ea8ff" stroke="#d7e8ff" '
@@ -1816,6 +1851,7 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
         a(f'<text data-cat="core" x="{core_cx}" y="{core_cy+3}" text-anchor="middle" font-size="8" '
           f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#081018">'
           f'{html.escape(str(rec.get("core_name") or "C1"))}</text>')
+        a('</g>')
 
     # Beacon
     bp = rec.get("beacon_pos")
@@ -3171,6 +3207,44 @@ JS = r"""
     }
   }
 
+  // ── Marker FLIP animation ────────────────────────────────────────────
+  // render_svg() wraps every moving marker in <g data-anim data-wx data-wy>.
+  // Before swapping in the new SVG we snapshot each marker's world position,
+  // then translate the fresh marker from the old spot to the new one so units
+  // glide between ticks instead of teleporting. Deltas are computed in world
+  // cells × cell-size, so a growing map viewport cannot skew the motion.
+  function captureAnimAnchors(){
+    const anchors = {};
+    const stageEl = document.getElementById('mapStage');
+    if(!stageEl) return anchors;
+    stageEl.querySelectorAll('g[data-anim]').forEach(function(g){
+      anchors[g.getAttribute('data-anim')] = [Number(g.dataset.wx), Number(g.dataset.wy)];
+    });
+    return anchors;
+  }
+
+  function animateMarkers(prevAnchors){
+    if(!svg || drag) return;
+    if(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const cellSize = Number(svg.dataset.cell || 16);
+    svg.querySelectorAll('g[data-anim]').forEach(function(g){
+      const prev = prevAnchors[g.getAttribute('data-anim')];
+      if(!prev) return;
+      const dx = (Number(g.dataset.wx) - prev[0]) * cellSize;
+      const dy = (Number(g.dataset.wy) - prev[1]) * cellSize;
+      if(dx === 0 && dy === 0) return;
+      // A jump of more than a handful of cells is a respawn / relocation, not
+      // movement — animating it would look like a unit streaking across the
+      // map, so it snaps instead.
+      if(Math.abs(dx) > cellSize * 6 || Math.abs(dy) > cellSize * 6) return;
+      g.style.transition = 'none';
+      g.style.transform = 'translate(' + (-dx) + 'px,' + (-dy) + 'px)';
+      void g.getBoundingClientRect();  // force layout so the offset sticks
+      g.style.transition = 'transform 1.1s cubic-bezier(0.25, 0.6, 0.3, 1)';
+      g.style.transform = 'translate(0px,0px)';
+    });
+  }
+
   async function softRefresh(){
     if(document.hidden || drag || refreshing) return;
     refreshing = true;
@@ -3214,6 +3288,7 @@ JS = r"""
       if(data.mapSvg && data.mapSvg !== lastMapSvg){
         const stageEl = document.getElementById('mapStage');
         if(stageEl){
+          const prevAnchors = captureAnimAnchors();
           stageEl.innerHTML = data.mapSvg;
           lastMapSvg = data.mapSvg;
           svg = document.getElementById('gameMap');
@@ -3221,6 +3296,7 @@ JS = r"""
             svg.addEventListener('dragstart', function(e){ e.preventDefault(); });
             applyMapFilters();
             apply();
+            animateMarkers(prevAnchors);
           }
         }
       }
@@ -4285,8 +4361,21 @@ JS = r"""
       zoomAt(e.clientX, e.clientY, view.scale * factor);
     }, {passive:false});
   }
-  setInterval(softRefresh, 2000);
-  setInterval(loadTrends, 2000);
+  // SSE push replaces the old 2 s poll: the server signals the instant the
+  // tactic writes a new tick (or map memory / battle log changes), so the
+  // map, panels and log update live. EventSource reconnects on its own; the
+  // slow poll stays as a fallback for when the stream is blocked.
+  function onStreamTick(){
+    softRefresh();
+    refreshLogRows();
+    loadTrends();
+  }
+  if(window.EventSource){
+    const stream = new EventSource('/api/stream');
+    stream.addEventListener('tick', onStreamTick);
+  }
+  setInterval(softRefresh, 10000);
+  setInterval(loadTrends, 10000);
   setInterval(function(){ loadConfig(false); }, 10000);
   setInterval(function(){ loadTeams(false); }, 5000);
 })();
@@ -4999,6 +5088,47 @@ class Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send(code, body, "application/json; charset=utf-8")
 
+    def _stream_events(self):
+        """Server-Sent Events: push the moment the data files change.
+
+        Replaces the old 2 s client poll — a new tick (or map-memory / battle
+        log update) shows up on the dashboard as soon as the tactic writes it.
+        The client keeps a slow fallback poll in case the stream is blocked.
+        """
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            # Some reverse proxies buffer SSE bodies by default.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        self.close_connection = True
+        try:
+            self.wfile.write(b"retry: 2000\n: connected\n\n")
+            self.wfile.flush()
+            last = _stream_signature()
+            idle = 0.0
+            while True:
+                time.sleep(0.25)
+                sig = _stream_signature()
+                if sig != last:
+                    last = sig
+                    self.wfile.write(b"event: tick\ndata: 1\n\n")
+                    idle = 0.0
+                else:
+                    idle += 0.25
+                    if idle >= 15.0:
+                        # Keep-alive comment: stops proxies from dropping the
+                        # idle connection and surfaces dead peers promptly.
+                        self.wfile.write(b": ping\n\n")
+                        idle = 0.0
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            # Client disconnected; nothing to clean up (daemon thread).
+            return
+
     def do_GET(self):
         path = urlparse(self.path).path
         if not self._authed():
@@ -5009,6 +5139,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/":
             self._send(200, generate_html().encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == "/api/stream":
+            self._stream_events()
             return
         if path == "/api/state":
             parts = build_parts(log_limit=_clamp_log_limit(self))
