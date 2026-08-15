@@ -3886,6 +3886,9 @@ JS = r"""
     if(!form || !config) return;
     form.querySelectorAll('[name]').forEach(function(input){
       if(!(input.name in config)) return;
+      // Never overwrite the field being typed into — a stale poll response
+      // must not wipe a half-typed draft.
+      if(input === document.activeElement) return;
       if(input.dataset.kind === 'boolean') input.checked = Boolean(config[input.name]);
       else input.value = String(config[input.name]);
     });
@@ -4031,6 +4034,9 @@ JS = r"""
     Object.keys(map).forEach(function(key){
       const el = document.getElementById(map[key]);
       if(el && key in config) {
+        // Skip the field being typed into — a stale poll response must not
+        // wipe a half-typed draft.
+        if(el === document.activeElement) return;
         if (el.type === 'checkbox') el.checked = !!config[key];
         else el.value = String(config[key]);
       }
@@ -4203,7 +4209,9 @@ JS = r"""
   }
 
   async function loadTeams(force){
-    if(!force && (teamsDirty || teamsBusy)) return;
+    const form = document.getElementById('teamsForm');
+    const editing = form && form.contains(document.activeElement);
+    if(!force && (teamsDirty || teamsBusy || editing)) return;
     if(teamsBusy) return;
     const discardedDraft = force && teamsDirty;
     if(discardedDraft){
@@ -4214,6 +4222,8 @@ JS = r"""
       const res = await fetch('/api/teams?ts=' + Date.now(), {cache:'no-store'});
       const data = await res.json();
       if(!res.ok || !data.ok) return;
+      // Re-check after the await: a draft started mid-flight must survive.
+      if(!force && (teamsDirty || (form && form.contains(document.activeElement)))) return;
       teamsConfig = data.config;
       teamsUnits = data.combat_units || [];
       applyTeamSettings(data.config);
@@ -4285,6 +4295,9 @@ JS = r"""
     try{
       const res = await fetch('/api/config?ts=' + Date.now(), {cache:'no-store'});
       const data = await res.json();
+      // The fetch can resolve after the user started typing; re-check so a
+      // slow response never clobbers a draft that appeared mid-flight.
+      if(!force && (configDirty || form.contains(document.activeElement))) return;
       if(res.ok && data.ok){ applyConfigValues(data.config); configDirty = false; }
     }catch(e){}
   }
