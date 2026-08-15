@@ -813,6 +813,9 @@ def _render_svg_cached(rec: dict, mm: dict, waypoints: dict,
         str(config.get("attack_mode", "coords")),
         int(config.get("attack_target_x", 0)),
         int(config.get("attack_target_y", 0)),
+        str(config.get("kite_mode", "coords")),
+        int(config.get("kite_target_x", 0)),
+        int(config.get("kite_target_y", 0)),
         bool(config.get("core_target_enabled", False)),
         int(config.get("core_target_x", 0)),
         int(config.get("core_target_y", 0)),
@@ -1056,14 +1059,15 @@ def request_self_destruct(name: str) -> dict:
     return {"ok": True, "name": name, "pending": len(units)}
 
 
-TEAM_BOARD_KEYS = ("unassigned", "home", "attack", "guerrilla")
+TEAM_BOARD_KEYS = ("unassigned", "home", "attack", "kite", "guerrilla")
 TEAM_BOARD_META = {
     "unassigned": {"label": "待命池", "hint": "未编队", "tone": "idle"},
     "home": {"label": "守家队", "hint": "巡逻+迎击驱赶", "tone": "home"},
     "attack": {"label": "进攻队", "hint": "集体推进接战", "tone": "attack"},
+    "kite": {"label": "风筝队", "hint": "避开射程 · 预判打格", "tone": "kite"},
     "guerrilla": {"label": "游击队", "hint": "八向分散袭扰", "tone": "guerrilla"},
 }
-TEAM_ROSTER_FIELDS = ("home_team", "attack_team", "guerrilla_team")
+TEAM_ROSTER_FIELDS = ("home_team", "attack_team", "kite_team", "guerrilla_team")
 TEAM_SETTING_FIELDS = tuple(
     field["key"]
     for field in config_schema()["fields"]
@@ -1114,6 +1118,8 @@ def _team_of_name(name: str, config: dict) -> str:
         return "home"
     if upper in _parse_roster_names(config.get("attack_team", "")):
         return "attack"
+    if upper in _parse_roster_names(config.get("kite_team", "")):
+        return "kite"
     if upper in _parse_roster_names(config.get("guerrilla_team", "")):
         return "guerrilla"
     return "unassigned"
@@ -1330,6 +1336,15 @@ def render_teams_panel() -> str:
     coords_hidden = "" if attack_mode == "coords" else " hidden"
     auto_hidden = "" if attack_mode == "auto" else " hidden"
     beacon_hidden = "" if attack_mode == "beacon" else " hidden"
+    kite_mode = str(config.get("kite_mode", "coords"))
+    kite_mode_checked = {
+        "coords": " checked" if kite_mode == "coords" else "",
+        "auto": " checked" if kite_mode == "auto" else "",
+        "beacon": " checked" if kite_mode == "beacon" else "",
+    }
+    kite_coords_hidden = "" if kite_mode == "coords" else " hidden"
+    kite_auto_hidden = "" if kite_mode == "auto" else " hidden"
+    kite_beacon_hidden = "" if kite_mode == "beacon" else " hidden"
     lead_checked = " checked" if bool(config["ranger_lead_fire_enabled"]) else ""
 
     home_settings = "".join([
@@ -1380,6 +1395,37 @@ def render_teams_panel() -> str:
                        "坐标/信标只接战顺路敌人；N>0 时再限定距本单位 N 格内")
         + '</div>'
     )
+    kite_coords = (
+        f'<div class="team-kite-fields" data-kite-fields="coords"{kite_coords_hidden}>'
+        '<label class="team-field" data-field-wrap="kite_target_x" for="teamKiteX">'
+        '<span>目标坐标<small>点击地图按钮可同时填写 X / Y</small></span>'
+        '<span class="coord-input">'
+        f'<input id="teamKiteX" name="kite_target_x" type="number" min="-1000" max="1000" '
+        f'step="1" value="{config["kite_target_x"]}" required aria-label="风筝队目标 X">'
+        '<span class="coord-divider">,</span>'
+        f'<input id="teamKiteY" name="kite_target_y" type="number" min="-1000" max="1000" '
+        f'step="1" value="{config["kite_target_y"]}" required aria-label="风筝队目标 Y">'
+        '<button type="button" class="pick-btn" id="pickKiteBtn" '
+        'title="点击地图选择风筝队坐标（X 与 Y 一起填入）">⌖</button></span>'
+        '<em class="team-field-error" data-field-error="kite_target_x"></em>'
+        '<em class="team-field-error" data-field-error="kite_target_y"></em></label></div>'
+    )
+    kite_auto = (
+        f'<div class="team-kite-fields team-field-grid" data-kite-fields="auto"{kite_auto_hidden}>'
+        + number_field("teamKiteAutoRadius", "kite_auto_radius", "目标范围", 0, 1000,
+                       "距核心的搜索范围，0 不限；风筝队没有人数劣势撤退")
+        + '</div>'
+    )
+    kite_beacon = (
+        f'<p class="team-mode-note" data-kite-fields="beacon"{kite_beacon_hidden}>'
+        '风筝队将以冠军信标为目标，接敌后仍执行避险与预判。</p>'
+    )
+    kite_march_leash = (
+        '<div class="team-kite-fields team-field-grid" data-kite-fields="coords beacon">'
+        + number_field("teamKiteMarchRadius", "kite_march_engage_radius", "沿途接敌半径", 0, 500,
+                       "坐标/信标只主动处理顺路敌人；危险范围内敌人始终参与避险")
+        + '</div>'
+    )
 
     return (
         '<section class="panel teams-panel" id="teamsPanel">'
@@ -1426,6 +1472,18 @@ def render_teams_panel() -> str:
         f'{mode_checked["beacon"]}><span>冠军信标</span></label>'
         '</div><em class="team-field-error" data-field-error="attack_mode"></em></fieldset>'
         f'{attack_coords}{attack_auto}{attack_beacon}{march_leash_field}</section>'
+        '<section class="team-setting-group tone-kite team-kite-group" aria-labelledby="teamKiteTitle">'
+        '<div class="team-setting-title"><b id="teamKiteTitle">风筝策略</b>'
+        '<span>无人数撤退 · 躲射程 · 预判攻击格</span></div>'
+        '<fieldset class="team-mode"><legend>进攻方式</legend><div class="team-mode-opts">'
+        '<label class="team-radio"><input type="radio" name="kite_mode" value="coords"'
+        f'{kite_mode_checked["coords"]}><span>坐标进攻</span></label>'
+        '<label class="team-radio"><input type="radio" name="kite_mode" value="auto"'
+        f'{kite_mode_checked["auto"]}><span>自动进攻</span></label>'
+        '<label class="team-radio"><input type="radio" name="kite_mode" value="beacon"'
+        f'{kite_mode_checked["beacon"]}><span>冠军信标</span></label>'
+        '</div><em class="team-field-error" data-field-error="kite_mode"></em></fieldset>'
+        f'{kite_coords}{kite_auto}{kite_beacon}{kite_march_leash}</section>'
         '<div class="teams-footer">'
         '<span class="teams-message" id="teamsMessage" aria-live="polite">修改后统一保存，下个 Tick 生效</span>'
         '<div class="teams-actions">'
@@ -2061,6 +2119,9 @@ def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
     if str(config.get("attack_mode", "coords")) == "coords":
         _config_marker(int(config.get("attack_target_x", 0)),
                        int(config.get("attack_target_y", 0)), "#ff8c42", "攻", "attack-target")
+    if str(config.get("kite_mode", "coords")) == "coords":
+        _config_marker(int(config.get("kite_target_x", 0)),
+                       int(config.get("kite_target_y", 0)), "#3dd6c9", "筝", "kite-target")
     if bool(config.get("core_target_enabled", False)):
         _config_marker(int(config.get("core_target_x", 0)),
                        int(config.get("core_target_y", 0)), "#6ea8ff", "核", "core-target")
@@ -2240,6 +2301,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .game-map.hide-target [data-cat="target"],
 .game-map.hide-beacon [data-cat="beacon"],
 .game-map.hide-attack-target [data-cat="attack-target"],
+.game-map.hide-kite-target [data-cat="kite-target"],
 .game-map.hide-core-target [data-cat="core-target"],
 .game-map.hide-combat [data-cat="combat"],
 .game-map.hide-wp [data-cat="wp"]{display:none}
@@ -2261,6 +2323,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .map-legend .route-line{width:18px;height:0;border-top:2px solid #63d8ff;box-shadow:none;border-radius:0}
 .map-legend .target-ring{width:10px;height:10px;border:2px solid #63d8ff;background:transparent;box-shadow:none}
 .map-legend .dot.attack-target{width:10px;height:10px;border:2px dashed #ff8c42;background:transparent;box-shadow:none;border-radius:0}
+.map-legend .dot.kite-target{width:10px;height:10px;border:2px dashed #3dd6c9;background:transparent;box-shadow:none;border-radius:0}
 .map-legend .dot.core-target{width:10px;height:10px;border:2px dashed #6ea8ff;background:transparent;box-shadow:none;border-radius:0}
 .map-legend .dot.wp{width:10px;height:10px;border:2px dashed #3dd6c9;background:transparent;box-shadow:none;border-radius:0}
 .map-legend .dot.combat{background:#ff4964;color:#ff4964}
@@ -2408,6 +2471,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-column.tone-idle{background:linear-gradient(90deg,rgba(148,163,184,.08),rgba(255,255,255,.02))}
 .team-column.tone-home{background:linear-gradient(90deg,rgba(87,214,163,.12),rgba(255,255,255,.02));border-color:rgba(87,214,163,.22)}
 .team-column.tone-attack{background:linear-gradient(90deg,rgba(255,107,157,.12),rgba(255,255,255,.02));border-color:rgba(255,107,157,.22)}
+.team-column.tone-kite{background:linear-gradient(90deg,rgba(61,214,201,.12),rgba(255,255,255,.02));border-color:rgba(61,214,201,.24)}
 .team-column.tone-guerrilla{background:linear-gradient(90deg,rgba(179,140,255,.12),rgba(255,255,255,.02));border-color:rgba(179,140,255,.22)}
 .team-column.drag-over{box-shadow:0 0 0 2px rgba(110,168,255,.35) inset}
 .team-column-head{display:flex;flex-direction:column;justify-content:center;gap:2px;flex:0 0 108px;padding:10px 14px;border-right:1px solid rgba(255,255,255,.06)}
@@ -2440,6 +2504,7 @@ body{margin:0;min-height:100vh;color:var(--text);
 .team-setting-group{min-width:0;padding:12px;border:1px solid rgba(255,255,255,.07);border-radius:12px;background:rgba(7,14,29,.34)}
 .team-setting-group.tone-home{border-color:rgba(87,214,163,.18);background:linear-gradient(135deg,rgba(87,214,163,.07),rgba(7,14,29,.34) 46%)}
 .team-setting-group.tone-attack{border-color:rgba(255,107,157,.18);background:linear-gradient(135deg,rgba(255,107,157,.065),rgba(7,14,29,.34) 42%)}
+.team-setting-group.tone-kite{border-color:rgba(61,214,201,.2);background:linear-gradient(135deg,rgba(61,214,201,.07),rgba(7,14,29,.34) 46%)}
 .team-setting-group.tone-guerrilla{border-color:rgba(179,140,255,.18);background:linear-gradient(135deg,rgba(179,140,255,.07),rgba(7,14,29,.34) 48%)}
 .team-setting-group.tone-common{border-color:rgba(110,168,255,.16)}
 .team-setting-title{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,.06)}
@@ -2829,18 +2894,20 @@ JS = r"""
 
   const PICK_TARGETS = {
     attack: {xId: 'teamAttackX', yId: 'teamAttackY'},
+    kite:   {xId: 'teamKiteX', yId: 'teamKiteY'},
     core:   {xId: 'cfg-core_target_x', yId: 'cfg-core_target_y'},
     ore:    {xId: 'oreX', yId: 'oreY'},
     wp:     {xId: 'wpX', yId: 'wpY'},
   };
   const PICK_BUTTONS = {
     pickAttackBtn: 'attack',
+    pickKiteBtn:   'kite',
     pickCoreBtn:   'core',
     pickOreBtn:    'ore',
     pickWpBtn:     'wp',
   };
   const PICK_LABELS = {
-    attack: '进攻目标', core: '核心目标', ore: '矿点', wp: '手动目标',
+    attack: '进攻目标', kite: '风筝队目标', core: '核心目标', ore: '矿点', wp: '手动目标',
   };
 
   function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
@@ -3078,6 +3145,9 @@ JS = r"""
     const modeEl = document.querySelector('input[name="attack_mode"]:checked');
     const btn = document.getElementById('pickAttackBtn');
     if(btn) btn.disabled = !!(modeEl && modeEl.value !== 'coords');
+    const kiteModeEl = document.querySelector('input[name="kite_mode"]:checked');
+    const kiteBtn = document.getElementById('pickKiteBtn');
+    if(kiteBtn) kiteBtn.disabled = !!(kiteModeEl && kiteModeEl.value !== 'coords');
   }
 
   function zoomAt(clientX, clientY, nextScale){
@@ -3891,6 +3961,7 @@ JS = r"""
 
   function currentTeamSettings(){
     const modeEl = document.querySelector('input[name="attack_mode"]:checked');
+    const kiteModeEl = document.querySelector('input[name="kite_mode"]:checked');
     return {
       home_patrol_radius: Number((document.getElementById('teamHomeRadius') || {}).value || 5),
       home_engage_radius: Number((document.getElementById('teamHomeEngageRadius') || {}).value || 0),
@@ -3900,6 +3971,11 @@ JS = r"""
       attack_target_x: Number((document.getElementById('teamAttackX') || {}).value || 0),
       attack_target_y: Number((document.getElementById('teamAttackY') || {}).value || 0),
       attack_mode: (modeEl && modeEl.value) || 'coords',
+      kite_target_x: Number((document.getElementById('teamKiteX') || {}).value || 0),
+      kite_target_y: Number((document.getElementById('teamKiteY') || {}).value || 0),
+      kite_mode: (kiteModeEl && kiteModeEl.value) || 'coords',
+      kite_auto_radius: Number((document.getElementById('teamKiteAutoRadius') || {}).value || 0),
+      kite_march_engage_radius: Number((document.getElementById('teamKiteMarchRadius') || {}).value || 0),
       ranger_attack_range: Number((document.getElementById('teamRangerRange') || {}).value || 3),
       ranger_lead_fire_enabled: Boolean((document.getElementById('teamLeadFire') || {}).checked),
       attack_retreat_radius: Number((document.getElementById('teamRetreatRadius') || {}).value || 5),
@@ -3920,6 +3996,15 @@ JS = r"""
     });
     syncPickButtonsDisabled();
     if(mode !== 'coords' && pickMode === 'attack') setPickMode(null);
+    const kiteModeEl = document.querySelector('input[name="kite_mode"]:checked');
+    const kiteMode = (kiteModeEl && kiteModeEl.value) || 'coords';
+    document.querySelectorAll('[data-kite-fields]').forEach(function(group){
+      const modes = (group.getAttribute('data-kite-fields') || '').split(' ');
+      const active = modes.indexOf(kiteMode) !== -1;
+      group.hidden = !active;
+      group.querySelectorAll('input,select,button').forEach(function(el){ el.disabled = !active; });
+    });
+    if(kiteMode !== 'coords' && pickMode === 'kite') setPickMode(null);
   }
 
   function applyTeamSettings(config){
@@ -3937,6 +4022,10 @@ JS = r"""
       attack_retreat_radius: 'teamRetreatRadius',
       attack_auto_radius: 'teamAutoRadius',
       attack_march_engage_radius: 'teamMarchRadius',
+      kite_target_x: 'teamKiteX',
+      kite_target_y: 'teamKiteY',
+      kite_auto_radius: 'teamKiteAutoRadius',
+      kite_march_engage_radius: 'teamKiteMarchRadius',
       guerrilla_engage_radius: 'teamGuerrillaSight'
     };
     Object.keys(map).forEach(function(key){
@@ -3949,6 +4038,10 @@ JS = r"""
     const mode = config.attack_mode || 'coords';
     document.querySelectorAll('input[name="attack_mode"]').forEach(function(el){
       el.checked = (el.value === mode);
+    });
+    const kiteMode = config.kite_mode || 'coords';
+    document.querySelectorAll('input[name="kite_mode"]').forEach(function(el){
+      el.checked = (el.value === kiteMode);
     });
     syncTeamModeVisibility();
   }
@@ -3971,6 +4064,7 @@ JS = r"""
     return {
       home_team: rosterFromUnits('home'),
       attack_team: rosterFromUnits('attack'),
+      kite_team: rosterFromUnits('kite'),
       guerrilla_team: rosterFromUnits('guerrilla'),
       home_patrol_radius: settings.home_patrol_radius,
       home_engage_radius: settings.home_engage_radius,
@@ -3980,6 +4074,11 @@ JS = r"""
       attack_target_x: settings.attack_target_x,
       attack_target_y: settings.attack_target_y,
       attack_mode: settings.attack_mode,
+      kite_target_x: settings.kite_target_x,
+      kite_target_y: settings.kite_target_y,
+      kite_mode: settings.kite_mode,
+      kite_auto_radius: settings.kite_auto_radius,
+      kite_march_engage_radius: settings.kite_march_engage_radius,
       ranger_attack_range: settings.ranger_attack_range,
       ranger_lead_fire_enabled: settings.ranger_lead_fire_enabled,
       attack_retreat_radius: settings.attack_retreat_radius,
@@ -3990,7 +4089,7 @@ JS = r"""
   }
 
   function renderTeamBoard(){
-    const counts = {unassigned:0, home:0, attack:0, guerrilla:0};
+    const counts = {unassigned:0, home:0, attack:0, kite:0, guerrilla:0};
     document.querySelectorAll('[data-team-drop]').forEach(function(drop){
       drop.innerHTML = '';
       drop.classList.remove('drag-over');
@@ -4153,11 +4252,11 @@ JS = r"""
     const form = document.getElementById('teamsForm');
     if(form){
       form.addEventListener('input', function(e){
-        if(e.target && e.target.name === 'attack_mode') syncTeamModeVisibility();
+        if(e.target && (e.target.name === 'attack_mode' || e.target.name === 'kite_mode')) syncTeamModeVisibility();
         markTeamsDirty('参数已修改，点击保存后生效');
       });
       form.addEventListener('change', function(e){
-        if(e.target && e.target.name === 'attack_mode') syncTeamModeVisibility();
+        if(e.target && (e.target.name === 'attack_mode' || e.target.name === 'kite_mode')) syncTeamModeVisibility();
       });
       form.onsubmit = function(e){
         e.preventDefault();
@@ -5153,6 +5252,7 @@ def generate_html() -> str:
         <button type="button" class="map-filter" data-cat="target"><i class="dot target-ring"></i>目标</button>
         <button type="button" class="map-filter" data-cat="beacon"><i class="dot beacon"></i>信标</button>
         <button type="button" class="map-filter" data-cat="attack-target"><i class="dot attack-target"></i>进攻目标</button>
+        <button type="button" class="map-filter" data-cat="kite-target"><i class="dot kite-target"></i>风筝目标</button>
         <button type="button" class="map-filter" data-cat="core-target"><i class="dot core-target"></i>核心目标</button>
         <button type="button" class="map-filter" data-cat="wp"><i class="dot wp"></i>手动目标</button>
         <button type="button" class="map-filter-reset" id="mapFilterReset">全部显示</button>

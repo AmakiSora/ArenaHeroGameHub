@@ -983,11 +983,13 @@ class CombatTeamPlannerTests(unittest.TestCase):
         config = default_config()
         config["home_team"] = "V1, r1"
         config["attack_team"] = "V1,V2"
-        config["guerrilla_team"] = "R2"
+        config["kite_team"] = "V2,R2"
+        config["guerrilla_team"] = "R2,R3"
 
         self.assertEqual(tactic._combat_team_for("V1", config), "home")
         self.assertEqual(tactic._combat_team_for("v2", config), "attack")
-        self.assertEqual(tactic._combat_team_for("R2", config), "guerrilla")
+        self.assertEqual(tactic._combat_team_for("R2", config), "kite")
+        self.assertEqual(tactic._combat_team_for("R3", config), "guerrilla")
         self.assertEqual(tactic._combat_team_for("V9", config), "unassigned")
 
     def test_new_combat_units_auto_join_home_team(self) -> None:
@@ -2192,6 +2194,320 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertIn("Ticks played:     2 (10 -> 11)", summary)
         self.assertIn("Harvest success:  1", summary)
         self.assertIn("Deposit success:  1", summary)
+
+
+class KiteTeamPlannerTests(unittest.TestCase):
+    class Unit:
+        def __init__(self, uid, position, unit_type, hp):
+            self.id = uid
+            self.position = position
+            self.unit_type = unit_type
+            self.hp = hp
+            self.action = None
+            self.arg = None
+            self.expected_cell = None
+
+        def move(self, direction):
+            self.action = "MOVE"
+            self.arg = direction
+
+        def sweep(self, direction):
+            self.action = "SWEEP"
+            self.arg = direction
+
+        def shoot(self, target, *, expected_cell=None):
+            self.action = "SHOOT"
+            self.arg = target
+            self.expected_cell = expected_cell
+
+        def wait(self):
+            self.action = "WAIT"
+
+    class Enemy:
+        def __init__(self, uid, position, unit_type):
+            self.id = uid
+            self.position = position
+            self.unit_type = unit_type
+
+    def setUp(self):
+        self.config = default_config()
+        self.config.update({
+            "kite_target_x": 10,
+            "kite_target_y": 0,
+            "kite_mode": "coords",
+        })
+        self.old_tracks = {
+            key: list(value) for key, value in tactic._enemy_motion_tracks.items()
+        }
+        self.old_decisions = list(getattr(tactic.turn_context, "kite_decisions", []))
+        self.old_directives = dict(getattr(tactic.turn_context, "kite_directives", {}))
+        self.old_predictions = list(getattr(tactic.turn_context, "shot_predictions", []))
+        self.old_beacon = getattr(tactic.turn_context, "beacon_pos", None)
+        self.old_core = getattr(tactic.turn_context, "core_pos", None)
+        self.old_kite_squad = getattr(tactic.turn_context, "kite_squad_pos", None)
+        self.old_enemy_memory = set(tactic._enemy_memory)
+        tactic._enemy_motion_tracks.clear()
+        tactic.turn_context.tick = 5
+        tactic.turn_context.kite_decisions = []
+        tactic.turn_context.kite_directives = {}
+        tactic.turn_context.kite_obstacles = frozenset()
+        tactic.turn_context.kite_ranger_range = 3
+        tactic.turn_context.shot_predictions = []
+        tactic.turn_context.beacon_pos = None
+        tactic.turn_context.core_pos = (0, 0)
+        tactic.turn_context.kite_squad_pos = (0, 0)
+
+    def tearDown(self):
+        tactic._enemy_motion_tracks.clear()
+        tactic._enemy_motion_tracks.update(self.old_tracks)
+        tactic.turn_context.kite_decisions = self.old_decisions
+        tactic.turn_context.kite_directives = self.old_directives
+        tactic.turn_context.shot_predictions = self.old_predictions
+        tactic.turn_context.beacon_pos = self.old_beacon
+        tactic.turn_context.core_pos = self.old_core
+        tactic.turn_context.kite_squad_pos = self.old_kite_squad
+        tactic._enemy_memory.clear()
+        tactic._enemy_memory.update(self.old_enemy_memory)
+
+    def enemy(self, uid, position, unit_type=UnitType.VANGUARD):
+        return self.Enemy(uid, position, unit_type)
+
+    def unit(self, uid, position, unit_type=UnitType.VANGUARD, hp=None):
+        if hp is None:
+            hp = 4 if unit_type == UnitType.VANGUARD else 2
+        return self.Unit(uid, position, unit_type, hp)
+
+    def test_motion_classifies_advance_and_retreat_from_previous_tick(self):
+        enemy = self.enemy("enemy-motion", (2, 0))
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (3, 0)), (4, (2, 0))]
+        self.assertEqual(tactic._kite_motion_info(enemy, (0, 0))["state"], "advance")
+
+        enemy.position = (3, 0)
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (2, 0)), (4, (3, 0))]
+        self.assertEqual(tactic._kite_motion_info(enemy, (0, 0))["state"], "retreat")
+
+    def test_vanguard_prefires_straight_gap_against_advancing_vanguard(self):
+        unit = self.unit("kite-v", (0, 0))
+        enemy = self.enemy("enemy-v", (2, 0))
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (3, 0)), (4, (2, 0))]
+
+        action, detail = tactic._plan_vanguard(
+            unit, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "SWEEP")
+        self.assertEqual(unit.arg, Direction.RIGHT)
+        self.assertIn("prefire-gap", detail)
+
+    def test_vanguard_uses_enemy_axis_habit_for_diagonal_prefire(self):
+        unit = self.unit("kite-v", (0, 0))
+        enemy = self.enemy("enemy-diag", (1, 1))
+        # Repeated horizontal approach means the enemy habitually enters the
+        # vertical bridge (0,1), so sweep DOWN rather than RIGHT.
+        tactic._enemy_motion_tracks[enemy.id] = [
+            (2, (3, 1)), (3, (2, 1)), (4, (1, 1)),
+        ]
+
+        action, detail = tactic._plan_vanguard(
+            unit, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "SWEEP")
+        self.assertEqual(unit.arg, Direction.DOWN)
+        self.assertIn("prefire-diagonal", detail)
+
+    def test_face_to_face_vanguard_moves_instead_of_trading(self):
+        unit = self.unit("kite-v", (0, 0))
+        enemy = self.enemy("enemy-face", (1, 0))
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (2, 0)), (4, (1, 0))]
+
+        action, detail = tactic._plan_vanguard(
+            unit, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("kite-evade", detail)
+        self.assertNotEqual(unit.arg, Direction.RIGHT)
+
+    def test_vanguard_advances_on_stationary_enemy_when_safe(self):
+        unit = self.unit("kite-v", (0, 0))
+        enemy = self.enemy("enemy-stationary", (3, 0))
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (3, 0)), (4, (3, 0))]
+
+        action, detail = tactic._plan_vanguard(
+            unit, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(unit.arg, Direction.RIGHT)
+        self.assertIn("kite-position", detail)
+
+    def test_ranger_leads_both_advancing_and_retreating_vanguards(self):
+        ranger = self.unit("kite-r1", (0, 0), UnitType.RANGER)
+        advancing = self.enemy("advance-v", (0, 3))
+        tactic._enemy_motion_tracks[advancing.id] = [(3, (0, 4)), (4, (0, 3))]
+        action, _ = tactic._plan_ranger(
+            ranger, (advancing,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+        self.assertEqual(action, "SHOOT")
+        self.assertEqual(ranger.expected_cell, (0, 2))
+
+        ranger = self.unit("kite-r2", (0, 0), UnitType.RANGER)
+        retreating = self.enemy("retreat-v", (0, 2))
+        tactic._enemy_motion_tracks[retreating.id] = [(3, (0, 1)), (4, (0, 2))]
+        action, _ = tactic._plan_ranger(
+            ranger, (retreating,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+        self.assertEqual(action, "SHOOT")
+        self.assertEqual(ranger.expected_cell, (0, 3))
+
+    def test_ranger_in_enemy_ranger_range_moves_before_shooting(self):
+        ranger = self.unit("kite-r", (0, 0), UnitType.RANGER)
+        enemy = self.enemy("enemy-r", (0, 3), UnitType.RANGER)
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (0, 4)), (4, (0, 3))]
+
+        action, detail = tactic._plan_ranger(
+            ranger, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("kite-evade", detail)
+        self.assertNotEqual(ranger.arg, Direction.DOWN)
+
+    def test_full_health_vanguard_keeps_moving_toward_ranger(self):
+        vanguard = self.unit("kite-v", (0, 0), hp=4)
+        enemy = self.enemy("enemy-r", (0, 3), UnitType.RANGER)
+
+        action, detail = tactic._plan_vanguard(
+            vanguard, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(vanguard.arg, Direction.DOWN)
+        self.assertIn("moving-dodge", detail)
+
+    def test_nv1_prepares_collision_pin_and_current_cell_shot(self):
+        vanguard = self.unit("vanguard-pin", (0, 0))
+        ranger = self.unit("ranger-pin", (2, 3), UnitType.RANGER)
+        enemy = self.enemy("enemy-pin", (2, 0))
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (3, 0)), (4, (2, 0))]
+        self.config["kite_team"] = "V1, R1"
+        with patch.object(
+            tactic,
+            "_object_name",
+            side_effect=lambda uid, prefix: "V1" if str(uid).startswith("vanguard") else "R1",
+        ):
+            directives = tactic._prepare_kite_coordination(
+                (vanguard, ranger), (enemy,), self.config, frozenset(),
+            )
+
+        self.assertEqual(directives[vanguard.id]["kind"], "move")
+        self.assertEqual(directives[vanguard.id]["direction"], Direction.RIGHT)
+        self.assertEqual(directives[ranger.id]["kind"], "shoot_current")
+
+    def test_two_stacked_vanguards_cover_both_diagonal_cells(self):
+        first = self.unit("vanguard-a", (0, 0))
+        second = self.unit("vanguard-b", (0, 0))
+        enemy = self.enemy("enemy-diag", (1, 1))
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (2, 1)), (4, (1, 1))]
+        self.config["kite_team"] = "V1, V2"
+        with patch.object(
+            tactic,
+            "_object_name",
+            side_effect=lambda uid, prefix: "V1" if str(uid).endswith("a") else "V2",
+        ):
+            directives = tactic._prepare_kite_coordination(
+                (first, second), (enemy,), self.config, frozenset(),
+            )
+
+        directions = {directives[first.id]["direction"], directives[second.id]["direction"]}
+        self.assertEqual(directions, {Direction.RIGHT, Direction.DOWN})
+
+    def test_kite_planner_ignores_attack_squad_retreat_verdict(self):
+        unit = self.unit("kite-v", (0, 0))
+        tactic.turn_context.attack_retreat = True
+        tactic.turn_context.attack_retreat_from = (1, 0)
+        try:
+            action, detail = tactic._plan_vanguard(
+                unit, (), frozenset(), self.config,
+                core_pos=(0, 0), team="kite",
+            )
+        finally:
+            tactic.turn_context.attack_retreat = False
+            tactic.turn_context.attack_retreat_from = None
+
+        self.assertEqual(action, "MOVE")
+        self.assertNotIn("attack-retreat", detail)
+
+    def test_kite_beacon_and_auto_modes_choose_their_own_targets(self):
+        unit = self.unit("kite-v", (0, 0))
+        self.config["kite_mode"] = "beacon"
+        tactic.turn_context.beacon_pos = (0, 5)
+        action, detail = tactic._plan_vanguard(
+            unit, (), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(unit.arg, Direction.DOWN)
+        self.assertIn("goal=(0, 5)", detail)
+
+        unit = self.unit("kite-v-auto", (0, 0))
+        self.config["kite_mode"] = "auto"
+        tactic._enemy_memory.clear()
+        tactic._enemy_memory.add((0, 4))
+        action, detail = tactic._plan_vanguard(
+            unit, (), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(unit.arg, Direction.DOWN)
+        self.assertIn("goal=(0, 4)", detail)
+
+    def test_battle_log_is_contact_only_and_one_row_per_tick(self):
+        no_contact = [{
+            "unit_name": "V1", "action": "MOVE", "reason": "kite-position",
+            "enemies": [],
+        }]
+        self.assertEqual(tactic._kite_battle_log_entries(no_contact, 5), [])
+
+        contact = [
+            {
+                "unit_name": "V1", "action": "MOVE", "reason": "kite-evade",
+                "enemies": [{"id": "enemy-1"}],
+            },
+            {
+                "unit_name": "R1", "action": "SHOOT", "reason": "kite-current",
+                "enemies": [{"id": "enemy-1"}],
+            },
+        ]
+        entries = tactic._kite_battle_log_entries(contact, 5)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["tick"], 5)
+        self.assertIn("单位 2/2", entries[0]["msg"])
+        self.assertIn("MOVE=1", entries[0]["msg"])
+        self.assertIn("SHOOT=1", entries[0]["msg"])
+
+    def test_battle_log_writes_only_after_accepted_submission(self):
+        tactic.turn_context.kite_decisions = [{
+            "unit_name": "R1", "action": "SHOOT", "reason": "kite-current",
+            "enemies": [{"id": "enemy-1"}],
+        }]
+        with patch.object(tactic, "append_jsonl") as append_mock:
+            tactic._append_accepted_kite_battle_log(False)
+            append_mock.assert_not_called()
+
+            tactic._append_accepted_kite_battle_log(True)
+            append_mock.assert_called_once()
+            self.assertEqual(len(append_mock.call_args.args[1]), 1)
 
 
 class DashboardLogTests(unittest.TestCase):

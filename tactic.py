@@ -890,6 +890,7 @@ class TickRecord:
     events: list[dict] = field(default_factory=list)
     shot_predictions: list[dict] = field(default_factory=list)
     shot_prediction_results: list[dict] = field(default_factory=list)
+    kite_decisions: list[dict] = field(default_factory=list)
     plan_unit_actions: dict[str, str] = field(default_factory=dict)
     plan_core_action: str | None = None
     accepted: bool = False
@@ -1021,6 +1022,7 @@ class TacticLogger:
             for item in turn_context.shot_predictions
         ]
         rec.shot_prediction_results = list(turn_context.shot_prediction_results)
+        rec.kite_decisions = list(getattr(turn_context, "kite_decisions", []) or [])
         rec.accepted = accepted
         rec.latency_ms = round(latency_ms, 1)
         if phase_ms:
@@ -2315,12 +2317,14 @@ def _parse_team_names(raw: Any) -> set[str]:
 
 
 def _combat_team_for(unit_name: str, config: dict[str, Any]) -> str:
-    """Return home / attack / guerrilla / unassigned for a named combat unit."""
+    """Return the priority-resolved squad for a named combat unit."""
     name = unit_name.upper()
     if name in _parse_team_names(config.get("home_team", "")):
         return "home"
     if name in _parse_team_names(config.get("attack_team", "")):
         return "attack"
+    if name in _parse_team_names(config.get("kite_team", "")):
+        return "kite"
     if name in _parse_team_names(config.get("guerrilla_team", "")):
         return "guerrilla"
     return "unassigned"
@@ -2373,6 +2377,7 @@ def _ensure_home_team_membership(
     assigned = (
         _parse_team_names(config.get("home_team", ""))
         | _parse_team_names(config.get("attack_team", ""))
+        | _parse_team_names(config.get("kite_team", ""))
         | _parse_team_names(config.get("guerrilla_team", ""))
     )
     if not (normalized_names - assigned):
@@ -2382,8 +2387,9 @@ def _ensure_home_team_membership(
     def apply(latest: dict[str, int | bool | str]) -> dict[str, Any] | None:
         home = _parse_team_names(latest.get("home_team", ""))
         attack = _parse_team_names(latest.get("attack_team", ""))
+        kite = _parse_team_names(latest.get("kite_team", ""))
         guerrilla = _parse_team_names(latest.get("guerrilla_team", ""))
-        assigned = home | attack | guerrilla
+        assigned = home | attack | kite | guerrilla
         added.extend(sorted(normalized_names - assigned))
         if not added:
             return None
@@ -2421,6 +2427,7 @@ def _auto_enlist_new_combat_units(turn: Any, config: dict[str, Any]) -> dict[str
     rosters = (
         _parse_team_names(config.get("home_team", "")),
         _parse_team_names(config.get("attack_team", "")),
+        _parse_team_names(config.get("kite_team", "")),
         _parse_team_names(config.get("guerrilla_team", "")),
     )
     if not any(roster - alive for roster in rosters):
@@ -2432,7 +2439,7 @@ def _auto_enlist_new_combat_units(turn: Any, config: dict[str, Any]) -> dict[str
 
     def prune(latest: dict[str, int | bool | str]) -> dict[str, Any] | None:
         nonlocal changed
-        for team_key in ("home_team", "attack_team", "guerrilla_team"):
+        for team_key in ("home_team", "attack_team", "kite_team", "guerrilla_team"):
             old = _parse_team_names(latest.get(team_key, ""))
             pruned = old & alive
             if pruned != old:
@@ -3304,6 +3311,781 @@ def _plan_attack_combat(
     return ("WAIT", f"attack-blocked-{mode} {target}")
 
 
+def _kite_motion_info(
+    enemy: Any,
+    friendly_pos: tuple[int, int],
+) -> dict[str, Any]:
+    """Classify the enemy's last step relative to one kite unit.
+
+    The velocity dot the vector from the enemy's previous cell to us is
+    positive for 进攻 and negative for 撤退. This detects a horizontal closing
+    step even when Chebyshev distance stays flat because the units are also
+    vertically separated. Lateral/stationary motion remains explicit.
+    """
+    history = _enemy_motion_tracks.get(str(enemy.id), [])
+    velocity, streak = _motion_streak(history)
+    state = "unknown"
+    previous = history[-2][1] if len(history) >= 2 else None
+    current = tuple(enemy.position)
+    if previous is not None:
+        step = current[0] - previous[0], current[1] - previous[1]
+        toward = friendly_pos[0] - previous[0], friendly_pos[1] - previous[1]
+        alignment = step[0] * toward[0] + step[1] * toward[1]
+        if current == previous:
+            state = "stationary"
+        elif alignment > 0:
+            state = "advance"
+        elif alignment < 0:
+            state = "retreat"
+        else:
+            state = "lateral"
+    predicted = None
+    if velocity is not None and abs(velocity[0]) + abs(velocity[1]) == 1:
+        predicted = (current[0] + velocity[0], current[1] + velocity[1])
+    return {
+        "state": state,
+        "previous": previous,
+        "current": current,
+        "velocity": velocity,
+        "streak": streak,
+        "predicted": predicted,
+    }
+
+
+def _kite_enemy_can_hit(
+    cell: tuple[int, int],
+    enemy: Any,
+    obstacle_cells: frozenset[tuple[int, int]],
+    ranger_range: int,
+    *,
+    enemy_pos: tuple[int, int] | None = None,
+) -> bool:
+    """Whether an enemy could attack ``cell`` if it occupied ``enemy_pos``."""
+    origin = tuple(enemy_pos or enemy.position)
+    etype = _enemy_unit_type_name(enemy)
+    dx, dy = cell[0] - origin[0], cell[1] - origin[1]
+    if etype == "WORKER":
+        return False
+    if etype == "RANGER":
+        dist = max(abs(dx), abs(dy))
+        return (
+            1 <= dist <= ranger_range
+            and (dx == 0 or dy == 0 or abs(dx) == abs(dy))
+            and not _line_blocked(origin, cell, obstacle_cells)
+        )
+    # Vanguard and Core are conservatively treated as cardinal melee threats.
+    return abs(dx) + abs(dy) == 1
+
+
+def _kite_cell_assessment(
+    cell: tuple[int, int],
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    ranger_range: int,
+) -> dict[str, Any]:
+    current_hits = 0
+    predicted_hits = 0
+    nearest = 10_000
+    for enemy in _combat_threats(enemies):
+        epos = tuple(enemy.position)
+        nearest = min(nearest, _chebyshev(cell, epos))
+        if _kite_enemy_can_hit(cell, enemy, obstacle_cells, ranger_range):
+            current_hits += 1
+        motion = _kite_motion_info(enemy, cell)
+        predicted = motion.get("predicted")
+        if predicted is not None and _kite_enemy_can_hit(
+            cell,
+            enemy,
+            obstacle_cells,
+            ranger_range,
+            enemy_pos=predicted,
+        ):
+            predicted_hits += 1
+    return {
+        "current_hits": current_hits,
+        "predicted_hits": predicted_hits,
+        "nearest": nearest if nearest < 10_000 else 999,
+    }
+
+
+def _kite_choose_move(
+    unit: Any,
+    pos: tuple[int, int],
+    goal: tuple[int, int],
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    ranger_range: int,
+    cell_counts: Mapping | None,
+    *,
+    must_move: bool,
+) -> tuple[Direction | None, dict[str, Any], list[dict[str, Any]]]:
+    """Choose the safest cardinal cell, using goal progress only as a tie-break."""
+    counts = cell_counts or {}
+    enemy_cells = {tuple(enemy.position) for enemy in enemies}
+    choices: list[tuple[tuple, Direction | None, tuple[int, int], dict[str, Any]]] = []
+    directions: tuple[Direction | None, ...] = (
+        Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT, None,
+    )
+    for direction in directions:
+        if direction is None:
+            if must_move:
+                continue
+            cell = pos
+        else:
+            cell = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+            if cell in obstacle_cells or cell in enemy_cells:
+                continue
+            if counts.get(cell, 0) >= _CELL_UNIT_LIMIT:
+                continue
+        assessment = _kite_cell_assessment(
+            cell, enemies, obstacle_cells, ranger_range,
+        )
+        progress = _manhattan(pos, goal) - _manhattan(cell, goal)
+        dead_end = int(
+            direction is not None
+            and _is_dead_end_step(cell, obstacle_cells, allow=(goal,))
+        )
+        # Never trade safety for progress. Once two cells are equally safe,
+        # however, keep advancing instead of backing away forever from a
+        # stationary/retreating melee target. Distance remains the stronger
+        # tie-break while every available cell is still dangerous.
+        risk_free = not (
+            assessment["current_hits"] or assessment["predicted_hits"]
+        )
+        tactical_ties = (
+            (progress, assessment["nearest"])
+            if risk_free
+            else (assessment["nearest"], progress)
+        )
+        score = (
+            -assessment["current_hits"],
+            -assessment["predicted_hits"],
+            *tactical_ties,
+            -dead_end,
+            int(direction is not None),
+        )
+        choices.append((score, direction, cell, {**assessment, "progress": progress}))
+    if not choices:
+        return None, _kite_cell_assessment(pos, enemies, obstacle_cells, ranger_range), []
+    choices.sort(key=lambda item: item[0], reverse=True)
+    _, direction, _, assessment = choices[0]
+    public = [
+        {
+            "direction": item[1].name if item[1] is not None else "WAIT",
+            "cell": list(item[2]),
+            **item[3],
+        }
+        for item in choices
+    ]
+    return direction, assessment, public
+
+
+def _kite_mode_target(
+    pos: tuple[int, int],
+    config: dict[str, Any],
+) -> tuple[str, tuple[int, int]]:
+    mode = str(config.get("kite_mode", "coords"))
+    fallback = (
+        int(config.get("kite_target_x", 0)),
+        int(config.get("kite_target_y", 0)),
+    )
+    if mode == "beacon":
+        return mode, getattr(turn_context, "beacon_pos", None) or fallback
+    if mode == "auto" and _enemy_memory:
+        radius = max(int(config.get("kite_auto_radius", 0) or 0), 0)
+        core_pos = getattr(turn_context, "core_pos", None)
+        squad_pos = getattr(turn_context, "kite_squad_pos", None) or pos
+        candidates = set(_enemy_memory)
+        if radius > 0 and core_pos is not None:
+            candidates = {p for p in candidates if _manhattan(p, core_pos) <= radius}
+        if candidates:
+            if core_pos is None:
+                return mode, min(candidates, key=lambda p: _manhattan(p, squad_pos))
+            return mode, min(
+                candidates,
+                key=lambda p: _manhattan(p, core_pos) + _manhattan(p, squad_pos),
+            )
+    return mode, fallback
+
+
+def _kite_engage_pool(
+    pos: tuple[int, int],
+    target: tuple[int, int],
+    mode: str,
+    enemies: tuple,
+    config: dict[str, Any],
+) -> tuple:
+    if mode == "auto":
+        radius = max(int(config.get("kite_auto_radius", 0) or 0), 0)
+        core_pos = getattr(turn_context, "core_pos", None)
+        if radius > 0 and core_pos is not None:
+            return tuple(
+                enemy for enemy in enemies
+                if _manhattan(tuple(enemy.position), core_pos) <= radius
+            )
+        return tuple(enemies)
+    leash = max(int(config.get("kite_march_engage_radius", 0) or 0), 0)
+    target_dist = _manhattan(pos, target)
+    return tuple(
+        enemy for enemy in enemies
+        if _manhattan(tuple(enemy.position), target) <= target_dist
+        and (leash <= 0 or _manhattan(pos, tuple(enemy.position)) <= leash)
+    )
+
+
+def _kite_diagonal_sweep_directions(
+    unit_pos: tuple[int, int],
+    enemy: Any,
+) -> tuple[Direction, Direction]:
+    """Return preferred/alternate bridge cells for a diagonal Vanguard duel."""
+    epos = tuple(enemy.position)
+    x_direction = Direction.RIGHT if epos[0] > unit_pos[0] else Direction.LEFT
+    y_direction = Direction.DOWN if epos[1] > unit_pos[1] else Direction.UP
+    history = _enemy_motion_tracks.get(str(enemy.id), [])
+    axis_score = {"x": 0, "y": 0}
+    for weight, index in enumerate(range(max(1, len(history) - 3), len(history)), start=1):
+        if index <= 0:
+            continue
+        dx = history[index][1][0] - history[index - 1][1][0]
+        dy = history[index][1][1] - history[index - 1][1][1]
+        if dx:
+            axis_score["x"] += weight
+        if dy:
+            axis_score["y"] += weight
+    # Horizontal enemy motion enters the vertical bridge (our y direction),
+    # vertical motion enters the horizontal bridge (our x direction).
+    if axis_score["x"] > axis_score["y"]:
+        return y_direction, x_direction
+    if axis_score["y"] > axis_score["x"]:
+        return x_direction, y_direction
+    if _stable_slot_index(str(enemy.id), 2) == 0:
+        return x_direction, y_direction
+    return y_direction, x_direction
+
+
+def _kite_log_decision(
+    unit: Any,
+    unit_kind: str,
+    mode: str,
+    objective: tuple[int, int],
+    enemies: tuple,
+    action: str,
+    reason: str,
+    *,
+    target: Any | None = None,
+    candidates: list[dict[str, Any]] | None = None,
+) -> None:
+    pos = tuple(unit.position)
+    enemy_rows = []
+    ranger_range = int(getattr(turn_context, "kite_ranger_range", 3) or 3)
+    obstacles = getattr(turn_context, "kite_obstacles", frozenset())
+    for enemy in enemies:
+        motion = _kite_motion_info(enemy, pos)
+        predicted = motion["predicted"]
+        enemy_rows.append({
+            "id": str(enemy.id)[:8],
+            "type": _enemy_unit_type_name(enemy) or "ENEMY",
+            "position": list(enemy.position),
+            "motion": motion["state"],
+            "velocity": list(motion["velocity"]) if motion["velocity"] is not None else None,
+            "streak": motion["streak"],
+            "predicted": list(predicted) if predicted else None,
+            "can_hit_now": _kite_enemy_can_hit(pos, enemy, obstacles, ranger_range),
+            "can_hit_predicted": bool(
+                predicted is not None
+                and _kite_enemy_can_hit(
+                    pos, enemy, obstacles, ranger_range, enemy_pos=predicted,
+                )
+            ),
+        })
+    turn_context.kite_decisions.append({
+        "tick": turn_context.tick,
+        "unit_id": str(unit.id)[:8],
+        "unit_name": _object_name(unit.id, "V" if unit_kind == "vanguard" else "R"),
+        "unit_type": unit_kind.upper(),
+        "position": list(pos),
+        "hp": int(getattr(unit, "hp", 0) or 0),
+        "mode": mode,
+        "objective": list(objective),
+        "target_id": str(target.id)[:8] if target is not None else None,
+        "enemies": enemy_rows,
+        "action": action,
+        "reason": reason,
+        "candidates": candidates or [],
+    })
+
+
+def _kite_battle_log_entries(
+    decisions: Iterable[dict[str, Any]],
+    tick: int,
+) -> list[dict[str, Any]]:
+    """Build at most one compact battle-log row for an accepted kite Tick.
+
+    The structured tactic log retains every candidate and enemy assessment.
+    The shared dashboard battle log has a 500-line retention budget, so it
+    records only Ticks with actual contact and summarizes the whole squad.
+    """
+    all_decisions = list(decisions)
+    contact = [
+        decision for decision in all_decisions
+        if decision.get("enemies")
+        or str(decision.get("action", "")).upper() in {"SHOOT", "SWEEP"}
+    ]
+    if not contact:
+        return []
+
+    action_counts: dict[str, int] = defaultdict(int)
+    enemy_ids: set[str] = set()
+    summaries: list[str] = []
+    for decision in contact:
+        action = str(decision.get("action") or "WAIT").upper()
+        action_counts[action] += 1
+        enemy_ids.update(
+            str(row.get("id"))
+            for row in decision.get("enemies", [])
+            if row.get("id")
+        )
+        if len(summaries) < 8:
+            summaries.append(
+                f"{decision.get('unit_name', '?')}:{action} "
+                f"{decision.get('reason', '')}".strip()
+            )
+
+    actions = ", ".join(
+        f"{action}={action_counts[action]}" for action in sorted(action_counts)
+    )
+    omitted = len(contact) - len(summaries)
+    detail = "; ".join(summaries)
+    if omitted > 0:
+        detail += f"; 另 {omitted} 个单位"
+    return [{
+        "tick": tick,
+        "ts": time.time(),
+        "cat": "combat",
+        "msg": (
+            f"风筝队接敌：单位 {len(contact)}/{len(all_decisions)}，"
+            f"敌人 {len(enemy_ids)}，{actions}｜{detail}"
+        ),
+    }]
+
+
+def _append_accepted_kite_battle_log(accepted: bool) -> None:
+    """Persist kite battle summaries only after the server accepts the plan."""
+    if not accepted:
+        return
+    entries = _kite_battle_log_entries(
+        getattr(turn_context, "kite_decisions", []) or [],
+        int(getattr(turn_context, "tick", 0) or 0),
+    )
+    if not entries:
+        return
+    try:
+        append_jsonl(BATTLE_LOG_PATH, entries)
+    except OSError:
+        pass
+
+
+def _kite_ranger_fire(
+    ranger: Any,
+    pos: tuple[int, int],
+    target: Any,
+    expected: tuple[int, int] | None,
+    obstacle_cells: frozenset[tuple[int, int]],
+    attack_range: int,
+) -> tuple[str, str] | None:
+    fired = expected or tuple(target.position)
+    dx, dy = fired[0] - pos[0], fired[1] - pos[1]
+    dist = max(abs(dx), abs(dy))
+    if not (
+        1 <= dist <= attack_range
+        and (dx == 0 or dy == 0 or abs(dx) == abs(dy))
+        and not _line_blocked(pos, fired, obstacle_cells)
+    ):
+        return None
+    if expected is not None:
+        ranger.shoot(target, expected_cell=expected)
+        motion = _kite_motion_info(target, pos)
+        prediction = _shadow_shot_prediction(
+            ranger, pos, target, obstacle_cells, attack_range,
+        )
+        prediction.update({
+            "predicted_cell": list(expected),
+            "velocity": list(motion["velocity"]) if motion["velocity"] else None,
+            "move_streak": motion["streak"],
+            "motion_state": f"kite_{motion['state']}",
+            "prediction_legal": True,
+            "eligible": True,
+            "reason": "kite_motion_prediction",
+            "lead_fire_used": True,
+            "lead_fire_rejection": None,
+            "fire_mode": "kite_lead",
+            "fired_cell": list(expected),
+        })
+        turn_context.shot_predictions.append(prediction)
+        return "SHOOT", f"kite-lead {expected} motion={motion['state']}"
+    ranger.shoot(target)
+    return "SHOOT", f"kite-current {tuple(target.position)}"
+
+
+def _prepare_kite_coordination(
+    units: Iterable[Any],
+    enemies: tuple,
+    config: dict[str, Any],
+    obstacle_cells: frozenset[tuple[int, int]],
+) -> dict[str, dict[str, Any]]:
+    """Pre-assign Nv1 collision traps and two-Vanguard diagonal coverage."""
+    kite_names = _parse_team_names(config.get("kite_team", ""))
+    kite_units = [
+        unit for unit in units
+        if unit.unit_type in (UnitType.VANGUARD, UnitType.RANGER)
+        and _object_name(unit.id, _UNIT_NAME_PREFIX[unit.unit_type]).upper() in kite_names
+    ]
+    directives: dict[str, dict[str, Any]] = {}
+    threats = _combat_threats(enemies)
+    enemy_vanguards = [e for e in threats if _enemy_unit_type_name(e) == "VANGUARD"]
+    friendly_cells: dict[tuple[int, int], int] = defaultdict(int)
+    for unit in units:
+        if getattr(unit, "unit_type", None) in (
+            UnitType.WORKER, UnitType.VANGUARD, UnitType.RANGER,
+        ):
+            friendly_cells[tuple(unit.position)] += 1
+
+    # Game rule 2: two friendly Vanguards stacked on a diagonal cover both
+    # possible bridge cells, so the opponent cannot choose an unguarded side.
+    by_cell: dict[tuple[int, int], list[Any]] = defaultdict(list)
+    for unit in kite_units:
+        if unit.unit_type == UnitType.VANGUARD:
+            by_cell[tuple(unit.position)].append(unit)
+    for cell, stacked in by_cell.items():
+        if len(threats) != 1 or len(stacked) < 2:
+            continue
+        diagonal = next((
+            enemy for enemy in enemy_vanguards
+            if abs(enemy.position[0] - cell[0]) == 1
+            and abs(enemy.position[1] - cell[1]) == 1
+            and _kite_motion_info(enemy, cell)["state"] == "advance"
+        ), None)
+        if diagonal is None:
+            continue
+        first, second = _kite_diagonal_sweep_directions(cell, diagonal)
+        open_directions = tuple(
+            direction for direction in (first, second)
+            if (cell[0] + direction.delta[0], cell[1] + direction.delta[1])
+            not in obstacle_cells
+        )
+        for unit, direction in zip(
+            sorted(stacked, key=lambda u: str(u.id)), open_directions,
+        ):
+            directives[str(unit.id)] = {
+                "kind": "sweep", "direction": direction, "target": diagonal,
+                "reason": "nv1-stacked-diagonal-cover",
+            }
+
+    # Game rule 1: in Nv1, collide one Vanguard with an advancing enemy at the
+    # middle cell while one Ranger fires at the enemy's unchanged current cell.
+    if len(kite_units) >= 2 and len(threats) == 1 and enemy_vanguards:
+        enemy = enemy_vanguards[0]
+        vanguards = sorted(
+            (u for u in kite_units if u.unit_type == UnitType.VANGUARD),
+            key=lambda u: _manhattan(tuple(u.position), tuple(enemy.position)),
+        )
+        rangers = sorted(
+            (u for u in kite_units if u.unit_type == UnitType.RANGER),
+            key=lambda u: _manhattan(tuple(u.position), tuple(enemy.position)),
+        )
+        for vanguard in vanguards:
+            vpos = tuple(vanguard.position)
+            dx = enemy.position[0] - vpos[0]
+            dy = enemy.position[1] - vpos[1]
+            if not ((abs(dx) == 2 and dy == 0) or (abs(dy) == 2 and dx == 0)):
+                continue
+            if _kite_motion_info(enemy, vpos)["state"] != "advance":
+                continue
+            direction = _cardinal_toward_delta(dx, dy)
+            middle = (vpos[0] + direction.delta[0], vpos[1] + direction.delta[1])
+            if (
+                middle in obstacle_cells
+                or friendly_cells.get(middle, 0) > 0
+                or str(vanguard.id) in directives
+            ):
+                continue
+            shooter = next((
+                ranger for ranger in rangers
+                if _kite_ranger_fire_legal(
+                    tuple(ranger.position), tuple(enemy.position), obstacle_cells,
+                    int(config.get("ranger_attack_range", 3)),
+                )
+                and not _kite_enemy_can_hit(
+                    tuple(ranger.position), enemy, obstacle_cells,
+                    int(config.get("ranger_attack_range", 3)),
+                )
+            ), None)
+            if shooter is None:
+                continue
+            directives[str(vanguard.id)] = {
+                "kind": "move", "direction": direction, "target": enemy,
+                "reason": "nv1-contest-middle",
+            }
+            directives[str(shooter.id)] = {
+                "kind": "shoot_current", "target": enemy,
+                "reason": "nv1-collision-pin-shot",
+            }
+            break
+    return directives
+
+
+def _kite_ranger_fire_legal(
+    ranger_pos: tuple[int, int],
+    cell: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    attack_range: int,
+) -> bool:
+    dx, dy = cell[0] - ranger_pos[0], cell[1] - ranger_pos[1]
+    return (
+        1 <= max(abs(dx), abs(dy)) <= attack_range
+        and (dx == 0 or dy == 0 or abs(dx) == abs(dy))
+        and not _line_blocked(ranger_pos, cell, obstacle_cells)
+    )
+
+
+def _plan_kite_combat(
+    unit: Any,
+    *,
+    unit_kind: str,
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, Any],
+    cell_counts: Mapping | None = None,
+) -> tuple[str, str]:
+    """Fight to the end by staying outside attack zones and striking future cells."""
+    pos = tuple(unit.position)
+    mode, objective = _kite_mode_target(pos, config)
+    attack_range = int(config.get("ranger_attack_range", 3))
+    # turn.visible_enemies is the union of the whole army's sight. "Nearby"
+    # must remain per-kite-unit or one scout would make every kite unit dodge a
+    # threat on the other side of the map.
+    sight = _GUERRILLA_SIGHT.get(unit_kind, attack_range + 1)
+    threats = tuple(
+        enemy for enemy in _combat_threats(enemies)
+        if _manhattan(pos, tuple(enemy.position)) <= sight
+    )
+    directive = getattr(turn_context, "kite_directives", {}).get(str(unit.id))
+    if directive is not None:
+        target = directive.get("target")
+        if directive["kind"] == "sweep":
+            unit.sweep(directive["direction"])
+            action, detail = "SWEEP", f"{directive['direction'].name} {directive['reason']}"
+        elif directive["kind"] == "move":
+            unit.move(directive["direction"])
+            action, detail = "MOVE", f"{directive['direction'].name} {directive['reason']}"
+        else:
+            unit.shoot(target)
+            action, detail = "SHOOT", f"{directive['reason']} {tuple(target.position)}"
+        _kite_log_decision(
+            unit, unit_kind, mode, objective, threats, action, detail, target=target,
+        )
+        return action, detail
+
+    engage_pool = _kite_engage_pool(pos, objective, mode, enemies, config)
+    # A kite squad may not ignore an off-route enemy that is about to enter
+    # its own range: route leashes only select long-distance objectives. Keep
+    # every nearby combat threat in the tactical pool for pre-fire/spacing.
+    local_pool = tuple(
+        enemy for enemy in threats
+        if _chebyshev(pos, tuple(enemy.position)) <= attack_range + 1
+    )
+    pool_by_id = {str(enemy.id): enemy for enemy in (*engage_pool, *local_pool)}
+    combat_pool = _combat_threats(tuple(pool_by_id.values()))
+    target = min(
+        combat_pool or engage_pool,
+        key=lambda enemy: _manhattan(pos, tuple(enemy.position)),
+        default=None,
+    )
+    current_assessment = _kite_cell_assessment(
+        pos, threats, obstacle_cells, attack_range,
+    )
+
+    # Full-health Vanguard vs Ranger is the deliberate exception: keep moving
+    # so the non-predictive Ranger shoots the old cell, close, then trade 4 HP
+    # into 2 HP face-to-face. It never invokes a retreat-to-base branch.
+    full_v_vs_r = (
+        unit_kind == "vanguard"
+        and int(getattr(unit, "hp", 0) or 0) >= 4
+        and target is not None
+        and _enemy_unit_type_name(target) == "RANGER"
+    )
+    if full_v_vs_r:
+        dx = target.position[0] - pos[0]
+        dy = target.position[1] - pos[1]
+        if abs(dx) + abs(dy) == 1:
+            direction = _cardinal_toward_delta(dx, dy)
+            unit.sweep(direction)
+            detail = f"{direction.name} full-vanguard-trade ranger={tuple(target.position)}"
+            _kite_log_decision(
+                unit, unit_kind, mode, objective, threats, "SWEEP", detail, target=target,
+            )
+            return "SWEEP", detail
+        direct = _cardinal_toward_delta(dx, dy)
+        if direct is not None:
+            next_cell = (pos[0] + direct.delta[0], pos[1] + direct.delta[1])
+            counts = cell_counts or {}
+            if (
+                next_cell not in obstacle_cells
+                and next_cell not in {tuple(enemy.position) for enemy in enemies}
+                and counts.get(next_cell, 0) < _CELL_UNIT_LIMIT
+            ):
+                unit.move(direct)
+                detail = (
+                    f"{direct.name} full-vanguard-moving-dodge "
+                    f"ranger={tuple(target.position)}"
+                )
+                _kite_log_decision(
+                    unit, unit_kind, mode, objective, threats, "MOVE", detail,
+                    target=target,
+                )
+                return "MOVE", detail
+        direction, assessment, candidates = _kite_choose_move(
+            unit, pos, tuple(target.position), threats, obstacle_cells,
+            attack_range, cell_counts, must_move=True,
+        )
+        if direction is not None:
+            unit.move(direction)
+            detail = (
+                f"{direction.name} full-vanguard-close ranger={tuple(target.position)} "
+                f"risk={assessment['current_hits']}/{assessment['predicted_hits']}"
+            )
+            _kite_log_decision(
+                unit, unit_kind, mode, objective, threats, "MOVE", detail,
+                target=target, candidates=candidates,
+            )
+            return "MOVE", detail
+
+    # Standing in any current enemy range always yields to movement. This is
+    # the central invariant: prefer a missed attack over accepting damage.
+    if current_assessment["current_hits"] > 0:
+        direction, assessment, candidates = _kite_choose_move(
+            unit, pos, objective, threats, obstacle_cells, attack_range,
+            cell_counts, must_move=True,
+        )
+        if direction is not None:
+            unit.move(direction)
+            detail = (
+                f"{direction.name} kite-evade current={current_assessment['current_hits']} "
+                f"next={assessment['current_hits']}/{assessment['predicted_hits']}"
+            )
+            _kite_log_decision(
+                unit, unit_kind, mode, objective, threats, "MOVE", detail,
+                target=target, candidates=candidates,
+            )
+            return "MOVE", detail
+        unit.wait()
+        detail = (
+            f"kite-evade-blocked current={current_assessment['current_hits']} "
+            "skip-attack"
+        )
+        _kite_log_decision(
+            unit, unit_kind, mode, objective, threats, "WAIT", detail,
+            target=target, candidates=candidates,
+        )
+        return "WAIT", detail
+
+    if target is not None and unit_kind == "vanguard":
+        etype = _enemy_unit_type_name(target)
+        dx = int(target.position[0]) - pos[0]
+        dy = int(target.position[1]) - pos[1]
+        motion = _kite_motion_info(target, pos)
+        # V vs V straight line with one gap: sweep the entry cell now.
+        if (
+            etype == "VANGUARD"
+            and motion["state"] == "advance"
+            and ((abs(dx) == 2 and dy == 0) or (abs(dy) == 2 and dx == 0))
+        ):
+            direction = _cardinal_toward_delta(dx, dy)
+            gap = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+            if gap not in obstacle_cells:
+                unit.sweep(direction)
+                detail = f"{direction.name} kite-prefire-gap enemy={tuple(target.position)}"
+                _kite_log_decision(
+                    unit, unit_kind, mode, objective, threats, "SWEEP", detail, target=target,
+                )
+                return "SWEEP", detail
+        # Diagonal V vs V: cover the historically preferred bridge cell.
+        if (
+            etype == "VANGUARD"
+            and motion["state"] == "advance"
+            and abs(dx) == 1 and abs(dy) == 1
+        ):
+            preferred, alternate = _kite_diagonal_sweep_directions(pos, target)
+            direction = next((
+                candidate for candidate in (preferred, alternate)
+                if (pos[0] + candidate.delta[0], pos[1] + candidate.delta[1])
+                not in obstacle_cells
+            ), None)
+            if direction is not None:
+                unit.sweep(direction)
+                detail = f"{direction.name} kite-prefire-diagonal enemy={tuple(target.position)}"
+                _kite_log_decision(
+                    unit, unit_kind, mode, objective, threats, "SWEEP", detail, target=target,
+                )
+                return "SWEEP", detail
+        if abs(dx) + abs(dy) == 1:
+            # Workers cannot retaliate; combat targets would have triggered
+            # current-range evasion above (except the full-health Ranger case).
+            if etype == "WORKER":
+                direction = _cardinal_toward_delta(dx, dy)
+                unit.sweep(direction)
+                detail = f"{direction.name} kite-safe-sweep worker={tuple(target.position)}"
+                _kite_log_decision(
+                    unit, unit_kind, mode, objective, threats, "SWEEP", detail, target=target,
+                )
+                return "SWEEP", detail
+
+    if target is not None and unit_kind == "ranger":
+        motion = _kite_motion_info(target, pos)
+        expected = motion.get("predicted") if motion["state"] in {"advance", "retreat"} else None
+        shot = _kite_ranger_fire(
+            unit, pos, target, expected, obstacle_cells, attack_range,
+        )
+        if shot is None and motion["state"] in {"stationary", "unknown"}:
+            shot = _kite_ranger_fire(
+                unit, pos, target, None, obstacle_cells, attack_range,
+            )
+        if shot is not None:
+            action, detail = shot
+            _kite_log_decision(
+                unit, unit_kind, mode, objective, threats, action, detail, target=target,
+            )
+            return action, detail
+
+    # No safe/valuable attack: keep spacing while still advancing the selected
+    # coordinate/auto/beacon objective. Tactical evasion is not squad retreat;
+    # the unit never returns home and never stops fighting due to headcount.
+    must_move = any(_enemy_unit_type_name(enemy) == "RANGER" for enemy in threats)
+    move_goal = tuple(target.position) if target is not None else objective
+    direction, assessment, candidates = _kite_choose_move(
+        unit, pos, move_goal, threats, obstacle_cells, attack_range,
+        cell_counts, must_move=must_move,
+    )
+    if direction is not None:
+        unit.move(direction)
+        detail = (
+            f"{direction.name} kite-position goal={move_goal} "
+            f"risk={assessment['current_hits']}/{assessment['predicted_hits']}"
+        )
+        _kite_log_decision(
+            unit, unit_kind, mode, objective, threats, "MOVE", detail,
+            target=target, candidates=candidates,
+        )
+        return "MOVE", detail
+    unit.wait()
+    detail = f"kite-hold-safe objective={objective}"
+    _kite_log_decision(
+        unit, unit_kind, mode, objective, threats, "WAIT", detail,
+        target=target, candidates=candidates,
+    )
+    return "WAIT", detail
+
+
 def _plan_guerrilla_combat(
     unit: Any,
     *,
@@ -3481,6 +4263,15 @@ def _plan_vanguard(
             obstacle_cells=obstacle_cells,
             config=config,
         )
+    if team == "kite":
+        return _plan_kite_combat(
+            vanguard,
+            unit_kind="vanguard",
+            enemies=enemies,
+            obstacle_cells=obstacle_cells,
+            config=config,
+            cell_counts=cell_counts,
+        )
     if team == "guerrilla":
         return _plan_guerrilla_combat(
             vanguard,
@@ -3528,6 +4319,15 @@ def _plan_ranger(
             enemies=enemies,
             obstacle_cells=obstacle_cells,
             config=config,
+        )
+    if team == "kite":
+        return _plan_kite_combat(
+            ranger,
+            unit_kind="ranger",
+            enemies=enemies,
+            obstacle_cells=obstacle_cells,
+            config=config,
+            cell_counts=cell_counts,
         )
     if team == "guerrilla":
         return _plan_guerrilla_combat(
@@ -4533,6 +5333,11 @@ turn_context = type(
         "attack_retreat": False,
         "attack_retreat_from": None,
         "attack_forbidden_targets": frozenset(),
+        "kite_squad_pos": None,
+        "kite_directives": {},
+        "kite_decisions": [],
+        "kite_ranger_range": 3,
+        "kite_obstacles": frozenset(),
         "shot_predictions": [],
         "shot_prediction_results": [],
         # Per-Tick planning profiler output (filled by choose_actions, read by
@@ -4740,6 +5545,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
     turn_context.shot_predictions = []
+    turn_context.kite_decisions = []
     _phase.start("prediction")
     turn_context.shot_prediction_results = _resolve_shadow_predictions(
         turn, turn_context.tick,
@@ -4855,6 +5661,27 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         )
     else:
         turn_context.attack_squad_pos = None
+
+    kite_squad_names = _parse_team_names(config.get("kite_team", ""))
+    kite_cells = [
+        tuple(u.position)
+        for u in turn.units
+        if u.unit_type in (UnitType.VANGUARD, UnitType.RANGER)
+        and _object_name(u.id, _UNIT_NAME_PREFIX.get(u.unit_type, "U")).upper()
+        in kite_squad_names
+    ]
+    turn_context.kite_squad_pos = (
+        (
+            round(sum(x for x, _ in kite_cells) / len(kite_cells)),
+            round(sum(y for _, y in kite_cells) / len(kite_cells)),
+        )
+        if kite_cells else None
+    )
+    turn_context.kite_ranger_range = int(config.get("ranger_attack_range", 3))
+    turn_context.kite_obstacles = obstacle_cells
+    turn_context.kite_directives = _prepare_kite_coordination(
+        turn.units, enemies, config, obstacle_cells,
+    )
 
     # Squad-wide auto-attack retreat decision (computed once per Tick so every
     # attack-team member acts on the same verdict). In auto mode, when the
@@ -5591,6 +6418,7 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             continue
                         stale_streak = 0
                         _commit_shadow_predictions(accepted.accepted)
+                        _append_accepted_kite_battle_log(accepted.accepted)
                         latency = (time.monotonic() - tick_start) * 1000
                         plan_actions: dict[str, str] = {}
                         for uid, detail in unit_actions.items():

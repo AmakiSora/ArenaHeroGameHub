@@ -172,7 +172,7 @@ python status.py
 |----|----------|------|
 | **工人与寻路** | `worker_bfs_enabled`, `bfs_max_steps`, `avoid_backtracking`, `backtrack_penalty`, `enemy_threat_radius`, `worker_mine_max_distance` | A* 寻路开关、节点上限、回头规避、遇敌回避半径 |
 | **核心** | `core_movement_enabled`, `cargo_wait_distance`, `repair_enabled`, `heal_enabled`, `peace_shield_target`, `combat_shield_target`, `resource_reserve` | 核心移动、修盾目标、生产保留金币 |
-| **战斗分队** | `home_team`, `attack_team`, `guerrilla_team`, `home_patrol_radius`, `home_engage_memory_ticks`, `attack_target_x/y`, `attack_mode`, `guerrilla_engage_radius`, `ranger_attack_range`, `ranger_lead_fire_enabled` | 三队名单（V1/R2 等）、守家/进攻/游击策略、游侠射程与预判 |
+| **战斗分队** | `home_team`, `attack_team`, `kite_team`, `guerrilla_team`, `home_patrol_radius`, `home_engage_memory_ticks`, `attack_target_x/y`, `attack_mode`, `kite_target_x/y`, `kite_mode`, `guerrilla_engage_radius`, `ranger_attack_range`, `ranger_lead_fire_enabled` | 四队名单（V1/R2 等）、守家/进攻/风筝/游击策略、游侠射程与预判 |
 | **运行** | `map_save_interval_ticks` | 地图记忆落盘节奏 |
 | **生产** | `target_workers`, `target_vanguards`, `target_rangers` | 各兵种目标数量（0–100） |
 
@@ -219,10 +219,11 @@ curl -X POST http://localhost:4399/api/config/reset \
 | 5 | 无货 + 指派到记忆矿 | BFS MOVE → 记忆矿 |
 | 6 | 无货 + 无指派 | MOVE 按 UUID 旋转方向探索 |
 
-**战斗分队**（先锋 V / 游侠 R，按稳定单位名编队，同一单位多队时优先级 守家 > 进攻 > 游击）
+**战斗分队**（先锋 V / 游侠 R，按稳定单位名编队，同一单位多队时优先级 守家 > 进攻 > 风筝 > 游击）
 
 - **守家队**：拦截靠近核心的威胁，超过巡逻半径则回防，无威胁时按 UUID 分 8 方位分散巡逻
 - **进攻队**：可三选一目标——进攻坐标 / 自动狩猎最近记忆敌人 / 直扑冠军信标；沿途遇敌即战
+- **风筝队**：同样可三选一目标；持续远离敌方攻击范围，按上一 Tick 运动方向预判敌人进入格，先锋提前扫击、游侠预判射击；不执行人数劣势撤退或回城
 - **游击队**：见 3+ 敌人撤退，单敌单挑，2 敌能打则打不追，其余按 UUID 8 向漫游
 
 > **游戏机制**：只要单位保持移动就不会被命中，原地才会被打。因此当可见敌人在工人的 `enemy_threat_radius` 内时，工人**每 Tick 必须移动**，禁止 HARVEST/DEPOSIT/WAIT，改为朝远离敌人方向移动一格。
@@ -249,7 +250,7 @@ curl -X POST http://localhost:4399/api/config/reset \
 ### 主要面板
 
 - **地图舞台**：平移缩放 SVG，显示核心、工人、先锋、游侠、敌人（按兵种细分）、敌人踪迹、墙、可见/记忆矿、单位路径、目标、信标等。图例标签均为可点击开关，显示/隐藏对应类别，选择持久化在 localStorage
-- **战斗分队卡片**：四个拖拽列（待命池 / 守家 / 进攻 / 游击）和守家、进攻、游击、通用四组参数；拖拽与参数修改先形成草稿，点击“保存修改”后统一生效。进攻方式只显示当前模式需要的字段
+- **战斗分队卡片**：五个拖拽列（待命池 / 守家 / 进攻 / 风筝 / 游击）和守家、进攻、风筝、游击、通用参数组；拖拽与参数修改先形成草稿，点击“保存修改”后统一生效。进攻队与风筝队只显示各自当前模式需要的字段
 - **策略配置面板**：生产需求及工人、核心、运行参数，含范围校验；不会隐式修改战斗分队
 - **战报统计面板**：经济（采集/卸货/效率）、生产（各兵种生产/自裁/阵亡）、战斗（攻击/命中/命中率/参与击杀）、移动，每单位明细
 - **历史趋势**：资源、人口、敌人三图，窗口按时间可选（最近 10 分钟 / 30 分钟 / 1 小时），横轴按真实墙钟时间排布，选择持久化
@@ -286,7 +287,7 @@ tick=35060 core=MOVE_RIGHT res=9/45 pop=9 workers=7 enemies=0 resources_visible=
 每 Tick 完整状态：Tick、时间戳、Core 状态、资源/容量/人口/生产单价、所有单位位置货物 HP、动作指令、目标与规划路径、可见敌人、矿点、上 Tick 解析事件、决策与提交耗时。文件超 `ARENA_LOG_MAX_MB`（默认 20）自动轮转，最多保留 3 个备份。
 
 ### 战斗日志 `battle_log.jsonl`
-分类事件，由 tactic（发现/解析事件）与 dashboard（配置/分队改动）并发写入，用 `file_lock` 串行化，超 2 MB 自动裁剪保留最新 500 条。
+分类事件，由 tactic（发现/解析事件，以及提交成功后的风筝接敌 Tick 汇总）与 dashboard（配置/分队改动）并发写入，用 `file_lock` 串行化，超 2 MB 自动裁剪保留最新 500 条。风筝队完整逐单位候选和敌情保存在 `tactic_log.jsonl`，避免行军 Tick 挤占战斗日志。
 
 ### 战报统计 `game_stats.json`
 每 Tick 从解析事件聚合累计：经济、生产、战斗命中率、移动、游侠预判准确度，跨重启保留，面板渲染。每单位明细按稳定名跟踪（阵亡后显示「已阵亡 · 生前攻 N 中 N」）。

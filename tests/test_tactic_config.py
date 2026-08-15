@@ -26,6 +26,7 @@ class TacticConfigTests(unittest.TestCase):
         self.assertTrue(config["core_movement_enabled"])
         self.assertEqual(config["home_team"], "")
         self.assertEqual(config["attack_team"], "")
+        self.assertEqual(config["kite_team"], "")
         self.assertEqual(config["guerrilla_team"], "")
         self.assertEqual(config["home_patrol_radius"], 5)
         self.assertEqual(config["home_engage_radius"], 10)
@@ -34,6 +35,10 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(config["attack_target_y"], 0)
         self.assertEqual(config["attack_mode"], "coords")
         self.assertEqual(config["attack_auto_radius"], 100)
+        self.assertEqual(config["kite_mode"], "coords")
+        self.assertEqual(config["kite_target_x"], 0)
+        self.assertEqual(config["kite_target_y"], 0)
+        self.assertEqual(config["kite_auto_radius"], 100)
         self.assertEqual(config["combat_heal_hp_threshold"], 2)
         self.assertEqual(config["combat_heal_return_limit"], 1)
 
@@ -66,6 +71,8 @@ class TacticConfigTests(unittest.TestCase):
             validate_config({"attack_mode": "nuke"})
         with self.assertRaises(ConfigValidationError):
             validate_config({"attack_mode": True})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"kite_mode": "nuke"})
 
     def test_attack_auto_radius_validation(self) -> None:
         # 0 = 不限制，1..1000 为曼哈顿半径；越界拒绝。
@@ -214,9 +221,13 @@ class TacticConfigTests(unittest.TestCase):
         self.assertIn("team-board", teams)
         self.assertIn("守家队", teams)
         self.assertIn("进攻队", teams)
+        self.assertIn("风筝队", teams)
         self.assertIn("游击队", teams)
         self.assertIn("待命池", teams)
         self.assertIn('name="attack_mode"', teams)
+        self.assertIn('name="kite_mode"', teams)
+        self.assertIn('name="kite_auto_radius"', teams)
+        self.assertIn('id="pickKiteBtn"', teams)
         self.assertIn('name="attack_auto_radius"', teams)
         self.assertIn('id="teamAutoRadius"', teams)
         self.assertIn("冠军信标", teams)
@@ -253,6 +264,7 @@ class TacticConfigTests(unittest.TestCase):
         config = default_config()
         config["home_team"] = "V1"
         config["attack_team"] = "V2"
+        config["kite_team"] = "R2"
         config["guerrilla_team"] = "R9"
         rec = {
             "vanguards": [{"name": "V1", "id": "aaaa1111", "pos": [1, 2], "hp": 4}],
@@ -269,6 +281,7 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(by_name["V1"]["team"], "home")
         self.assertTrue(by_name["V1"]["alive"])
         self.assertEqual(by_name["V2"]["team"], "attack")
+        self.assertEqual(by_name["R2"]["team"], "kite")
         self.assertFalse(by_name["V2"]["alive"])
         self.assertEqual(by_name["R1"]["team"], "unassigned")
         self.assertTrue(by_name["R1"]["alive"])
