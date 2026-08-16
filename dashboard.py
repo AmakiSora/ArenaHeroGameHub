@@ -3234,6 +3234,8 @@ JS = r"""
       view.worldX = w[0]; view.worldY = w[1];
       apply();
     };
+    const rm = document.getElementById('refreshMapBtn');
+    if(rm) rm.onclick = function(){ refreshMapNow(); };
   }
 
   function setHtml(sel, html){
@@ -3579,6 +3581,22 @@ JS = r"""
   }
 
   
+  // Force a full re-render bypassing the idle/drag/tick guards and the
+  // mapSvg-unchanged dedup so a manually requested refresh always repaints.
+  async function refreshMapNow(){
+    const wasDragging = drag;
+    // release the refreshing guard if it's stuck (it shouldn't normally be).
+    lastTick = null;
+    lastMapSvg = '';
+    refreshing = false;
+    drag = false;
+    try{
+      await softRefresh();
+    } finally {
+      drag = wasDragging;
+    }
+  }
+
   function bindOreForm(){
     // Bind the right-column ore add form + chip delete buttons; idempotent.
     // Also bind enemy clear button.
@@ -5242,6 +5260,7 @@ def generate_html() -> str:
         <button type="button" id="zoomInBtn">+</button>
         <button type="button" id="resetViewBtn">重置视角</button>
         <button type="button" id="focusCoreBtn">定位核心</button>
+        <button type="button" id="refreshMapBtn" title="强制重新拉取并刷新地图">↻ 刷新地图</button>
         <span id="zoomLabel">100%</span>
         <span class="coord-readout" id="mapCoordLabel">坐标 —</span>
        </div>
