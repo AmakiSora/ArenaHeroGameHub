@@ -3468,6 +3468,34 @@ def _kite_cell_assessment(
     }
 
 
+def _kite_record_move_attempt(
+    unit: Any,
+    pos: tuple[int, int],
+    target_cell: tuple[int, int],
+) -> None:
+    """Track a same-tick move collision to enable predictive cell attacks.
+
+    Movement resolves before combat. If two units (or a unit and an enemy)
+    both submit a move into the same cell on the same tick, the server
+    cancels both and neither advances. When this unit calls move() toward
+    target_cell, record (pos, target_cell). On the next tick _plan_kite_combat
+    inspects the entry: if pos is unchanged the previous move collided, and
+    the counter increments. At count >= 2 the enemy's next move into that cell
+    is predictable, so the caller attacks the cell directly.
+    """
+    uid = str(unit.id)
+    prev = _kite_collision_streak.get(uid)
+    if prev is not None and prev[0] == pos and prev[1] == target_cell:
+        _kite_collision_streak[uid] = (pos, target_cell, prev[2] + 1)
+    else:
+        _kite_collision_streak[uid] = (pos, target_cell, 1)
+
+
+def _kite_clear_move_attempt(unit: Any) -> None:
+    """Drop the collision tracker once the unit advanced or attacked."""
+    _kite_collision_streak.pop(str(unit.id), None)
+
+
 def _kite_bfs_unstick(
     unit: Any,
     pos: tuple[int, int],
@@ -4058,6 +4086,48 @@ def _plan_kite_combat(
         and target is not None
         and _enemy_unit_type_name(target) == "RANGER"
     )
+    # Predictive attack on a contested cell. If this unit already had two
+    # same-tick move attempts toward the same cell cancelled by collision
+    # (same pos, same target cell, the server dropped both moves), the enemy
+    # is reliably still trying to enter that cell next tick. Attack the cell
+    # directly instead of retrying the doomed move: a Vanguard sweep hits the
+    # cell without entering it (no collision possible), and a Ranger can
+    # shoot_cell it. Movement resolves before combat, so the shot lands on
+    # the enemy's post-move cell.
+    collision = _kite_collision_streak.get(str(unit.id))
+    if (
+        collision is not None
+        and collision[0] == pos
+        and collision[2] >= 2
+    ):
+        contested = collision[1]
+        cdx, cdy = contested[0] - pos[0], contested[1] - pos[1]
+        if unit_kind == "vanguard" and abs(cdx) + abs(cdy) == 1:
+            direction = _direction_for_step(pos, contested)
+            if direction is not None:
+                unit.sweep(direction)
+                _kite_collision_streak.pop(str(unit.id), None)
+                detail = (
+                    f"{direction.name} kite-collision-prefire "
+                    f"cell={contested} enemy={tuple(target.position) if target else contested}"
+                )
+                _kite_log_decision(
+                    unit, unit_kind, mode, objective, threats, "SWEEP", detail,
+                    target=target,
+                )
+                return "SWEEP", detail
+        if unit_kind == "ranger":
+            shot = _kite_ranger_fire(
+                unit, pos, target, contested, obstacle_cells, attack_range,
+            )
+            if shot is not None:
+                _kite_collision_streak.pop(str(unit.id), None)
+                action, detail = shot
+                _kite_log_decision(
+                    unit, unit_kind, mode, objective, threats, action, detail,
+                    target=target,
+                )
+                return action, detail
     if full_v_vs_r:
         dx = target.position[0] - pos[0]
         dy = target.position[1] - pos[1]
@@ -4078,6 +4148,7 @@ def _plan_kite_combat(
                 and next_cell not in {tuple(enemy.position) for enemy in enemies}
                 and counts.get(next_cell, 0) < _CELL_UNIT_LIMIT
             ):
+                _kite_record_move_attempt(unit, pos, next_cell)
                 unit.move(direct)
                 detail = (
                     f"{direct.name} full-vanguard-moving-dodge "
@@ -4144,6 +4215,10 @@ def _plan_kite_combat(
                 )
                 return action, detail
         if direction is not None:
+            _kite_record_move_attempt(
+                unit, pos,
+                (pos[0] + direction.delta[0], pos[1] + direction.delta[1]),
+            )
             unit.move(direction)
             detail = (
                 f"{direction.name} kite-evade current={current_assessment['current_hits']} "
@@ -4252,6 +4327,17 @@ def _plan_kite_combat(
     )
     if bfs_step is not None:
         action, detail = bfs_step
+        # Record the attempted target cell so a same-tick collision (the
+        # unit stays on pos next tick) is detected next tick.
+        try:
+            _route_dir = Direction[detail.split()[0]]
+        except (KeyError, IndexError):
+            _route_dir = None
+        if _route_dir is not None:
+            _kite_record_move_attempt(
+                unit, pos,
+                (pos[0] + _route_dir.delta[0], pos[1] + _route_dir.delta[1]),
+            )
         _kite_log_decision(
             unit, unit_kind, mode, objective, threats, action, detail,
             target=target,
@@ -4264,6 +4350,8 @@ def _plan_kite_combat(
         cell_counts, must_move=must_move,
     )
     if direction is not None:
+        _next_cell = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+        _kite_record_move_attempt(unit, pos, _next_cell)
         unit.move(direction)
         detail = (
             f"{direction.name} kite-position goal={move_goal} "
@@ -4484,6 +4572,15 @@ _worker_path_cache: dict[str, dict] = {}
 # Combat units use the same map search but keep a separate cache because their
 # goals change independently as enemies move or team assignments change.
 _combat_path_cache: dict[str, dict] = {}
+# Same-tick move collision tracker for kite/guerrilla units. When two units
+# (or a unit and an enemy) both submit a move into the same cell on the same
+# tick, the server cancels both moves and neither advances. If the unit keeps
+# targeting the same contested cell from the same position, that is a deadlock.
+# After two such cancelled attempts, the enemy's next move into that cell is
+# predictable, so the unit attacks the cell directly (Vanguard sweep / Ranger
+# shoot_cell) instead of retrying the doomed move.
+# {uid: (pos, contested_cell, count)}
+_kite_collision_streak: dict[str, tuple[tuple[int, int], tuple[int, int], int]] = {}
 # Consecutive ticks a worker has not moved — triggers un-stick recovery.
 # _worker_stuck_ticks counts consecutive same-position ticks; _worker_stuck_pos
 # remembers the position those ticks were counted at (independent of last-pos,

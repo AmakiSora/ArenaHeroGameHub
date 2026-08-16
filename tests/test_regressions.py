@@ -2282,7 +2282,9 @@ class KiteTeamPlannerTests(unittest.TestCase):
         self.old_core = getattr(tactic.turn_context, "core_pos", None)
         self.old_kite_squad = getattr(tactic.turn_context, "kite_squad_pos", None)
         self.old_enemy_memory = set(tactic._enemy_memory)
+        self.old_collision = dict(tactic._kite_collision_streak)
         tactic._enemy_motion_tracks.clear()
+        tactic._kite_collision_streak.clear()
         tactic.turn_context.tick = 5
         tactic.turn_context.kite_decisions = []
         tactic.turn_context.kite_directives = {}
@@ -2296,6 +2298,8 @@ class KiteTeamPlannerTests(unittest.TestCase):
     def tearDown(self):
         tactic._enemy_motion_tracks.clear()
         tactic._enemy_motion_tracks.update(self.old_tracks)
+        tactic._kite_collision_streak.clear()
+        tactic._kite_collision_streak.update(self.old_collision)
         tactic.turn_context.kite_decisions = self.old_decisions
         tactic.turn_context.kite_directives = self.old_directives
         tactic.turn_context.shot_predictions = self.old_predictions
@@ -2402,6 +2406,54 @@ class KiteTeamPlannerTests(unittest.TestCase):
         )
         self.assertEqual(action, "SHOOT")
         self.assertEqual(ranger.expected_cell, (0, 3))
+
+    def test_vanguard_sweeps_contested_cell_after_two_move_collisions(self):
+        # Two units moving into the same cell on the same tick both fail to
+        # advance (server cancels both). After two such cancelled attempts at
+        # the same cell, the enemy's next move into that cell is predictable:
+        # attack the cell directly instead of retrying the doomed move.
+        #
+        # Vanguard at (0,0), enemy Ranger at (1,1) (diagonal). The Vanguard
+        # wants to enter (1,0) toward the Ranger. Simulate two collisions by
+        # pre-seeding the streak: same pos (0,0), same contested cell (1,0),
+        # count=2. The planner must SWEEP (1,0), not MOVE.
+        vanguard = self.unit("kite-v-collide", (0, 0), hp=4)
+        enemy = self.enemy("enemy-r-diag", (1, 1), UnitType.RANGER)
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (2, 1)), (4, (1, 1))]
+        tactic._kite_collision_streak.clear()
+        tactic._kite_collision_streak[str(vanguard.id)] = ((0, 0), (1, 0), 2)
+
+        action, detail = tactic._plan_vanguard(
+            vanguard, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "SWEEP")
+        self.assertEqual(vanguard.arg, Direction.RIGHT)
+        self.assertIn("kite-collision-prefire", detail)
+        # The streak is cleared once the predictive attack fires.
+        self.assertNotIn(str(vanguard.id), tactic._kite_collision_streak)
+
+    def test_ranger_shoots_contested_cell_after_two_move_collisions(self):
+        # Same collision rule as the Vanguard test, but for a Ranger: after
+        # two cancelled move attempts into the same cell, shoot_cell that cell
+        # instead of retrying the doomed move (movement resolves before combat,
+        # so the shot lands on the enemy's post-move cell).
+        ranger = self.unit("kite-r-collide", (0, 0), UnitType.RANGER)
+        enemy = self.enemy("enemy-v", (0, 1), UnitType.VANGUARD)
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (0, 2)), (4, (0, 1))]
+        tactic._kite_collision_streak.clear()
+        tactic._kite_collision_streak[str(ranger.id)] = ((0, 0), (0, -1), 2)
+
+        action, detail = tactic._plan_ranger(
+            ranger, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "SHOOT")
+        self.assertIn("kite-lead", detail)
+        self.assertEqual(ranger.expected_cell, (0, -1))
+        self.assertNotIn(str(ranger.id), tactic._kite_collision_streak)
 
     def test_ranger_lead_fires_when_cornered_by_vanguard_cannot_escape(self):
         # Regression: a Ranger cornered by a melee Vanguard used to flee
