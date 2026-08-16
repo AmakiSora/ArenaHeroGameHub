@@ -2200,7 +2200,7 @@ class CombatTeamPlannerTests(unittest.TestCase):
         )
 
         self.assertEqual(action, "MOVE")
-        self.assertIn("kite-position", detail)
+        self.assertIn("kite-route", detail)
     def test_summary_reads_jsonl_tick_records(self) -> None:
         records = [
             {"_meta": "test"},
@@ -2380,7 +2380,7 @@ class KiteTeamPlannerTests(unittest.TestCase):
 
         self.assertEqual(action, "MOVE")
         self.assertEqual(unit.arg, Direction.RIGHT)
-        self.assertIn("kite-position", detail)
+        self.assertIn("kite-route", detail)
 
     def test_ranger_leads_both_advancing_and_retreating_vanguards(self):
         ranger = self.unit("kite-r1", (0, 0), UnitType.RANGER)
@@ -2402,6 +2402,32 @@ class KiteTeamPlannerTests(unittest.TestCase):
         )
         self.assertEqual(action, "SHOOT")
         self.assertEqual(ranger.expected_cell, (0, 3))
+
+    def test_ranger_lead_fires_when_cornered_by_vanguard_cannot_escape(self):
+        # Regression: a Ranger cornered by a melee Vanguard used to flee
+        # every tick. The Vanguard chases one cell per tick, the Ranger can
+        # only retreat one cell, so the gap stays 1 — the Ranger dies having
+        # never shot. When every escape cell still predicts a hit, the Ranger
+        # must stand and lead-fire the enemy's next cell instead.
+        #
+        # Ranger at (0,0); enemy Vanguard advanced (0,2)->(0,1) toward it,
+        # so velocity=(0,-1), predicted next cell=(0,0). Down is walled so
+        # the only retreat is UP to (0,-1), but the Vanguard's predicted cell
+        # (0,0) still hits (0,-1) -> predicted_hits=1, i.e. fleeing fails.
+        ranger = self.unit("kite-r-cornered", (0, 0), UnitType.RANGER)
+        enemy = self.enemy("chasing-v", (0, 1), UnitType.VANGUARD)
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (0, 2)), (4, (0, 1))]
+        walls = frozenset({(1, 0), (-1, 0)})  # block sideways, force vertical
+
+        action, detail = tactic._plan_ranger(
+            ranger, (enemy,), walls, self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "SHOOT")
+        # The enemy's predicted cell is the Ranger's own cell (distance 0),
+        # so lead-fire is illegal and it falls back to the current cell.
+        self.assertIn("kite-current", detail)
 
     def test_ranger_in_enemy_ranger_range_moves_before_shooting(self):
         ranger = self.unit("kite-r", (0, 0), UnitType.RANGER)
@@ -2493,7 +2519,7 @@ class KiteTeamPlannerTests(unittest.TestCase):
         )
         self.assertEqual(action, "MOVE")
         self.assertEqual(unit.arg, Direction.DOWN)
-        self.assertIn("goal=(0, 5)", detail)
+        self.assertIn("kite-route (0, 5)", detail)
 
         unit = self.unit("kite-v-auto", (0, 0))
         self.config["kite_mode"] = "auto"
@@ -2505,7 +2531,7 @@ class KiteTeamPlannerTests(unittest.TestCase):
         )
         self.assertEqual(action, "MOVE")
         self.assertEqual(unit.arg, Direction.DOWN)
-        self.assertIn("goal=(0, 4)", detail)
+        self.assertIn("kite-route (0, 4)", detail)
 
     def test_kite_core_is_a_target_but_not_a_danger_zone(self):
         unit = self.unit("kite-v-core", (0, 0))
@@ -2555,6 +2581,40 @@ class KiteTeamPlannerTests(unittest.TestCase):
             tactic._append_accepted_kite_battle_log(True)
             append_mock.assert_called_once()
             self.assertEqual(len(append_mock.call_args.args[1]), 1)
+
+    def test_kite_unit_escapes_dead_end_pocket_via_bfs_unstick(self):
+        # Regression: a kite unit whose only exit steps *away* from the
+        # objective used to WAIT forever. _kite_choose_move is single-step
+        # and scores on goal progress, so any detour step (progress=-1) loses
+        # to WAIT (progress=0) even when the detour is the start of a valid
+        # A* route. The BFS unstick fallback must take the first A* step
+        # toward the objective instead of stalling.
+        #
+        # Map: unit at (0,0), objective at (10,0) (far right). RIGHT and UP
+        # are walled; only DOWN (a progress=-1 detour) and LEFT are open.
+        # Without the fallback the unit WAITed forever; with it the unit steps
+        # DOWN, the first cell of the A* route that loops back to the goal.
+        unit = self.unit("kite-stuck", (0, 0))
+        walls = frozenset({(1, 0), (0, -1)})
+        # Force the dead-end cache to recompute for this obstacle set.
+        saved_obstacles = tactic._dead_obstacles
+        tactic._dead_obstacles = None
+        try:
+            action, detail = tactic._plan_kite_combat(
+                unit,
+                unit_kind="vanguard",
+                enemies=(),
+                obstacle_cells=walls,
+                config=self.config,
+                cell_counts={},
+            )
+        finally:
+            tactic._dead_obstacles = saved_obstacles
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("kite-route", detail)
+        self.assertEqual(unit.action, "MOVE")
+        self.assertEqual(unit.arg, Direction.DOWN)
 
 
 class DashboardLogTests(unittest.TestCase):

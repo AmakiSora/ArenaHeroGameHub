@@ -3468,6 +3468,48 @@ def _kite_cell_assessment(
     }
 
 
+def _kite_bfs_unstick(
+    unit: Any,
+    pos: tuple[int, int],
+    goal: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    cell_counts: Mapping | None,
+) -> tuple[str, str] | None:
+    """Multi-step escape hatch for a kite unit pinned by walls.
+
+    ``_kite_choose_move`` is a single-step greedy picker. When a unit is
+    cornered against a wall, every adjacent cell that leads out of the pocket
+    is either an obstacle or a dead end, so progress turns negative and WAIT
+    wins forever — the unit never leaves. This runs a real A* search toward
+    ``goal`` and takes the first step, bypassing the dead-end penalty the way
+    ``_move_towards`` does for the home/attack squads. Safety (danger-zone
+    evasion) is already settled before this is reached; this only fires when
+    the single-step policy would otherwise WAIT on the spot indefinitely.
+    """
+    if pos == goal:
+        return None
+    path = _bfs_path(pos, goal, obstacle_cells, max_steps=2500)
+    if not path or len(path) < 2:
+        return None
+    counts = cell_counts or {}
+    for idx in range(1, len(path)):
+        next_cell = path[idx]
+        if next_cell in obstacle_cells:
+            continue
+        if counts.get(next_cell, 0) >= _CELL_UNIT_LIMIT:
+            continue
+        # allow dead-end cells here: the route itself proves an exit exists
+        direction = _direction_for_step(pos, next_cell)
+        if direction is None:
+            continue
+        if _try_move(
+            unit, direction, pos, obstacle_cells, avoid_dead_ends=False,
+        ):
+            _set_unit_route(unit, goal, path, complete=False)
+            return ("MOVE", f"{direction.name} kite-unstick goal={goal}")
+    return None
+
+
 def _kite_choose_move(
     unit: Any,
     pos: tuple[int, int],
@@ -4069,6 +4111,38 @@ def _plan_kite_combat(
             unit, pos, objective, threats, obstacle_cells, attack_range,
             cell_counts, must_move=True,
         )
+        # Ranger exception: against a melee Vanguard that has already closed
+        # to face-to-face, kiting is futile — the Vanguard chases one cell per
+        # tick, the Ranger can only retreat one cell, so the gap stays 1 and
+        # the Ranger dies having never shot. When every escape cell still
+        # predicts a hit (running does not break contact), stand and lead-fire
+        # the enemy's next cell instead of fleeing into the same damage.
+        if (
+            unit_kind == "ranger"
+            and target is not None
+            and _enemy_unit_type_name(target) == "VANGUARD"
+            and assessment["predicted_hits"] > 0
+        ):
+            motion = _kite_motion_info(target, pos)
+            expected = motion.get("predicted")
+            shot = _kite_ranger_fire(
+                unit, pos, target, expected, obstacle_cells, attack_range,
+            )
+            # The enemy's predicted cell may be the Ranger's own cell
+            # (distance 0, face-to-face charge): lead-fire is illegal there,
+            # so fall back to shooting the enemy's current cell instead of
+            # fleeing into the same damage.
+            if shot is None:
+                shot = _kite_ranger_fire(
+                    unit, pos, target, None, obstacle_cells, attack_range,
+                )
+            if shot is not None:
+                action, detail = shot
+                _kite_log_decision(
+                    unit, unit_kind, mode, objective, threats, action, detail,
+                    target=target, candidates=candidates,
+                )
+                return action, detail
         if direction is not None:
             unit.move(direction)
             detail = (
@@ -4166,6 +4240,25 @@ def _plan_kite_combat(
         return _guerrilla_roam(unit, pos, obstacle_cells, config)
     must_move = any(_enemy_unit_type_name(enemy) == "RANGER" for enemy in threats)
     move_goal = tuple(target.position) if target is not None else objective
+    # Follow a real A* route toward the objective first. The single-step
+    # greedy picker below scores cells by Manhattan progress, which oscillates
+    # against walls: at cell A it picks the y-axis step that looks marginally
+    # closer, at cell B every step scores <=0 so BFS picks the first cell of
+    # the real detour (back to A), and the unit shuttles forever. A cached
+    # multi-step route keeps the unit committed to one detour direction.
+    bfs_step = _move_towards(
+        unit, pos, move_goal, obstacle_cells,
+        detail_prefix="kite-route",
+    )
+    if bfs_step is not None:
+        action, detail = bfs_step
+        _kite_log_decision(
+            unit, unit_kind, mode, objective, threats, action, detail,
+            target=target,
+        )
+        return action, detail
+    # No multi-step route (open field or A* exhausted): fall back to the
+    # single-step safety/progress picker, then to a forced unstick step.
     direction, assessment, candidates = _kite_choose_move(
         unit, pos, move_goal, threats, obstacle_cells, attack_range,
         cell_counts, must_move=must_move,
@@ -4181,6 +4274,20 @@ def _plan_kite_combat(
             target=target, candidates=candidates,
         )
         return "MOVE", detail
+    # Single-step selection would WAIT here. When the unit is cornered by
+    # walls (every adjacent cell is a dead end relative to the objective),
+    # WAIT wins forever and the unit never leaves the pocket. Fall back to a
+    # real A* search so the squad can still navigate out of cul-de-sacs.
+    unstick = _kite_bfs_unstick(
+        unit, pos, move_goal, obstacle_cells, cell_counts,
+    )
+    if unstick is not None:
+        action, detail = unstick
+        _kite_log_decision(
+            unit, unit_kind, mode, objective, threats, action, detail,
+            target=target, candidates=candidates,
+        )
+        return action, detail
     unit.wait()
     detail = f"kite-hold-safe objective={objective}"
     _kite_log_decision(
