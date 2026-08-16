@@ -2455,6 +2455,107 @@ class KiteTeamPlannerTests(unittest.TestCase):
         self.assertEqual(ranger.expected_cell, (0, -1))
         self.assertNotIn(str(ranger.id), tactic._kite_collision_streak)
 
+    def test_ranger_without_target_avoids_contested_cell_instead_of_shooting(self):
+        ranger = self.unit("kite-r-no-target", (0, 0), UnitType.RANGER)
+        tactic._kite_collision_streak[str(ranger.id)] = (
+            (0, 0), (1, 0), 2,
+        )
+
+        action, detail = tactic._plan_ranger(
+            ranger, (), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertNotEqual(ranger.arg, Direction.RIGHT)
+        self.assertIn("kite-route", detail)
+
+    def test_guerrilla_roam_avoids_repeatedly_contested_cell(self):
+        ranger = self.unit("guerrilla-r-contested", (0, 0), UnitType.RANGER)
+        roam_goal = tactic._guerrilla_roam_goal(ranger, (0, 0))
+        preferred = tactic._step_towards((0, 0), roam_goal)
+        contested = preferred.delta
+        tactic._kite_collision_streak[str(ranger.id)] = (
+            (0, 0), contested, 2,
+        )
+
+        action, detail = tactic._plan_ranger(
+            ranger, (), frozenset(), self.config,
+            core_pos=(0, 0), team="guerrilla",
+        )
+
+        self.assertEqual(action, "MOVE")
+        next_cell = ranger.arg.delta
+        self.assertNotEqual(next_cell, contested)
+        self.assertIn("guerrilla-roam", detail)
+
+    def test_kite_route_avoids_enemy_range_and_full_friendly_cell(self):
+        ranger = self.unit("kite-r-safe-route", (0, 0), UnitType.RANGER)
+        enemy = self.enemy("enemy-r-route", (0, 4), UnitType.RANGER)
+
+        action, detail = tactic._plan_ranger(
+            ranger, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+            cell_counts={(0, 1): tactic._CELL_UNIT_LIMIT},
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertNotEqual(ranger.arg, Direction.DOWN)
+        next_cell = (
+            ranger.position[0] + ranger.arg.delta[0],
+            ranger.position[1] + ranger.arg.delta[1],
+        )
+        assessment = tactic._kite_cell_assessment(
+            next_cell, (enemy,), frozenset(), 3,
+        )
+        self.assertEqual(assessment["current_hits"], 0)
+        self.assertIn("kite-route", detail)
+
+    def test_kite_attack_clears_stale_move_attempt(self):
+        ranger = self.unit("kite-r-clear", (0, 0), UnitType.RANGER)
+        enemy = self.enemy("enemy-worker", (2, 0), UnitType.WORKER)
+        tactic._kite_collision_streak[str(ranger.id)] = (
+            (0, 0), (1, 0), 1,
+        )
+
+        action, _ = tactic._plan_ranger(
+            ranger, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "SHOOT")
+        self.assertNotIn(str(ranger.id), tactic._kite_collision_streak)
+
+    def test_rejected_plan_rolls_back_collision_state(self):
+        unit = self.unit("kite-rejected", (0, 0))
+        tactic._kite_collision_streak[str(unit.id)] = (
+            (0, 0), (1, 0), 1,
+        )
+        tactic.turn_context.kite_collision_snapshot = dict(
+            tactic._kite_collision_streak
+        )
+        tactic._kite_record_move_attempt(unit, (0, 0), (1, 0))
+        self.assertEqual(tactic._kite_collision_streak[str(unit.id)][2], 2)
+
+        tactic._finalize_kite_collision_state(False)
+
+        self.assertEqual(tactic._kite_collision_streak[str(unit.id)][2], 1)
+
+    def test_cell_limit_failure_is_not_counted_as_collision(self):
+        unit = self.unit("kite-cell-limit", (0, 0))
+        tactic._kite_collision_streak[str(unit.id)] = (
+            (0, 0), (1, 0), 1,
+        )
+        turn = SimpleNamespace(events=(SimpleNamespace(
+            event_type="UNIT_MOVE_FAILED",
+            reason_code="CELL_UNIT_LIMIT",
+            actor_id=unit.id,
+        ),))
+
+        tactic._discard_noncollision_move_failures(turn)
+
+        self.assertNotIn(str(unit.id), tactic._kite_collision_streak)
+
     def test_ranger_lead_fires_when_cornered_by_vanguard_cannot_escape(self):
         # Regression: a Ranger cornered by a melee Vanguard used to flee
         # every tick. The Vanguard chases one cell per tick, the Ranger can

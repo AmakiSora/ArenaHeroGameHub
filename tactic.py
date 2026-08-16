@@ -12,7 +12,7 @@ import os
 import time
 import traceback
 from collections import defaultdict, deque
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from functools import wraps
@@ -2326,8 +2326,10 @@ def _guerrilla_roam(
     pos: tuple[int, int],
     obstacle_cells: frozenset[tuple[int, int]],
     config: dict[str, Any],
+    avoid_cells: Iterable[tuple[int, int]] = (),
 ) -> tuple[str, str]:
     """Take one safe step on this unit's independent eight-way bearing."""
+    avoided = frozenset(avoid_cells)
     bearing = _stable_slot_index(str(unit.id), len(_EIGHT_WAY_DELTAS))
     dx, dy = _EIGHT_WAY_DELTAS[bearing]
     label = _EIGHT_WAY_LABELS[bearing]
@@ -2348,17 +2350,45 @@ def _guerrilla_roam(
         candidates = (_cardinal_toward_delta(dx, dy),)
     for avoid_dead_ends in (True, False):
         for direction in candidates:
-            if direction is not None and _try_move(
+            if direction is None:
+                continue
+            next_cell = (
+                pos[0] + direction.delta[0],
+                pos[1] + direction.delta[1],
+            )
+            if next_cell in avoided:
+                continue
+            if _try_move(
                 unit,
                 direction,
                 pos,
                 obstacle_cells,
                 avoid_dead_ends=avoid_dead_ends,
             ):
+                _kite_record_move_attempt(unit, pos, next_cell)
                 return ("MOVE", f"{direction.name} guerrilla-roam {label}")
-    return _scout_cardinal(
-        unit, pos, obstacle_cells, config, label=f"guerrilla-roam {label}",
+    action, detail = _scout_cardinal(
+        unit,
+        pos,
+        obstacle_cells,
+        config,
+        label=f"guerrilla-roam {label}",
+        avoid_cells=avoided,
     )
+    if action == "MOVE":
+        try:
+            direction = Direction[detail.split()[0]]
+        except (KeyError, IndexError):
+            direction = None
+        if direction is not None:
+            _kite_record_move_attempt(
+                unit,
+                pos,
+                (pos[0] + direction.delta[0], pos[1] + direction.delta[1]),
+            )
+    else:
+        _kite_clear_move_attempt(unit)
+    return action, detail
 
 
 def _parse_team_names(raw: Any) -> set[str]:
@@ -2549,12 +2579,25 @@ def _move_towards(
     obstacle_cells: frozenset[tuple[int, int]],
     *,
     detail_prefix: str,
+    cell_counts: Mapping | None = None,
+    extra_obstacles: Iterable[tuple[int, int]] = (),
+    step_filter: Callable[[tuple[int, int]], bool] | None = None,
 ) -> tuple[str, str] | None:
     if pos == goal:
         _combat_path_cache.pop(str(unit.id), None)
         return None
 
     uid = str(unit.id)
+    counts = cell_counts or {}
+    transient_obstacles = frozenset(extra_obstacles)
+
+    def _step_allowed(cell: tuple[int, int]) -> bool:
+        if cell in obstacle_cells or cell in transient_obstacles:
+            return False
+        if counts.get(cell, 0) >= _CELL_UNIT_LIMIT:
+            return False
+        return step_filter is None or bool(step_filter(cell))
+
     cached = _combat_path_cache.get(uid)
     path: list[tuple[int, int]] | None = None
     if cached is not None and cached.get("goal") == goal:
@@ -2562,14 +2605,20 @@ def _move_towards(
         index = _path_index(cached_path, pos, cached.get("index", -1))
         if index >= 0 and index + 1 < len(cached_path):
             next_cell = cached_path[index + 1]
-            if next_cell not in obstacle_cells and not _is_dead_end_step(
+            if _step_allowed(next_cell) and not _is_dead_end_step(
                 next_cell, obstacle_cells, allow=(goal,),
             ):
                 path = cached_path
                 cached["index"] = index
     if path is None:
         _combat_path_cache.pop(uid, None)
-        path = _bfs_path(pos, goal, obstacle_cells, max_steps=2500)
+        path = _bfs_path(
+            pos,
+            goal,
+            obstacle_cells,
+            max_steps=2500,
+            extras=transient_obstacles,
+        )
         if path and len(path) > 1:
             _combat_path_cache[uid] = {"goal": goal, "path": path, "index": 0}
 
@@ -2578,13 +2627,17 @@ def _move_towards(
         index = _path_index(path, pos, entry.get("index", -1) if entry else -1)
         next_cell = path[index + 1] if 0 <= index + 1 < len(path) else None
         direction = _direction_for_step(pos, next_cell) if next_cell else None
-        if direction is not None and _try_move(
-            unit,
-            direction,
-            pos,
-            obstacle_cells,
-            avoid_dead_ends=True,
-            allow=(goal,),
+        if (
+            direction is not None
+            and _step_allowed(next_cell)
+            and _try_move(
+                unit,
+                direction,
+                pos,
+                obstacle_cells,
+                avoid_dead_ends=True,
+                allow=(goal,),
+            )
         ):
             if entry is not None:
                 entry["index"] = index + 1
@@ -2597,7 +2650,8 @@ def _move_towards(
         return None
     # Skip 凸-shaped cul-de-sacs unless the goal itself is inside one.
     allow = (goal,)
-    if _try_move(
+    next_cell = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+    if _step_allowed(next_cell) and _try_move(
         unit,
         direction,
         pos,
@@ -2632,7 +2686,8 @@ def _move_towards(
     for alt in alternates:
         if alt == direction:
             continue
-        if _try_move(
+        alt_cell = (pos[0] + alt.delta[0], pos[1] + alt.delta[1])
+        if _step_allowed(alt_cell) and _try_move(
             unit,
             alt,
             pos,
@@ -2642,13 +2697,17 @@ def _move_towards(
         ):
             return ("MOVE", f"{alt.name} {detail_prefix} {goal}")
     # Last resort: ignore dead-end filter if goal requires it.
-    if _try_move(unit, direction, pos, obstacle_cells):
+    next_cell = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+    if _step_allowed(next_cell) and _try_move(
+        unit, direction, pos, obstacle_cells,
+    ):
         _set_unit_route(unit, goal, [pos, goal], complete=False)
         return ("MOVE", f"{direction.name} {detail_prefix} {goal}")
     for alt in alternates:
         if alt == direction:
             continue
-        if _try_move(unit, alt, pos, obstacle_cells):
+        alt_cell = (pos[0] + alt.delta[0], pos[1] + alt.delta[1])
+        if _step_allowed(alt_cell) and _try_move(unit, alt, pos, obstacle_cells):
             return ("MOVE", f"{alt.name} {detail_prefix} {goal}")
     return None
 
@@ -2947,8 +3006,10 @@ def _scout_cardinal(
     config: dict[str, Any],
     *,
     label: str,
+    avoid_cells: Iterable[tuple[int, int]] = (),
 ) -> tuple[str, str]:
     prev = _worker_last_pos.get(str(unit.id))
+    avoided = frozenset(avoid_cells)
     idx = _stable_slot_index(str(unit.id), 4)
     base = [Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT]
     rotated = base[idx:] + base[:idx]
@@ -2968,6 +3029,9 @@ def _scout_cardinal(
 
     rotated.sort(key=_scout_key)
     for direction in rotated:
+        npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+        if npos in avoided:
+            continue
         if _try_move(
             unit,
             direction,
@@ -2975,13 +3039,14 @@ def _scout_cardinal(
             obstacle_cells,
             avoid_dead_ends=True,
         ):
-            npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
             _set_unit_route(unit, npos, [pos, npos], complete=False)
             return ("MOVE", f"{direction.name} {label}")
     # If every open neighbor is a dead end, take the least-bad exit rather than wait.
     for direction in rotated:
+        npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+        if npos in avoided:
+            continue
         if _try_move(unit, direction, pos, obstacle_cells):
-            npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
             _set_unit_route(unit, npos, [pos, npos], complete=False)
             return ("MOVE", f"{direction.name} {label}")
     unit.wait()
@@ -3496,12 +3561,38 @@ def _kite_clear_move_attempt(unit: Any) -> None:
     _kite_collision_streak.pop(str(unit.id), None)
 
 
+def _finalize_kite_collision_state(accepted: bool) -> None:
+    """Rollback speculative collision updates when a plan was not accepted."""
+    snapshot = getattr(turn_context, "kite_collision_snapshot", None)
+    if snapshot is None:
+        return
+    if not accepted:
+        _kite_collision_streak.clear()
+        _kite_collision_streak.update(snapshot)
+    turn_context.kite_collision_snapshot = None
+
+
+def _discard_noncollision_move_failures(turn: Any) -> None:
+    """Do not interpret explicit capacity rejections as move collisions."""
+    for event in getattr(turn, "events", ()) or ():
+        if (
+            getattr(event, "event_type", "") == "UNIT_MOVE_FAILED"
+            and getattr(event, "reason_code", None) == "CELL_UNIT_LIMIT"
+        ):
+            actor_id = getattr(event, "actor_id", None)
+            if actor_id is not None:
+                _kite_collision_streak.pop(str(actor_id), None)
+
+
 def _kite_bfs_unstick(
     unit: Any,
     pos: tuple[int, int],
     goal: tuple[int, int],
     obstacle_cells: frozenset[tuple[int, int]],
     cell_counts: Mapping | None,
+    *,
+    extra_obstacles: Iterable[tuple[int, int]] = (),
+    step_filter: Callable[[tuple[int, int]], bool] | None = None,
 ) -> tuple[str, str] | None:
     """Multi-step escape hatch for a kite unit pinned by walls.
 
@@ -3516,15 +3607,24 @@ def _kite_bfs_unstick(
     """
     if pos == goal:
         return None
-    path = _bfs_path(pos, goal, obstacle_cells, max_steps=2500)
+    transient_obstacles = frozenset(extra_obstacles)
+    path = _bfs_path(
+        pos,
+        goal,
+        obstacle_cells,
+        max_steps=2500,
+        extras=transient_obstacles,
+    )
     if not path or len(path) < 2:
         return None
     counts = cell_counts or {}
     for idx in range(1, len(path)):
         next_cell = path[idx]
-        if next_cell in obstacle_cells:
+        if next_cell in obstacle_cells or next_cell in transient_obstacles:
             continue
         if counts.get(next_cell, 0) >= _CELL_UNIT_LIMIT:
+            continue
+        if step_filter is not None and not step_filter(next_cell):
             continue
         # allow dead-end cells here: the route itself proves an exit exists
         direction = _direction_for_step(pos, next_cell)
@@ -3533,6 +3633,7 @@ def _kite_bfs_unstick(
         if _try_move(
             unit, direction, pos, obstacle_cells, avoid_dead_ends=False,
         ):
+            _kite_record_move_attempt(unit, pos, next_cell)
             _set_unit_route(unit, goal, path, complete=False)
             return ("MOVE", f"{direction.name} kite-unstick goal={goal}")
     return None
@@ -3548,10 +3649,12 @@ def _kite_choose_move(
     cell_counts: Mapping | None,
     *,
     must_move: bool,
+    avoid_cells: Iterable[tuple[int, int]] = (),
 ) -> tuple[Direction | None, dict[str, Any], list[dict[str, Any]]]:
     """Choose the safest cardinal cell, using goal progress only as a tie-break."""
     counts = cell_counts or {}
     enemy_cells = {tuple(enemy.position) for enemy in enemies}
+    avoided = frozenset(avoid_cells)
     choices: list[tuple[tuple, Direction | None, tuple[int, int], dict[str, Any]]] = []
     directions: tuple[Direction | None, ...] = (
         Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT, None,
@@ -3563,7 +3666,7 @@ def _kite_choose_move(
             cell = pos
         else:
             cell = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
-            if cell in obstacle_cells or cell in enemy_cells:
+            if cell in obstacle_cells or cell in enemy_cells or cell in avoided:
                 continue
             if counts.get(cell, 0) >= _CELL_UNIT_LIMIT:
                 continue
@@ -4034,12 +4137,22 @@ def _plan_kite_combat(
     if directive is not None:
         target = directive.get("target")
         if directive["kind"] == "sweep":
+            _kite_clear_move_attempt(unit)
             unit.sweep(directive["direction"])
             action, detail = "SWEEP", f"{directive['direction'].name} {directive['reason']}"
         elif directive["kind"] == "move":
+            _kite_record_move_attempt(
+                unit,
+                pos,
+                (
+                    pos[0] + directive["direction"].delta[0],
+                    pos[1] + directive["direction"].delta[1],
+                ),
+            )
             unit.move(directive["direction"])
             action, detail = "MOVE", f"{directive['direction'].name} {directive['reason']}"
         else:
+            _kite_clear_move_attempt(unit)
             unit.shoot(target)
             action, detail = "SHOOT", f"{directive['reason']} {tuple(target.position)}"
         _kite_log_decision(
@@ -4095,10 +4208,12 @@ def _plan_kite_combat(
     # shoot_cell it. Movement resolves before combat, so the shot lands on
     # the enemy's post-move cell.
     collision = _kite_collision_streak.get(str(unit.id))
+    collision_avoid: tuple[int, int] | None = None
     if (
         collision is not None
         and collision[0] == pos
         and collision[2] >= 2
+        and target is not None
     ):
         contested = collision[1]
         cdx, cdy = contested[0] - pos[0], contested[1] - pos[1]
@@ -4128,11 +4243,23 @@ def _plan_kite_combat(
                     target=target,
                 )
                 return action, detail
+    elif (
+        collision is not None
+        and collision[0] == pos
+        and collision[2] >= 2
+        and target is None
+    ):
+        # A contested move without a visible target is not an attack
+        # opportunity. Avoid that cell for this Tick and drop the marker
+        # instead of passing None into the Ranger fire planner.
+        collision_avoid = collision[1]
+        _kite_clear_move_attempt(unit)
     if full_v_vs_r:
         dx = target.position[0] - pos[0]
         dy = target.position[1] - pos[1]
         if abs(dx) + abs(dy) == 1:
             direction = _cardinal_toward_delta(dx, dy)
+            _kite_clear_move_attempt(unit)
             unit.sweep(direction)
             detail = f"{direction.name} full-vanguard-trade ranger={tuple(target.position)}"
             _kite_log_decision(
@@ -4164,6 +4291,11 @@ def _plan_kite_combat(
             attack_range, cell_counts, must_move=True,
         )
         if direction is not None:
+            _kite_record_move_attempt(
+                unit,
+                pos,
+                (pos[0] + direction.delta[0], pos[1] + direction.delta[1]),
+            )
             unit.move(direction)
             detail = (
                 f"{direction.name} full-vanguard-close ranger={tuple(target.position)} "
@@ -4209,6 +4341,7 @@ def _plan_kite_combat(
                 )
             if shot is not None:
                 action, detail = shot
+                _kite_clear_move_attempt(unit)
                 _kite_log_decision(
                     unit, unit_kind, mode, objective, threats, action, detail,
                     target=target, candidates=candidates,
@@ -4229,6 +4362,7 @@ def _plan_kite_combat(
                 target=target, candidates=candidates,
             )
             return "MOVE", detail
+        _kite_clear_move_attempt(unit)
         unit.wait()
         detail = (
             f"kite-evade-blocked current={current_assessment['current_hits']} "
@@ -4254,6 +4388,7 @@ def _plan_kite_combat(
             direction = _cardinal_toward_delta(dx, dy)
             gap = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
             if gap not in obstacle_cells:
+                _kite_clear_move_attempt(unit)
                 unit.sweep(direction)
                 detail = f"{direction.name} kite-prefire-gap enemy={tuple(target.position)}"
                 _kite_log_decision(
@@ -4273,6 +4408,7 @@ def _plan_kite_combat(
                 not in obstacle_cells
             ), None)
             if direction is not None:
+                _kite_clear_move_attempt(unit)
                 unit.sweep(direction)
                 detail = f"{direction.name} kite-prefire-diagonal enemy={tuple(target.position)}"
                 _kite_log_decision(
@@ -4284,6 +4420,7 @@ def _plan_kite_combat(
             # current-range evasion above (except the full-health Ranger case).
             if etype in {"WORKER", "CORE"}:
                 direction = _cardinal_toward_delta(dx, dy)
+                _kite_clear_move_attempt(unit)
                 unit.sweep(direction)
                 detail = f"{direction.name} kite-safe-sweep {etype.lower()}={tuple(target.position)}"
                 _kite_log_decision(
@@ -4303,6 +4440,7 @@ def _plan_kite_combat(
             )
         if shot is not None:
             action, detail = shot
+            _kite_clear_move_attempt(unit)
             _kite_log_decision(
                 unit, unit_kind, mode, objective, threats, action, detail, target=target,
             )
@@ -4312,7 +4450,13 @@ def _plan_kite_combat(
     # a solo guerrilla resumes its own bearing instead of converging on a
     # shared coordinate. Tactical evasion is per-unit in both modes.
     if solo and target is None:
-        return _guerrilla_roam(unit, pos, obstacle_cells, config)
+        return _guerrilla_roam(
+            unit,
+            pos,
+            obstacle_cells,
+            config,
+            avoid_cells=(collision_avoid,) if collision_avoid is not None else (),
+        )
     must_move = any(_enemy_unit_type_name(enemy) == "RANGER" for enemy in threats)
     move_goal = tuple(target.position) if target is not None else objective
     # Follow a real A* route toward the objective first. The single-step
@@ -4321,9 +4465,40 @@ def _plan_kite_combat(
     # closer, at cell B every step scores <=0 so BFS picks the first cell of
     # the real detour (back to A), and the unit shuttles forever. A cached
     # multi-step route keeps the unit committed to one detour direction.
+    route_enemy_cells = {tuple(enemy.position) for enemy in local_enemies}
+
+    def _kite_route_step_allowed(cell: tuple[int, int]) -> bool:
+        if collision_avoid is not None and cell == collision_avoid:
+            return False
+        if cell in route_enemy_cells:
+            return False
+        assessment = _kite_cell_assessment(
+            cell, threats, obstacle_cells, attack_range,
+        )
+        return not (
+            assessment["current_hits"] or assessment["predicted_hits"]
+        )
+
+    route_counts = cell_counts or {}
+    route_blocked_steps: set[tuple[int, int]] = set()
+    for candidate in (
+        Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT,
+    ):
+        cell = (
+            pos[0] + candidate.delta[0],
+            pos[1] + candidate.delta[1],
+        )
+        if (
+            route_counts.get(cell, 0) >= _CELL_UNIT_LIMIT
+            or not _kite_route_step_allowed(cell)
+        ):
+            route_blocked_steps.add(cell)
     bfs_step = _move_towards(
         unit, pos, move_goal, obstacle_cells,
         detail_prefix="kite-route",
+        cell_counts=cell_counts,
+        extra_obstacles=route_blocked_steps,
+        step_filter=_kite_route_step_allowed,
     )
     if bfs_step is not None:
         action, detail = bfs_step
@@ -4347,7 +4522,9 @@ def _plan_kite_combat(
     # single-step safety/progress picker, then to a forced unstick step.
     direction, assessment, candidates = _kite_choose_move(
         unit, pos, move_goal, threats, obstacle_cells, attack_range,
-        cell_counts, must_move=must_move,
+        cell_counts,
+        must_move=must_move,
+        avoid_cells=(collision_avoid,) if collision_avoid is not None else (),
     )
     if direction is not None:
         _next_cell = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
@@ -4368,6 +4545,8 @@ def _plan_kite_combat(
     # real A* search so the squad can still navigate out of cul-de-sacs.
     unstick = _kite_bfs_unstick(
         unit, pos, move_goal, obstacle_cells, cell_counts,
+        extra_obstacles=route_blocked_steps,
+        step_filter=_kite_route_step_allowed,
     )
     if unstick is not None:
         action, detail = unstick
@@ -4376,6 +4555,7 @@ def _plan_kite_combat(
             target=target, candidates=candidates,
         )
         return action, detail
+    _kite_clear_move_attempt(unit)
     unit.wait()
     detail = f"kite-hold-safe objective={objective}"
     _kite_log_decision(
@@ -5526,6 +5706,7 @@ turn_context = type(
         "kite_directives": {},
         "kite_decisions": [],
         "guerrilla_decisions": [],
+        "kite_collision_snapshot": None,
         "kite_ranger_range": 3,
         "kite_obstacles": frozenset(),
         "shot_predictions": [],
@@ -5628,6 +5809,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _worker_stuck_pos.pop(dead_id, None)
     for dead_id in set(_waypoint_stuck) - alive_ids:
         _waypoint_stuck.pop(dead_id, None)
+    for dead_id in set(_kite_collision_streak) - alive_ids:
+        _kite_collision_streak.pop(dead_id, None)
     for (prefix, obj_id), name in list(_object_names.items()):
         if prefix in ("W", "V", "R") and str(obj_id) not in alive_ids:
             _object_names.pop((prefix, obj_id), None)
@@ -5734,6 +5917,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.worker_routes = {}
     turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
+    _discard_noncollision_move_failures(turn)
     turn_context.shot_predictions = []
     turn_context.kite_decisions = []
     turn_context.guerrilla_decisions = []
@@ -5770,6 +5954,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     for r in getattr(turn, "rangers", ()) or ():
         alive_ids.add(str(r.id))
     _prune_dead_unit_bookkeeping(alive_ids)
+    turn_context.kite_collision_snapshot = dict(_kite_collision_streak)
 
     # ── Aggregate battle-report statistics ─────────────────────────────
     game_stats.sync_units(_game_stats, turn, turn_context.tick)
@@ -6559,6 +6744,7 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                         try:
                             core_action, unit_actions = choose_actions(turn)
                         except Exception as e:
+                            _finalize_kite_collision_state(False)
                             print(
                                 f"tick={getattr(turn, 'tick', '?')} plan_error={e}\n"
                                 f"{traceback.format_exc()}",
@@ -6570,6 +6756,7 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             accepted = turn.submit()
                             _submit_ms = (time.monotonic() - _submit_t0) * 1000
                         except APIError as e:
+                            _finalize_kite_collision_state(False)
                             # 409 TICK_MISMATCH: the server rejects every tick of
                             # a desynced session. A fresh connection normally
                             # self-heals within a tick or two; an unbroken run well
@@ -6600,6 +6787,7 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             )
                             continue
                         except Exception as e:
+                            _finalize_kite_collision_state(False)
                             stale_streak = 0
                             print(
                                 f"tick={turn.tick} submit_error={e}\n"
@@ -6608,6 +6796,7 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             )
                             continue
                         stale_streak = 0
+                        _finalize_kite_collision_state(accepted.accepted)
                         _commit_shadow_predictions(accepted.accepted)
                         _append_accepted_kite_battle_log(accepted.accepted)
                         latency = (time.monotonic() - tick_start) * 1000
