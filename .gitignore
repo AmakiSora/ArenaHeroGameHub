@@ -45,3 +45,7 @@ _nul
 
 # Pi skill
 .pi/
+
+# Arena web console build artifacts
+web/node_modules/
+web/dist/

@@ -3,12 +3,19 @@ Run: python dashboard.py  -> http://localhost:4399
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import hmac
 import html
 import json
 import os
 import re
+import socket
+import ssl
+import threading
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
 from functools import wraps
@@ -44,6 +51,41 @@ PORT = 4399
 # ?token=). Empty => auth disabled (local dev without env). Loopback always
 # bypasses so the Docker healthcheck and deploy smoke-tests keep working.
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
+
+# ---------- arena web console (React SPA under /arena) ---------------------
+# The dashboard serves the built frontend from web/dist and reverse-proxies
+# /api/v1/* to the game API, injecting the server-side API key. Browsers
+# cannot attach Authorization headers to a WebSocket upgrade, so the WS
+# handshake terminates here and only the upstream socket carries the key.
+ARENA_API_HOST = os.environ.get("ARENA_API_HOST", "").strip() or "api.arenahero.io"
+ARENA_API_KEY = os.environ.get("ARENA_HERO_API_KEY", "").strip()
+WEB_DIST_DIR = Path(__file__).resolve().parent / "web" / "dist"
+
+_ARENA_MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".txt": "text/plain; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+}
+
+# Upstream endpoints the browser may reach through the dashboard proxy.
+_ARENA_GET_PATHS = {"/api/v1/leaderboard", "/api/v1/me", "/api/v1/me/stats"}
+_ARENA_POST_PATHS = {"/api/v1/game/commands", "/api/v1/auth/login", "/api/v1/auth/logout"}
+# Extra cookie the proxy uses to carry the upstream CSRF token alongside the
+# imported session cookie; never forwarded as-is, never readable by JS.
+_ARENA_CSRF_COOKIE = "arena_csrf"
+_ARENA_WS_PATH = "/api/v1/game/ws"
+_WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
 # ---------- data loading --------------------------------------------------
@@ -5392,11 +5434,13 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self) -> bool:
         return self._is_loopback() or self._token_ok(self._client_token())
 
-    def _send(self, code: int, body: bytes, content_type: str):
+    def _send(self, code: int, body: bytes, content_type: str, extra_headers=None):
         try:
             self.send_response(code)
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", "no-store")
+            for name, value in extra_headers or ():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -5408,18 +5452,371 @@ class Handler(BaseHTTPRequestHandler):
         # Silence per-request noise; errors still print via handle_one_request.
         return
 
-    def _read_json(self) -> dict:
+    def _read_raw_body(self) -> bytes:
         length = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(length) if length > 0 else b"{}"
-        try:
-            data = json.loads(raw.decode("utf-8") or "{}")
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        return self.rfile.read(min(length, 1_048_576)) if length > 0 else b""
 
     def _send_json(self, code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send(code, body, "application/json; charset=utf-8")
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    # ---- arena SPA static hosting (/arena) ---------------------------------
+
+    def _serve_arena_spa(self, path: str):
+        if path == "/arena":
+            self._redirect("/arena/")
+            return
+        if not WEB_DIST_DIR.is_dir():
+            self._send(404, "arena 页面未构建：请先在 web/ 下执行 npm run build".encode("utf-8"), "text/plain; charset=utf-8")
+            return
+        dist_root = WEB_DIST_DIR.resolve()
+        rel = path[len("/arena/"):].split("?", 1)[0].lstrip("/")
+        target = (dist_root / rel).resolve() if rel else dist_root / "index.html"
+        # Unknown subpaths fall back to index.html (React Router owns them);
+        # the parent check also blocks ../ traversal attempts.
+        if target != dist_root / "index.html" and not (target.is_file() and dist_root in target.parents):
+            target = dist_root / "index.html"
+        try:
+            body = target.read_bytes()
+        except OSError:
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+            return
+        mime = _ARENA_MIME.get(target.suffix.lower(), "application/octet-stream")
+        self._send(200, body, mime)
+
+    # ---- reverse proxy to the game API (injects the server-side key) -------
+
+    def _session_cookies(self) -> str:
+        """The browser's game-session cookies (dashboard-owned ones excluded).
+
+        Upstream login sets an HttpOnly session cookie that this proxy
+        rewrites to the dashboard origin; its presence means the operator
+        logged in, so upstream requests must use the session credential
+        (commands land in the MANUAL plan slot) instead of the injected
+        API key (AGENT slot, shared with the tactic bot). The CSRF carrier
+        cookie is kept out: it is attached separately as X-CSRF-Token.
+        """
+        raw = self.headers.get("Cookie") if getattr(self, "headers", None) else None
+        if not raw:
+            return ""
+        pairs = []
+        for part in raw.split(";"):
+            part = part.strip()
+            name = part.split("=", 1)[0].strip()
+            if not part or name in ("arena_token", _ARENA_CSRF_COOKIE):
+                continue
+            pairs.append(part)
+        return "; ".join(pairs)
+
+    def _csrf_token(self) -> str:
+        """CSRF token bound to the imported session (carrier cookie or header).
+
+        Storing it beside the session cookie keeps both in lockstep: a new
+        import replaces both, so a stale browser-side token can never poison
+        a fresh session.
+        """
+        raw = self.headers.get("Cookie") if getattr(self, "headers", None) else None
+        if raw:
+            for part in raw.split(";"):
+                name, sep, value = part.strip().partition("=")
+                if sep and name.strip() == _ARENA_CSRF_COOKIE:
+                    return value.strip()
+        return ""
+
+    def _arena_upstream(self, method: str, path: str, body: bytes | None = None,
+                        extra_headers: dict | None = None):
+        """Forward one request to the game API; return (status, headers, body).
+
+        headers is a list of (name, value) tuples so repeated Set-Cookie
+        headers survive. Credential choice: a browser session cookie wins;
+        otherwise the server-side API key is injected.
+        """
+        cookies = self._session_cookies()
+        if not cookies and not ARENA_API_KEY:
+            return 503, [], json.dumps({"error": "ARENA_HERO_API_KEY 未配置"}, ensure_ascii=False).encode("utf-8")
+        url = f"https://{ARENA_API_HOST}{path}"
+        headers = {"User-Agent": "arenagame-dashboard/1.0"}
+        if cookies:
+            headers["Cookie"] = cookies
+        else:
+            headers["Authorization"] = f"Bearer {ARENA_API_KEY}"
+        if extra_headers:
+            headers.update(extra_headers)
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                return resp.status, list(resp.headers.items()), resp.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                payload = exc.read()
+            except Exception:
+                payload = b""
+            return exc.code, list((exc.headers or {}).items()), payload
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return 502, [], json.dumps({"error": f"上游不可达: {exc}"}, ensure_ascii=False).encode("utf-8")
+
+    @staticmethod
+    def _rewrite_set_cookie(value: str) -> str:
+        """Rebind an upstream session cookie to this origin.
+
+        The upstream cookie targets api.arenahero.io over HTTPS; the browser
+        talks to the dashboard origin (possibly plain HTTP), so Domain and
+        Secure are dropped and the attributes are normalized.
+        """
+        name_value = value.split(";", 1)[0].strip()
+        return f"{name_value}; Path=/; HttpOnly; SameSite=Lax"
+
+    _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+    _COOKIE_VALUE_RE = re.compile(r"^[\x21-\x7e]+$")
+
+    def _import_session(self, raw: bytes):
+        """Validate pasted upstream cookies, then bind them to this origin."""
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            data = {}
+        cookies_raw = str(data.get("cookies", "")).strip()
+        pairs = []
+        for part in cookies_raw.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            name, sep, value = part.partition("=")
+            name = name.strip()
+            if not sep or name == "arena_token" \
+                    or not self._COOKIE_NAME_RE.match(name) \
+                    or not self._COOKIE_VALUE_RE.match(value):
+                self._send_json(400, {"ok": False, "error": "SESSION_IMPORT_INVALID"})
+                return
+            pairs.append((name, value))
+        if not pairs:
+            self._send_json(400, {"ok": False, "error": "SESSION_IMPORT_INVALID"})
+            return
+        cookie_header = "; ".join(f"{n}={v}" for n, v in pairs)
+        # The CSRF token is mandatory for session-credential (MANUAL) command
+        # POSTs; the upstream only issues it at authentication time, so the
+        # operator copies it from the official site's localStorage and we
+        # echo it back for the frontend to store.
+        csrf = str(data.get("csrf", "")).strip()
+        if csrf and not self._COOKIE_VALUE_RE.match(csrf):
+            self._send_json(400, {"ok": False, "error": "SESSION_IMPORT_INVALID"})
+            return
+        # Validate against the game API before storing anything.
+        request = urllib.request.Request(
+            f"https://{ARENA_API_HOST}/api/v1/me",
+            headers={"Cookie": cookie_header, "User-Agent": "arenagame-dashboard/1.0"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                user_body = resp.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                exc.read()
+            except Exception:
+                pass
+            self._send_json(401, {"ok": False, "error": "SESSION_IMPORT_EXPIRED"})
+            return
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self._send_json(502, {"ok": False, "error": f"上游不可达: {exc}"})
+            return
+        set_cookies = [("Set-Cookie", f"{n}={v}; Path=/; HttpOnly; SameSite=Lax") for n, v in pairs]
+        if csrf:
+            # Bind the CSRF token to the session cookie itself: the proxy
+            # attaches it as X-CSRF-Token on session POSTs, so a stale
+            # browser-side token can never outlive the session it came from.
+            set_cookies.append(("Set-Cookie", f"{_ARENA_CSRF_COOKIE}={csrf}; Path=/; HttpOnly; SameSite=Lax"))
+        try:
+            user = json.loads(user_body.decode("utf-8"))
+        except Exception:
+            user = {}
+        print(f"[arena-proxy] session import ok for {user.get('username', '?')} "
+              f"({len(pairs)} cookie(s), csrf={'yes' if csrf else 'no'})", flush=True)
+        self._send(200, json.dumps({"ok": True, "user": user, "csrf_token": csrf}, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8", extra_headers=set_cookies)
+
+    def _forward_upstream_response(self, status, headers, body):
+        ctype = "application/json; charset=utf-8"
+        set_cookies = []
+        for name, value in headers:
+            lowered = name.lower()
+            if lowered == "content-type":
+                ctype = value
+            elif lowered == "set-cookie":
+                set_cookies.append(("Set-Cookie", self._rewrite_set_cookie(value)))
+        self._send(status, body, ctype, extra_headers=set_cookies)
+
+    def _log_proxy(self, method: str, path: str, status: int, body: bytes) -> None:
+        # Diagnostic trail for manual-control issues: the upstream error code
+        # (CSRF_INVALID, TICK_MISMATCH, ...) tells exactly why a plan failed.
+        try:
+            snippet = body[:240].decode("utf-8", "replace")
+        except Exception:
+            snippet = ""
+        print(f"[arena-proxy] {method} {path} -> {status} {snippet}", flush=True)
+
+    def _proxy_arena_get(self, path: str):
+        status, headers, body = self._arena_upstream("GET", path)
+        self._log_proxy("GET", path, status, body)
+        self._forward_upstream_response(status, headers, body)
+
+    def _proxy_arena_post(self, path: str, raw: bytes):
+        extra = {"Content-Type": self.headers.get("Content-Type", "application/json")}
+        idem = self.headers.get("Idempotency-Key")
+        if idem:
+            extra["Idempotency-Key"] = idem
+        # Session credential (imported cookies or email login): upstream
+        # validates CSRF on browser Manual requests. The token travels in a
+        # proxy-owned cookie so it always matches the current session; an
+        # explicit header (fresh email login) wins over it.
+        cookies = self._session_cookies()
+        if cookies:
+            csrf = self.headers.get("X-CSRF-Token") or self._csrf_token()
+            if csrf:
+                extra["X-CSRF-Token"] = csrf
+        else:
+            csrf = self.headers.get("X-CSRF-Token")
+            if csrf:
+                extra["X-CSRF-Token"] = csrf
+        print(f"[arena-proxy] POST {path} arrived (session={'yes' if cookies else 'no'}, "
+              f"csrf={'yes' if 'X-CSRF-Token' in extra else 'no'}, {len(raw)}B)", flush=True)
+        status, headers, body = self._arena_upstream("POST", path, body=raw, extra_headers=extra)
+        self._log_proxy("POST", path, status, body)
+        self._forward_upstream_response(status, headers, body)
+
+    # ---- WebSocket transparent proxy (/api/v1/game/ws) ----------------------
+
+    def _proxy_game_ws(self):
+        """Pipe browser <-> game API. The upstream socket carries the API key;
+        frames move byte-for-byte in both directions without being parsed."""
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        protocol = self.headers.get("Sec-WebSocket-Protocol")
+        if not key:
+            self._send(400, b"missing Sec-WebSocket-Key", "text/plain; charset=utf-8")
+            return
+        if not ARENA_API_KEY:
+            self._send(503, json.dumps({"error": "ARENA_HERO_API_KEY 未配置"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        try:
+            upstream, leftover, upstream_err = self._ws_upstream_handshake(protocol)
+        except OSError as exc:
+            self._send(502, json.dumps({"error": f"上游不可达: {exc}"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+            return
+        if upstream is None:
+            # Non-101 upstream reply (401/409/429 ...): surface its body.
+            status, body, ctype = upstream_err
+            print(f"[arena-proxy] WS handshake rejected upstream -> {status} "
+                  f"{body[:160].decode('utf-8', 'replace')}", flush=True)
+            self._send(status, body, ctype)
+            return
+        print("[arena-proxy] WS open", flush=True)
+        # Finish the browser-side handshake with raw bytes, then take over the
+        # socket: send_response() would add server log noise on the wire.
+        accept = base64.b64encode(hashlib.sha1((key + _WS_ACCEPT_GUID).encode()).digest()).decode()
+        try:
+            lines = [
+                "HTTP/1.1 101 Switching Protocols",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Accept: {accept}",
+            ]
+            if protocol:
+                lines.append(f"Sec-WebSocket-Protocol: {protocol}")
+            self.wfile.write(("\r\n".join(lines) + "\r\n\r\n").encode())
+            # Frames received while the handshake was in flight (the tick
+            # often arrives with the 101) must not be dropped.
+            if leftover:
+                self.wfile.write(leftover)
+            self.wfile.flush()
+        except OSError:
+            upstream.close()
+            return
+        self.close_connection = True
+        self._pipe_pair(self.connection, upstream)
+        print("[arena-proxy] WS closed", flush=True)
+
+    def _ws_upstream_handshake(self, protocol: str | None):
+        """Open the upstream WebSocket with the API key. Returns
+        (socket, leftover_bytes, None) on 101 — leftover carries frames that
+        already arrived and must be flushed to the browser before piping — or
+        (None, b"", (status, body, content_type)) for error replies."""
+        sock = socket.create_connection((ARENA_API_HOST, 443), timeout=30)
+        wrapped = ssl.create_default_context().wrap_socket(sock, server_hostname=ARENA_API_HOST)
+        headers = [
+            f"GET {_ARENA_WS_PATH} HTTP/1.1",
+            f"Host: {ARENA_API_HOST}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            f"Sec-WebSocket-Key: {base64.b64encode(os.urandom(16)).decode()}",
+            "Sec-WebSocket-Version: 13",
+            f"Authorization: Bearer {ARENA_API_KEY}",
+        ]
+        if protocol:
+            headers.append(f"Sec-WebSocket-Protocol: {protocol}")
+        wrapped.sendall(("\r\n".join(headers) + "\r\n\r\n").encode())
+        # Read the response head byte-by-byte: it is small and keeps the
+        # stream aligned for the frame pipe that follows a 101.
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < 8192:
+            chunk = wrapped.recv(1)
+            if not chunk:
+                break
+            buf += chunk
+        head, _, leftover = buf.partition(b"\r\n\r\n")
+        parts = head.split(b"\r\n", 1)[0].split(None, 2)
+        status = int(parts[1]) if len(parts) >= 2 else 502
+        if status != 101:
+            ctype = "application/json; charset=utf-8"
+            for line in head.split(b"\r\n")[1:]:
+                if line.lower().startswith(b"content-type:"):
+                    ctype = line.split(b":", 1)[1].strip().decode("latin-1")
+            body = leftover
+            try:
+                while len(body) < 65536:
+                    chunk = wrapped.recv(4096)
+                    if not chunk:
+                        break
+                    body += chunk
+            except OSError:
+                pass
+            wrapped.close()
+            return None, b"", (status, body, ctype)
+        return wrapped, leftover, None
+
+    @staticmethod
+    def _pipe(src: socket.socket, dst: socket.socket):
+        try:
+            while True:
+                chunk = src.recv(16384)
+                if not chunk:
+                    break
+                dst.sendall(chunk)
+        except OSError:
+            pass
+        finally:
+            for sock in (src, dst):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+    def _pipe_pair(self, browser_sock: socket.socket, upstream_sock: socket.socket):
+        # Upstream->browser on a helper thread; browser->upstream blocks here
+        # until either side closes, then we wait briefly for the mirror pipe.
+        helper = threading.Thread(target=self._pipe, args=(upstream_sock, browser_sock), daemon=True)
+        helper.start()
+        self._pipe(browser_sock, upstream_sock)
+        helper.join(timeout=5)
 
     def _stream_events(self):
         """Server-Sent Events: push the moment the data files change.
@@ -5465,13 +5862,25 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if not self._authed():
-            if path == "/":
+            if path == "/" or path == "/dashboard" or path == "/arena" or path.startswith("/arena/"):
                 self._send(401, LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8")
             else:
                 self._send_json(401, {"ok": False, "error": "未授权：缺少或错误的 DASHBOARD_TOKEN"})
             return
         if path == "/":
+            self._redirect("/dashboard")
+            return
+        if path == "/dashboard":
             self._send(200, generate_html().encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == _ARENA_WS_PATH and "websocket" in (self.headers.get("Upgrade") or "").lower():
+            self._proxy_game_ws()
+            return
+        if path == "/arena" or path.startswith("/arena/"):
+            self._serve_arena_spa(path)
+            return
+        if path in _ARENA_GET_PATHS:
+            self._proxy_arena_get(path)
             return
         if path == "/api/stream":
             self._stream_events()
@@ -5527,7 +5936,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        data = self._read_json()
+        raw = self._read_raw_body()
+        try:
+            parsed = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            parsed = {}
+        data = parsed if isinstance(parsed, dict) else {}
         if path == "/api/login":
             # Login is the one endpoint that must work without auth.
             token = str(data.get("token", "")).strip()
@@ -5542,7 +5956,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(401, {"ok": False, "error": "token 错误"})
             return
         if not self._authed():
+            if path.startswith("/api/v1/"):
+                # A browser POST to the game API that never reaches the
+                # proxy shows up as the generic frontend error; log it so the
+                # missing-dashboard-token case is visible server-side.
+                print(f"[arena-proxy] POST {path} blocked: dashboard auth failed", flush=True)
             self._send_json(401, {"ok": False, "error": "未授权：缺少或错误的 DASHBOARD_TOKEN"})
+            return
+        if path == "/api/v1/session/import":
+            # OAuth-only accounts (LINUX DO / GitHub) cannot log in here
+            # directly: the upstream OAuth redirect_uri is fixed to the
+            # official site. The operator copies their session cookie there
+            # and imports it; we validate it upstream, then rebind it to
+            # this origin so later requests flow through the MANUAL slot.
+            self._import_session(raw)
+            return
+        if path in _ARENA_POST_PATHS:
+            # Game command plan: forward upstream with the server-side key.
+            self._proxy_arena_post(path, raw)
             return
         if path in {"/api/config", "/api/config/reset"}:
             try:

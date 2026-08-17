@@ -1,3 +1,11 @@
+# Build stage: the React real-time control console served at /arena.
+FROM node:24-alpine AS web-builder
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -26,6 +34,10 @@ COPY dashboard.py \
      status.py \
      docker-entrypoint.py \
      ./
+
+# Static bundle of the /arena console; dashboard.py serves it and proxies
+# /api/v1/* to the game API with the server-side key.
+COPY --from=web-builder /web/dist ./web/dist
 
 RUN useradd --system --uid 10001 --home-dir /app arena \
     && mkdir -p /app/runtime \

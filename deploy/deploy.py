@@ -281,6 +281,13 @@ def main() -> None:
         print("ERROR: DEPLOY_PASSWORD is not set in .env.deploy")
         sys.exit(1)
 
+    # Remote build output contains unicode (vite checkmarks); the Windows
+    # GBK console would crash print() mid-stream and kill the deploy.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
     print(f"Connecting to {HOST}:{PORT} as {USERNAME}...")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())

@@ -7067,5 +7067,416 @@ class CombatHotspotTests(unittest.TestCase):
         self.assertIn('class="hotspot-ring engaged"', svg)
 
 
+
+class ArenaConsoleRoutingTests(unittest.TestCase):
+    """HTTP-level coverage for the /arena console integration.
+
+    The old dashboard page moved to /dashboard, / redirects there, and the
+    React build is served from web/dist with the game API proxied behind the
+    dashboard token (the proxy injects the server-side API key).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from http.server import ThreadingHTTPServer
+
+        cls._server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+        cls._server.daemon_threads = True
+        cls._thread = threading.Thread(target=cls._server.serve_forever, daemon=True)
+        cls._thread.start()
+        cls._port = cls._server.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._server.shutdown()
+        cls._server.server_close()
+
+    def _request(self, method: str, path: str, body: bytes | None = None,
+                 headers: dict | None = None):
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=10)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            data = resp.read()
+            return resp.status, dict(resp.getheaders()), data
+        finally:
+            conn.close()
+
+    def test_root_redirects_to_dashboard(self) -> None:
+        status, headers, _ = self._request("GET", "/")
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), "/dashboard")
+
+    def test_dashboard_path_serves_legacy_page(self) -> None:
+        status, headers, body = self._request("GET", "/dashboard")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        self.assertIn("<title>Arena Hero 战术仪表盘</title>", body.decode("utf-8"))
+
+    def test_arena_spa_serves_dist_with_route_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            (dist / "index.html").write_text("<html>arena spa</html>", encoding="utf-8")
+            assets = dist / "assets"
+            assets.mkdir()
+            (assets / "app.js").write_text("console.log(1)", encoding="utf-8")
+            with patch.object(dashboard, "WEB_DIST_DIR", dist):
+                # /arena redirects so relative asset URLs resolve.
+                status, headers, _ = self._request("GET", "/arena")
+                self.assertEqual(status, 302)
+                self.assertEqual(headers.get("Location"), "/arena/")
+                # Built entry point.
+                status, headers, body = self._request("GET", "/arena/")
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b"<html>arena spa</html>")
+                # Static asset with its MIME type.
+                status, headers, body = self._request("GET", "/arena/assets/app.js")
+                self.assertEqual(status, 200)
+                self.assertIn("javascript", headers.get("Content-Type", ""))
+                self.assertEqual(body, b"console.log(1)")
+                # Client-side routes fall back to index.html.
+                status, _, body = self._request("GET", "/arena/leaderboard")
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b"<html>arena spa</html>")
+                # Traversal attempts never escape the dist root.
+                status, _, body = self._request("GET", "/arena/../dashboard.py")
+                self.assertEqual(status, 200)
+                self.assertEqual(body, b"<html>arena spa</html>")
+
+    def test_arena_without_build_reports_404(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(dashboard, "WEB_DIST_DIR", Path(tmp) / "missing"):
+                status, _, body = self._request("GET", "/arena/")
+        self.assertEqual(status, 404)
+        self.assertIn("npm run build", body.decode("utf-8"))
+
+    def test_unauthenticated_arena_pages_show_login_html(self) -> None:
+        with patch.object(dashboard, "DASHBOARD_TOKEN", "secret-token"), \
+                patch.object(dashboard.Handler, "_is_loopback", return_value=False):
+            status, headers, body = self._request("GET", "/arena/")
+            self.assertEqual(status, 401)
+            self.assertIn("text/html", headers.get("Content-Type", ""))
+            self.assertIn("登录", body.decode("utf-8"))
+            status, headers, body = self._request("GET", "/api/v1/leaderboard")
+            self.assertEqual(status, 401)
+            self.assertIn("application/json", headers.get("Content-Type", ""))
+
+    def test_get_proxy_forwards_whitelisted_paths_only(self) -> None:
+        calls = []
+
+        def fake_upstream(self_handler, method, path, body=None, extra_headers=None):
+            calls.append((method, path))
+            return 200, [("Content-Type", "application/json")], b'{"ranked": true}'
+
+        with patch.object(dashboard.Handler, "_arena_upstream", fake_upstream):
+            status, _, body = self._request("GET", "/api/v1/leaderboard")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), {"ranked": True})
+            self.assertEqual(calls, [("GET", "/api/v1/leaderboard")])
+            # Non-whitelisted upstream paths stay local 404s.
+            status, _, _ = self._request("GET", "/api/v1/auth/login")
+            self.assertEqual(status, 404)
+
+    def test_post_commands_proxy_keeps_body_and_idempotency_key(self) -> None:
+        captured = {}
+
+        def fake_upstream(self_handler, method, path, body=None, extra_headers=None):
+            captured["method"] = method
+            captured["path"] = path
+            captured["body"] = body
+            captured["extra"] = extra_headers
+            return 202, [("Content-Type", "application/json")], b'{"accepted": true}'
+
+        plan = json.dumps({"tick": 7, "unit_actions": {}}).encode("utf-8")
+        with patch.object(dashboard.Handler, "_arena_upstream", fake_upstream):
+            status, _, body = self._request(
+                "POST", "/api/v1/game/commands", body=plan,
+                headers={"Content-Type": "application/json", "Idempotency-Key": "manual-7-plan-01"},
+            )
+        self.assertEqual(status, 202)
+        self.assertEqual(json.loads(body), {"accepted": True})
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["path"], "/api/v1/game/commands")
+        self.assertEqual(captured["body"], plan)
+        self.assertEqual(captured["extra"].get("Idempotency-Key"), "manual-7-plan-01")
+
+    def test_upstream_request_injects_bearer_key(self) -> None:
+        import urllib.request
+
+        seen = {}
+
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def read(self):
+                return b'{"ok": true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            seen["url"] = request.full_url
+            seen["auth"] = request.get_header("Authorization")
+            seen["method"] = request.get_method()
+            return FakeResponse()
+
+        with patch.object(dashboard, "ARENA_API_KEY", "ah_live_test"), \
+                patch.object(dashboard, "ARENA_API_HOST", "api.example.test"), \
+                patch.object(urllib.request, "urlopen", fake_urlopen):
+            handler = dashboard.Handler.__new__(dashboard.Handler)
+            status, _, body = handler._arena_upstream("GET", "/api/v1/me")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b'{"ok": true}')
+        self.assertEqual(seen["url"], "https://api.example.test/api/v1/me")
+        self.assertEqual(seen["auth"], "Bearer ah_live_test")
+
+    def test_upstream_error_statuses_pass_through(self) -> None:
+        import io as _io
+        import urllib.error
+        import urllib.request
+
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "rate limited",
+                {"Content-Type": "application/json"},
+                _io.BytesIO(b'{"error": "REALTIME_CONNECTION_LIMIT"}'),
+            )
+
+        with patch.object(dashboard, "ARENA_API_KEY", "ah_live_test"), \
+                patch.object(urllib.request, "urlopen", fake_urlopen):
+            handler = dashboard.Handler.__new__(dashboard.Handler)
+            status, _, body = handler._arena_upstream("GET", "/api/v1/me")
+        self.assertEqual(status, 429)
+        self.assertEqual(json.loads(body)["error"], "REALTIME_CONNECTION_LIMIT")
+
+    def test_upstream_without_key_reports_503(self) -> None:
+        with patch.object(dashboard, "ARENA_API_KEY", ""):
+            handler = dashboard.Handler.__new__(dashboard.Handler)
+            status, _, body = handler._arena_upstream("GET", "/api/v1/me")
+        self.assertEqual(status, 503)
+        self.assertIn("ARENA_HERO_API_KEY", body.decode("utf-8"))
+
+    def test_ws_endpoint_rejects_plain_get_and_missing_key(self) -> None:
+        # Without an Upgrade header the WS path is not a normal GET route.
+        status, _, _ = self._request("GET", "/api/v1/game/ws")
+        self.assertEqual(status, 404)
+        # Upgrade without Sec-WebSocket-Key is a bad handshake.
+        status, _, _ = self._request("GET", "/api/v1/game/ws",
+                                     headers={"Upgrade": "websocket", "Connection": "Upgrade"})
+        self.assertEqual(status, 400)
+        # Valid handshake shape but no server-side key configured.
+        with patch.object(dashboard, "ARENA_API_KEY", ""):
+            status, _, body = self._request(
+                "GET", "/api/v1/game/ws",
+                headers={"Upgrade": "websocket", "Connection": "Upgrade",
+                         "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                         "Sec-WebSocket-Version": "13"},
+            )
+        self.assertEqual(status, 503)
+        self.assertIn("ARENA_HERO_API_KEY", body.decode("utf-8"))
+
+    def test_session_cookie_takes_precedence_over_api_key(self) -> None:
+        import urllib.request
+
+        seen = {}
+
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def read(self):
+                return b'{"ok": true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            seen["cookie"] = request.get_header("Cookie")
+            seen["auth"] = request.get_header("Authorization")
+            return FakeResponse()
+
+        with patch.object(dashboard, "ARENA_API_KEY", "ah_live_test"), \
+                patch.object(urllib.request, "urlopen", fake_urlopen):
+            status, _, _ = self._request(
+                "GET", "/api/v1/leaderboard",
+                headers={"Cookie": "ah_session=abc123; arena_token=whatever; arena_csrf=c9"},
+            )
+        self.assertEqual(status, 200)
+        # Session credential wins: cookie forwarded, API key NOT injected, and
+        # the dashboard's own token / CSRF carrier never leak upstream.
+        self.assertEqual(seen["cookie"], "ah_session=abc123")
+        self.assertIsNone(seen["auth"])
+
+    def test_login_set_cookie_is_rewritten_to_dashboard_origin(self) -> None:
+        import urllib.request
+
+        class FakeResponse:
+            status = 201
+            headers = {
+                "Content-Type": "application/json",
+                "Set-Cookie": "ah_session=abc123; Domain=api.arenahero.io; Path=/; Secure; HttpOnly",
+            }
+
+            def read(self):
+                return b'{"csrf_token": "csrf-x"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            return FakeResponse()
+
+        with patch.object(dashboard, "ARENA_API_KEY", "ah_live_test"), \
+                patch.object(urllib.request, "urlopen", fake_urlopen):
+            status, headers, body = self._request(
+                "POST", "/api/v1/auth/login",
+                body=b'{"email": "a@b.c", "password": "pw"}',
+                headers={"Content-Type": "application/json"},
+            )
+        self.assertEqual(status, 201)
+        self.assertEqual(json.loads(body), {"csrf_token": "csrf-x"})
+        cookie = headers.get("Set-Cookie", "")
+        # Domain/Secure must go (dashboard origin may be plain HTTP); the
+        # cookie must stay HttpOnly and bind to this origin's path.
+        self.assertEqual(cookie, "ah_session=abc123; Path=/; HttpOnly; SameSite=Lax")
+
+    def test_csrf_token_is_forwarded_upstream(self) -> None:
+        captured = {}
+
+        def fake_upstream(self_handler, method, path, body=None, extra_headers=None):
+            captured["extra"] = extra_headers
+            return 202, [("Content-Type", "application/json")], b'{"accepted": true}'
+
+        with patch.object(dashboard.Handler, "_arena_upstream", fake_upstream):
+            self._request(
+                "POST", "/api/v1/game/commands", body=b'{"tick": 1, "unit_actions": {}}',
+                headers={"Content-Type": "application/json",
+                         "Idempotency-Key": "manual-1-plan-01", "X-CSRF-Token": "csrf-9"},
+            )
+        self.assertEqual(captured["extra"].get("X-CSRF-Token"), "csrf-9")
+
+    def test_csrf_carrier_cookie_is_attached_to_session_posts(self) -> None:
+        captured = {}
+
+        def fake_upstream(self_handler, method, path, body=None, extra_headers=None):
+            captured["extra"] = extra_headers
+            return 202, [("Content-Type", "application/json")], b'{"accepted": true}'
+
+        with patch.object(dashboard.Handler, "_arena_upstream", fake_upstream):
+            self._request_with_cookies(
+                "POST", "/api/v1/game/commands", body=b'{"tick": 2, "unit_actions": {}}',
+                cookies="ah_session=x1; arena_csrf=carrier-csrf",
+                headers={"Content-Type": "application/json", "Idempotency-Key": "manual-2-plan-01"},
+            )
+        # No explicit header was sent: the token bound to the session cookie
+        # (carrier cookie) must be attached so MANUAL POSTs pass CSRF checks.
+        self.assertEqual(captured["extra"].get("X-CSRF-Token"), "carrier-csrf")
+
+    def _request_with_cookies(self, method: str, path: str, body: bytes | None = None,
+                              cookies: str = "", headers: dict | None = None):
+        import http.client
+
+        merged = dict(headers or {})
+        merged["Cookie"] = cookies
+        conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=10)
+        try:
+            conn.request(method, path, body=body, headers=merged)
+            resp = conn.getresponse()
+            return resp.status, resp.getheaders(), resp.read()
+        finally:
+            conn.close()
+
+    def _import_request(self, cookies_json: str):
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self._port, timeout=10)
+        try:
+            conn.request("POST", "/api/v1/session/import", body=cookies_json.encode("utf-8"),
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            return resp.status, resp.getheaders(), resp.read()
+        finally:
+            conn.close()
+
+    def test_session_import_validates_then_binds_cookies(self) -> None:
+        import urllib.request
+
+        seen = {}
+
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def read(self):
+                return b'{"username": "operator", "email": "", "auth_source": "MANUAL", "oauth_providers": ["linux_do"]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            seen["url"] = request.full_url
+            seen["cookie"] = request.get_header("Cookie")
+            return FakeResponse()
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            status, headers, body = self._import_request(
+                '{"cookies": "arena_session=s3cr3t; csrf_hint=x1", "csrf": "csrf-abc"}')
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["user"]["username"], "operator")
+        # The CSRF token is echoed back so the frontend can attach it to the
+        # session-credential MANUAL command POSTs.
+        self.assertEqual(payload["csrf_token"], "csrf-abc")
+        self.assertEqual(seen["url"], "https://api.arenahero.io/api/v1/me")
+        self.assertEqual(seen["cookie"], "arena_session=s3cr3t; csrf_hint=x1")
+        set_cookies = [v for name, v in headers if name.lower() == "set-cookie"]
+        self.assertIn("arena_session=s3cr3t; Path=/; HttpOnly; SameSite=Lax", set_cookies)
+        self.assertIn("csrf_hint=x1; Path=/; HttpOnly; SameSite=Lax", set_cookies)
+        # The CSRF token rides in its own carrier cookie so the proxy can
+        # attach it as X-CSRF-Token on session POSTs.
+        self.assertIn("arena_csrf=csrf-abc; Path=/; HttpOnly; SameSite=Lax", set_cookies)
+
+    def test_session_import_rejects_malformed_cookies(self) -> None:
+        status, _, body = self._import_request('{"cookies": "no-equals-sign"}')
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"], "SESSION_IMPORT_INVALID")
+        status, _, body = self._import_request('{"cookies": "arena_token=keepmeout"}')
+        self.assertEqual(status, 400)
+        status, _, body = self._import_request('{"cookies": ""}')
+        self.assertEqual(status, 400)
+
+    def test_session_import_expired_session_reports_401(self) -> None:
+        import io as _io
+        import urllib.error
+        import urllib.request
+
+        def fake_urlopen(request, timeout=None):
+            raise urllib.error.HTTPError(
+                request.full_url, 401, "unauthorized",
+                {"Content-Type": "application/json"},
+                _io.BytesIO(b'{"error": "UNAUTHORIZED"}'),
+            )
+
+        with patch.object(urllib.request, "urlopen", fake_urlopen):
+            status, _, body = self._import_request('{"cookies": "arena_session=stale"}')
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body)["error"], "SESSION_IMPORT_EXPIRED")
+
+
 if __name__ == "__main__":
     unittest.main()

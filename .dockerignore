@@ -29,3 +29,5 @@ _*.py
 nul
 *.md
 !requirements.txt
+web/node_modules
+web/dist
