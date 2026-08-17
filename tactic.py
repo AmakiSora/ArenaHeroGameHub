@@ -3060,12 +3060,8 @@ def _stable_slot_index(text: str, modulo: int) -> int:
     return int.from_bytes(digest[:8], "big") % modulo
 
 
-def _home_patrol_goal(
-    unit_id: str,
-    core_pos: tuple[int, int],
-    radius: int,
-) -> tuple[int, int]:
-    """Pick a stable perimeter offset around the Core for this unit."""
+def _home_patrol_slots(radius: int) -> tuple[tuple[int, int], ...]:
+    """Return the perimeter slot offsets for a given patrol radius."""
     radius = max(1, int(radius))
     if radius >= 2:
         # Eight slots around the ring keep multiple defenders spread out.
@@ -3075,7 +3071,7 @@ def _home_patrol_goal(
         # past the return_radius=r+1 line, ping-ponging home-return/patrol.
         half = radius - radius // 2  # ceil(radius/2)
         other = radius // 2          # floor(radius/2)
-        slots = (
+        return (
             (0, -radius),
             (half, -other),
             (radius, 0),
@@ -3085,20 +3081,66 @@ def _home_patrol_goal(
             (-radius, 0),
             (-half, -other),
         )
-    else:
-        # Radius 1 has only 4 cells within distance 1; keep the full 8-slot
-        # ring (corners at distance 2) for spread.
-        slots = (
-            (0, -radius),
-            (radius, -radius),
-            (radius, 0),
-            (radius, radius),
-            (0, radius),
-            (-radius, radius),
-            (-radius, 0),
-            (-radius, -radius),
+    # Radius 1 has only 4 cells within distance 1; keep the full 8-slot
+    # ring (corners at distance 2) for spread.
+    return (
+        (0, -radius),
+        (radius, -radius),
+        (radius, 0),
+        (radius, radius),
+        (0, radius),
+        (-radius, radius),
+        (-radius, 0),
+        (-radius, -radius),
+    )
+
+
+def _home_patrol_slot_assignments(
+    home_names: Iterable[str],
+    radius: int,
+) -> dict[str, int]:
+    """Distribute home team names across patrol slots as evenly as possible.
+
+    Each server cell can stack up to ``_CELL_UNIT_LIMIT`` friendly units, so
+    we allow that many defenders per slot before spilling to the next slot.
+    This avoids the hash-collision case where several units map to the same
+    of the 8 slots and perpetually CELL_UNIT_LIMIT each other.
+    """
+    cache_key = (int(radius), tuple(sorted(home_names, key=lambda n: n.upper())))
+    cached = _home_patrol_slot_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    slots = _home_patrol_slots(radius)
+    sorted_names = sorted(home_names, key=lambda n: n.upper())
+    loads = [0] * len(slots)
+    assignments: dict[str, int] = {}
+    for name in sorted_names:
+        # Pick the least-loaded slot; cap each slot at the per-cell unit limit
+        # so stacked pairings are intentional rather than accidental collisions.
+        best = min(
+            range(len(slots)),
+            key=lambda i: (loads[i] if loads[i] < _CELL_UNIT_LIMIT else 10_000, i),
         )
-    slot = slots[_stable_slot_index(unit_id, len(slots))]
+        assignments[name] = best
+        loads[best] += 1
+    _home_patrol_slot_cache[cache_key] = assignments
+    return assignments
+
+
+def _home_patrol_goal(
+    unit_id: str,
+    core_pos: tuple[int, int],
+    radius: int,
+    *,
+    preferred_slot: int | None = None,
+) -> tuple[int, int]:
+    """Pick a stable perimeter offset around the Core for this unit."""
+    slots = _home_patrol_slots(radius)
+    if preferred_slot is None:
+        slot = slots[_stable_slot_index(unit_id, len(slots))]
+    else:
+        slot = slots[preferred_slot % len(slots)]
     return (core_pos[0] + slot[0], core_pos[1] + slot[1])
 
 
@@ -3245,8 +3287,22 @@ def _plan_home_combat(
             unit.move(d)
             _set_unit_route(unit, npos, [pos, npos], complete=False)
             return ("MOVE", f"{d.name} chute-clear")
+        # Every outward cell is at capacity: waiting one tick is better than
+        # re-issuing the same blocked move and logging another CELL_UNIT_LIMIT.
+        unit.wait()
+        return ("WAIT", "packed-outward-wait")
 
-    goal = _home_patrol_goal(str(unit.id), core_pos, radius)
+    unit_name = _object_name(
+        unit.id, _UNIT_NAME_PREFIX.get(getattr(unit, "unit_type", None), "U")
+    )
+    home_names = _parse_team_names(config.get("home_team", ""))
+    slot_assignments = _home_patrol_slot_assignments(home_names, radius)
+    goal = _home_patrol_goal(
+        str(unit.id),
+        core_pos,
+        radius,
+        preferred_slot=slot_assignments.get(unit_name),
+    )
     # Already on/near the assigned slot: hold instead of micro-stepping.
     if _manhattan(pos, goal) <= 1 and dist_home <= return_radius:
         unit.wait()
@@ -4817,6 +4873,11 @@ _CELL_UNIT_LIMIT = 2
 # again survive), so it can neither grow unbounded nor go stale.
 _cell_limit_streak: dict[str, int] = {}
 _CELL_LIMIT_DETOUR_AFTER = 3
+# Cache of per-name home-team patrol slot indices. Keyed by (radius, sorted
+# roster tuple) so changing the roster or radius recomputes the assignment.
+# Prevents multiple home defenders from hashing onto the same patrol slot and
+# hammering each other with CELL_UNIT_LIMIT moves (observed with R5/R6).
+_home_patrol_slot_cache: dict[tuple[int, tuple[str, ...]], dict[str, int]] = {}
 # Lease holder frozen this many ticks (rejected moves count as no progress)
 # before the lease rotates to the next carrier.
 _DELIVERY_STUCK_LIMIT = 4
