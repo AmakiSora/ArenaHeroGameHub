@@ -1234,6 +1234,27 @@ def collect_combat_units(rec: dict | None = None, config: dict | None = None) ->
     return sorted(by_name.values(), key=sort_key)
 
 
+def unit_display_names(rec: dict | None = None) -> dict[str, str]:
+    """Map short unit id -> tactic display name (W1/V2/R3) for the arena SPA.
+
+    The tactic dashboard keys every unit by these names; the arena page looks
+    them up by str(object_id)[:8] (the record id format) so both surfaces
+    label the same unit identically. Only live units from the latest record
+    are exposed — a just-spawned unit appears once the tactic names it.
+    """
+    rec = rec or {}
+    names: dict[str, str] = {}
+    for group in ("workers", "vanguards", "rangers"):
+        for unit in rec.get(group) or []:
+            if not isinstance(unit, dict):
+                continue
+            uid = unit.get("id")
+            name = unit.get("name")
+            if isinstance(uid, str) and uid and isinstance(name, str) and name:
+                names[uid] = name
+    return names
+
+
 # Coordinate fields the user can fill by clicking the map. Maps the X field to
 # its paired Y field and the DOM id of the map-pick button (rendered on the X row).
 COORD_PICKER_ROWS = {
@@ -5931,6 +5952,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/waypoints":
             self._send_json(200, {"ok": True, "waypoints": load_waypoints()})
+            return
+        if path == "/api/unit-names":
+            # Tactic display names (W1/V2/R3) keyed by short unit id, so the
+            # arena SPA labels units exactly like this dashboard does.
+            history = read_history(1)
+            rec = history[0] if history else {}
+            self._send_json(200, {
+                "ok": True,
+                "tick": rec.get("tick"),
+                "names": unit_display_names(rec),
+            })
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 

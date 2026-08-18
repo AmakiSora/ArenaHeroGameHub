@@ -64,4 +64,23 @@ describe('PendingCommands', () => {
     />)
     expect(container).toBeEmptyDOMElement()
   })
+
+  it('labels unit actors with the tactic-dashboard names when provided', () => {
+    render(<PendingCommands
+      tick={42}
+      state={demoState}
+      unitNames={{ [workerID.slice(0, 8)]: 'W4' }}
+      receipts={{
+        MANUAL: {
+          tick: 42,
+          source: 'MANUAL',
+          received_at: '2026-07-26T00:00:00Z',
+          plan: { tick: 42, unit_actions: { [workerID]: { type: 'HARVEST' } } },
+        },
+      }}
+    />)
+
+    expect(screen.getByText('W4')).toBeInTheDocument()
+    expect(screen.queryByText(/Worker ·/)).not.toBeInTheDocument()
+  })
 })

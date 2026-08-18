@@ -2821,6 +2821,31 @@ class DashboardLogTests(unittest.TestCase):
         self.assertNotIn('data-unit="E9"', svg)
         self.assertNotIn('data-unit="C1"', svg)
 
+    def test_unit_display_names_maps_short_ids_to_dashboard_names(self) -> None:
+        """The arena SPA looks up tactic display names by short unit id so it
+        labels units exactly like the dashboard (W1/V2/R3)."""
+        rec = {
+            "workers": [
+                {"id": "aaaaaaaa-1111", "name": "W1"},
+                {"id": "", "name": "W2"},
+                {"id": "cccccccc-3333", "name": ""},
+                "not-a-dict",
+            ],
+            "vanguards": [{"id": "bbbbbbbb-2222", "name": "V1"}],
+            "rangers": [{"id": "dddddddd-4444", "name": "R1"}],
+            "enemies": [{"id": "eeeeeeee-5555", "name": "E1"}],
+        }
+
+        names = dashboard.unit_display_names(rec)
+
+        self.assertEqual(names, {
+            "aaaaaaaa-1111": "W1",
+            "bbbbbbbb-2222": "V1",
+            "dddddddd-4444": "R1",
+        })
+        self.assertEqual(dashboard.unit_display_names(None), {})
+        self.assertEqual(dashboard.unit_display_names({}), {})
+
     def test_svg_route_is_trimmed_to_unwalked_remainder(self) -> None:
         """Routes only draw the segment ahead of the unit, not the ground it
         has already crossed. A unit mid-path must not re-render the cells it

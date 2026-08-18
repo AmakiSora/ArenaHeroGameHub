@@ -30,6 +30,14 @@ describe('AssetList', () => {
     expect(screen.queryByText(/worker-12/)).not.toBeInTheDocument()
   })
 
+  it('prefers the tactic-dashboard display name over the unit type label', () => {
+    const worker = { kind: 'UNIT' as const, id: 'aaaaaaaa-1111-4000-8000', controlled: true, position: [1, 0] as [number, number], hp: 2, unit_type: 'WORKER' as const, cargo: 0 }
+    render(<AssetList state={state} objects={[worker]} selectedId={null} onSelect={() => undefined} unitNames={{ aaaaaaaa: 'W7' }} />)
+
+    expect(screen.getByText('W7')).toBeInTheDocument()
+    expect(screen.queryByText('Worker')).not.toBeInTheDocument()
+  })
+
   it('groups controlled assets into Core, Worker, Ranger and Vanguard squads', () => {
     const core = { kind: 'CORE' as const, id: 'core-1', controlled: true, position: [0, 0] as [number, number], hp: 12 }
     const worker = { kind: 'UNIT' as const, id: 'worker-1', controlled: true, position: [1, 0] as [number, number], hp: 2, unit_type: 'WORKER' as const, cargo: 0 }

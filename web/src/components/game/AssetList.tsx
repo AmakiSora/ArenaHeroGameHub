@@ -2,6 +2,7 @@ import { ChevronDown } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { PlayerState, UnitType, WorldObject } from '../../lib/types'
+import { unitDashboardName, type UnitNameMap } from '../../lib/unitNames'
 import { Logo } from '../Logo'
 import { GameStats } from './GameStats'
 import { UnitArtIcon } from './UnitArtIcon'
@@ -16,7 +17,7 @@ function groupKeyOf(object: WorldObject): UnitGroupKey {
   return type === 'RANGER' ? 'RANGER' : type === 'VANGUARD' ? 'VANGUARD' : 'WORKER'
 }
 
-export function AssetList({ state, objects, selectedId, onSelect }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void }) {
+export function AssetList({ state, objects, selectedId, onSelect, unitNames = {} }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap }) {
   const { t } = useTranslation(); const controlled = useMemo(() => objects.filter((object) => object.controlled), [objects])
   const groups = useMemo(() => UNIT_GROUP_KEYS.map((key) => ({ key, members: controlled.filter((object) => groupKeyOf(object) === key) })), [controlled])
   const [collapsedGroups, setCollapsedGroups] = useState<Partial<Record<UnitGroupKey, boolean>>>({})
@@ -39,7 +40,7 @@ export function AssetList({ state, objects, selectedId, onSelect }: { state: Pla
           <span className="flex min-w-0 items-center gap-1.5"><ChevronDown aria-hidden="true" size={12} className={`shrink-0 text-zinc-600 transition-transform ${collapsedGroups[key] ? '-rotate-90' : ''}`} /><span className="eyebrow truncate">{t(`game.unitGroups.${key}`)}</span></span>
           <span className="shrink-0 font-mono text-[9px] text-zinc-600">{members.length}</span>
         </button>
-        {!collapsedGroups[key] && members.map((object) => { const artType = object.kind === 'CORE' ? 'CORE' : object.unit_type ?? 'WORKER'; const name = object.kind === 'CORE' ? t('game.units.CORE') : t(`game.units.${object.unit_type}`); return <button key={object.id} onClick={() => onSelect(object)} style={{ contentVisibility: 'auto', containIntrinsicSize: '44px' }} className={`focus-ring mb-0.5 flex min-h-11 w-full items-center gap-2 rounded-gold px-2.5 text-left transition-colors ${selectedId === object.id ? 'bg-indigo-deep/55 text-blue-soft' : 'text-zinc-400 hover:bg-white/[.04] hover:text-zinc-100'}`}>
+        {!collapsedGroups[key] && members.map((object) => { const artType = object.kind === 'CORE' ? 'CORE' : object.unit_type ?? 'WORKER'; const name = object.kind === 'CORE' ? t('game.units.CORE') : unitDashboardName(object, unitNames) ?? t(`game.units.${object.unit_type}`); return <button key={object.id} onClick={() => onSelect(object)} style={{ contentVisibility: 'auto', containIntrinsicSize: '44px' }} className={`focus-ring mb-0.5 flex min-h-11 w-full items-center gap-2 rounded-gold px-2.5 text-left transition-colors ${selectedId === object.id ? 'bg-indigo-deep/55 text-blue-soft' : 'text-zinc-400 hover:bg-white/[.04] hover:text-zinc-100'}`}>
         <span className="grid size-7 shrink-0 place-items-center rounded-gold-sm border border-violet-cosmic/15 bg-indigo-deep/45"><UnitArtIcon type={artType} className="size-5" /></span><span className="flex min-w-0 flex-1 items-baseline gap-1.5"><span className="truncate text-xs font-medium">{name}</span><span className="shrink-0 font-mono text-[9px] text-zinc-600">[{object.position?.join(', ') ?? '—'}]</span></span><span className="shrink-0 font-mono text-[9px]">{object.hp} HP</span>
       </button> })}
       </section>)}

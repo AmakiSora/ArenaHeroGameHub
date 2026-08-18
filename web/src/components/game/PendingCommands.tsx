@@ -10,11 +10,13 @@ import type {
   UnitAction,
   WorldObject,
 } from '../../lib/types'
+import { unitDashboardName, type UnitNameMap } from '../../lib/unitNames'
 
 interface Props {
   tick: number
   state: PlayerState
   receipts: CommandReceipts
+  unitNames?: UnitNameMap
 }
 
 interface CommandRow {
@@ -24,7 +26,7 @@ interface CommandRow {
   overridesAgent: boolean
 }
 
-export function PendingCommands({ tick, state, receipts }: Props) {
+export function PendingCommands({ tick, state, receipts, unitNames = {} }: Props) {
   const { t, i18n } = useTranslation()
   const [expanded, setExpanded] = useState(true)
   const sections = useMemo(() => (['AGENT', 'MANUAL'] as CommandSource[])
@@ -34,9 +36,9 @@ export function PendingCommands({ tick, state, receipts }: Props) {
       return [{
         source,
         receivedAt: receipt.received_at,
-        rows: commandRows(receipt.plan, source, receipts.AGENT?.tick === tick ? receipts.AGENT.plan : undefined, state, t),
+        rows: commandRows(receipt.plan, source, receipts.AGENT?.tick === tick ? receipts.AGENT.plan : undefined, state, t, unitNames),
       }]
-    }), [receipts, state, t, tick])
+    }), [receipts, state, t, tick, unitNames])
   if (!sections.length) return null
 
   const effectiveCount = effectiveCommandCount(sections.flatMap((section) => section.rows))
@@ -93,6 +95,7 @@ function commandRows(
   agentPlan: CommandPlan | undefined,
   state: PlayerState,
   t: (key: string, options?: Record<string, unknown>) => string,
+  unitNames: UnitNameMap,
 ): CommandRow[] {
   const objects = new Map(state.objects.flatMap((object) => object.id ? [[object.id, object] as const] : []))
   const rows: CommandRow[] = []
@@ -105,12 +108,12 @@ function commandRows(
     })
   }
   const actions = Object.entries(plan.unit_actions).sort(([left], [right]) =>
-    actorName(objects.get(left), left, t).localeCompare(actorName(objects.get(right), right, t)))
+    actorName(objects.get(left), left, t, unitNames).localeCompare(actorName(objects.get(right), right, t, unitNames)))
   for (const [id, action] of actions) {
     rows.push({
       key: id,
-      actor: actorName(objects.get(id), id, t),
-      action: describeUnitAction(action, objects, t),
+      actor: actorName(objects.get(id), id, t, unitNames),
+      action: describeUnitAction(action, objects, t, unitNames),
       overridesAgent: source === 'MANUAL' && Boolean(agentPlan?.unit_actions[id]),
     })
   }
@@ -128,11 +131,12 @@ function describeUnitAction(
   action: UnitAction,
   objects: Map<string, WorldObject>,
   t: (key: string, options?: Record<string, unknown>) => string,
+  unitNames: UnitNameMap,
 ) {
   const parts = [t(`game.actions.${action.type}`)]
   if (action.direction) parts.push(t(`game.directions.${action.direction}`))
   if (action.expected_cell) parts.push(`[${action.expected_cell.join(', ')}]`)
-  else if (action.target_id) parts.push(actorName(objects.get(action.target_id), action.target_id, t))
+  else if (action.target_id) parts.push(actorName(objects.get(action.target_id), action.target_id, t, unitNames))
   return parts.join(' · ')
 }
 
@@ -140,9 +144,14 @@ function actorName(
   object: WorldObject | undefined,
   id: string,
   t: (key: string, options?: Record<string, unknown>) => string,
+  unitNames: UnitNameMap,
 ) {
   const shortID = `${id.slice(0, 6)}…${id.slice(-4)}`
   if (!object) return shortID
+  // Prefer the tactic-dashboard display name (W3/V2/R1) so both surfaces
+  // label the same unit identically.
+  const dashboardName = unitDashboardName(object, unitNames)
+  if (dashboardName) return dashboardName
   const name = object.kind === 'CORE' ? t('game.units.CORE') : t(`game.units.${object.unit_type}`)
   return `${name} · ${shortID}`
 }

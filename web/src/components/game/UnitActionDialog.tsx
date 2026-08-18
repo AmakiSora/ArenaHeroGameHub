@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { type ActionAvailability, type AvailableAction } from '../../lib/actionAvailability'
 import { unitCost } from '../../lib/gameRules'
 import type { CommandPlan, CoreAction, Position, StreamPhase, UnitAction, UnitActionType, UnitType, WorldObject } from '../../lib/types'
+import { unitDashboardName, type UnitNameMap } from '../../lib/unitNames'
 import { UnitArtIcon } from './UnitArtIcon'
 
 export interface MapAnchor { x: number; y: number; side: 'left' | 'right' | 'top' | 'bottom' }
@@ -13,6 +14,7 @@ interface Props {
   selected: WorldObject
   plan: CommandPlan
   movementGoal?: Position
+  unitNames?: UnitNameMap
   phase: StreamPhase
   resources: number
   population?: number
@@ -62,7 +64,7 @@ export function UnitActionDialog(props: Props) {
   }
   const spawn = (unit_type: UnitType) => { if (props.phase !== 'open' || !props.availability.spawns[unit_type]) return; props.onCoreAction({ type: 'SPAWN', unit_type }); props.onClose() }
   const clear = () => { if (props.selected.kind === 'CORE') props.onCoreAction(null); else if (props.selected.id) props.onUnitAction(props.selected.id, null); props.onClose() }
-  const name = props.selected.kind === 'CORE' ? t('game.units.CORE') : t(`game.units.${props.selected.unit_type}`)
+  const name = props.selected.kind === 'CORE' ? t('game.units.CORE') : unitDashboardName(props.selected, props.unitNames ?? {}) ?? t(`game.units.${props.selected.unit_type}`)
   const selectedArtType = props.selected.kind === 'CORE' ? 'CORE' : props.selected.unit_type ?? 'WORKER'
   const transforms = { right: 'translate(0, -50%)', left: 'translate(-100%, -50%)', top: 'translate(0, -100%)', bottom: 'translate(0, 0)' }
   const arrowClasses = { right: '-left-1.5 top-1/2 -translate-y-1/2 border-b border-l', left: '-right-1.5 top-1/2 -translate-y-1/2 border-r border-t', top: '-bottom-1.5 left-1/2 -translate-x-1/2 border-b border-r', bottom: '-top-1.5 left-1/2 -translate-x-1/2 border-l border-t' }
