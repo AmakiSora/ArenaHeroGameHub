@@ -168,4 +168,65 @@ describe('AssetList', () => {
       expect(screen.getByText('V1').closest('button')).not.toHaveAttribute('draggable', 'true')
     })
   })
+
+  describe('squad settings', () => {
+    afterEach(() => localStorage.clear())
+
+    const vanguard = { kind: 'UNIT' as const, id: 'v1aaaaaa-0000', controlled: true, position: [1, 0] as [number, number], hp: 4, unit_type: 'VANGUARD' as const }
+    const baseConfig = { home_patrol_radius: 5, home_engage_radius: 0, home_engage_memory_ticks: 0, combat_heal_hp_threshold: 1, combat_heal_return_limit: 0, attack_mode: 'coords', attack_target_x: 10, attack_target_y: -4, attack_auto_radius: 0, attack_retreat_radius: 0, attack_march_engage_radius: 0, ranger_attack_range: 2, ranger_lead_fire_enabled: false }
+
+    const openSquadsTab = (props: { teamConfig: Record<string, number | boolean | string>; onUpdateConfig: (field: string, value: number | boolean | string) => void }) => {
+      render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{ V1: 'home' }} onAssignTeam={() => undefined} teamConfig={props.teamConfig} onUpdateConfig={props.onUpdateConfig} />)
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+    }
+
+    it('opens the settings panel from the gear button and commits numbers on blur', () => {
+      const updates: Array<[string, number | boolean | string]> = []
+      openSquadsTab({ teamConfig: baseConfig, onUpdateConfig: (field, value) => updates.push([field, value]) })
+
+      fireEvent.click(screen.getByRole('button', { name: 'Squad settings · Home Squad' }))
+      expect(screen.getByText('Home Strategy')).toBeInTheDocument()
+      const input = screen.getByDisplayValue('5')
+      fireEvent.change(input, { target: { value: '8' } })
+      // No POST per keystroke: only blur commits.
+      expect(updates).toEqual([])
+      fireEvent.blur(input)
+      expect(updates).toEqual([['home_patrol_radius', 8]])
+    })
+
+    it('commits selects and switches at once', () => {
+      const updates: Array<[string, number | boolean | string]> = []
+      openSquadsTab({ teamConfig: baseConfig, onUpdateConfig: (field, value) => updates.push([field, value]) })
+
+      fireEvent.click(screen.getByRole('button', { name: 'Squad settings · Attack Squad' }))
+      fireEvent.change(screen.getByDisplayValue('2'), { target: { value: '3' } })
+      fireEvent.click(screen.getByRole('checkbox'))
+      expect(updates).toEqual([['ranger_attack_range', 3], ['ranger_lead_fire_enabled', true]])
+    })
+
+    it('hides mode-gated parameters exactly like the dashboard form', () => {
+      openSquadsTab({ teamConfig: { ...baseConfig, attack_mode: 'auto' }, onUpdateConfig: () => undefined })
+
+      fireEvent.click(screen.getByRole('button', { name: 'Squad settings · Attack Squad' }))
+      // auto mode: search range visible, coordinate inputs hidden.
+      expect(screen.getByText('Search range')).toBeInTheDocument()
+      expect(screen.queryByText('Target X')).not.toBeInTheDocument()
+      expect(screen.getByRole('radio', { name: 'Auto' })).toHaveAttribute('aria-checked', 'true')
+    })
+
+    it('switches the squad mode through the radio group', () => {
+      const updates: Array<[string, number | boolean | string]> = []
+      openSquadsTab({ teamConfig: baseConfig, onUpdateConfig: (field, value) => updates.push([field, value]) })
+
+      fireEvent.click(screen.getByRole('button', { name: 'Squad settings · Attack Squad' }))
+      fireEvent.click(screen.getByRole('radio', { name: 'Champion beacon' }))
+      expect(updates).toEqual([['attack_mode', 'beacon']])
+    })
+
+    it('shows no gear for the standby pool and none without an update handler', () => {
+      render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{}} teamConfig={baseConfig} />)
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      expect(screen.queryByRole('button', { name: /Squad settings/ })).not.toBeInTheDocument()
+    })
+  })
 })

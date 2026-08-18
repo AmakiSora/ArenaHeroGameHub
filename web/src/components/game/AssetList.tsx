@@ -1,9 +1,10 @@
-import { ChevronDown } from 'lucide-react'
+import { ChevronDown, Settings } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { maximumHealth } from '../../lib/gameRules'
 import type { PlayerState, UnitType, WorldObject } from '../../lib/types'
 import { TEAM_KEYS, teamOfName, type TeamKey, type TeamRoster } from '../../lib/teamRoster'
+import { MODE_OPTIONS, TEAM_SETTINGS, type ModeValue, type SquadSettingsSpec, type TeamConfig, type TeamSettingField } from '../../lib/teamSettings'
 import { unitDashboardName, type UnitNameMap } from '../../lib/unitNames'
 import { Logo } from '../Logo'
 import { GameStats } from './GameStats'
@@ -42,7 +43,51 @@ function hpTone(object: WorldObject): string {
   return 'bg-rose-400'
 }
 
-export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {}, onAssignTeam }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster; onAssignTeam?: (name: string, team: TeamKey) => void }) {
+// Squad settings panel mirroring the dashboard's 战斗分队 form: number fields
+// commit on blur / Enter (avoiding a POST per keystroke), radios, selects
+// and switches commit at once. Every change is POSTed to /api/teams.
+function SquadSettingsPanel({ spec, config, onUpdateConfig }: { spec: SquadSettingsSpec; config: TeamConfig; onUpdateConfig: (field: string, value: number | boolean | string) => void }) {
+  const { t } = useTranslation()
+  const mode = spec.modeField ? String(config[spec.modeField] ?? 'coords') as ModeValue : null
+  const commitNumber = (field: TeamSettingField & { kind: 'number' }, raw: string) => {
+    const parsed = Number(raw)
+    if (Number.isNaN(parsed)) return
+    const clamped = Math.min(field.max, Math.max(field.min, parsed))
+    if (clamped !== Number(config[field.field] ?? 0)) onUpdateConfig(field.field, clamped)
+  }
+  const fieldLabel = (labelKey: string, hintKey?: string) => <span className="min-w-0"><span className="block truncate text-[10px] text-zinc-300">{t(`game.teamSettings.${labelKey}`)}</span>{hintKey && <span className="block truncate text-[9px] text-zinc-600">{t(`game.teamSettings.${hintKey}`)}</span>}</span>
+  return <div className="mx-1 mb-1.5 space-y-1.5 rounded-gold border border-white/[.07] bg-black/25 p-2">
+    <div className="border-b border-white/[.06] pb-1">
+      <p className="text-[10px] font-medium text-zinc-200">{t(`game.teamSettings.${spec.titleKey}`)}</p>
+      {spec.subtitleKey && <p className="text-[9px] text-zinc-600">{t(`game.teamSettings.${spec.subtitleKey}`)}</p>}
+    </div>
+    {spec.fields.map((field) => {
+      // Mode-gated parameters hide exactly like the dashboard form does.
+      if (field.kind === 'number' && field.modes && (!mode || !field.modes.includes(mode))) return null
+      if (field.kind === 'mode') return <div key={field.field} role="radiogroup" aria-label={t('game.teamSettings.modeLegend')} className="flex gap-1">
+        {MODE_OPTIONS.map((option) => { const active = String(config[field.field] ?? 'coords') === option; return <button key={option} type="button" role="radio" aria-checked={active} onClick={() => onUpdateConfig(field.field, option)} className={`focus-ring flex-1 rounded-gold-sm px-1 py-1 text-[9px] transition-colors ${active ? 'bg-indigo-deep/55 text-blue-soft' : 'bg-white/[.03] text-zinc-500 hover:bg-white/[.06] hover:text-zinc-200'}`}>{t(`game.teamSettings.modes.${option}`)}</button> })}
+      </div>
+      if (field.kind === 'number') return <label key={field.field} className="flex items-center justify-between gap-2">
+        {fieldLabel(field.labelKey, field.hintKey)}
+        <input type="number" min={field.min} max={field.max} step={1} key={`${field.field}=${String(config[field.field])}`} defaultValue={Number(config[field.field] ?? 0)} onBlur={(event) => commitNumber(field, event.currentTarget.value)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} className="w-16 shrink-0 rounded-gold-sm border border-white/[.08] bg-white/[.04] px-1 py-0.5 text-right font-mono text-[10px] text-zinc-200" />
+      </label>
+      if (field.kind === 'select') return <label key={field.field} className="flex items-center justify-between gap-2">
+        {fieldLabel(field.labelKey, field.hintKey)}
+        <select value={Number(config[field.field] ?? field.options[0])} onChange={(event) => onUpdateConfig(field.field, Number(event.target.value))} className="shrink-0 rounded-gold-sm border border-white/[.08] bg-white/[.04] px-1 py-0.5 font-mono text-[10px] text-zinc-200">
+          {field.options.map((option) => <option key={option} value={option}>{option}</option>)}
+        </select>
+      </label>
+      return <label key={field.field} className="flex items-center justify-between gap-2">
+        {fieldLabel(field.labelKey, field.hintKey)}
+        <input type="checkbox" checked={Boolean(config[field.field])} onChange={(event) => onUpdateConfig(field.field, event.target.checked)} className="size-3.5 shrink-0 accent-indigo-400" />
+      </label>
+    })}
+    {mode === 'beacon' && spec.beaconNoteKey && <p className="text-[9px] text-zinc-600">{t(`game.teamSettings.${spec.beaconNoteKey}`)}</p>}
+    <p className="text-[9px] text-zinc-700">{t('game.teamSettings.saved')}</p>
+  </div>
+}
+
+export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {}, onAssignTeam, teamConfig = {}, onUpdateConfig }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster; onAssignTeam?: (name: string, team: TeamKey) => void; teamConfig?: TeamConfig; onUpdateConfig?: (field: string, value: number | boolean | string) => void }) {
   const { t } = useTranslation(); const controlled = useMemo(() => objects.filter((object) => object.controlled), [objects])
   const groups = useMemo(() => UNIT_GROUP_KEYS.map((key) => ({ key, members: controlled.filter((object) => groupKeyOf(object) === key) })), [controlled])
   // Squad view: only combat units have a team assignment. Membership is
@@ -62,8 +107,11 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
   const [dragName, setDragName] = useState<string | null>(null)
   const [dropTeam, setDropTeam] = useState<TeamKey | null>(null)
   const dragging = dragName !== null
+  // At most one squad's settings panel is open; it only exists in the teams
+  // view, so leaving that view closes it.
+  const [openSettings, setOpenSettings] = useState<TeamKey | null>(null)
   const toggleSection = (key: string) => setCollapsedSections((current) => ({ ...current, [key]: !current[key] }))
-  const switchView = (next: FleetView) => { setView(next); localStorage.setItem(FLEET_VIEW_KEY, next) }
+  const switchView = (next: FleetView) => { setView(next); localStorage.setItem(FLEET_VIEW_KEY, next); if (next !== 'teams') setOpenSettings(null) }
   const sections = view === 'teams' ? squadGroups : groups
   const sectionLabel = (key: string) => view === 'teams' ? t(`game.squads.${key}`) : t(`game.unitGroups.${key}`)
   // Compact chip: name + HP dot only, with coordinates and exact HP in the
@@ -101,11 +149,15 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
       </div>
     </div>
     <div className="min-h-0 flex-1 overflow-y-auto p-2">
-      {sections.map(({ key, members }) => { const alwaysShown = view === 'teams' && ALWAYS_SHOWN_SQUADS.includes(key as TeamKey); const droppable = view === 'teams' && !!onAssignTeam; return members.length === 0 && !alwaysShown && !dragging ? null : <section key={key} aria-label={sectionLabel(key)} onDragOver={droppable ? (event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'; setDropTeam(key as TeamKey) } : undefined} onDragLeave={droppable ? (event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropTeam(null) } : undefined} onDrop={droppable ? (event) => { event.preventDefault(); const name = event.dataTransfer?.getData('text/plain') || dragName; setDragName(null); setDropTeam(null); if (name) onAssignTeam?.(name, key as TeamKey) } : undefined} className={droppable && dropTeam === key ? 'rounded-gold outline outline-1 outline-blue-soft/60' : undefined}>
-        <button type="button" onClick={() => toggleSection(key)} aria-expanded={!collapsedSections[key]} className="focus-ring mb-0.5 flex w-full items-center justify-between rounded-gold px-2.5 py-1.5 text-left transition-colors hover:bg-white/[.04]">
-          <span className="flex min-w-0 items-center gap-1.5"><ChevronDown aria-hidden="true" size={12} className={`shrink-0 text-zinc-600 transition-transform ${collapsedSections[key] ? '-rotate-90' : ''}`} /><span className="eyebrow truncate">{sectionLabel(key)}</span></span>
-          <span className="shrink-0 font-mono text-[9px] text-zinc-600">{members.length}</span>
-        </button>
+      {sections.map(({ key, members }) => { const alwaysShown = view === 'teams' && ALWAYS_SHOWN_SQUADS.includes(key as TeamKey); const droppable = view === 'teams' && !!onAssignTeam; const spec = TEAM_SETTINGS[key]; const showGear = view === 'teams' && !!onUpdateConfig && !!spec; return members.length === 0 && !alwaysShown && !dragging ? null : <section key={key} aria-label={sectionLabel(key)} onDragOver={droppable ? (event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'; setDropTeam(key as TeamKey) } : undefined} onDragLeave={droppable ? (event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropTeam(null) } : undefined} onDrop={droppable ? (event) => { event.preventDefault(); const name = event.dataTransfer?.getData('text/plain') || dragName; setDragName(null); setDropTeam(null); if (name) onAssignTeam?.(name, key as TeamKey) } : undefined} className={droppable && dropTeam === key ? 'rounded-gold outline outline-1 outline-blue-soft/60' : undefined}>
+        <div className="mb-0.5 flex items-center gap-1">
+          <button type="button" onClick={() => toggleSection(key)} aria-expanded={!collapsedSections[key]} className="focus-ring flex min-w-0 flex-1 items-center justify-between rounded-gold px-2.5 py-1.5 text-left transition-colors hover:bg-white/[.04]">
+            <span className="flex min-w-0 items-center gap-1.5"><ChevronDown aria-hidden="true" size={12} className={`shrink-0 text-zinc-600 transition-transform ${collapsedSections[key] ? '-rotate-90' : ''}`} /><span className="eyebrow truncate">{sectionLabel(key)}</span></span>
+            <span className="shrink-0 font-mono text-[9px] text-zinc-600">{members.length}</span>
+          </button>
+          {showGear && spec && <button type="button" onClick={() => setOpenSettings((current) => current === key ? null : key as TeamKey)} aria-expanded={openSettings === key} aria-label={`${t('game.teamSettings.gear')} · ${sectionLabel(key)}`} className={`focus-ring grid size-6 shrink-0 place-items-center rounded-gold-sm transition-colors ${openSettings === key ? 'bg-indigo-deep/55 text-blue-soft' : 'text-zinc-600 hover:bg-white/[.05] hover:text-zinc-300'}`}><Settings aria-hidden="true" size={12} /></button>}
+        </div>
+        {openSettings === key && spec && onUpdateConfig && <SquadSettingsPanel spec={spec} config={teamConfig} onUpdateConfig={onUpdateConfig} />}
         {!collapsedSections[key] && (members.length > 0 ? <div className="flex flex-wrap gap-1 px-1 pb-1.5">{members.map((object) => object.kind === 'CORE' ? coreRow(object) : unitChip(object))}</div> : <p className="px-2.5 py-1.5 text-[10px] text-zinc-600">{dragging ? t('game.squads.dropHere') : '—'}</p>)}
       </section> })}
     </div>

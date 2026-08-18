@@ -1,6 +1,8 @@
 // Combat-squad membership served by the tactic dashboard (/api/teams). The
 // arena sidebar uses it to show the same 守家/进攻/风筝 squads the dashboard
 // manages, keyed by the dashboard display names (V1/R2...).
+import type { TeamConfig } from './teamSettings'
+
 export type TeamKey = 'home' | 'attack' | 'kite' | 'guerrilla' | 'unassigned'
 
 export type TeamRoster = Record<string, TeamKey>
@@ -9,12 +11,17 @@ export type TeamRoster = Record<string, TeamKey>
 // guerrilla / unassigned only when they hold members (rendering decides).
 export const TEAM_KEYS: TeamKey[] = ['home', 'attack', 'kite', 'guerrilla', 'unassigned']
 
-export async function loadTeamRoster(): Promise<TeamRoster> {
+export interface TeamData {
+  roster: TeamRoster
+  config: TeamConfig
+}
+
+export async function loadTeamRoster(): Promise<TeamData> {
   try {
     const response = await fetch('/api/teams', { credentials: 'same-origin' })
-    if (!response.ok) return {}
-    const data = await response.json() as { ok?: boolean; combat_units?: unknown }
-    if (!data || data.ok !== true || !Array.isArray(data.combat_units)) return {}
+    if (!response.ok) return { roster: {}, config: {} }
+    const data = await response.json() as { ok?: boolean; combat_units?: unknown; config?: unknown }
+    if (!data || data.ok !== true || !Array.isArray(data.combat_units)) return { roster: {}, config: {} }
     const roster: TeamRoster = {}
     for (const unit of data.combat_units as Array<Record<string, unknown>>) {
       const name = typeof unit.name === 'string' ? unit.name : ''
@@ -22,11 +29,14 @@ export async function loadTeamRoster(): Promise<TeamRoster> {
       if (!name) continue
       roster[name] = (TEAM_KEYS as string[]).includes(team) ? (team as TeamKey) : 'unassigned'
     }
-    return roster
+    const config = data.config && typeof data.config === 'object' && !Array.isArray(data.config)
+      ? data.config as TeamConfig
+      : {}
+    return { roster, config }
   } catch {
     // Outside the deployed dashboard (dev server / demo) the endpoint does
     // not exist — the squads tab simply stays empty.
-    return {}
+    return { roster: {}, config: {} }
   }
 }
 
@@ -67,12 +77,22 @@ export function rosterPayload(roster: TeamRoster): Record<string, string> {
 // merges partial updates, so combat settings (radii, modes...) stay
 // untouched. The tactic engine picks the change up on the next tick.
 export async function saveTeamRoster(roster: TeamRoster): Promise<boolean> {
+  return postTeams(rosterPayload(roster))
+}
+
+// Persist one squad-setting change (partial update: the dashboard merges
+// only the keys present, so rosters and other settings stay untouched).
+export async function saveTeamSettings(patch: TeamConfig): Promise<boolean> {
+  return postTeams(patch)
+}
+
+async function postTeams(payload: Record<string, unknown>): Promise<boolean> {
   try {
     const response = await fetch('/api/teams', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'same-origin',
-      body: JSON.stringify(rosterPayload(roster)),
+      body: JSON.stringify(payload),
     })
     if (!response.ok) return false
     const data = await response.json() as { ok?: boolean }
