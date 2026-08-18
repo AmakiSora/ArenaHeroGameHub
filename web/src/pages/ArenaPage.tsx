@@ -12,6 +12,7 @@ import { WorldCanvas } from '../components/game/WorldCanvas'
 import { UnitActionDialog, type MapAnchor } from '../components/game/UnitActionDialog'
 import { useGameStream } from '../hooks/useGameStream'
 import { useUnitNames } from '../hooks/useUnitNames'
+import { useUnitTeams } from '../hooks/useUnitTeams'
 import { useAuth } from '../context/AuthContext'
 import { plannedShotMarkers, plannedSweepMarkers, rangerAttackOptions, vanguardAttackOptions } from '../lib/combatPreview'
 import { directionTo, moveTargets, plannedMoveArrows } from '../lib/movementPreview'
@@ -28,6 +29,9 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   // Tactic-dashboard display names (W1/V2/R3) so the arena page labels units
   // exactly like the dashboard; the demo has no dashboard backend behind it.
   const unitNames = useUnitNames(game.tick, !demo)
+  // Combat-squad membership (守家/进攻/风筝...) from the tactic dashboard so
+  // the sidebar's squads tab mirrors the dashboard's team board.
+  const teamRoster = useUnitTeams(game.tick, !demo)
   const submitGamePlan = game.submit
   const movementStorageKey = `arena-hero.movement-goals.${demo ? 'demo' : user?.username ?? 'anonymous'}`
   const [selectedId, setSelectedId] = useState<string | null>(null); const [targetMode, setTargetMode] = useState<'SHOOT' | 'SWEEP' | null>(null); const [moveSelecting, setMoveSelecting] = useState(false)
@@ -171,7 +175,7 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   const describeError = (code: string) => `${getErrorMessage(code)} [${code}]`
   if (!game.state) return <div className="grid h-dvh place-items-center"><div className="text-center"><div className="mx-auto mb-4 size-2 animate-pulse rounded-full bg-cyan-signal shadow-[0_0_14px_rgba(69,145,197,.45)]" /><p className="font-mono text-xs tracking-[.2em] text-zinc-500">{t(`game.${game.phase}`)}</p>{game.error && <p role="alert" className="mt-3 text-xs text-coral-hostile">{describeError(game.error)}</p>}</div></div>
   return <div className="grid h-dvh min-h-[560px] grid-cols-1 overflow-hidden lg:grid-cols-[260px_1fr]">
-    <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} />
+    <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} teamRoster={teamRoster} />
     <section className="relative min-h-0 overflow-hidden">
       {!respawning && <GameHUD phase={game.phase} stateReceivedAt={game.stateReceivedAt} />}
       {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} />}

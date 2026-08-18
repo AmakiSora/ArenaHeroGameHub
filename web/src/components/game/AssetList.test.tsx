@@ -1,5 +1,5 @@
 import { fireEvent, render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import '../../lib/i18n'
 import { AssetList } from './AssetList'
 
@@ -84,5 +84,50 @@ describe('AssetList', () => {
     fireEvent.click(workerHeader)
     expect(workerHeader).toHaveAttribute('aria-expanded', 'true')
     expect(screen.getByText('[1, 0]')).toBeInTheDocument()
+  })
+
+  describe('fleet view tabs', () => {
+    afterEach(() => localStorage.clear())
+
+    const vanguard = { kind: 'UNIT' as const, id: 'v1aaaaaa-0000', controlled: true, position: [1, 0] as [number, number], hp: 4, unit_type: 'VANGUARD' as const }
+    const ranger = { kind: 'UNIT' as const, id: 'r1bbbbbb-0000', controlled: true, position: [2, 0] as [number, number], hp: 2, unit_type: 'RANGER' as const }
+    const worker = { kind: 'UNIT' as const, id: 'w1cccccc-0000', controlled: true, position: [3, 0] as [number, number], hp: 2, unit_type: 'WORKER' as const, cargo: 0 }
+    const names = { v1aaaaaa: 'V1', r1bbbbbb: 'R1', w1cccccc: 'W1' }
+
+    it('shows the unit-type groups by default and switches to combat squads', () => {
+      render(<AssetList state={state} objects={[vanguard, ranger, worker]} selectedId={null} onSelect={() => undefined} unitNames={names} teamRoster={{ V1: 'home', R1: 'kite' }} />)
+
+      expect(screen.getByRole('tab', { name: 'Unit Groups' })).toHaveAttribute('aria-selected', 'true')
+      expect(screen.getByRole('region', { name: 'Worker Group' })).toBeInTheDocument()
+      expect(screen.queryByRole('region', { name: 'Home Squad' })).not.toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      expect(screen.getByRole('tab', { name: 'Combat Squads' })).toHaveAttribute('aria-selected', 'true')
+      expect(screen.queryByRole('region', { name: 'Worker Group' })).not.toBeInTheDocument()
+      expect(screen.getByRole('region', { name: 'Home Squad' })).toHaveTextContent('V1')
+      expect(screen.getByRole('region', { name: 'Kite Squad' })).toHaveTextContent('R1')
+      // 进攻队 stays visible while empty; workers never join a combat squad.
+      expect(screen.getByRole('region', { name: 'Attack Squad' })).toBeInTheDocument()
+      expect(screen.queryByText('W1')).not.toBeInTheDocument()
+      // Guerrilla / standby pool hide while they hold no members.
+      expect(screen.queryByRole('region', { name: 'Guerrilla Squad' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('region', { name: 'Standby Pool' })).not.toBeInTheDocument()
+    })
+
+    it('drops unnamed combat units into the standby pool', () => {
+      render(<AssetList state={state} objects={[ranger]} selectedId={null} onSelect={() => undefined} teamRoster={{}} />)
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      expect(screen.getByRole('region', { name: 'Standby Pool' })).toHaveTextContent('Ranger')
+    })
+
+    it('remembers the chosen fleet view across remounts', () => {
+      const first = render(<AssetList state={state} objects={[worker]} selectedId={null} onSelect={() => undefined} />)
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      first.unmount()
+
+      render(<AssetList state={state} objects={[worker]} selectedId={null} onSelect={() => undefined} />)
+      expect(screen.getByRole('tab', { name: 'Combat Squads' })).toHaveAttribute('aria-selected', 'true')
+    })
   })
 })
