@@ -4,7 +4,7 @@ import { BEACON_SPRITE_PATH, beaconSpriteRect } from '../../lib/beaconArt'
 import { resolvedShotMarkers, resolvedSweepMarkers, type ResolvedShotMarker } from '../../lib/combatAnimation'
 import type { ShotMarker, SweepMarker } from '../../lib/combatPreview'
 import type { ExploredCell } from '../../lib/exploration'
-import { CORE_MAX_HP, coreResourceCapacity, visibleCoreShieldLimit } from '../../lib/gameRules'
+import { coreResourceCapacity, maximumHealth, visibleCoreShieldLimit } from '../../lib/gameRules'
 import { mapFeaturesAt, type MapFeatureView } from '../../lib/mapFeatures'
 import { collectEntityPositions, continueOrStartMotionAnimation, interpolatePosition, type EntityMotion, type EntityMotionAnimation } from '../../lib/movementAnimation'
 import type { MoveArrow } from '../../lib/movementPreview'
@@ -991,11 +991,6 @@ function drawCoreOwnerLabel(ctx: CanvasRenderingContext2D, x: number, y: number,
   ctx.fillStyle = controlled ? PRIMARY_BLUE_LIGHT : '#e9a0aa'
   ctx.shadowColor = 'rgba(0,0,0,.9)'; ctx.shadowBlur = 2; ctx.shadowOffsetY = 1; ctx.fillText(label, x, y)
   ctx.restore()
-}
-
-function maximumHealth(object: WorldObject) {
-  if (object.hp === undefined) return 0
-  return object.kind === 'CORE' ? CORE_MAX_HP : object.unit_type === 'VANGUARD' ? 4 : 2
 }
 
 function drawStackBadge(ctx: CanvasRenderingContext2D, x: number, y: number, cell: number, count: number, color: string) {

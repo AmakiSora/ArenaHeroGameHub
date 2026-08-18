@@ -53,9 +53,21 @@ describe('ArenaPage asset selection', () => {
     expect(map).toHaveAttribute('data-center-position', '')
     expect(map).toHaveAttribute('data-center-request', '0')
 
-    await userEvent.click(screen.getByText('Worker'))
+    // The enemy-sightings panel also shows a 'Worker' row, so target the
+    // asset-list entry by its position text.
+    await userEvent.click(screen.getByRole('button', { name: /Worker.*12, -7/ }))
 
     expect(map).toHaveAttribute('data-center-position', '[12,-7]')
+    expect(map).toHaveAttribute('data-center-request', '1')
+  })
+
+  it('centers the map on an enemy clicked in the sightings panel', async () => {
+    render(<ArenaPage demo />)
+    const map = screen.getByTestId('world-canvas')
+
+    await userEvent.click(screen.getByRole('button', { name: /Vanguard.*3, 1/ }))
+
+    expect(map).toHaveAttribute('data-center-position', '[3,1]')
     expect(map).toHaveAttribute('data-center-request', '1')
   })
 

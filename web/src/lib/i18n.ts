@@ -80,6 +80,7 @@ const resources = {
       directions: { UP: 'Up', DOWN: 'Down', LEFT: 'Left', RIGHT: 'Right' },
       units: { WORKER: 'Worker', VANGUARD: 'Vanguard', RANGER: 'Ranger', CORE: 'Core' },
       unitGroups: { CORE: 'Core', WORKER: 'Worker Group', RANGER: 'Ranger Group', VANGUARD: 'Vanguard Group' },
+      enemySightings: 'Visible enemies', jumpToEnemy: 'Jump to this enemy',
     },
     tutorial: {
       training: 'TRAINING',
@@ -190,6 +191,7 @@ const resources = {
       directions: { UP: '向上', DOWN: '向下', LEFT: '向左', RIGHT: '向右' },
       units: { WORKER: '工人', VANGUARD: '先锋', RANGER: '游侠', CORE: 'Core' },
       unitGroups: { CORE: 'Core', WORKER: '工人组', RANGER: '游侠组', VANGUARD: '先锋组' },
+      enemySightings: '可见敌人', jumpToEnemy: '跳转到该敌人位置',
     },
     tutorial: {
       training: '训练场',

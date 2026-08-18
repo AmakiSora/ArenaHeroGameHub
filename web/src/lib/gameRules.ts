@@ -1,4 +1,4 @@
-import type { PlayerState, UnitType } from './types'
+import type { PlayerState, UnitType, WorldObject } from './types'
 
 export const MAX_ENTITIES_PER_CELL = 2
 export const CORE_MAX_HP = 5
@@ -7,6 +7,11 @@ export const CORE_BEACON_MAX_SHIELD = 10
 export const CORE_RESOURCE_CAPACITY_PER_UNIT = 5
 export const CORE_RESOURCE_MINIMUM_CAPACITY = 10
 export const UNIT_BASE_COST: Record<UnitType, number> = { WORKER: 5, VANGUARD: 10, RANGER: 12 }
+
+export function maximumHealth(object: WorldObject) {
+  if (object.hp === undefined) return 0
+  return object.kind === 'CORE' ? CORE_MAX_HP : object.unit_type === 'VANGUARD' ? 4 : 2
+}
 
 export function coreResourceCapacity(population: number) {
   return Math.max(CORE_RESOURCE_MINIMUM_CAPACITY, Math.max(0, population) * CORE_RESOURCE_CAPACITY_PER_UNIT)

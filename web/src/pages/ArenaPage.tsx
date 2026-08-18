@@ -2,6 +2,7 @@ import { Crosshair, Move, Sword } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { AssetList } from '../components/game/AssetList'
+import { EnemySightings } from '../components/game/EnemySightings'
 import { GameHUD } from '../components/game/GameHUD'
 import { MapControls } from '../components/game/MapControls'
 import { PendingCommands } from '../components/game/PendingCommands'
@@ -125,6 +126,14 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     setCenterPosition(object.position)
     setCenterRequest((value) => value + 1)
   }
+  // Same jump behavior for enemy sightings: land the camera on the threat so
+  // the operator can immediately order units into combat.
+  const jumpToEnemy = (enemy: WorldObject) => {
+    select(enemy)
+    if (!enemy.position) return
+    setCenterPosition(enemy.position)
+    setCenterRequest((value) => value + 1)
+  }
   const setUnitAction = (id: string, action: UnitAction | null) => { const current = planRef.current; const unit_actions = { ...current.unit_actions }; if (action) unit_actions[id] = action; else delete unit_actions[id]; commitManualPlan({ ...current, unit_actions }) }
   const setCoreAction = (action: CoreAction | null) => { const current = planRef.current; if (action) { commitManualPlan({ ...current, core_action: action }); return } const next = { ...current }; delete next.core_action; commitManualPlan(next) }
   const unitAction = (id: string, action: UnitAction | null) => {
@@ -165,6 +174,7 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} />
     <section className="relative min-h-0 overflow-hidden">
       {!respawning && <GameHUD phase={game.phase} stateReceivedAt={game.stateReceivedAt} />}
+      {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} />}
       {!respawning && game.tick && <PendingCommands tick={game.tick} state={game.state} receipts={game.receipts} unitNames={unitNames} />}
       <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onAnchorChange={setAnchor} />
       {!respawning && <ResourceActivity events={game.state.events} />}
