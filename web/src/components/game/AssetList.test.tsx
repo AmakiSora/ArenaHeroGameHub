@@ -20,13 +20,13 @@ describe('AssetList', () => {
     expect(screen.getByText('Population')).toBeInTheDocument()
   })
 
-  it('shows a compact asset row without the object id', () => {
+  it('shows a compact asset chip whose tooltip carries position and health without leaking the object id', () => {
     const worker = { kind: 'UNIT' as const, id: 'worker-12345678', controlled: true, position: [3, -2] as [number, number], hp: 2, unit_type: 'WORKER' as const, cargo: 0 }
     render(<AssetList state={state} objects={[worker]} selectedId={null} onSelect={() => undefined} />)
 
-    const name = screen.getByText('Worker')
-    const coordinates = screen.getByText('[3, -2]')
-    expect(name.parentElement).toBe(coordinates.parentElement)
+    expect(screen.getByText('Worker')).toBeInTheDocument()
+    expect(screen.getByTitle('Worker · (3, -2) · HP 2/2')).toBeInTheDocument()
+    expect(screen.queryByText(/\[3, -2\]/)).not.toBeInTheDocument()
     expect(screen.queryByText(/worker-12/)).not.toBeInTheDocument()
   })
 
@@ -74,16 +74,16 @@ describe('AssetList', () => {
 
     const workerHeader = screen.getByRole('button', { name: /Worker Group/ })
     expect(workerHeader).toHaveAttribute('aria-expanded', 'true')
-    expect(screen.getByText('[1, 0]')).toBeInTheDocument()
+    expect(screen.getByTitle('Worker · (1, 0) · HP 2/2')).toBeInTheDocument()
 
     fireEvent.click(workerHeader)
     expect(workerHeader).toHaveAttribute('aria-expanded', 'false')
-    expect(screen.queryByText('[1, 0]')).not.toBeInTheDocument()
-    expect(screen.getByText('[2, 0]')).toBeInTheDocument()
+    expect(screen.queryByTitle('Worker · (1, 0) · HP 2/2')).not.toBeInTheDocument()
+    expect(screen.getByTitle('Ranger · (2, 0) · HP 3/2')).toBeInTheDocument()
 
     fireEvent.click(workerHeader)
     expect(workerHeader).toHaveAttribute('aria-expanded', 'true')
-    expect(screen.getByText('[1, 0]')).toBeInTheDocument()
+    expect(screen.getByTitle('Worker · (1, 0) · HP 2/2')).toBeInTheDocument()
   })
 
   describe('fleet view tabs', () => {

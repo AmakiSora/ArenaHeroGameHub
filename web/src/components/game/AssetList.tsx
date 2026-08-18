@@ -1,6 +1,7 @@
 import { ChevronDown } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { maximumHealth } from '../../lib/gameRules'
 import type { PlayerState, UnitType, WorldObject } from '../../lib/types'
 import { TEAM_KEYS, teamOfName, type TeamKey, type TeamRoster } from '../../lib/teamRoster'
 import { unitDashboardName, type UnitNameMap } from '../../lib/unitNames'
@@ -31,6 +32,16 @@ function readFleetView(): FleetView {
   return localStorage.getItem(FLEET_VIEW_KEY) === 'teams' ? 'teams' : 'groups'
 }
 
+// HP dot tone mirrors the dashboard's health readout at a glance: green when
+// untouched, amber once damaged, red below half.
+function hpTone(object: WorldObject): string {
+  const max = maximumHealth(object)
+  const ratio = max > 0 ? (object.hp ?? 0) / max : 0
+  if (ratio >= 1) return 'bg-emerald-400'
+  if (ratio >= 0.5) return 'bg-amber-400'
+  return 'bg-rose-400'
+}
+
 export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {} }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster }) {
   const { t } = useTranslation(); const controlled = useMemo(() => objects.filter((object) => object.controlled), [objects])
   const groups = useMemo(() => UNIT_GROUP_KEYS.map((key) => ({ key, members: controlled.filter((object) => groupKeyOf(object) === key) })), [controlled])
@@ -48,9 +59,21 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
   const switchView = (next: FleetView) => { setView(next); localStorage.setItem(FLEET_VIEW_KEY, next) }
   const sections = view === 'teams' ? squadGroups : groups
   const sectionLabel = (key: string) => view === 'teams' ? t(`game.squads.${key}`) : t(`game.unitGroups.${key}`)
-  const unitRow = (object: WorldObject) => { const artType = object.kind === 'CORE' ? 'CORE' : object.unit_type ?? 'WORKER'; const name = object.kind === 'CORE' ? t('game.units.CORE') : unitDashboardName(object, unitNames) ?? t(`game.units.${object.unit_type}`); return <button key={object.id} onClick={() => onSelect(object)} style={{ contentVisibility: 'auto', containIntrinsicSize: '44px' }} className={`focus-ring mb-0.5 flex min-h-11 w-full items-center gap-2 rounded-gold px-2.5 text-left transition-colors ${selectedId === object.id ? 'bg-indigo-deep/55 text-blue-soft' : 'text-zinc-400 hover:bg-white/[.04] hover:text-zinc-100'}`}>
-        <span className="grid size-7 shrink-0 place-items-center rounded-gold-sm border border-violet-cosmic/15 bg-indigo-deep/45"><UnitArtIcon type={artType} className="size-5" /></span><span className="flex min-w-0 flex-1 items-baseline gap-1.5"><span className="truncate text-xs font-medium">{name}</span><span className="shrink-0 font-mono text-[9px] text-zinc-600">[{object.position?.join(', ') ?? '—'}]</span></span><span className="shrink-0 font-mono text-[9px]">{object.hp} HP</span>
-      </button> }
+  // Compact chip: name + HP dot only, with coordinates and exact HP in the
+  // tooltip. Fifty units as full rows made the sidebar unbearably long; the
+  // chip flow fits ~three units per row.
+  const unitChip = (object: WorldObject) => {
+    const name = unitDashboardName(object, unitNames) ?? t(`game.units.${object.unit_type}`)
+    const title = `${name} · (${object.position?.join(', ') ?? '—'}) · HP ${object.hp ?? '?'}/${maximumHealth(object)}`
+    return <button key={object.id} onClick={() => onSelect(object)} title={title} aria-label={title} className={`focus-ring inline-flex min-h-6 items-center gap-1 rounded-gold-sm border px-1.5 py-0.5 font-mono text-[10px] transition-colors ${selectedId === object.id ? 'border-blue-soft/40 bg-indigo-deep/55 text-blue-soft' : 'border-white/[.06] bg-white/[.03] text-zinc-400 hover:bg-white/[.06] hover:text-zinc-100'}`}>
+      <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${hpTone(object)}`} /><span>{name}</span>
+    </button>
+  }
+  // The Core stays a full row: it is unique, carries an icon, and opens the
+  // core action dialog — a chip would hide that affordance.
+  const coreRow = (object: WorldObject) => <button key={object.id} onClick={() => onSelect(object)} style={{ contentVisibility: 'auto', containIntrinsicSize: '44px' }} className={`focus-ring mb-0.5 flex min-h-11 w-full items-center gap-2 rounded-gold px-2.5 text-left transition-colors ${selectedId === object.id ? 'bg-indigo-deep/55 text-blue-soft' : 'text-zinc-400 hover:bg-white/[.04] hover:text-zinc-100'}`}>
+    <span className="grid size-7 shrink-0 place-items-center rounded-gold-sm border border-violet-cosmic/15 bg-indigo-deep/45"><UnitArtIcon type="CORE" className="size-5" /></span><span className="flex min-w-0 flex-1 items-baseline gap-1.5"><span className="truncate text-xs font-medium">{t('game.units.CORE')}</span><span className="shrink-0 font-mono text-[9px] text-zinc-600">[{object.position?.join(', ') ?? '—'}]</span></span><span className="shrink-0 font-mono text-[9px]">{object.hp} HP</span>
+  </button>
   return <aside className="panel-strong hidden h-full min-h-0 flex-col border-y-0 border-l-0 lg:flex">
     <div className="border-b border-white/[.07]">
       <div className="px-5 py-4"><Logo /><GameStats state={state} className="mt-4" /></div>
@@ -72,7 +95,7 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
           <span className="flex min-w-0 items-center gap-1.5"><ChevronDown aria-hidden="true" size={12} className={`shrink-0 text-zinc-600 transition-transform ${collapsedSections[key] ? '-rotate-90' : ''}`} /><span className="eyebrow truncate">{sectionLabel(key)}</span></span>
           <span className="shrink-0 font-mono text-[9px] text-zinc-600">{members.length}</span>
         </button>
-        {!collapsedSections[key] && (members.length > 0 ? members.map(unitRow) : <p className="px-2.5 py-1.5 text-[10px] text-zinc-600">—</p>)}
+        {!collapsedSections[key] && (members.length > 0 ? <div className="flex flex-wrap gap-1 px-1 pb-1.5">{members.map((object) => object.kind === 'CORE' ? coreRow(object) : unitChip(object))}</div> : <p className="px-2.5 py-1.5 text-[10px] text-zinc-600">—</p>)}
       </section> })}
     </div>
   </aside>
