@@ -2484,24 +2484,6 @@ body{margin:0;min-height:100vh;color:var(--text);
 .unit-tab .count{font-size:11px}
 .unit-tab-pane{display:none}
 .unit-tab-pane.active{display:block}
-.roster-panel .roster-tabs{display:flex;gap:6px;margin-bottom:10px}
-.roster-tab{flex:1;appearance:none;font:inherit;font-size:12px;color:var(--muted);padding:6px 10px;border-radius:999px;
- background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);cursor:pointer;
- display:inline-flex;align-items:center;justify-content:center;gap:6px;transition:.12s}
-.roster-tab:hover{color:#eef3ff;border-color:rgba(255,255,255,.22)}
-.roster-tab.active{background:rgba(110,168,255,.16);border-color:rgba(110,168,255,.4);color:#cfe6ff}
-.roster-pane{display:none}
-.roster-pane.active{display:grid;gap:8px;max-height:52vh;overflow:auto;padding-right:2px}
-.roster-pane.active::-webkit-scrollbar{width:6px}
-.roster-pane.active::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:99px}
-.roster-group{display:grid;gap:5px}
-.roster-group h4{margin:0;font-size:11px;color:var(--muted);font-weight:600;letter-spacing:.45px;display:flex;align-items:center;gap:6px}
-.roster-row{display:flex;align-items:center;gap:7px;padding:5px 8px;border-radius:9px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);font-size:12px;cursor:pointer;transition:.12s}
-.roster-row:hover{border-color:rgba(110,168,255,.35);background:rgba(110,168,255,.07)}
-.roster-row.ghost{opacity:.55;cursor:default}
-.roster-name{font-weight:700;color:#eef3ff;min-width:26px}
-.roster-kind{font-size:10px;color:var(--muted)}
-.roster-facts{margin-left:auto;display:inline-flex;gap:8px;color:var(--muted);font-size:11px;font-family:Consolas,monospace}
 .kv{display:flex;justify-content:space-between;gap:8px;padding:8px 10px;border-radius:12px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.06);font-size:12px}
 .kv b{color:#eef3ff;font-weight:700}
 .kv span{color:var(--muted)}
@@ -3553,39 +3535,6 @@ JS = r"""
     }
   }
 
-  // ── Left-rail roster tabs (兵种组 / 战斗分队) ──────────────────────────
-  // The whole left column is swapped out on every soft refresh, so the tab
-  // buttons are re-bound after each update and the active tab is persisted
-  // in localStorage, mirroring the right-rail unit tabs.
-  const ROSTER_TAB_KEY = 'arenaRosterTab.v1';
-  function applyRosterTab(tab){
-    const tabs = document.querySelectorAll('.roster-tab[data-roster-tab]');
-    const panes = document.querySelectorAll('.roster-pane[data-roster-pane]');
-    for(let i = 0; i < tabs.length; i++){
-      const on = tabs[i].getAttribute('data-roster-tab') === tab;
-      tabs[i].classList.toggle('active', on);
-      tabs[i].setAttribute('aria-selected', on ? 'true' : 'false');
-    }
-    for(let i = 0; i < panes.length; i++){
-      panes[i].classList.toggle('active', panes[i].getAttribute('data-roster-pane') === tab);
-    }
-    try{ localStorage.setItem(ROSTER_TAB_KEY, tab); }catch(e){}
-  }
-  function bindRosterTabs(){
-    const tabs = document.querySelectorAll('.roster-tab[data-roster-tab]');
-    if(!tabs.length) return;
-    for(let i = 0; i < tabs.length; i++){
-      tabs[i].addEventListener('click', function(){
-        applyRosterTab(tabs[i].getAttribute('data-roster-tab'));
-      });
-    }
-    let saved = null;
-    try{ saved = localStorage.getItem(ROSTER_TAB_KEY); }catch(e){}
-    if(saved && ['groups','teams'].indexOf(saved) >= 0){
-      applyRosterTab(saved);
-    }
-  }
-
   // ── Marker FLIP animation ────────────────────────────────────────────
   // render_svg() wraps every moving marker in <g data-anim data-wx data-wy>.
   // Before swapping in the new SVG we snapshot each marker's world position,
@@ -3637,7 +3586,7 @@ JS = r"""
       lastTick = data.tick;
 
       if(data.brand) setHtml('#brandLine', data.brand);
-      if(data.leftHtml){ setHtml('#leftColumn', data.leftHtml); bindOreForm(); bindRosterTabs(); }
+      if(data.leftHtml){ setHtml('#leftColumn', data.leftHtml); bindOreForm(); }
       if(data.statusHtml) setHtml('#statusPill', data.statusHtml);
       if(data.statusClass) setClass('#statusPill', 'status-pill ' + data.statusClass);
       if(data.heroHtml) setHtml('#heroSection', data.heroHtml);
@@ -4738,7 +4687,6 @@ JS = r"""
   bindLogFilters();
   bindLogTimeFilters();
   bindUnitTabs();
-  bindRosterTabs();
   // ── per-unit 自裁 (self-destruct) buttons ─────────────────────────────
   // Cards are re-rendered on every soft refresh, so bind once on the document
   // and delegate by class.
@@ -4966,113 +4914,6 @@ def build_parts(log_limit: int = 200):
     vg_html = "".join(ucard(v, "combat") for v in vgs) or '<div class="empty">暂无先锋</div>'
     rg_html = "".join(ucard(r, "combat") for r in rgs) or '<div class="empty">暂无游侠</div>'
     combat_units = collect_combat_units(rec, load_config(CONFIG_PATH))
-
-    # ── Left-rail roster panel: 兵种组 / 战斗分队 two-tab switcher ─────
-    # The entire left column is swapped out on every soft refresh, so the
-    # active tab lives in localStorage and is re-applied client-side (see
-    # bindRosterTabs in the JS). Rows carry the same focus attributes as
-    # the right-rail cards, so clicking one jumps the map to the unit.
-    def _roster_focus(pos) -> str:
-        if isinstance(pos, (list, tuple)) and len(pos) == 2:
-            return f' data-focus-wx="{int(pos[0])}" data-focus-wy="{int(pos[1])}"'
-        return ""
-
-    def _roster_worker_row(w) -> str:
-        wid = w.get("id", "")
-        sid = short_id(wid)
-        name = w.get("name") or sid
-        act = actions.get(sid) or actions.get(wid, "")
-        cargo = w.get("cargo", 0)
-        badge = action_label(act, cargo)
-        vitals = f"矿 {cargo}" if cargo else f'HP {w.get("hp","?")}'
-        return (
-            f'<div class="roster-row" title="{html.escape(str(act or "暂无指令"))}"'
-            f'{_roster_focus(w.get("pos"))}>'
-            f'<b class="roster-name">{html.escape(str(name))}</b>'
-            f'<span class="badge {action_kind(act, cargo)}">{html.escape(str(badge))}</span>'
-            f'<span class="roster-facts"><span>{fmt_pos(w.get("pos"))}</span>'
-            f'<span>{vitals}</span></span></div>'
-        )
-
-    def _roster_combat_row(u) -> str:
-        uid = u.get("id", "")
-        sid = short_id(uid)
-        name = u.get("name") or sid
-        act = actions.get(sid) or actions.get(uid, "")
-        return (
-            f'<div class="roster-row" title="{html.escape(str(act or "暂无指令"))}"'
-            f'{_roster_focus(u.get("pos"))}>'
-            f'<b class="roster-name">{html.escape(str(name))}</b>'
-            f'<span class="badge combat">{team_label(act)}</span>'
-            f'<span class="roster-facts"><span>{fmt_pos(u.get("pos"))}</span>'
-            f'<span>HP {u.get("hp","?")}</span></span></div>'
-        )
-
-    def _roster_team_row(unit) -> str:
-        name = str(unit.get("name") or "")
-        kind_label = {"VANGUARD": "先锋", "RANGER": "游侠"}.get(
-            str(unit.get("kind") or "").upper(), "作战"
-        )
-        alive = bool(unit.get("alive"))
-        facts = (
-            f'<span>{fmt_pos(unit.get("pos"))}</span>'
-            f'<span>HP {unit.get("hp","?")}/{unit.get("max_hp","?")}</span>'
-            if alive else "<span>未出场</span>"
-        )
-        focus = _roster_focus(unit.get("pos")) if alive else ""
-        return (
-            f'<div class="roster-row{" ghost" if not alive else ""}"{focus}>'
-            f'<b class="roster-name">{html.escape(name)}</b>'
-            f'<span class="roster-kind">{kind_label}</span>'
-            f'<span class="roster-facts">{facts}</span></div>'
-        )
-
-    def _roster_group(title: str, rows: list[str]) -> str:
-        body = "".join(rows) or '<div class="muted">暂无单位</div>'
-        return (
-            f'<div class="roster-group"><h4>{html.escape(title)}'
-            f'<span class="count">{len(rows)}</span></h4>{body}</div>'
-        )
-
-    groups_pane = "".join((
-        _roster_group("工人组", [_roster_worker_row(w) for w in workers]),
-        _roster_group("游侠组", [_roster_combat_row(r) for r in rgs]),
-        _roster_group("先锋组", [_roster_combat_row(v) for v in vgs]),
-    ))
-    members_by_team: dict[str, list[dict]] = defaultdict(list)
-    for unit in combat_units:
-        members_by_team[str(unit.get("team") or "unassigned")].append(unit)
-    team_blocks = [
-        _roster_group(
-            TEAM_BOARD_META[key]["label"],
-            [_roster_team_row(u) for u in members_by_team.get(key, [])],
-        )
-        for key in ("home", "attack", "kite")
-    ]
-    # 游击队 / 待命池 only appear when they actually hold members, keeping
-    # the default view on the three primary squads.
-    team_blocks += [
-        _roster_group(
-            TEAM_BOARD_META[key]["label"],
-            [_roster_team_row(u) for u in members_by_team.get(key, [])],
-        )
-        for key in ("guerrilla", "unassigned")
-        if members_by_team.get(key)
-    ]
-    roster_html = (
-        '<section class="panel left-rail-panel roster-panel" id="leftRosterPanel">'
-        '<div class="panel-title"><span class="rail-title"><i class="rail-mark">♟</i>兵力编成</span>'
-        f'<span class="count">{len(workers) + len(vgs) + len(rgs)} 单位</span></div>'
-        '<div class="roster-tabs" role="tablist">'
-        '<button type="button" class="roster-tab active" data-roster-tab="groups" '
-        'role="tab" aria-selected="true">兵种组</button>'
-        '<button type="button" class="roster-tab" data-roster-tab="teams" '
-        'role="tab" aria-selected="false">战斗分队</button></div>'
-        f'<div class="roster-pane active" data-roster-pane="groups" role="tabpanel">{groups_pane}</div>'
-        f'<div class="roster-pane" data-roster-pane="teams" role="tabpanel">{"".join(team_blocks)}</div>'
-        '</section>'
-    )
-
     wp_workers = [w.get("name") for w in workers if w.get("name")]
     wp_vgs = [v.get("name") for v in vgs if v.get("name")]
     wp_rgs = [r.get("name") for r in rgs if r.get("name")]
@@ -5335,7 +5176,6 @@ def build_parts(log_limit: int = 200):
         f'<span class="rail-title"><i class="rail-mark">⬡</i>资源</span><span class="count">采集态势</span></div>{left_res}</section>'
         f'<section class="panel left-rail-panel battle-summary"><div class="panel-title">'
         f'<span class="rail-title"><i class="rail-mark">◎</i>战场</span><span class="count">实时兵力</span></div>{left_fight}</section>'
-        + roster_html +
         f'<section class="panel left-rail-panel issue-summary"><div class="panel-title">'
         f'<span class="rail-title"><i class="rail-mark">!</i>异常</span><span class="count">{len(issues)}</span></div>'
         f'<div class="compact-list">{left_issues}</div></section>'
