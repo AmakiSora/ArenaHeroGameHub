@@ -1159,6 +1159,32 @@ def _retreat_from(
     return best
 
 
+def _capacity_blocked_cells(
+    occupied: frozenset[tuple[int, int]],
+    enemy_cells: frozenset[tuple[int, int]],
+    cell_counts: Mapping | None,
+    core_pos: tuple[int, int] | None = None,
+) -> frozenset[tuple[int, int]]:
+    """Occupied cells that hard-block a move this tick, capacity aware.
+
+    The server stacks up to _CELL_UNIT_LIMIT units on one cell, so a cell with
+    a single friendly occupant is enterable ("squeeze") — two workers meeting
+    head-on in a narrow lane pass each other instead of WAITing forever. Enemy
+    cells, cells already at the stacking limit and the core cell (capacity is
+    Core + one unit: the single unloading chute) stay hard-blocked. Without
+    ``cell_counts`` the legacy fully-blocked view is returned.
+    """
+    if cell_counts is None:
+        return occupied
+    return frozenset(
+        cell
+        for cell in occupied
+        if cell in enemy_cells
+        or (core_pos is not None and cell == core_pos)
+        or cell_counts.get(cell, 0) >= _CELL_UNIT_LIMIT
+    )
+
+
 def _worker_cached_path_step(
     worker,
     uid: str,
@@ -1413,6 +1439,7 @@ def _plan_waypoint(
     occupied: frozenset[tuple[int, int]],
     enemies: tuple,
     core_pos: tuple[int, int],
+    cell_counts: Mapping | None = None,
 ) -> tuple[str, str]:
     """March one unit along its manual target queue; resume planning on arrival.
 
@@ -1472,7 +1499,16 @@ def _plan_waypoint(
     if target in obstacle_cells and _manhattan(pos, target) <= 1:
         return _finish("waypoint-reached-adjacent")
 
-    blocked = frozenset(obstacle_cells) | frozenset(occupied)
+    # Capacity-aware occupancy: the server stacks up to _CELL_UNIT_LIMIT units
+    # per cell, so a single friendly occupant shares its cell and marchers
+    # squeeze past instead of wedging head-on. Enemy and packed cells stay
+    # hard-blocked; without counts the legacy fully-blocked view applies.
+    blocked = frozenset(obstacle_cells) | _capacity_blocked_cells(
+        frozenset(occupied),
+        frozenset(tuple(e.position) for e in enemies),
+        cell_counts,
+        tuple(core_pos),
+    )
 
     def _count_stuck() -> bool:
         """Return True when the unit should skip the current target."""
@@ -1779,6 +1815,19 @@ def _plan_worker(
     if not carrying and _chute_in_demand and pos != core_pos:
         others = others | {core_pos}
 
+    # Movement view: the server stacks up to _CELL_UNIT_LIMIT units on one
+    # cell, so a cell with a single friendly occupant is enterable — workers
+    # meeting head-on in a narrow lane pass each other instead of both WAITing
+    # forever (observed W13/W22 wedging each other). Enemy cells, packed cells
+    # and the core cell stay hard-blocked. Queue coordination below keeps the
+    # strict ``others`` view; only actual stepping uses the squeezed set.
+    move_blocked = _capacity_blocked_cells(
+        others,
+        frozenset(tuple(e.position) for e in enemies),
+        cell_counts,
+        core_pos,
+    )
+
     # Retreat view: with per-cell counts the friendly units are judged by
     # capacity (< _CELL_UNIT_LIMIT is squeezable) and only enemy cells stay
     # hard-blocked; the core-cell mirroring above carries over so an adjacent
@@ -1822,7 +1871,7 @@ def _plan_worker(
             # includes them); union them again so a fleeing worker can never
             # step onto an enemy even if `occupied` was not passed. Block all
             # visible enemy cells (including non-combat Workers) as geometry.
-            flee_blocked = others | {tuple(e.position) for e in enemies}
+            flee_blocked = move_blocked | {tuple(e.position) for e in enemies}
             return _worker_flee(
                 worker,
                 uid,
@@ -2051,7 +2100,7 @@ def _plan_worker(
 
     # Move toward goal (BFS multi-step pathfinding, avoids dead ends)
     if config["worker_bfs_enabled"] and goal is not None and goal != pos:
-        cached_move = _worker_cached_path_step(worker, uid, pos, goal, obstacle_cells, others)
+        cached_move = _worker_cached_path_step(worker, uid, pos, goal, obstacle_cells, move_blocked)
         if cached_move is not None:
             return cached_move
 
@@ -2061,7 +2110,7 @@ def _plan_worker(
         # wall `obstacles` (cached dead-end base) + transient `extras` (occupied
         # cells), so the wall dead-end cache is not defeated per worker.
         obstacles_here = obstacle_cells
-        extras_here = others
+        extras_here = move_blocked
         if goal == core_pos:
             if goal in obstacle_cells:
                 # Rare: the Core cell itself is in the wall memory. Must exclude
@@ -2069,14 +2118,14 @@ def _plan_worker(
                 # unavoidable but rare). Set-algebra keeps the blocked set
                 # identical to the old (obstacle_cells | others) - {goal}.
                 obstacles_here = obstacle_cells - {goal}
-                extras_here = others - {goal}
-            elif goal in others:
+                extras_here = move_blocked - {goal}
+            elif goal in move_blocked:
                 # Goal (Core) occupied by a unit this tick: keep the stable wall
                 # object so dead-ends come from the cached base, and just drop
                 # the goal from the transient blockers so it stays enterable.
                 # dead((O | X) - {g}) == dead(O | (X - {g})) when g not in O,
                 # so the blocked set is byte-identical — but no new frozenset.
-                extras_here = others - {goal}
+                extras_here = move_blocked - {goal}
         path = _bfs_path(
             pos,
             goal,
@@ -2103,7 +2152,7 @@ def _plan_worker(
             # when free — or when its occupant vacates this tick, so the
             # entry chains behind the departure: "one out, one in").
             if (npos not in obstacle_cells or npos == goal) and (
-                npos not in others
+                npos not in move_blocked
                 or (npos == goal and _chute_vacating_this_tick)
             ):
                 worker.move(bfs_dir)
@@ -2122,7 +2171,7 @@ def _plan_worker(
         if pos == core_pos and not carrying:
             for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
                 npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
-                if npos in obstacle_cells or npos in others:
+                if npos in obstacle_cells or npos in move_blocked:
                     continue
                 if _is_dead_end_step(npos, obstacle_cells):
                     continue
@@ -2166,7 +2215,7 @@ def _plan_worker(
         for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
             npos = (nx, ny)
-            if npos in obstacle_cells or npos in others:
+            if npos in obstacle_cells or npos in move_blocked:
                 continue
             dist = _manhattan(npos, core.position)
             if prev and npos == prev:
@@ -2219,7 +2268,7 @@ def _plan_worker(
         rotated.sort(key=_sort_key)
         for d in rotated:
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
-            if (nx, ny) in obstacle_cells or (nx, ny) in others:
+            if (nx, ny) in obstacle_cells or (nx, ny) in move_blocked:
                 continue
             # Never explore into a recognized dead end when any open alternative exists.
             if _is_dead_end_step((nx, ny), obstacle_cells):
@@ -2250,7 +2299,7 @@ def _plan_worker(
         if direction is not None:
             nx = pos[0] + direction.delta[0]
             ny = pos[1] + direction.delta[1]
-            if (nx, ny) not in obstacle_cells and (nx, ny) not in others and not (
+            if (nx, ny) not in obstacle_cells and (nx, ny) not in move_blocked and not (
                 _is_dead_end_step((nx, ny), obstacle_cells, allow=(goal,))
             ):
                 worker.move(direction)
@@ -2271,7 +2320,7 @@ def _plan_worker(
             npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
             if npos in obstacle_cells:
                 continue
-            if npos in others:
+            if npos in move_blocked:
                 worker.move(d)
                 _worker_last_pos[uid] = pos
                 _set_worker_route(worker, npos, [tuple(pos), npos], complete=False)
@@ -6700,6 +6749,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 occupied=occupied,
                 enemies=enemies,
                 core_pos=core_pos,
+                cell_counts=friendly_cell_counts,
             )
             unit_actions_detail[uid] = f"{action}:{detail}[waypoint]"
             continue

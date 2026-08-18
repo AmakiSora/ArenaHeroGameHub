@@ -641,6 +641,178 @@ class ConfiguredPlannerTests(unittest.TestCase):
         self.assertNotEqual(worker.direction, tactic.Direction.UP)
         self.assertEqual(worker.direction, tactic.Direction.DOWN)
 
+    def test_worker_squeezes_past_single_friendly_in_narrow_lane(self) -> None:
+        # Two workers meeting head-on in a one-wide lane used to WAIT forever:
+        # each treated the other's cell as fully blocked. The server stacks up
+        # to _CELL_UNIT_LIMIT units per cell, so the planner must squeeze past
+        # a cell holding a single friendly (observed W13/W22 wedging each other).
+        class Worker:
+            id = "w-squeeze"
+            position = (0, 1)
+            cargo = 0
+            direction = None
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+        class CoreOff:
+            position = (9, 9)
+
+        worker = Worker()
+        config = default_config()
+        # Sealed one-wide corridor: the only route to (0,3) is through (0,2).
+        obstacles = frozenset({
+            (0, -1),
+            (-1, 0), (-1, 1), (-1, 2), (-1, 3),
+            (1, 0), (1, 1), (1, 2), (1, 3),
+        })
+        tactic._resource_assignments[str(worker.id)] = (0, 3)
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                CoreOff(),
+                resource_cells=frozenset({(0, 3)}),
+                obstacle_cells=obstacles,
+                depleted=set(),
+                config=config,
+                occupied=frozenset({(0, 1), (0, 2)}),
+                enemies=(),
+                cell_counts={(0, 1): 1, (0, 2): 1},
+            )
+        finally:
+            tactic._resource_assignments.clear()
+            tactic._worker_path_cache.pop(str(worker.id), None)
+            tactic._worker_stuck_pos.pop(str(worker.id), None)
+            tactic._worker_stuck_ticks.pop(str(worker.id), None)
+            tactic._worker_last_pos.pop(str(worker.id), None)
+            tactic._worker_recent.pop(str(worker.id), None)
+
+        self.assertEqual(action, "MOVE")
+        expected = tactic._direction_for_step((0, 1), (0, 2))
+        self.assertEqual(worker.direction, expected)
+        self.assertIn("(0, 3)", detail)
+
+    def test_worker_legacy_view_still_waits_behind_friendly(self) -> None:
+        # Without cell counts the planner keeps the legacy fully-blocked view
+        # (unit tests / callers that do not pass counts): the lane is sealed.
+        class Worker:
+            id = "w-squeeze-legacy"
+            position = (0, 1)
+            cargo = 0
+            direction = None
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+        class CoreOff:
+            position = (9, 9)
+
+        worker = Worker()
+        config = default_config()
+        # Sealed one-wide corridor: the only route to (0,3) is through (0,2).
+        obstacles = frozenset({
+            (0, -1),
+            (-1, 0), (-1, 1), (-1, 2), (-1, 3),
+            (1, 0), (1, 1), (1, 2), (1, 3),
+        })
+        tactic._resource_assignments[str(worker.id)] = (0, 3)
+        try:
+            action, _ = tactic._plan_worker(
+                worker,
+                CoreOff(),
+                resource_cells=frozenset({(0, 3)}),
+                obstacle_cells=obstacles,
+                depleted=set(),
+                config=config,
+                occupied=frozenset({(0, 1), (0, 2)}),
+                enemies=(),
+            )
+        finally:
+            tactic._resource_assignments.clear()
+            tactic._worker_path_cache.pop(str(worker.id), None)
+            tactic._worker_stuck_pos.pop(str(worker.id), None)
+            tactic._worker_stuck_ticks.pop(str(worker.id), None)
+            tactic._worker_last_pos.pop(str(worker.id), None)
+            tactic._worker_recent.pop(str(worker.id), None)
+
+        self.assertEqual(action, "WAIT")
+
+    def test_cargo_worker_greedy_squeezes_past_friendly(self) -> None:
+        # Greedy home-march fallback (BFS disabled): LEFT toward the core is
+        # occupied by a single friendly. Capacity-aware stepping squeezes
+        # through instead of detouring away from the core.
+        class Worker:
+            id = "w-cargo-squeeze"
+            position = (5, 0)
+            cargo = 2
+            direction = None
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+            def deposit(self) -> None:
+                self.deposited = True
+
+        class Core:
+            position = (0, 0)
+
+        worker = Worker()
+        config = default_config()
+        config["worker_bfs_enabled"] = False
+        action, _ = tactic._plan_worker(
+            worker,
+            Core(),
+            resource_cells=frozenset(),
+            obstacle_cells=frozenset(),
+            depleted=set(),
+            config=config,
+            occupied=frozenset({(5, 0), (4, 0)}),
+            enemies=(),
+            cell_counts={(5, 0): 1, (4, 0): 1},
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(worker.direction, Direction.LEFT)
+
+    def test_worker_never_squeezes_onto_enemy_or_packed_cell(self) -> None:
+        # Squeezing only applies to cells with one friendly occupant: enemy
+        # cells and cells already at the stacking limit stay hard-blocked.
+        self.assertEqual(
+            tactic._capacity_blocked_cells(
+                frozenset({(1, 0), (2, 0), (3, 0)}),
+                frozenset({(1, 0)}),
+                {(1, 0): 0, (2, 0): 1, (3, 0): tactic._CELL_UNIT_LIMIT},
+                core_pos=(9, 9),
+            ),
+            frozenset({(1, 0), (3, 0)}),
+        )
+        # Core cell keeps its stricter Core+one-unit capacity.
+        self.assertEqual(
+            tactic._capacity_blocked_cells(
+                frozenset({(0, 0)}),
+                frozenset(),
+                {(0, 0): 1},
+                core_pos=(0, 0),
+            ),
+            frozenset({(0, 0)}),
+        )
+        # No counts: legacy fully-blocked view.
+        self.assertEqual(
+            tactic._capacity_blocked_cells(
+                frozenset({(2, 0)}), frozenset(), None, core_pos=(9, 9),
+            ),
+            frozenset({(2, 0)}),
+        )
+
     def test_object_names_are_stable_and_sequential(self) -> None:
         tactic._object_names.clear()
         tactic._object_name_counters.clear()
@@ -5691,6 +5863,19 @@ class ManualWaypointTests(unittest.TestCase):
         self.assertEqual(action, "MOVE")
         self.assertEqual(unit.arg.name, "RIGHT")
         self.assertIn("waypoint", detail)
+
+    def test_march_squeezes_past_single_friendly_cell(self) -> None:
+        # A marcher must not stall behind a cell holding one friendly unit:
+        # the server stacks up to two units per cell, so it squeezes through
+        # (same head-on wedge class as the W13/W22 worker deadlock).
+        unit = self.Unit("w1", (0, 0), UnitType.WORKER)
+        action, _ = self._plan(
+            unit, "W1", (2, 0),
+            occupied=frozenset({(0, 0), (1, 0)}),
+            cell_counts={(0, 0): 1, (1, 0): 1},
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(unit.arg, Direction.RIGHT)
 
     def test_reach_clears_waypoint_only_for_that_unit(self) -> None:
         unit = self.Unit("w1", (5, 0), UnitType.WORKER)
