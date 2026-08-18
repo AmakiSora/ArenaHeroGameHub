@@ -42,19 +42,26 @@ function hpTone(object: WorldObject): string {
   return 'bg-rose-400'
 }
 
-export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {} }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster }) {
+export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {}, onAssignTeam }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster; onAssignTeam?: (name: string, team: TeamKey) => void }) {
   const { t } = useTranslation(); const controlled = useMemo(() => objects.filter((object) => object.controlled), [objects])
   const groups = useMemo(() => UNIT_GROUP_KEYS.map((key) => ({ key, members: controlled.filter((object) => groupKeyOf(object) === key) })), [controlled])
   // Squad view: only combat units have a team assignment. Membership is
   // looked up by the dashboard display name (V1/R2...) shared with the
   // tactic; unnamed or freshly spawned units land in the standby pool.
+  // All five squads stay in the list: rendering hides empty optional ones
+  // except while a chip is being dragged, when every squad becomes a
+  // drop target.
   const squadGroups = useMemo(() => {
     const combat = controlled.filter((object) => object.kind === 'UNIT' && (object.unit_type === 'RANGER' || object.unit_type === 'VANGUARD'))
     return TEAM_KEYS.map((key) => ({ key, members: combat.filter((object) => teamOfName(unitDashboardName(object, unitNames), teamRoster) === key) }))
-      .filter(({ key, members }) => ALWAYS_SHOWN_SQUADS.includes(key) || members.length > 0)
   }, [controlled, teamRoster, unitNames])
   const [view, setView] = useState<FleetView>(readFleetView)
   const [collapsedSections, setCollapsedSections] = useState<Partial<Record<string, boolean>>>({})
+  // Squad drag & drop mirrors the dashboard board: a chip is dragged by its
+  // dashboard name and dropped onto a squad section, which saves at once.
+  const [dragName, setDragName] = useState<string | null>(null)
+  const [dropTeam, setDropTeam] = useState<TeamKey | null>(null)
+  const dragging = dragName !== null
   const toggleSection = (key: string) => setCollapsedSections((current) => ({ ...current, [key]: !current[key] }))
   const switchView = (next: FleetView) => { setView(next); localStorage.setItem(FLEET_VIEW_KEY, next) }
   const sections = view === 'teams' ? squadGroups : groups
@@ -63,9 +70,13 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
   // tooltip. Fifty units as full rows made the sidebar unbearably long; the
   // chip flow fits ~three units per row.
   const unitChip = (object: WorldObject) => {
-    const name = unitDashboardName(object, unitNames) ?? t(`game.units.${object.unit_type}`)
+    const dashboardName = unitDashboardName(object, unitNames)
+    const name = dashboardName ?? t(`game.units.${object.unit_type}`)
     const title = `${name} · (${object.position?.join(', ') ?? '—'}) · HP ${object.hp ?? '?'}/${maximumHealth(object)}`
-    return <button key={object.id} onClick={() => onSelect(object)} title={title} aria-label={title} className={`focus-ring inline-flex min-h-6 items-center gap-1 rounded-gold-sm border px-1.5 py-0.5 font-mono text-[10px] transition-colors ${selectedId === object.id ? 'border-blue-soft/40 bg-indigo-deep/55 text-blue-soft' : 'border-white/[.06] bg-white/[.03] text-zinc-400 hover:bg-white/[.06] hover:text-zinc-100'}`}>
+    // Only named combat chips drag: rosters are stored by display name, and
+    // workers never join a squad.
+    const canDrag = view === 'teams' && !!dashboardName && !!onAssignTeam
+    return <button key={object.id} draggable={canDrag} onDragStart={canDrag ? (event) => { setDragName(dashboardName); if (event.dataTransfer) { event.dataTransfer.setData('text/plain', dashboardName); event.dataTransfer.effectAllowed = 'move' } } : undefined} onDragEnd={canDrag ? () => { setDragName(null); setDropTeam(null) } : undefined} onClick={() => onSelect(object)} title={title} aria-label={title} className={`focus-ring inline-flex min-h-6 items-center gap-1 rounded-gold-sm border px-1.5 py-0.5 font-mono text-[10px] transition-colors ${selectedId === object.id ? 'border-blue-soft/40 bg-indigo-deep/55 text-blue-soft' : 'border-white/[.06] bg-white/[.03] text-zinc-400 hover:bg-white/[.06] hover:text-zinc-100'} ${dragName === dashboardName ? 'opacity-40' : ''} ${canDrag ? 'cursor-grab active:cursor-grabbing' : ''}`}>
       <span aria-hidden="true" className={`size-1.5 shrink-0 rounded-full ${hpTone(object)}`} /><span>{name}</span>
     </button>
   }
@@ -90,12 +101,12 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
       </div>
     </div>
     <div className="min-h-0 flex-1 overflow-y-auto p-2">
-      {sections.map(({ key, members }) => { const alwaysShown = view === 'teams' && ALWAYS_SHOWN_SQUADS.includes(key as TeamKey); return members.length === 0 && !alwaysShown ? null : <section key={key} aria-label={sectionLabel(key)}>
+      {sections.map(({ key, members }) => { const alwaysShown = view === 'teams' && ALWAYS_SHOWN_SQUADS.includes(key as TeamKey); const droppable = view === 'teams' && !!onAssignTeam; return members.length === 0 && !alwaysShown && !dragging ? null : <section key={key} aria-label={sectionLabel(key)} onDragOver={droppable ? (event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'; setDropTeam(key as TeamKey) } : undefined} onDragLeave={droppable ? (event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropTeam(null) } : undefined} onDrop={droppable ? (event) => { event.preventDefault(); const name = event.dataTransfer?.getData('text/plain') || dragName; setDragName(null); setDropTeam(null); if (name) onAssignTeam?.(name, key as TeamKey) } : undefined} className={droppable && dropTeam === key ? 'rounded-gold outline outline-1 outline-blue-soft/60' : undefined}>
         <button type="button" onClick={() => toggleSection(key)} aria-expanded={!collapsedSections[key]} className="focus-ring mb-0.5 flex w-full items-center justify-between rounded-gold px-2.5 py-1.5 text-left transition-colors hover:bg-white/[.04]">
           <span className="flex min-w-0 items-center gap-1.5"><ChevronDown aria-hidden="true" size={12} className={`shrink-0 text-zinc-600 transition-transform ${collapsedSections[key] ? '-rotate-90' : ''}`} /><span className="eyebrow truncate">{sectionLabel(key)}</span></span>
           <span className="shrink-0 font-mono text-[9px] text-zinc-600">{members.length}</span>
         </button>
-        {!collapsedSections[key] && (members.length > 0 ? <div className="flex flex-wrap gap-1 px-1 pb-1.5">{members.map((object) => object.kind === 'CORE' ? coreRow(object) : unitChip(object))}</div> : <p className="px-2.5 py-1.5 text-[10px] text-zinc-600">—</p>)}
+        {!collapsedSections[key] && (members.length > 0 ? <div className="flex flex-wrap gap-1 px-1 pb-1.5">{members.map((object) => object.kind === 'CORE' ? coreRow(object) : unitChip(object))}</div> : <p className="px-2.5 py-1.5 text-[10px] text-zinc-600">{dragging ? t('game.squads.dropHere') : '—'}</p>)}
       </section> })}
     </div>
   </aside>

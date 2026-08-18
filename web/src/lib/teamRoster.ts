@@ -36,3 +36,48 @@ export function teamOfName(name: string | undefined, roster: TeamRoster): TeamKe
   if (!name) return 'unassigned'
   return roster[name] ?? 'unassigned'
 }
+
+// Move one unit into a squad, removing it from wherever it was before. The
+// input is not mutated; callers can roll back by keeping the old roster.
+export function moveUnitInRoster(roster: TeamRoster, name: string, team: TeamKey): TeamRoster {
+  const next: TeamRoster = {}
+  for (const [unit, current] of Object.entries(roster)) if (unit !== name) next[unit] = current
+  next[name] = team
+  return next
+}
+
+// Squad key -> tactic_config.json roster field. 'unassigned' has no field:
+// dropping a unit there simply removes the name from every roster string.
+const ROSTER_FIELDS: Array<[Exclude<TeamKey, 'unassigned'>, string]> = [
+  ['home', 'home_team'],
+  ['attack', 'attack_team'],
+  ['kite', 'kite_team'],
+  ['guerrilla', 'guerrilla_team'],
+]
+
+export function rosterPayload(roster: TeamRoster): Record<string, string> {
+  const payload: Record<string, string> = {}
+  for (const [team, field] of ROSTER_FIELDS) {
+    payload[field] = Object.entries(roster).filter(([, value]) => value === team).map(([unit]) => unit).join(',')
+  }
+  return payload
+}
+
+// Persist a dragged assignment. POST only the roster fields: /api/teams
+// merges partial updates, so combat settings (radii, modes...) stay
+// untouched. The tactic engine picks the change up on the next tick.
+export async function saveTeamRoster(roster: TeamRoster): Promise<boolean> {
+  try {
+    const response = await fetch('/api/teams', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(rosterPayload(roster)),
+    })
+    if (!response.ok) return false
+    const data = await response.json() as { ok?: boolean }
+    return data?.ok === true
+  } catch {
+    return false
+  }
+}

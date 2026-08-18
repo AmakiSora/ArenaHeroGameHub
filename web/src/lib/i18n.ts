@@ -81,7 +81,7 @@ const resources = {
       units: { WORKER: 'Worker', VANGUARD: 'Vanguard', RANGER: 'Ranger', CORE: 'Core' },
       unitGroups: { CORE: 'Core', WORKER: 'Worker Group', RANGER: 'Ranger Group', VANGUARD: 'Vanguard Group' },
       fleetTabs: { label: 'Fleet view', groups: 'Unit Groups', teams: 'Combat Squads' },
-      squads: { home: 'Home Squad', attack: 'Attack Squad', kite: 'Kite Squad', guerrilla: 'Guerrilla Squad', unassigned: 'Standby Pool' },
+      squads: { home: 'Home Squad', attack: 'Attack Squad', kite: 'Kite Squad', guerrilla: 'Guerrilla Squad', unassigned: 'Standby Pool', dropHere: 'Drop here' },
       enemySightings: 'Visible enemies', jumpToEnemy: 'Jump to this enemy',
     },
     tutorial: {
@@ -194,7 +194,7 @@ const resources = {
       units: { WORKER: '工人', VANGUARD: '先锋', RANGER: '游侠', CORE: 'Core' },
       unitGroups: { CORE: 'Core', WORKER: '工人组', RANGER: '游侠组', VANGUARD: '先锋组' },
       fleetTabs: { label: '编队视图', groups: '兵种组', teams: '战斗分队' },
-      squads: { home: '守家队', attack: '进攻队', kite: '风筝队', guerrilla: '游击队', unassigned: '待命池' },
+      squads: { home: '守家队', attack: '进攻队', kite: '风筝队', guerrilla: '游击队', unassigned: '待命池', dropHere: '拖到这里' },
       enemySightings: '可见敌人', jumpToEnemy: '跳转到该敌人位置',
     },
     tutorial: {

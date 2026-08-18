@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import '../../lib/i18n'
+import type { TeamKey } from '../../lib/teamRoster'
 import { AssetList } from './AssetList'
 
 const state = { status: 'ACTIVE' as const, resources: 28, population: 6, champion_beacon: { position: [0, 0] as [number, number] }, objects: [], events: [] }
@@ -128,6 +129,43 @@ describe('AssetList', () => {
 
       render(<AssetList state={state} objects={[worker]} selectedId={null} onSelect={() => undefined} />)
       expect(screen.getByRole('tab', { name: 'Combat Squads' })).toHaveAttribute('aria-selected', 'true')
+    })
+
+    const dragStart = (element: HTMLElement) => fireEvent.dragStart(element, { dataTransfer: { setData: vi.fn(), effectAllowed: '' } })
+
+    it('drags a named chip onto another squad and reports the assignment at once', () => {
+      const assignments: Array<[string, TeamKey]> = []
+      render(<AssetList state={state} objects={[vanguard, ranger, worker]} selectedId={null} onSelect={() => undefined} unitNames={names} teamRoster={{ V1: 'home', R1: 'kite' }} onAssignTeam={(name, team) => assignments.push([name, team])} />)
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      const chip = screen.getByText('V1').closest('button')!
+      expect(chip).toHaveAttribute('draggable', 'true')
+      dragStart(chip)
+      fireEvent.dragOver(screen.getByRole('region', { name: 'Attack Squad' }), { dataTransfer: { dropEffect: '' } })
+      fireEvent.drop(screen.getByRole('region', { name: 'Attack Squad' }), { dataTransfer: { getData: () => 'V1' } })
+      expect(assignments).toEqual([['V1', 'attack']])
+    })
+
+    it('reveals empty squads as drop targets while a chip is being dragged', () => {
+      render(<AssetList state={state} objects={[vanguard, ranger]} selectedId={null} onSelect={() => undefined} unitNames={names} teamRoster={{ V1: 'home', R1: 'attack' }} onAssignTeam={() => undefined} />)
+
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      expect(screen.queryByRole('region', { name: 'Standby Pool' })).not.toBeInTheDocument()
+      const chip = screen.getByText('V1').closest('button')!
+      dragStart(chip)
+      expect(screen.getByRole('region', { name: 'Standby Pool' })).toHaveTextContent('Drop here')
+      fireEvent.dragEnd(chip)
+      expect(screen.queryByRole('region', { name: 'Standby Pool' })).not.toBeInTheDocument()
+    })
+
+    it('does not drag in the unit-groups view or without an assignment handler', () => {
+      render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={names} teamRoster={{ V1: 'home' }} />)
+
+      // Groups view: chips never drag even when named.
+      expect(screen.getByText('V1').closest('button')).not.toHaveAttribute('draggable', 'true')
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      // Squads view without an onAssignTeam handler (e.g. demo) stays read-only.
+      expect(screen.getByText('V1').closest('button')).not.toHaveAttribute('draggable', 'true')
     })
   })
 })
