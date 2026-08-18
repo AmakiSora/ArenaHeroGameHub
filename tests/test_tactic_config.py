@@ -253,6 +253,18 @@ class TacticConfigTests(unittest.TestCase):
         for n in (1, 2, 3):
             self.assertIn(f'<option value="{n}"', teams)
         self.assertNotIn('type="number" min="1" max="3"', teams)
+        # 左侧栏兵力编成面板：兵种组 / 战斗分队两个 tab，战斗分队按
+        # 守家队 / 进攻队 / 风筝队分组展示。
+        self.assertIn('id="leftRosterPanel"', page)
+        roster = page[page.index('id="leftRosterPanel"'):]
+        self.assertIn('data-roster-tab="groups"', roster)
+        self.assertIn('data-roster-tab="teams"', roster)
+        self.assertIn('data-roster-pane="groups"', roster)
+        self.assertIn('data-roster-pane="teams"', roster)
+        for group_name in ("工人组", "游侠组", "先锋组", "守家队", "进攻队", "风筝队"):
+            self.assertIn(group_name, roster)
+        self.assertIn("bindRosterTabs", page)
+        self.assertIn("arenaRosterTab.v1", page)
         self.assertIn("resAddToggle", page)
         self.assertIn("resAddForm", page)
         self.assertIn("chip-x", page)
