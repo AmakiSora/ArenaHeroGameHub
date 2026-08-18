@@ -79,6 +79,7 @@ const resources = {
       actions: { MOVE: 'Move', HARVEST: 'Harvest', DEPOSIT: 'Deposit', SWEEP: 'Sweep', SHOOT: 'Shoot', PICKUP_BEACON: 'Pick up Beacon', DROP_BEACON: 'Drop Beacon', SELF_DESTRUCT: 'Self-destruct', HEAL: 'Heal HP', WAIT: 'Wait', SPAWN: 'Spawn', REPAIR_SHIELD: 'Repair shield', START_MOVE: 'Move Core', CANCEL_MOVE: 'Cancel migration' },
       directions: { UP: 'Up', DOWN: 'Down', LEFT: 'Left', RIGHT: 'Right' },
       units: { WORKER: 'Worker', VANGUARD: 'Vanguard', RANGER: 'Ranger', CORE: 'Core' },
+      unitGroups: { CORE: 'Core', WORKER: 'Worker Group', RANGER: 'Ranger Group', VANGUARD: 'Vanguard Group' },
     },
     tutorial: {
       training: 'TRAINING',
@@ -188,6 +189,7 @@ const resources = {
       actions: { MOVE: '移动', HARVEST: '采集', DEPOSIT: '交付', SWEEP: '横扫', SHOOT: '射击', PICKUP_BEACON: '拾取信标', DROP_BEACON: '放下信标', SELF_DESTRUCT: '自毁', HEAL: '恢复 HP', WAIT: '原地待命', SPAWN: '生产', REPAIR_SHIELD: '修复护盾', START_MOVE: '迁移 Core', CANCEL_MOVE: '取消迁移' },
       directions: { UP: '向上', DOWN: '向下', LEFT: '向左', RIGHT: '向右' },
       units: { WORKER: '工人', VANGUARD: '先锋', RANGER: '游侠', CORE: 'Core' },
+      unitGroups: { CORE: 'Core', WORKER: '工人组', RANGER: '游侠组', VANGUARD: '先锋组' },
     },
     tutorial: {
       training: '训练场',
