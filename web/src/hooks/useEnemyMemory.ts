@@ -5,8 +5,8 @@ import { loadEnemyMemory, type EnemySighting } from '../lib/enemyMemory'
 // tick so a confirmed kill or re-scout retires its stale marker promptly.
 // Demo mode ships a fixed pair of markers so the feature stays visible.
 const DEMO_SIGHTINGS: EnemySighting[] = [
-  { position: [8, 4], type: 'VANGUARD' },
-  { position: [-6, 9], type: 'CORE' },
+  { position: [8, 4], type: 'VANGUARD', tick: 10570 },
+  { position: [-6, 9], type: 'CORE', tick: 10581 },
 ]
 
 export function useEnemyMemory(tick: number | null, enabled = true): EnemySighting[] {

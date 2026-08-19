@@ -40,9 +40,9 @@ vi.mock('../hooks/useUnitNames', () => ({ useUnitNames: () => ({}) }))
 const memory = vi.hoisted(() => ({
   // [3, 1] overlaps a live enemy and must be filtered out by the page.
   sightings: [
-    { position: [8, 4] as [number, number], type: 'VANGUARD' as const },
-    { position: [3, 1] as [number, number], type: 'CORE' as const },
-    { position: [-6, 9] as [number, number], type: 'ENEMY' as const },
+    { position: [8, 4] as [number, number], type: 'VANGUARD' as const, tick: 900 },
+    { position: [3, 1] as [number, number], type: 'CORE' as const, tick: 905 },
+    { position: [-6, 9] as [number, number], type: 'ENEMY' as const, tick: 910 },
   ],
 }))
 vi.mock('../hooks/useEnemyMemory', () => ({ useEnemyMemory: () => memory.sightings }))
@@ -128,8 +128,8 @@ describe('ArenaPage remembered enemies', () => {
 
     // [3, 1] collides with the live Vanguard, so only two markers survive.
     expect(map).toHaveAttribute('data-memory', JSON.stringify([
-      { position: [8, 4], type: 'VANGUARD' },
-      { position: [-6, 9], type: 'ENEMY' },
+      { position: [8, 4], type: 'VANGUARD', tick: 900 },
+      { position: [-6, 9], type: 'ENEMY', tick: 910 },
     ]))
     expect(screen.getByRole('button', { name: 'Vanguard [8, 4] · Last known position' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Enemy [-6, 9] · Last known position' })).toBeInTheDocument()
@@ -154,5 +154,32 @@ describe('ArenaPage remembered enemies', () => {
     await user.click(screen.getByRole('button', { name: 'Show remembered enemies' }))
     expect(map.getAttribute('data-memory')).not.toBe('[]')
     expect(localStorage.getItem('arena-hero.enemy-memory-visible.player')).toBe('true')
+  })
+
+  it('filters memory markers by unit type and remembers the filter set', async () => {
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+    const map = screen.getByTestId('world-canvas')
+    const vanguardFilter = screen.getByRole('button', { name: 'Vanguard memory filter' })
+    expect(vanguardFilter).toHaveAttribute('aria-pressed', 'true')
+
+    await user.click(vanguardFilter)
+    expect(map).toHaveAttribute('data-memory', JSON.stringify([
+      { position: [-6, 9], type: 'ENEMY', tick: 910 },
+    ]))
+    expect(screen.queryByRole('button', { name: 'Vanguard [8, 4] · Last known position' })).not.toBeInTheDocument()
+    expect(vanguardFilter).toHaveAttribute('aria-pressed', 'false')
+    expect(localStorage.getItem('arena-hero.enemy-memory-filters.player')).toBe(JSON.stringify(['WORKER', 'RANGER', 'CORE']))
+
+    // Unknown (ENEMY) markers ignore the per-type filters.
+    await user.click(screen.getByRole('button', { name: 'Worker memory filter' }))
+    await user.click(screen.getByRole('button', { name: 'Ranger memory filter' }))
+    await user.click(screen.getByRole('button', { name: 'Core memory filter' }))
+    expect(map).toHaveAttribute('data-memory', JSON.stringify([
+      { position: [-6, 9], type: 'ENEMY', tick: 910 },
+    ]))
+
+    await user.click(vanguardFilter)
+    expect(map.getAttribute('data-memory')).toContain('[8,4]')
   })
 })

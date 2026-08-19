@@ -4834,6 +4834,9 @@ _enemy_memory: set[tuple[int, int]] = set()
 # Kept in lockstep with _enemy_memory so an out-of-vision CORE can be told apart
 # from a worker scout on the dashboard.
 _enemy_memory_types: dict[tuple[int, int], str] = {}
+# Last-seen tick per sighted position, kept in lockstep with _enemy_memory so
+# the arena page can show only the most recently observed sightings.
+_enemy_memory_ticks: dict[tuple[int, int], int] = {}
 # Consecutive visible positions keyed by full enemy UUID. This is intentionally
 # in-memory only; reconnects must rebuild confidence from fresh observations.
 _enemy_motion_tracks: dict[str, list[tuple[int, tuple[int, int]]]] = {}
@@ -4964,14 +4967,16 @@ def _coords_from_payload(raw) -> set[tuple[int, int]]:
     return out
 
 
-def _enemy_sightings_from_payload(raw) -> tuple[set[tuple[int, int]], dict[tuple[int, int], str]]:
-    """Parse enemy-sighting payloads into (positions, type-per-position).
+def _enemy_sightings_from_payload(raw) -> tuple[set[tuple[int, int]], dict[tuple[int, int], str], dict[tuple[int, int], int]]:
+    """Parse enemy-sighting payloads into (positions, types, last-seen ticks).
 
-    Supports the legacy ``[x, y]`` form and the typed ``[x, y, "CORE"]`` form;
-    unknown types default to "ENEMY".
+    Supports the legacy ``[x, y]`` form, the typed ``[x, y, "CORE"]`` form and
+    the timestamped ``[x, y, "CORE", tick]`` form; unknown types default to
+    "ENEMY" and missing ticks to 0 (oldest).
     """
     positions: set[tuple[int, int]] = set()
     types: dict[tuple[int, int], str] = {}
+    ticks: dict[tuple[int, int], int] = {}
     for item in raw or []:
         if not isinstance(item, (list, tuple)) or len(item) < 2:
             continue
@@ -4979,13 +4984,18 @@ def _enemy_sightings_from_payload(raw) -> tuple[set[tuple[int, int]], dict[tuple
         positions.add(pos)
         if len(item) >= 3 and item[2]:
             types[pos] = str(item[2]).upper()
-    return positions, types
+        if len(item) >= 4:
+            try:
+                ticks[pos] = int(item[3])
+            except (TypeError, ValueError):
+                pass
+    return positions, types, ticks
 
 
 def _load_map_memory() -> None:
     """Load permanent obstacle/resource/enemy memory from disk."""
     global _resource_memory, _obstacle_memory, _enemy_memory, _enemy_memory_types, \
-        _enemy_clear_seq, _last_dashboard_map_sig, _known_obstacles
+        _enemy_memory_ticks, _enemy_clear_seq, _last_dashboard_map_sig, _known_obstacles
     if not MAP_MEMORY_PATH.exists():
         return
     try:
@@ -4997,7 +5007,7 @@ def _load_map_memory() -> None:
         _resource_memory = (resources | manual) - forgotten
         _resource_tombstones.clear()
         _resource_tombstones.update(forgotten)
-        _enemy_memory, _enemy_memory_types = _enemy_sightings_from_payload(
+        _enemy_memory, _enemy_memory_types, _enemy_memory_ticks = _enemy_sightings_from_payload(
             data.get("enemy_sightings")
         )
         _enemy_clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
@@ -5060,8 +5070,8 @@ def _apply_dashboard_map_edits() -> None:
     live re-discovery after a clear is not immediately re-forgotten from a
     stale on-disk forget list.
     """
-    global _resource_memory, _enemy_memory, _enemy_memory_types, _enemy_clear_seq, \
-        _map_dirty, _last_dashboard_map_sig
+    global _resource_memory, _enemy_memory, _enemy_memory_types, _enemy_memory_ticks, \
+        _enemy_clear_seq, _map_dirty, _last_dashboard_map_sig
     if not MAP_MEMORY_PATH.exists():
         return
     file_sig = _file_signature(MAP_MEMORY_PATH)
@@ -5112,7 +5122,7 @@ def _apply_dashboard_map_edits() -> None:
     clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
     if clear_seq > _enemy_clear_seq:
         _enemy_clear_seq = clear_seq
-        disk_positions, disk_types = _enemy_sightings_from_payload(
+        disk_positions, disk_types, disk_ticks = _enemy_sightings_from_payload(
             data.get("enemy_sightings")
         )
         if _enemy_memory != disk_positions:
@@ -5120,6 +5130,8 @@ def _apply_dashboard_map_edits() -> None:
             _enemy_memory.update(disk_positions)
             _enemy_memory_types.clear()
             _enemy_memory_types.update(disk_types)
+            _enemy_memory_ticks.clear()
+            _enemy_memory_ticks.update(disk_ticks)
             _map_dirty = True
 
 
@@ -5189,7 +5201,12 @@ def _save_map_memory(
         "manual_resources": sorted([list(p) for p in manual]),
         "forgotten_resources": sorted([list(p) for p in forgotten]),
         "enemy_sightings": sorted(
-            [list(pos) + [_enemy_memory_types.get(pos) or "ENEMY"] for pos in _enemy_memory]
+            [
+                list(pos)
+                + [_enemy_memory_types.get(pos) or "ENEMY"]
+                + [_enemy_memory_ticks.get(pos, 0)]
+                for pos in _enemy_memory
+            ]
         ),
         "obstacle_count": len(_obstacle_memory),
         "resource_count": len(resources),
@@ -5528,7 +5545,7 @@ def _update_enemy_sightings(turn) -> None:
     only when a friendly unit can genuinely see the cell (within its own vision
     radius, with unobstructed line of sight) and no enemy is there.  A sighting
     no friendly can actually see is kept as last-known enemy info."""
-    global _enemy_memory, _enemy_memory_types, _map_dirty
+    global _enemy_memory, _enemy_memory_types, _enemy_memory_ticks, _map_dirty
     before = len(_enemy_memory)
 
     # Vision radius differs by object type (rules): Core 5 / Worker 3 /
@@ -5566,6 +5583,12 @@ def _update_enemy_sightings(turn) -> None:
             _enemy_memory_types.get(pos)
         ):
             _enemy_memory_types[pos] = new_type
+        # Refresh the last-seen tick so consumers can rank sightings by
+        # recency (the arena page only shows the most recent ones).
+        seen_tick = int(getattr(turn, "tick", 0) or 0)
+        if _enemy_memory_ticks.get(pos) != seen_tick:
+            _enemy_memory_ticks[pos] = seen_tick
+            _map_dirty = True
 
     # Remove stale sightings: some friendly unit can actually see the cell
     # (within its own vision radius, line of sight unobstructed) but no enemy
@@ -5587,6 +5610,7 @@ def _update_enemy_sightings(turn) -> None:
         _enemy_memory -= stale
         for pos in stale:
             _enemy_memory_types.pop(pos, None)
+            _enemy_memory_ticks.pop(pos, None)
 
     if len(_enemy_memory) != before:
         _map_dirty = True

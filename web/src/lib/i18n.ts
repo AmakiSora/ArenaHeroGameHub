@@ -115,7 +115,7 @@ const resources = {
         exploreWhenFull: 'Explore when full', exploreWhenFullHint: 'Explore instead of returning with full gold',
       },
       enemySightings: 'Visible enemies', jumpToEnemy: 'Jump to this enemy',
-      showEnemyMemory: 'Show remembered enemies', hideEnemyMemory: 'Hide remembered enemies', memoryEnemy: 'Last known position',
+      showEnemyMemory: 'Show remembered enemies', hideEnemyMemory: 'Hide remembered enemies', memoryEnemy: 'Last known position', enemyMemoryFilter: '{{type}} memory filter',
     },
     tutorial: {
       training: 'TRAINING',
@@ -261,7 +261,7 @@ const resources = {
         exploreWhenFull: '金币满后探索', exploreWhenFullHint: '满载后继续探索而非回城',
       },
       enemySightings: '可见敌人', jumpToEnemy: '跳转到该敌人位置',
-      showEnemyMemory: '显示记忆敌人', hideEnemyMemory: '隐藏记忆敌人', memoryEnemy: '最后已知位置',
+      showEnemyMemory: '显示记忆敌人', hideEnemyMemory: '隐藏记忆敌人', memoryEnemy: '最后已知位置', enemyMemoryFilter: '筛选记忆敌人·{{type}}',
     },
     tutorial: {
       training: '训练场',

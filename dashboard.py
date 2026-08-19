@@ -626,21 +626,30 @@ def _enemy_type_color(etype: str) -> str:
     return _ENEMY_TYPE_STYLE.get(str(etype or "").upper(), ("#ff6464", "敌"))[0]
 
 
-def _parse_enemy_sighting(item) -> tuple[tuple[int, int], str] | None:
-    """Normalize one enemy-sighting entry to ((x, y), type).
+def _parse_enemy_sighting(item) -> tuple[tuple[int, int], str, int] | None:
+    """Normalize one enemy-sighting entry to ((x, y), type, last-seen tick).
 
-    Accepts the raw on-disk forms ``[x, y]`` and ``[x, y, "CORE"]`` as well as
-    the parsed ``{"pos": ..., "type": ...}`` dicts returned by load_map_memory.
-    Unknown/legacy entries default to type "ENEMY".
+    Accepts the raw on-disk forms ``[x, y]``, ``[x, y, "CORE"]`` and
+    ``[x, y, "CORE", tick]`` as well as the parsed dicts returned by
+    load_map_memory. Unknown/legacy entries default to type "ENEMY" and
+    missing ticks to 0 (oldest).
     """
     if isinstance(item, dict):
         pos = item.get("pos")
         if not pos or len(pos) != 2:
             return None
-        return (int(pos[0]), int(pos[1])), str(item.get("type") or "ENEMY").upper()
+        try:
+            tick = int(item.get("tick") or 0)
+        except (TypeError, ValueError):
+            tick = 0
+        return (int(pos[0]), int(pos[1])), str(item.get("type") or "ENEMY").upper(), tick
     if isinstance(item, (list, tuple)) and len(item) >= 2:
         etype = str(item[2]).upper() if len(item) >= 3 and item[2] else "ENEMY"
-        return (int(item[0]), int(item[1])), etype
+        try:
+            tick = int(item[3]) if len(item) >= 4 else 0
+        except (TypeError, ValueError):
+            tick = 0
+        return (int(item[0]), int(item[1])), etype, tick
     return None
 
 
@@ -681,7 +690,8 @@ def load_map_memory():
         "manual_resources": sorted(manual),
         "forgotten_resources": sorted(forgotten),
         "enemy_sightings": [
-            {"pos": pos, "type": etype} for pos, etype in enemy_sightings
+            {"pos": pos, "type": etype, "tick": tick}
+            for pos, etype, tick in enemy_sightings
         ],
         "obstacle_count": d.get("obstacle_count", len(d.get("obstacles", []) or [])),
         "resource_count": len(all_res),
@@ -5958,6 +5968,8 @@ class Handler(BaseHTTPRequestHandler):
             # map_memory.json — the same data this dashboard draws as its
             # enemy-trace layer. Enemies currently visible in the latest
             # tick are skipped so the arena page never duplicates markers.
+            # Ranked by last-seen tick and capped at 20 so the overlay stays
+            # readable on long games with hundreds of stored sightings.
             memory = load_map_memory()
             history = read_history(1)
             rec = history[0] if history else {}
@@ -5966,12 +5978,18 @@ class Handler(BaseHTTPRequestHandler):
                 pos = enemy.get("pos") or []
                 if len(pos) == 2:
                     visible.add((int(pos[0]), int(pos[1])))
-            sightings = []
-            for item in memory.get("enemy_sightings", []) or []:
-                parsed = _parse_enemy_sighting(item)
-                if parsed is None or parsed[0] in visible:
-                    continue
-                sightings.append({"pos": list(parsed[0]), "type": parsed[1]})
+            parsed = [
+                s for s in (
+                    _parse_enemy_sighting(item)
+                    for item in memory.get("enemy_sightings", []) or []
+                )
+                if s is not None and s[0] not in visible
+            ]
+            parsed.sort(key=lambda s: s[2], reverse=True)
+            sightings = [
+                {"pos": list(pos), "type": etype, "tick": tick}
+                for pos, etype, tick in parsed[:20]
+            ]
             self._send_json(200, {"ok": True, "sightings": sightings})
             return
         if path == "/api/unit-names":

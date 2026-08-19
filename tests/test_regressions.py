@@ -6401,7 +6401,7 @@ class EnemySightingsMemoryTests(unittest.TestCase):
         return SimpleNamespace(position=pos)
 
     @staticmethod
-    def _turn(*, core=None, workers=(), vanguards=(), rangers=(), visible=(), obstacles=()):
+    def _turn(*, core=None, workers=(), vanguards=(), rangers=(), visible=(), obstacles=(), tick=0):
         return SimpleNamespace(
             core=core,
             workers=tuple(workers),
@@ -6409,15 +6409,18 @@ class EnemySightingsMemoryTests(unittest.TestCase):
             rangers=tuple(rangers),
             visible_enemies=tuple(visible),
             obstacle_cells=frozenset(obstacles),
+            tick=tick,
         )
 
     def setUp(self) -> None:
         self._enemies_backup = set(tactic._enemy_memory)
         self._enemy_types_backup = dict(tactic._enemy_memory_types)
+        self._enemy_ticks_backup = dict(tactic._enemy_memory_ticks)
         self._obstacles_backup = set(tactic._obstacle_memory)
         self._dirty_backup = tactic._map_dirty
         tactic._enemy_memory.clear()
         tactic._enemy_memory_types.clear()
+        tactic._enemy_memory_ticks.clear()
         tactic._obstacle_memory.clear()
 
     def tearDown(self) -> None:
@@ -6425,6 +6428,8 @@ class EnemySightingsMemoryTests(unittest.TestCase):
         tactic._enemy_memory.update(self._enemies_backup)
         tactic._enemy_memory_types.clear()
         tactic._enemy_memory_types.update(self._enemy_types_backup)
+        tactic._enemy_memory_ticks.clear()
+        tactic._enemy_memory_ticks.update(self._enemy_ticks_backup)
         tactic._obstacle_memory.clear()
         tactic._obstacle_memory.update(self._obstacles_backup)
         tactic._map_dirty = self._dirty_backup
@@ -6436,6 +6441,41 @@ class EnemySightingsMemoryTests(unittest.TestCase):
         turn = self._turn(workers=[self._unit((1, 0))])
         tactic._update_enemy_sightings(turn)
         self.assertIn((5, 0), tactic._enemy_memory)
+
+    def test_visible_enemy_records_last_seen_tick(self) -> None:
+        # The arena page ranks memory markers by recency, so every sighting
+        # must carry the tick it was last observed at.
+        turn = self._turn(visible=[self._unit((2, 3))], tick=77)
+        tactic._update_enemy_sightings(turn)
+        self.assertEqual(tactic._enemy_memory_ticks.get((2, 3)), 77)
+        self.assertTrue(tactic._map_dirty)
+
+        # Re-sighting refreshes the tick; a confirmed-empty sighting drops it.
+        tactic._update_enemy_sightings(self._turn(visible=[self._unit((2, 3))], tick=81))
+        self.assertEqual(tactic._enemy_memory_ticks.get((2, 3)), 81)
+        tactic._update_enemy_sightings(self._turn(rangers=[self._unit((2, 3))], tick=85))
+        self.assertNotIn((2, 3), tactic._enemy_memory)
+        self.assertNotIn((2, 3), tactic._enemy_memory_ticks)
+
+    def test_sightings_payload_round_trip_keeps_ticks(self) -> None:
+        positions, types, ticks = tactic._enemy_sightings_from_payload(
+            [[1, 2, "CORE", 9], [3, 4], [5, 6, "RANGER"]]
+        )
+        self.assertEqual(positions, {(1, 2), (3, 4), (5, 6)})
+        self.assertEqual(types, {(1, 2): "CORE", (5, 6): "RANGER"})
+        self.assertEqual(ticks, {(1, 2): 9})
+
+    def test_dashboard_parse_enemy_sighting_extracts_tick(self) -> None:
+        self.assertEqual(
+            dashboard._parse_enemy_sighting([1, 2, "CORE", 55]),
+            ((1, 2), "CORE", 55),
+        )
+        # Legacy entries without a timestamp rank as oldest.
+        self.assertEqual(dashboard._parse_enemy_sighting([3, 4]), ((3, 4), "ENEMY", 0))
+        self.assertEqual(
+            dashboard._parse_enemy_sighting({"pos": [5, 6], "type": "WORKER", "tick": 12}),
+            ((5, 6), "WORKER", 12),
+        )
 
     def test_ranger_within_own_radius_confirms_empty_and_clears(self) -> None:
         # Ranger vision is 5; standing 5 away with clear sight confirms the
@@ -6512,15 +6552,21 @@ class EnemySightingsMemoryTests(unittest.TestCase):
                 tactic._enemy_memory_types.clear()
                 tactic._enemy_memory.update({(7, 2), (3, 3)})
                 tactic._enemy_memory_types[(7, 2)] = "CORE"
+                tactic._enemy_memory_ticks[(7, 2)] = 41
                 tactic._map_dirty = True
                 tactic._save_map_memory(force=True)
                 saved = json.loads(path.read_text(encoding="utf-8"))
-                self.assertEqual(sorted(saved["enemy_sightings"]), [[3, 3, "ENEMY"], [7, 2, "CORE"]])
+                self.assertEqual(
+                    sorted(saved["enemy_sightings"]),
+                    [[3, 3, "ENEMY", 0], [7, 2, "CORE", 41]],
+                )
 
                 tactic._enemy_memory.clear()
                 tactic._enemy_memory_types.clear()
+                tactic._enemy_memory_ticks.clear()
                 tactic._load_map_memory()
                 self.assertEqual(tactic._enemy_memory_types.get((7, 2)), "CORE")
+                self.assertEqual(tactic._enemy_memory_ticks.get((7, 2)), 41)
                 self.assertIn((3, 3), tactic._enemy_memory)
 
     def test_stale_removal_also_drops_recorded_type(self) -> None:

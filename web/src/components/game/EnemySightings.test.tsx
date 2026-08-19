@@ -54,8 +54,8 @@ describe('EnemySightings', () => {
   it('appends remembered enemies after visible ones with dimmed dashed chips', () => {
     const visibleEnemy: WorldObject = { kind: 'UNIT', id: 'near', controlled: false, position: [3, 1], hp: 4, unit_type: 'VANGUARD' }
     const sightings: EnemySighting[] = [
-      { position: [6, 2], type: 'RANGER' },
-      { position: [-4, -4], type: 'ENEMY' },
+      { position: [6, 2], type: 'RANGER', tick: 12 },
+      { position: [-4, -4], type: 'ENEMY', tick: 9 },
     ]
     const onJumpTo = vi.fn()
 
@@ -76,7 +76,7 @@ describe('EnemySightings', () => {
   })
 
   it('renders memory-only sightings even when no live enemy is visible', () => {
-    const sightings: EnemySighting[] = [{ position: [2, 2], type: 'CORE' }]
+    const sightings: EnemySighting[] = [{ position: [2, 2], type: 'CORE', tick: 3 }]
 
     render(<EnemySightings state={stateWith([ownCore])} onJump={() => undefined} sightings={sightings} onJumpTo={() => undefined} />)
 

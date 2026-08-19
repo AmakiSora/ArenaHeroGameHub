@@ -9,6 +9,9 @@ export type EnemySightingType = 'WORKER' | 'VANGUARD' | 'RANGER' | 'CORE' | 'ENE
 export interface EnemySighting {
   position: Position
   type: EnemySightingType
+  // Last tick an enemy was actually seen here; the server already ranks and
+  // caps the list by recency, this is kept for display/debugging only.
+  tick: number
 }
 
 const KNOWN_TYPES: ReadonlySet<string> = new Set(['WORKER', 'VANGUARD', 'RANGER', 'CORE'])
@@ -17,13 +20,14 @@ export async function loadEnemyMemory(): Promise<EnemySighting[]> {
   try {
     const response = await fetch('/api/enemy-memory', { credentials: 'same-origin' })
     if (!response.ok) return []
-    const data = await response.json() as { ok?: boolean; sightings?: Array<{ pos?: number[]; type?: string }> }
+    const data = await response.json() as { ok?: boolean; sightings?: Array<{ pos?: number[]; type?: string; tick?: number }> }
     if (data?.ok !== true || !Array.isArray(data.sightings)) return []
     return data.sightings.flatMap((item) => {
       if (!item || !Array.isArray(item.pos) || item.pos.length !== 2) return []
       const rawType = String(item.type ?? '').toUpperCase()
       const type = (KNOWN_TYPES.has(rawType) ? rawType : 'ENEMY') as EnemySightingType
-      return [{ position: [item.pos[0], item.pos[1]] as Position, type }]
+      const tick = Number(item.tick)
+      return [{ position: [item.pos[0], item.pos[1]] as Position, type, tick: Number.isFinite(tick) ? tick : 0 }]
     })
   } catch {
     return []
