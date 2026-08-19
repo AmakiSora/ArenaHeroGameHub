@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { loadTeamRoster, moveUnitInRoster, saveTeamRoster, saveTeamSettings, type TeamKey, type TeamRoster } from '../lib/teamRoster'
-import type { TeamConfig } from '../lib/teamSettings'
+import { loadTeamRoster, moveUnitInRoster, saveStrategyConfig, saveTeamRoster, saveTeamSettings, type TeamKey, type TeamRoster } from '../lib/teamRoster'
+import { TEAM_SETTING_FIELDS, type TeamConfig } from '../lib/teamSettings'
 
 // Combat-squad rosters (守家/进攻/风筝/游击) and squad settings come from the
 // tactic dashboard's /api/teams endpoint; refresh on every new tick so roster
@@ -28,15 +28,17 @@ export function useUnitTeams(tick: number | null, enabled = true) {
     setRoster(next)
     void saveTeamRoster(next).then((ok) => { if (!ok) setRoster(current) })
   }, [enabled])
-  // Squad setting change: same optimistic pattern — apply locally, POST the
-  // single field, roll back on failure. The server validates ranges and
+  // Setting change: same optimistic pattern — apply locally, POST the single
+  // field, roll back on failure. Squad (combat) fields go to /api/teams;
+  // worker strategy fields go to /api/config. The server validates ranges and
   // answers 400 on invalid input, which maps to a rollback here.
   const updateConfig = useCallback((field: string, value: number | boolean | string) => {
     const current = configRef.current
     if (!enabled || current[field] === value) return
     const next = { ...current, [field]: value }
     setConfig(next)
-    void saveTeamSettings({ [field]: value }).then((ok) => { if (!ok) setConfig(current) })
+    const save = TEAM_SETTING_FIELDS.has(field) ? saveTeamSettings : saveStrategyConfig
+    void save({ [field]: value }).then((ok) => { if (!ok) setConfig(current) })
   }, [enabled])
   return { roster, config, assignTeam, updateConfig }
 }

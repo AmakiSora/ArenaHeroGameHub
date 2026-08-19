@@ -86,6 +86,24 @@ export async function saveTeamSettings(patch: TeamConfig): Promise<boolean> {
   return postTeams(patch)
 }
 
+// Worker strategy (and other non-combat fields) lives in the strategy
+// config, saved through /api/config with the same partial-merge semantics.
+export async function saveStrategyConfig(patch: TeamConfig): Promise<boolean> {
+  try {
+    const response = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(patch),
+    })
+    if (!response.ok) return false
+    const data = await response.json() as { ok?: boolean }
+    return data?.ok === true
+  } catch {
+    return false
+  }
+}
+
 async function postTeams(payload: Record<string, unknown>): Promise<boolean> {
   try {
     const response = await fetch('/api/teams', {

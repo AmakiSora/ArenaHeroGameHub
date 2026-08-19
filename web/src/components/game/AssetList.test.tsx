@@ -184,7 +184,7 @@ describe('AssetList', () => {
       const updates: Array<[string, number | boolean | string]> = []
       openSquadsTab({ teamConfig: baseConfig, onUpdateConfig: (field, value) => updates.push([field, value]) })
 
-      fireEvent.click(screen.getByRole('button', { name: 'Squad settings · Home Squad' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Home Squad' }))
       expect(screen.getByText('Home Strategy')).toBeInTheDocument()
       const input = screen.getByDisplayValue('5')
       fireEvent.change(input, { target: { value: '8' } })
@@ -198,7 +198,7 @@ describe('AssetList', () => {
       const updates: Array<[string, number | boolean | string]> = []
       openSquadsTab({ teamConfig: baseConfig, onUpdateConfig: (field, value) => updates.push([field, value]) })
 
-      fireEvent.click(screen.getByRole('button', { name: 'Squad settings · Attack Squad' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Attack Squad' }))
       fireEvent.change(screen.getByDisplayValue('2'), { target: { value: '3' } })
       fireEvent.click(screen.getByRole('checkbox'))
       expect(updates).toEqual([['ranger_attack_range', 3], ['ranger_lead_fire_enabled', true]])
@@ -207,7 +207,7 @@ describe('AssetList', () => {
     it('hides mode-gated parameters exactly like the dashboard form', () => {
       openSquadsTab({ teamConfig: { ...baseConfig, attack_mode: 'auto' }, onUpdateConfig: () => undefined })
 
-      fireEvent.click(screen.getByRole('button', { name: 'Squad settings · Attack Squad' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Attack Squad' }))
       // auto mode: search range visible, coordinate inputs hidden.
       expect(screen.getByText('Search range')).toBeInTheDocument()
       expect(screen.queryByText('Target X')).not.toBeInTheDocument()
@@ -218,7 +218,7 @@ describe('AssetList', () => {
       const updates: Array<[string, number | boolean | string]> = []
       openSquadsTab({ teamConfig: baseConfig, onUpdateConfig: (field, value) => updates.push([field, value]) })
 
-      fireEvent.click(screen.getByRole('button', { name: 'Squad settings · Attack Squad' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Attack Squad' }))
       fireEvent.click(screen.getByRole('radio', { name: 'Champion beacon' }))
       expect(updates).toEqual([['attack_mode', 'beacon']])
     })
@@ -226,7 +226,42 @@ describe('AssetList', () => {
     it('shows no gear for the standby pool and none without an update handler', () => {
       render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{}} teamConfig={baseConfig} />)
       fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
-      expect(screen.queryByRole('button', { name: /Squad settings/ })).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: /Settings ·/ })).not.toBeInTheDocument()
+    })
+  })
+
+  describe('worker strategy settings', () => {
+    afterEach(() => localStorage.clear())
+
+    const worker = { kind: 'UNIT' as const, id: 'w1cccccc-0000', controlled: true, position: [3, 0] as [number, number], hp: 2, unit_type: 'WORKER' as const, cargo: 0 }
+    const workerConfig = { worker_bfs_enabled: true, bfs_max_steps: 2500, avoid_backtracking: true, backtrack_penalty: 10, enemy_threat_radius: 3, worker_mine_max_distance: 0, worker_explore_when_full: false }
+
+    it('opens the worker strategy panel from the groups view and commits switches at once', () => {
+      const updates: Array<[string, number | boolean | string]> = []
+      render(<AssetList state={state} objects={[worker]} selectedId={null} onSelect={() => undefined} teamConfig={workerConfig} onUpdateConfig={(field, value) => updates.push([field, value])} />)
+
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Worker Group' }))
+      expect(screen.getByText('Worker Strategy')).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('checkbox', { name: /Explore when full/ }))
+      expect(updates).toEqual([['worker_explore_when_full', true]])
+    })
+
+    it('commits worker number fields on blur with the dashboard ranges', () => {
+      const updates: Array<[string, number | boolean | string]> = []
+      render(<AssetList state={state} objects={[worker]} selectedId={null} onSelect={() => undefined} teamConfig={workerConfig} onUpdateConfig={(field, value) => updates.push([field, value])} />)
+
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Worker Group' }))
+      const input = screen.getByDisplayValue('3')
+      fireEvent.change(input, { target: { value: '99' } })
+      expect(updates).toEqual([])
+      fireEvent.blur(input)
+      // Clamped to the evasion-radius maximum (0–10).
+      expect(updates).toEqual([['enemy_threat_radius', 10]])
+    })
+
+    it('shows no worker gear without an update handler', () => {
+      render(<AssetList state={state} objects={[worker]} selectedId={null} onSelect={() => undefined} teamConfig={workerConfig} />)
+      expect(screen.queryByRole('button', { name: /Settings ·/ })).not.toBeInTheDocument()
     })
   })
 })

@@ -6,7 +6,7 @@ export type TeamConfig = Record<string, number | boolean | string>
 export type ModeValue = 'coords' | 'auto' | 'beacon'
 
 export type TeamSettingField =
-  | { kind: 'number'; field: string; labelKey: string; hintKey?: string; min: number; max: number; modes?: ModeValue[] }
+  | { kind: 'number'; field: string; labelKey: string; hintKey?: string; min: number; max: number; step?: number; modes?: ModeValue[] }
   | { kind: 'mode'; field: string }
   | { kind: 'select'; field: string; labelKey: string; hintKey?: string; options: number[] }
   | { kind: 'switch'; field: string; labelKey: string; hintKey?: string }
@@ -74,6 +74,36 @@ export const TEAM_SETTINGS: Partial<Record<string, SquadSettingsSpec>> = {
     ],
   },
 }
+
+// Worker strategy mirrors the dashboard's 工人与寻路 config group; it is
+// saved via /api/config (strategy config), unlike squad fields which go to
+// /api/teams.
+export const WORKER_SETTINGS: SquadSettingsSpec = {
+  titleKey: 'workerTitle',
+  subtitleKey: 'workerSubtitle',
+  fields: [
+    { kind: 'switch', field: 'worker_bfs_enabled', labelKey: 'bfsEnabled', hintKey: 'bfsEnabledHint' },
+    { kind: 'number', field: 'bfs_max_steps', labelKey: 'bfsMaxSteps', hintKey: 'bfsMaxStepsHint', min: 50, max: 8000, step: 50 },
+    { kind: 'switch', field: 'avoid_backtracking', labelKey: 'avoidBacktracking', hintKey: 'avoidBacktrackingHint' },
+    { kind: 'number', field: 'backtrack_penalty', labelKey: 'backtrackPenalty', hintKey: 'backtrackPenaltyHint', min: 0, max: 100 },
+    { kind: 'number', field: 'enemy_threat_radius', labelKey: 'enemyThreatRadius', hintKey: 'enemyThreatRadiusHint', min: 0, max: 10 },
+    { kind: 'number', field: 'worker_mine_max_distance', labelKey: 'mineMaxDistance', hintKey: 'mineMaxDistanceHint', min: 0, max: 200 },
+    { kind: 'switch', field: 'worker_explore_when_full', labelKey: 'exploreWhenFull', hintKey: 'exploreWhenFullHint' },
+  ],
+}
+
+// Settings panel lookup for both sidebar views: squad keys (teams view) and
+// the WORKER unit-group key (groups view). Everything else has no panel.
+export function settingsSpecFor(key: string): SquadSettingsSpec | undefined {
+  if (key === 'WORKER') return WORKER_SETTINGS
+  return TEAM_SETTINGS[key]
+}
+
+// Every field owned by the squad panels; they save through /api/teams while
+// all other fields (worker strategy) go to /api/config.
+export const TEAM_SETTING_FIELDS: ReadonlySet<string> = new Set(
+  Object.values(TEAM_SETTINGS).flatMap((spec) => (spec ? spec.fields.map((field) => field.field) : [])),
+)
 
 const MODE_OPTIONS: ModeValue[] = ['coords', 'auto', 'beacon']
 
