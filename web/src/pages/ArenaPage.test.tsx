@@ -37,13 +37,23 @@ const teams = vi.hoisted(() => ({
 }))
 vi.mock('../hooks/useUnitTeams', () => ({ useUnitTeams: () => ({ roster: {}, config: teams.config, assignTeam: vi.fn(), updateConfig: teams.updateConfig }) }))
 vi.mock('../hooks/useUnitNames', () => ({ useUnitNames: () => ({}) }))
+const memory = vi.hoisted(() => ({
+  // [3, 1] overlaps a live enemy and must be filtered out by the page.
+  sightings: [
+    { position: [8, 4] as [number, number], type: 'VANGUARD' as const },
+    { position: [3, 1] as [number, number], type: 'CORE' as const },
+    { position: [-6, 9] as [number, number], type: 'ENEMY' as const },
+  ],
+}))
+vi.mock('../hooks/useEnemyMemory', () => ({ useEnemyMemory: () => memory.sightings }))
 vi.mock('../components/game/WorldCanvas', () => ({
-  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
+  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, memoryEnemies = [], onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; memoryEnemies?: Array<{ position: [number, number]; type: string }>; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
     useEffect(() => { onAnchorChange(selectedId ? { x: 100, y: 100, side: 'right' } : null) }, [onAnchorChange, selectedId])
     return <div
         data-testid="world-canvas"
         data-center-position={centerPosition ? JSON.stringify(centerPosition) : ''}
         data-center-request={centerRequest}
+        data-memory={JSON.stringify(memoryEnemies)}
       >
         {attackPositions.some(([x, y]) => x === 3 && y === 0) && <button type="button" onClick={() => onAttackPosition?.([3, 0])}>Attack predicted cell</button>}
         {coordPicking && <button type="button" onClick={() => onCoordPick?.([7, -3])}>Pick map cell</button>}
@@ -52,7 +62,7 @@ vi.mock('../components/game/WorldCanvas', () => ({
 }))
 
 describe('ArenaPage asset selection', () => {
-  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset() })
+  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear() })
 
   it('centers the map on a Unit selected from the asset list', async () => {
     render(<ArenaPage demo />)
@@ -105,5 +115,44 @@ describe('ArenaPage asset selection', () => {
     expect(teams.updateConfig).toHaveBeenNthCalledWith(1, 'attack_target_x', 7)
     expect(teams.updateConfig).toHaveBeenNthCalledWith(2, 'attack_target_y', -3)
     expect(screen.queryByText('Click the map to choose the target coordinates')).not.toBeInTheDocument()
+  })
+})
+
+describe('ArenaPage remembered enemies', () => {
+  beforeEach(() => localStorage.clear())
+
+  it('shows memory markers on the map and dimmed chips, skipping cells a live enemy occupies', async () => {
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+    const map = screen.getByTestId('world-canvas')
+
+    // [3, 1] collides with the live Vanguard, so only two markers survive.
+    expect(map).toHaveAttribute('data-memory', JSON.stringify([
+      { position: [8, 4], type: 'VANGUARD' },
+      { position: [-6, 9], type: 'ENEMY' },
+    ]))
+    expect(screen.getByRole('button', { name: 'Vanguard [8, 4] · Last known position' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Enemy [-6, 9] · Last known position' })).toBeInTheDocument()
+
+    // Clicking a memory chip centers the camera on the remembered position.
+    await user.click(screen.getByRole('button', { name: 'Vanguard [8, 4] · Last known position' }))
+    expect(map).toHaveAttribute('data-center-position', '[8,4]')
+    expect(map).toHaveAttribute('data-center-request', '1')
+  })
+
+  it('toggles memory markers from the bottom-left control and remembers the choice', async () => {
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+    const map = screen.getByTestId('world-canvas')
+
+    await user.click(screen.getByRole('button', { name: 'Hide remembered enemies' }))
+    expect(map).toHaveAttribute('data-memory', '[]')
+    expect(screen.queryByRole('button', { name: /Last known position/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Show remembered enemies' })).toHaveAttribute('aria-pressed', 'false')
+    expect(localStorage.getItem('arena-hero.enemy-memory-visible.player')).toBe('false')
+
+    await user.click(screen.getByRole('button', { name: 'Show remembered enemies' }))
+    expect(map.getAttribute('data-memory')).not.toBe('[]')
+    expect(localStorage.getItem('arena-hero.enemy-memory-visible.player')).toBe('true')
   })
 })

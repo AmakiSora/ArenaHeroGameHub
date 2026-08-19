@@ -5953,6 +5953,27 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/waypoints":
             self._send_json(200, {"ok": True, "waypoints": load_waypoints()})
             return
+        if path == "/api/enemy-memory":
+            # Remembered enemies (last-known positions) from the shared
+            # map_memory.json — the same data this dashboard draws as its
+            # enemy-trace layer. Enemies currently visible in the latest
+            # tick are skipped so the arena page never duplicates markers.
+            memory = load_map_memory()
+            history = read_history(1)
+            rec = history[0] if history else {}
+            visible = set()
+            for enemy in rec.get("enemies", []) or []:
+                pos = enemy.get("pos") or []
+                if len(pos) == 2:
+                    visible.add((int(pos[0]), int(pos[1])))
+            sightings = []
+            for item in memory.get("enemy_sightings", []) or []:
+                parsed = _parse_enemy_sighting(item)
+                if parsed is None or parsed[0] in visible:
+                    continue
+                sightings.append({"pos": list(parsed[0]), "type": parsed[1]})
+            self._send_json(200, {"ok": True, "sightings": sightings})
+            return
         if path == "/api/unit-names":
             # Tactic display names (W1/V2/R3) keyed by short unit id, so the
             # arena SPA labels units exactly like this dashboard does.

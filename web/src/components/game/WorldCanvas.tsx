@@ -3,6 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { BEACON_SPRITE_PATH, beaconSpriteRect } from '../../lib/beaconArt'
 import { resolvedShotMarkers, resolvedSweepMarkers, type ResolvedShotMarker } from '../../lib/combatAnimation'
 import type { ShotMarker, SweepMarker } from '../../lib/combatPreview'
+import type { EnemySighting } from '../../lib/enemyMemory'
 import type { ExploredCell } from '../../lib/exploration'
 import { coreResourceCapacity, maximumHealth, visibleCoreShieldLimit } from '../../lib/gameRules'
 import { mapFeaturesAt, type MapFeatureView } from '../../lib/mapFeatures'
@@ -18,6 +19,7 @@ import { canvasPixelRatio, MAX_WORLD_CELL_SIZE, MIN_WORLD_CELL_SIZE, prioritizeS
 import { BeaconDirectionIndicator } from './BeaconDirectionIndicator'
 import { MapFeatureInfo } from './MapFeatureInfo'
 import type { MapAnchor } from './UnitActionDialog'
+import { UnitArtIcon } from './UnitArtIcon'
 
 interface Props {
   state: PlayerState
@@ -45,6 +47,9 @@ interface Props {
   coordPicking?: boolean
   onCoordPick?: (position: Position) => void
   highlightPositions?: Position[]
+  // Last-known enemy positions from the tactic's map memory; drawn as dim
+  // dashed markers (they may have moved), unlike live visible units.
+  memoryEnemies?: EnemySighting[]
   preferredSelectionId?: string
 }
 
@@ -89,7 +94,7 @@ interface TerrainTileCache {
 const unitSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedUnitSprite>>()
 const beaconSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedBeaconSprite>>()
 
-export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], preferredSelectionId }: Props) {
+export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], memoryEnemies = [], preferredSelectionId }: Props) {
   const backgroundCanvasRef = useRef<HTMLCanvasElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -372,6 +377,20 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
         className="tutorial-map-highlight pointer-events-none absolute z-10 rounded-gold"
         style={{ left: point.left, top: point.top, width: diameter, height: diameter, transform: 'translate(-50%, -50%)' }}
       />
+    })}
+    {memoryEnemies.map((sighting) => {
+      const point = worldToScreen(sighting.position)
+      const diameter = Math.max(24, camera.cell * .7)
+      return <span
+        key={`memory:${positionKey(sighting.position)}`}
+        aria-hidden="true"
+        className="pointer-events-none absolute z-10 grid place-items-center rounded-full border border-dashed border-coral-hostile/45 bg-coral-hostile/[.08]"
+        style={{ left: point.left, top: point.top, width: diameter, height: diameter, transform: 'translate(-50%, -50%)' }}
+      >
+        {sighting.type === 'ENEMY'
+          ? <span className="size-[26%] rounded-full bg-coral-hostile/55" />
+          : <UnitArtIcon type={sighting.type} className="h-[68%] w-[68%] opacity-55 grayscale-[.35]" />}
+      </span>
     })}
     {visibleShotMarkers.map((marker) => {
       const from = worldToScreen(marker.from), to = worldToScreen(marker.to), dx = to.left - from.left, dy = to.top - from.top, length = Math.hypot(dx, dy)

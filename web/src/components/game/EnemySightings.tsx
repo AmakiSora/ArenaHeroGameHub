@@ -1,13 +1,15 @@
 import { useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
+import type { EnemySighting } from '../../lib/enemyMemory'
 import { maximumHealth } from '../../lib/gameRules'
-import type { PlayerState, WorldObject } from '../../lib/types'
+import type { PlayerState, Position, WorldObject } from '../../lib/types'
 import { UnitArtIcon } from './UnitArtIcon'
 
 // Compact top-left map overlay: one horizontal chip per visible enemy showing
-// only its sprite and a segmented HP bar. Clicking a chip jumps the camera
-// to that enemy so the operator can order units into combat.
-export function EnemySightings({ state, onJump }: { state: PlayerState; onJump: (enemy: WorldObject) => void }) {
+// only its sprite and a segmented HP bar, followed by dimmed last-known
+// (remembered) enemies from the tactic's map memory. Clicking any chip jumps
+// the camera there so the operator can order units into combat.
+export function EnemySightings({ state, onJump, sightings = [], onJumpTo }: { state: PlayerState; onJump: (enemy: WorldObject) => void; sightings?: EnemySighting[]; onJumpTo?: (position: Position) => void }) {
   const { t } = useTranslation()
   const enemies = useMemo(() => {
     const home = state.objects.find((object) => object.kind === 'CORE' && object.controlled)?.position
@@ -19,7 +21,7 @@ export function EnemySightings({ state, onJump }: { state: PlayerState; onJump: 
       .filter((object) => object.controlled === false && (object.kind === 'UNIT' || object.kind === 'CORE') && object.position)
       .sort((left, right) => distance(left) - distance(right))
   }, [state.objects])
-  if (!enemies.length) return null
+  if (!enemies.length && !sightings.length) return null
 
   return <section aria-label={t('game.enemySightings')} className="absolute left-3 top-16 z-20 flex max-w-[min(20rem,calc(100%-1.5rem))] flex-wrap gap-1 lg:top-5">
     {enemies.map((enemy) => {
@@ -39,6 +41,24 @@ export function EnemySightings({ state, onJump }: { state: PlayerState; onJump: 
         {maxHp > 0 && <span aria-hidden="true" className="absolute inset-x-1 bottom-1 flex gap-px">
           {Array.from({ length: maxHp }, (_, index) => <i key={index} className={`h-[3px] flex-1 rounded-full ${index < hp ? 'bg-coral-hostile' : 'bg-white/15'}`} />)}
         </span>}
+      </button>
+    })}
+    {/* Remembered enemies: dashed frame + dimmed sprite mark them as
+        last-known positions (they may have moved); no HP bar since the
+        memory carries no health information. */}
+    {sightings.map((sighting) => {
+      const name = sighting.type === 'ENEMY' ? t('game.units.ENEMY') : t(`game.units.${sighting.type}`)
+      return <button
+        key={`memory:${sighting.position.join(',')}`}
+        type="button"
+        onClick={() => onJumpTo?.(sighting.position)}
+        aria-label={`${name} [${sighting.position.join(', ')}] · ${t('game.memoryEnemy')}`}
+        title={t('game.jumpToEnemy')}
+        className="focus-ring relative grid size-10 shrink-0 place-items-center rounded-gold-sm border border-dashed border-coral-hostile/30 bg-space-900/60 opacity-70 shadow-lg shadow-black/20 backdrop-blur transition-colors hover:border-coral-hostile/50 hover:opacity-100"
+      >
+        {sighting.type === 'ENEMY'
+          ? <span aria-hidden="true" className="size-3 rounded-full border border-coral-hostile/60 bg-coral-hostile/25" />
+          : <UnitArtIcon type={sighting.type} className="size-6 opacity-60 grayscale-[.35]" />}
       </button>
     })}
   </section>

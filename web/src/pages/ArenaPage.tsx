@@ -11,6 +11,7 @@ import { RespawnOverlay } from '../components/game/RespawnOverlay'
 import { WorldCanvas } from '../components/game/WorldCanvas'
 import { UnitActionDialog, type MapAnchor } from '../components/game/UnitActionDialog'
 import { useGameStream } from '../hooks/useGameStream'
+import { useEnemyMemory } from '../hooks/useEnemyMemory'
 import { useUnitNames } from '../hooks/useUnitNames'
 import { useUnitTeams } from '../hooks/useUnitTeams'
 import { useAuth } from '../context/AuthContext'
@@ -33,6 +34,9 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   // the sidebar's squads tab mirrors the dashboard's team board, with
   // drag-and-drop reassignment saved straight back to it.
   const { roster: teamRoster, config: teamConfig, assignTeam, updateConfig } = useUnitTeams(game.tick, !demo)
+  // Remembered enemies (last-known positions) from the tactic bot's map
+  // memory — the same 敌人踪迹 layer the dashboard map draws.
+  const enemyMemory = useEnemyMemory(game.tick, !demo)
   const submitGamePlan = game.submit
   const movementStorageKey = `arena-hero.movement-goals.${demo ? 'demo' : user?.username ?? 'anonymous'}`
   const [selectedId, setSelectedId] = useState<string | null>(null); const [targetMode, setTargetMode] = useState<'SHOOT' | 'SWEEP' | null>(null); const [moveSelecting, setMoveSelecting] = useState(false)
@@ -43,8 +47,10 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   const [anchor, setAnchor] = useState<MapAnchor | null>(null)
   const destroyerStorageKey = `arena-hero.core-destroyer.${demo ? 'demo' : user?.username ?? 'anonymous'}`
   const selfDestructStorageKey = `arena-hero.core-self-destructed.${demo ? 'demo' : user?.username ?? 'anonymous'}`
+  const enemyMemoryStorageKey = `arena-hero.enemy-memory-visible.${demo ? 'demo' : user?.username ?? 'anonymous'}`
   const [coreDestroyer, setCoreDestroyer] = useState<string | null>(() => sessionStorage.getItem(destroyerStorageKey))
   const [coreSelfDestructed, setCoreSelfDestructed] = useState(() => sessionStorage.getItem(selfDestructStorageKey) === 'true')
+  const [enemyMemoryVisible, setEnemyMemoryVisible] = useState(() => localStorage.getItem(enemyMemoryStorageKey) !== 'false')
   const [centerRequest, setCenterRequest] = useState(0); const [zoomRequest, setZoomRequest] = useState(0)
   const [centerPosition, setCenterPosition] = useState<Position | null>(null)
   const [plan, setPlan] = useState<CommandPlan>({ tick: game.tick ?? 0, unit_actions: {} })
@@ -142,6 +148,23 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     setCenterPosition(enemy.position)
     setCenterRequest((value) => value + 1)
   }
+  // Remembered enemies have no live object to select; just center the camera.
+  const jumpToMemoryEnemy = (position: Position) => {
+    setCenterPosition(position)
+    setCenterRequest((value) => value + 1)
+  }
+  const toggleEnemyMemory = () => setEnemyMemoryVisible((visible) => {
+    const next = !visible
+    localStorage.setItem(enemyMemoryStorageKey, String(next))
+    return next
+  })
+  // Memory markers skip cells where a live enemy now stands, so a re-spotted
+  // threat never shows twice (dim marker under the bright unit sprite).
+  const memoryEnemies = useMemo(() => {
+    if (!enemyMemoryVisible) return []
+    const live = new Set((game.state?.objects ?? []).filter((object) => object.controlled === false && object.position).map((object) => positionKey(object.position!)))
+    return enemyMemory.filter((sighting) => !live.has(positionKey(sighting.position)))
+  }, [enemyMemory, enemyMemoryVisible, game.state])
   const setUnitAction = (id: string, action: UnitAction | null) => { const current = planRef.current; const unit_actions = { ...current.unit_actions }; if (action) unit_actions[id] = action; else delete unit_actions[id]; commitManualPlan({ ...current, unit_actions }) }
   const setCoreAction = (action: CoreAction | null) => { const current = planRef.current; if (action) { commitManualPlan({ ...current, core_action: action }); return } const next = { ...current }; delete next.core_action; commitManualPlan(next) }
   const unitAction = (id: string, action: UnitAction | null) => {
@@ -198,16 +221,16 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} teamRoster={teamRoster} onAssignTeam={demo ? undefined : assignTeam} teamConfig={teamConfig} onUpdateConfig={demo ? undefined : updateConfig} onPickCoords={demo ? undefined : startCoordPick} pickingCoordsField={coordPick?.xField ?? null} />
     <section className="relative min-h-0 overflow-hidden">
       {!respawning && <GameHUD phase={game.phase} stateReceivedAt={game.stateReceivedAt} />}
-      {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} />}
+      {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} sightings={memoryEnemies} onJumpTo={jumpToMemoryEnemy} />}
       {!respawning && game.tick && <PendingCommands tick={game.tick} state={game.state} receipts={game.receipts} unitNames={unitNames} />}
-      <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onAnchorChange={setAnchor} coordPicking={coordPick !== null} onCoordPick={completeCoordPick} highlightPositions={coordPickHighlight} />
+      <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onAnchorChange={setAnchor} coordPicking={coordPick !== null} onCoordPick={completeCoordPick} highlightPositions={coordPickHighlight} memoryEnemies={memoryEnemies} />
       {!respawning && <ResourceActivity events={game.state.events} />}
       {respawning && <RespawnOverlay destroyedBy={coreDestroyer} selfDestructed={coreSelfDestructed} />}
       {!respawning && selected?.controlled && anchor && actionAvailability && !targetMode && !moveSelecting && <UnitActionDialog anchor={anchor} selected={selected} plan={plan} movementGoal={selected.id ? movementGoals[selected.id] : undefined} unitNames={unitNames} phase={game.phase} resources={game.state.resources} population={game.state.population} availability={actionAvailability} onClose={() => select(null)} onTargeting={() => { setMoveSelecting(false); setTargetMode('SHOOT') }} onSweepTargeting={() => { setMoveSelecting(false); setTargetMode('SWEEP') }} onMoveTargeting={() => { setTargetMode(null); setMovementError(null); setMoveSelecting(true) }} onCancelMovementGoal={() => cancelMovementGoal(selected)} onUnitAction={unitAction} onCoreAction={coreAction} />}
       {targetMode && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-coral-hostile">{targetMode === 'SWEEP' ? <Sword size={15} /> : <Crosshair size={15} />}<span>{t(targetMode === 'SWEEP' ? 'game.sweepHint' : 'game.targetHint')}</span><button onClick={() => setTargetMode(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {moveSelecting && <div className={`panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs ${movementError ? 'text-coral-hostile' : 'text-cyan-signal'}`}><Move size={15} /><span>{t(movementError === 'UNKNOWN_DESTINATION' ? 'game.routeUnknown' : movementError ? 'game.routeBlocked' : 'game.moveHint')}</span><button onClick={() => { setMoveSelecting(false); setMovementError(null) }} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {coordPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.coordPickHint')}</span><button onClick={() => setCoordPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
-      {!respawning && <MapControls onCenter={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} onZoom={(direction) => setZoomRequest((value) => direction * (Math.abs(value) + 1))} />}
+      {!respawning && <MapControls onCenter={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} onZoom={(direction) => setZoomRequest((value) => direction * (Math.abs(value) + 1))} memoryVisible={enemyMemoryVisible} onToggleMemory={toggleEnemyMemory} />}
       {game.error && <div role="alert" className="panel absolute bottom-4 right-4 z-30 max-w-[min(24rem,calc(100%-2rem))] px-4 py-3 text-xs leading-5 text-coral-hostile">{describeError(game.error)}</div>}
     </section>
   </div>

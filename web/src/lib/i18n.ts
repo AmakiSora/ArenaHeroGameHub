@@ -78,7 +78,7 @@ const resources = {
       emptyPlan: 'No manual overrides. Agent orders remain active.', connected: 'Live', disconnected: 'Disconnected',
       actions: { MOVE: 'Move', HARVEST: 'Harvest', DEPOSIT: 'Deposit', SWEEP: 'Sweep', SHOOT: 'Shoot', PICKUP_BEACON: 'Pick up Beacon', DROP_BEACON: 'Drop Beacon', SELF_DESTRUCT: 'Self-destruct', HEAL: 'Heal HP', WAIT: 'Wait', SPAWN: 'Spawn', REPAIR_SHIELD: 'Repair shield', START_MOVE: 'Move Core', CANCEL_MOVE: 'Cancel migration' },
       directions: { UP: 'Up', DOWN: 'Down', LEFT: 'Left', RIGHT: 'Right' },
-      units: { WORKER: 'Worker', VANGUARD: 'Vanguard', RANGER: 'Ranger', CORE: 'Core' },
+      units: { WORKER: 'Worker', VANGUARD: 'Vanguard', RANGER: 'Ranger', CORE: 'Core', ENEMY: 'Enemy' },
       unitGroups: { CORE: 'Core', WORKER: 'Worker Group', RANGER: 'Ranger Group', VANGUARD: 'Vanguard Group' },
       fleetTabs: { label: 'Fleet view', groups: 'Unit Groups', teams: 'Combat Squads' },
       squads: { home: 'Home Squad', attack: 'Attack Squad', kite: 'Kite Squad', guerrilla: 'Guerrilla Squad', unassigned: 'Standby Pool', dropHere: 'Drop here' },
@@ -115,6 +115,7 @@ const resources = {
         exploreWhenFull: 'Explore when full', exploreWhenFullHint: 'Explore instead of returning with full gold',
       },
       enemySightings: 'Visible enemies', jumpToEnemy: 'Jump to this enemy',
+      showEnemyMemory: 'Show remembered enemies', hideEnemyMemory: 'Hide remembered enemies', memoryEnemy: 'Last known position',
     },
     tutorial: {
       training: 'TRAINING',
@@ -223,7 +224,7 @@ const resources = {
       emptyPlan: '没有手动覆盖，Agent 指令继续生效。', connected: '实时', disconnected: '已断开',
       actions: { MOVE: '移动', HARVEST: '采集', DEPOSIT: '交付', SWEEP: '横扫', SHOOT: '射击', PICKUP_BEACON: '拾取信标', DROP_BEACON: '放下信标', SELF_DESTRUCT: '自毁', HEAL: '恢复 HP', WAIT: '原地待命', SPAWN: '生产', REPAIR_SHIELD: '修复护盾', START_MOVE: '迁移 Core', CANCEL_MOVE: '取消迁移' },
       directions: { UP: '向上', DOWN: '向下', LEFT: '向左', RIGHT: '向右' },
-      units: { WORKER: '工人', VANGUARD: '先锋', RANGER: '游侠', CORE: 'Core' },
+      units: { WORKER: '工人', VANGUARD: '先锋', RANGER: '游侠', CORE: 'Core', ENEMY: '敌人' },
       unitGroups: { CORE: 'Core', WORKER: '工人组', RANGER: '游侠组', VANGUARD: '先锋组' },
       fleetTabs: { label: '编队视图', groups: '兵种组', teams: '战斗分队' },
       squads: { home: '守家队', attack: '进攻队', kite: '风筝队', guerrilla: '游击队', unassigned: '待命池', dropHere: '拖到这里' },
@@ -260,6 +261,7 @@ const resources = {
         exploreWhenFull: '金币满后探索', exploreWhenFullHint: '满载后继续探索而非回城',
       },
       enemySightings: '可见敌人', jumpToEnemy: '跳转到该敌人位置',
+      showEnemyMemory: '显示记忆敌人', hideEnemyMemory: '隐藏记忆敌人', memoryEnemy: '最后已知位置',
     },
     tutorial: {
       training: '训练场',
