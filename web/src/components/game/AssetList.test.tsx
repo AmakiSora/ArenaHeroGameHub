@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import '../../lib/i18n'
 import type { TeamKey } from '../../lib/teamRoster'
@@ -227,6 +227,37 @@ describe('AssetList', () => {
       render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{}} teamConfig={baseConfig} />)
       fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
       expect(screen.queryByRole('button', { name: /Settings ·/ })).not.toBeInTheDocument()
+    })
+
+    it('hides the pick button outside coords mode together with the coordinate rows', () => {
+      render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{ V1: 'attack' }} teamConfig={{ ...baseConfig, attack_mode: 'auto' }} onUpdateConfig={() => undefined} onPickCoords={() => undefined} />)
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Attack Squad' }))
+      expect(screen.queryByRole('button', { name: /Pick on map/ })).not.toBeInTheDocument()
+    })
+
+    it('invokes onPickCoords with the X/Y field pair and hides it without a handler', () => {
+      const picks: Array<[string, string]> = []
+      render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{ V1: 'attack' }} onAssignTeam={() => undefined} teamConfig={baseConfig} onUpdateConfig={() => undefined} onPickCoords={(xField, yField) => picks.push([xField, yField])} />)
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Attack Squad' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Pick on map · Target X' }))
+      expect(picks).toEqual([['attack_target_x', 'attack_target_y']])
+
+      // Without an onPickCoords handler (e.g. demo) there is no pick button.
+      const readOnly = render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{ V1: 'attack' }} teamConfig={baseConfig} onUpdateConfig={() => undefined} />)
+      fireEvent.click(within(readOnly.container).getByRole('tab', { name: 'Combat Squads' }))
+      fireEvent.click(within(readOnly.container).getByRole('button', { name: 'Settings · Attack Squad' }))
+      expect(within(readOnly.container).queryByRole('button', { name: /Pick on map/ })).not.toBeInTheDocument()
+    })
+
+    it('offers the same pick button for the kite squad target', () => {
+      const picks: Array<[string, string]> = []
+      render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{ V1: 'kite' }} teamConfig={{ kite_mode: 'coords', kite_target_x: 0, kite_target_y: 0 }} onUpdateConfig={() => undefined} onPickCoords={(xField, yField) => picks.push([xField, yField])} />)
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Kite Squad' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Pick on map · Target X' }))
+      expect(picks).toEqual([['kite_target_x', 'kite_target_y']])
     })
   })
 

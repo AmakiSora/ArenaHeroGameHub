@@ -40,6 +40,10 @@ interface Props {
   onMoveDestination: (position: Position) => void
   onCenterBeacon: () => void
   onAnchorChange: (anchor: MapAnchor | null) => void
+  // Squad target map picking (⌖): while active, the next click reports the
+  // cell to fill a squad's target X/Y instead of selecting anything.
+  coordPicking?: boolean
+  onCoordPick?: (position: Position) => void
   highlightPositions?: Position[]
   preferredSelectionId?: string
 }
@@ -85,7 +89,7 @@ interface TerrainTileCache {
 const unitSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedUnitSprite>>()
 const beaconSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedBeaconSprite>>()
 
-export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onAnchorChange, highlightPositions = [], preferredSelectionId }: Props) {
+export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], preferredSelectionId }: Props) {
   const backgroundCanvasRef = useRef<HTMLCanvasElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -325,6 +329,7 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
   }
   const worldToScreen = ([x, y]: Position) => ({ left: size.width / 2 + (x - camera.x) * camera.cell, top: size.height / 2 + (y - camera.y) * camera.cell })
   const choose = (position: Position) => {
+    if (coordPicking) { onCoordPick?.(position); return }
     if (destinationSelecting) { onMoveDestination(position); return }
     const candidates = prioritizeSelectionCandidates(entityGroupsByPosition.get(positionKey(position)) ?? [], preferredSelectionId)
     if (targeting) {
@@ -344,7 +349,7 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
     setInspectedFeature(next.feature); onSelect(null)
   }
   const featureAnchor = inspectedFeatureView ? mapFeatureAnchor(inspectedFeatureView.position, camera, size) : null
-  return <div ref={containerRef} style={{ backgroundImage: `url(${WORLD_BACKGROUND_PATH})`, backgroundPosition: 'center', backgroundSize: 'cover' }} className={`relative h-full min-h-[420px] w-full overflow-hidden bg-space-950 ${targeting || destinationSelecting ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'}`}>
+  return <div ref={containerRef} style={{ backgroundImage: `url(${WORLD_BACKGROUND_PATH})`, backgroundPosition: 'center', backgroundSize: 'cover' }} className={`relative h-full min-h-[420px] w-full overflow-hidden bg-space-950 ${targeting || destinationSelecting || coordPicking ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'}`}>
     <canvas ref={backgroundCanvasRef} className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden="true" />
     <canvas
       ref={canvasRef} className="absolute inset-0 h-full w-full touch-none" aria-label="Tactical world map"

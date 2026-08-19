@@ -6,7 +6,9 @@ export type TeamConfig = Record<string, number | boolean | string>
 export type ModeValue = 'coords' | 'auto' | 'beacon'
 
 export type TeamSettingField =
-  | { kind: 'number'; field: string; labelKey: string; hintKey?: string; min: number; max: number; step?: number; modes?: ModeValue[] }
+  // pickYField pairs an X input with its Y field for map picking (⌖), the
+  // same pairing the dashboard's pick buttons fill in one map click.
+  | { kind: 'number'; field: string; labelKey: string; hintKey?: string; min: number; max: number; step?: number; modes?: ModeValue[]; pickYField?: string }
   | { kind: 'mode'; field: string }
   | { kind: 'select'; field: string; labelKey: string; hintKey?: string; options: number[] }
   | { kind: 'switch'; field: string; labelKey: string; hintKey?: string }
@@ -40,7 +42,7 @@ export const TEAM_SETTINGS: Partial<Record<string, SquadSettingsSpec>> = {
     beaconNoteKey: 'attackBeaconNote',
     fields: [
       { kind: 'mode', field: 'attack_mode' },
-      { kind: 'number', field: 'attack_target_x', labelKey: 'targetX', min: -1000, max: 1000, modes: ['coords'] },
+      { kind: 'number', field: 'attack_target_x', labelKey: 'targetX', min: -1000, max: 1000, modes: ['coords'], pickYField: 'attack_target_y' },
       { kind: 'number', field: 'attack_target_y', labelKey: 'targetY', min: -1000, max: 1000, modes: ['coords'] },
       { kind: 'number', field: 'attack_auto_radius', labelKey: 'autoRadius', hintKey: 'autoRadiusHint', min: 0, max: 1000, modes: ['auto'] },
       { kind: 'number', field: 'attack_retreat_radius', labelKey: 'retreatRadius', hintKey: 'retreatRadiusHint', min: 0, max: 30, modes: ['auto'] },
@@ -58,7 +60,7 @@ export const TEAM_SETTINGS: Partial<Record<string, SquadSettingsSpec>> = {
     beaconNoteKey: 'kiteBeaconNote',
     fields: [
       { kind: 'mode', field: 'kite_mode' },
-      { kind: 'number', field: 'kite_target_x', labelKey: 'targetX', min: -1000, max: 1000, modes: ['coords'] },
+      { kind: 'number', field: 'kite_target_x', labelKey: 'targetX', min: -1000, max: 1000, modes: ['coords'], pickYField: 'kite_target_y' },
       { kind: 'number', field: 'kite_target_y', labelKey: 'targetY', min: -1000, max: 1000, modes: ['coords'] },
       { kind: 'number', field: 'kite_auto_radius', labelKey: 'autoRadius', hintKey: 'kiteAutoRadiusHint', min: 0, max: 1000, modes: ['auto'] },
       { kind: 'number', field: 'kite_march_engage_radius', labelKey: 'marchRadius', hintKey: 'kiteMarchRadiusHint', min: 0, max: 500, modes: ['coords', 'beacon'] },

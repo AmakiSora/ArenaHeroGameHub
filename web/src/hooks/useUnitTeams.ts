@@ -31,11 +31,14 @@ export function useUnitTeams(tick: number | null, enabled = true) {
   // Setting change: same optimistic pattern — apply locally, POST the single
   // field, roll back on failure. Squad (combat) fields go to /api/teams;
   // worker strategy fields go to /api/config. The server validates ranges and
-  // answers 400 on invalid input, which maps to a rollback here.
+  // answers 400 on invalid input, which maps to a rollback here. The ref is
+  // updated synchronously so back-to-back calls in one event (e.g. a map
+  // pick writing X and Y) build on each other instead of clobbering.
   const updateConfig = useCallback((field: string, value: number | boolean | string) => {
     const current = configRef.current
     if (!enabled || current[field] === value) return
     const next = { ...current, [field]: value }
+    configRef.current = next
     setConfig(next)
     const save = TEAM_SETTING_FIELDS.has(field) ? saveTeamSettings : saveStrategyConfig
     void save({ [field]: value }).then((ok) => { if (!ok) setConfig(current) })

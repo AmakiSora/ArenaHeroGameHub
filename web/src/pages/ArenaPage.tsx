@@ -36,6 +36,9 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   const submitGamePlan = game.submit
   const movementStorageKey = `arena-hero.movement-goals.${demo ? 'demo' : user?.username ?? 'anonymous'}`
   const [selectedId, setSelectedId] = useState<string | null>(null); const [targetMode, setTargetMode] = useState<'SHOOT' | 'SWEEP' | null>(null); const [moveSelecting, setMoveSelecting] = useState(false)
+  // Squad target map picking (⌖ in the sidebar squad settings): while set,
+  // the next map click fills that squad's target X/Y via /api/teams.
+  const [coordPick, setCoordPick] = useState<{ xField: string; yField: string } | null>(null)
   const [movementError, setMovementError] = useState<PathFailure | null>(null)
   const [anchor, setAnchor] = useState<MapAnchor | null>(null)
   const destroyerStorageKey = `arena-hero.core-destroyer.${demo ? 'demo' : user?.username ?? 'anonymous'}`
@@ -61,7 +64,7 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     planRef.current = authoritative.plan
     setPlan(authoritative.plan)
   }, [game.receipts.MANUAL, game.tick])
-  useEffect(() => { if (respawning) { setSelectedId(null); setTargetMode(null); setMoveSelecting(false); setMovementError(null); setAnchor(null); if (Object.keys(movementGoalsRef.current).length) replaceMovementGoals({}) } }, [replaceMovementGoals, respawning])
+  useEffect(() => { if (respawning) { setSelectedId(null); setTargetMode(null); setMoveSelecting(false); setMovementError(null); setAnchor(null); setCoordPick(null); if (Object.keys(movementGoalsRef.current).length) replaceMovementGoals({}) } }, [replaceMovementGoals, respawning])
   useEffect(() => {
     if (!game.state) return
     if (!respawning) {
@@ -159,6 +162,22 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
 		unitAction(selected.id, { type: 'SHOOT', expected_cell: position }); select(null)
   }
   const chooseTarget = (target: WorldObject) => { if (target.position) chooseAttackPosition(target.position) }
+  const startCoordPick = (xField: string, yField: string) => { setTargetMode(null); setMoveSelecting(false); setSelectedId(null); setCoordPick({ xField, yField }) }
+  const completeCoordPick = (position: Position) => {
+    if (!coordPick) return
+    const { xField, yField } = coordPick
+    setCoordPick(null)
+    // Two back-to-back updates: the hook stacks them on the same snapshot.
+    updateConfig(xField, position[0])
+    updateConfig(yField, position[1])
+  }
+  // While picking, mark the currently configured target so the operator sees
+  // what the new point will replace.
+  const coordPickHighlight = useMemo<Position[]>(() => {
+    if (!coordPick) return []
+    const x = Number(teamConfig[coordPick.xField]); const y = Number(teamConfig[coordPick.yField])
+    return Number.isFinite(x) && Number.isFinite(y) ? [[x, y]] : []
+  }, [coordPick, teamConfig])
   const chooseMoveDestination = (target: Position) => {
     if (!game.state || !selected?.id || !selected.position) return
     if (selected.position[0] === target[0] && selected.position[1] === target[1]) { removeMovementGoal(selected.id); if (selected.kind === 'CORE') setCoreAction(null); else setUnitAction(selected.id, null); select(null); return }
@@ -176,17 +195,18 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   const describeError = (code: string) => `${getErrorMessage(code)} [${code}]`
   if (!game.state) return <div className="grid h-dvh place-items-center"><div className="text-center"><div className="mx-auto mb-4 size-2 animate-pulse rounded-full bg-cyan-signal shadow-[0_0_14px_rgba(69,145,197,.45)]" /><p className="font-mono text-xs tracking-[.2em] text-zinc-500">{t(`game.${game.phase}`)}</p>{game.error && <p role="alert" className="mt-3 text-xs text-coral-hostile">{describeError(game.error)}</p>}</div></div>
   return <div className="grid h-dvh min-h-[560px] grid-cols-1 overflow-hidden lg:grid-cols-[260px_1fr]">
-    <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} teamRoster={teamRoster} onAssignTeam={demo ? undefined : assignTeam} teamConfig={teamConfig} onUpdateConfig={demo ? undefined : updateConfig} />
+    <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} teamRoster={teamRoster} onAssignTeam={demo ? undefined : assignTeam} teamConfig={teamConfig} onUpdateConfig={demo ? undefined : updateConfig} onPickCoords={demo ? undefined : startCoordPick} pickingCoordsField={coordPick?.xField ?? null} />
     <section className="relative min-h-0 overflow-hidden">
       {!respawning && <GameHUD phase={game.phase} stateReceivedAt={game.stateReceivedAt} />}
       {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} />}
       {!respawning && game.tick && <PendingCommands tick={game.tick} state={game.state} receipts={game.receipts} unitNames={unitNames} />}
-      <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onAnchorChange={setAnchor} />
+      <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onAnchorChange={setAnchor} coordPicking={coordPick !== null} onCoordPick={completeCoordPick} highlightPositions={coordPickHighlight} />
       {!respawning && <ResourceActivity events={game.state.events} />}
       {respawning && <RespawnOverlay destroyedBy={coreDestroyer} selfDestructed={coreSelfDestructed} />}
       {!respawning && selected?.controlled && anchor && actionAvailability && !targetMode && !moveSelecting && <UnitActionDialog anchor={anchor} selected={selected} plan={plan} movementGoal={selected.id ? movementGoals[selected.id] : undefined} unitNames={unitNames} phase={game.phase} resources={game.state.resources} population={game.state.population} availability={actionAvailability} onClose={() => select(null)} onTargeting={() => { setMoveSelecting(false); setTargetMode('SHOOT') }} onSweepTargeting={() => { setMoveSelecting(false); setTargetMode('SWEEP') }} onMoveTargeting={() => { setTargetMode(null); setMovementError(null); setMoveSelecting(true) }} onCancelMovementGoal={() => cancelMovementGoal(selected)} onUnitAction={unitAction} onCoreAction={coreAction} />}
       {targetMode && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-coral-hostile">{targetMode === 'SWEEP' ? <Sword size={15} /> : <Crosshair size={15} />}<span>{t(targetMode === 'SWEEP' ? 'game.sweepHint' : 'game.targetHint')}</span><button onClick={() => setTargetMode(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {moveSelecting && <div className={`panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs ${movementError ? 'text-coral-hostile' : 'text-cyan-signal'}`}><Move size={15} /><span>{t(movementError === 'UNKNOWN_DESTINATION' ? 'game.routeUnknown' : movementError ? 'game.routeBlocked' : 'game.moveHint')}</span><button onClick={() => { setMoveSelecting(false); setMovementError(null) }} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
+      {coordPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.coordPickHint')}</span><button onClick={() => setCoordPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {!respawning && <MapControls onCenter={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} onZoom={(direction) => setZoomRequest((value) => direction * (Math.abs(value) + 1))} />}
       {game.error && <div role="alert" className="panel absolute bottom-4 right-4 z-30 max-w-[min(24rem,calc(100%-2rem))] px-4 py-3 text-xs leading-5 text-coral-hostile">{describeError(game.error)}</div>}
     </section>

@@ -31,8 +31,14 @@ const game = vi.hoisted(() => ({
 
 vi.mock('../hooks/useGameStream', () => ({ useGameStream: () => game }))
 vi.mock('../context/AuthContext', () => ({ useAuth: () => ({ user: { username: 'player' } }) }))
+const teams = vi.hoisted(() => ({
+  updateConfig: vi.fn(),
+  config: { attack_mode: 'coords', attack_target_x: 10, attack_target_y: -4 } as Record<string, number | boolean | string>,
+}))
+vi.mock('../hooks/useUnitTeams', () => ({ useUnitTeams: () => ({ roster: {}, config: teams.config, assignTeam: vi.fn(), updateConfig: teams.updateConfig }) }))
+vi.mock('../hooks/useUnitNames', () => ({ useUnitNames: () => ({}) }))
 vi.mock('../components/game/WorldCanvas', () => ({
-  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], onAttackPosition, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; onAttackPosition?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
+  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
     useEffect(() => { onAnchorChange(selectedId ? { x: 100, y: 100, side: 'right' } : null) }, [onAnchorChange, selectedId])
     return <div
         data-testid="world-canvas"
@@ -40,12 +46,13 @@ vi.mock('../components/game/WorldCanvas', () => ({
         data-center-request={centerRequest}
       >
         {attackPositions.some(([x, y]) => x === 3 && y === 0) && <button type="button" onClick={() => onAttackPosition?.([3, 0])}>Attack predicted cell</button>}
+        {coordPicking && <button type="button" onClick={() => onCoordPick?.([7, -3])}>Pick map cell</button>}
       </div>
   },
 }))
 
 describe('ArenaPage asset selection', () => {
-  beforeEach(() => game.submit.mockReset())
+  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset() })
 
   it('centers the map on a Unit selected from the asset list', async () => {
     render(<ArenaPage demo />)
@@ -83,5 +90,20 @@ describe('ArenaPage asset selection', () => {
 			tick: 42,
 			unit_actions: { ranger: { type: 'SHOOT', expected_cell: [3, 0] } },
 		}))
+  })
+
+  it('picks the attack squad target coordinates from the map and saves both fields', async () => {
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+
+    await user.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+    await user.click(screen.getByRole('button', { name: 'Settings · Attack Squad' }))
+    await user.click(screen.getByRole('button', { name: 'Pick on map · Target X' }))
+    expect(screen.getByText('Click the map to choose the target coordinates')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Pick map cell' }))
+    expect(teams.updateConfig).toHaveBeenNthCalledWith(1, 'attack_target_x', 7)
+    expect(teams.updateConfig).toHaveBeenNthCalledWith(2, 'attack_target_y', -3)
+    expect(screen.queryByText('Click the map to choose the target coordinates')).not.toBeInTheDocument()
   })
 })
