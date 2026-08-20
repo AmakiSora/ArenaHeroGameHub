@@ -47,12 +47,14 @@ const memory = vi.hoisted(() => ({
 }))
 vi.mock('../hooks/useEnemyMemory', () => ({ useEnemyMemory: () => memory.sightings }))
 vi.mock('../components/game/WorldCanvas', () => ({
-  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, memoryEnemies = [], onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; memoryEnemies?: Array<{ position: [number, number]; type: string }>; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
+  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, memoryEnemies = [], beaconIndicatorVisible = true, coreIndicatorVisible = true, onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; memoryEnemies?: Array<{ position: [number, number]; type: string }>; beaconIndicatorVisible?: boolean; coreIndicatorVisible?: boolean; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
     useEffect(() => { onAnchorChange(selectedId ? { x: 100, y: 100, side: 'right' } : null) }, [onAnchorChange, selectedId])
     return <div
         data-testid="world-canvas"
         data-center-position={centerPosition ? JSON.stringify(centerPosition) : ''}
         data-center-request={centerRequest}
+        data-beacon-indicator={String(beaconIndicatorVisible)}
+        data-core-indicator={String(coreIndicatorVisible)}
         data-memory={JSON.stringify(memoryEnemies)}
       >
         {attackPositions.some(([x, y]) => x === 3 && y === 0) && <button type="button" onClick={() => onAttackPosition?.([3, 0])}>Attack predicted cell</button>}
@@ -154,6 +156,31 @@ describe('ArenaPage remembered enemies', () => {
     await user.click(screen.getByRole('button', { name: 'Show remembered enemies' }))
     expect(map.getAttribute('data-memory')).not.toBe('[]')
     expect(localStorage.getItem('arena-hero.enemy-memory-visible.player')).toBe('true')
+  })
+
+  it('toggles the Beacon and Core direction indicators and remembers both choices', async () => {
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+    const map = screen.getByTestId('world-canvas')
+    expect(map).toHaveAttribute('data-beacon-indicator', 'true')
+    expect(map).toHaveAttribute('data-core-indicator', 'true')
+
+    await user.click(screen.getByRole('button', { name: 'Hide Beacon indicator' }))
+    expect(map).toHaveAttribute('data-beacon-indicator', 'false')
+    expect(screen.getByRole('button', { name: 'Show Beacon indicator' })).toHaveAttribute('aria-pressed', 'false')
+    expect(localStorage.getItem('arena-hero.beacon-indicator-visible.player')).toBe('false')
+
+    await user.click(screen.getByRole('button', { name: 'Hide Core indicator' }))
+    expect(map).toHaveAttribute('data-core-indicator', 'false')
+    expect(screen.getByRole('button', { name: 'Show Core indicator' })).toHaveAttribute('aria-pressed', 'false')
+    expect(localStorage.getItem('arena-hero.core-indicator-visible.player')).toBe('false')
+
+    await user.click(screen.getByRole('button', { name: 'Show Beacon indicator' }))
+    await user.click(screen.getByRole('button', { name: 'Show Core indicator' }))
+    expect(map).toHaveAttribute('data-beacon-indicator', 'true')
+    expect(map).toHaveAttribute('data-core-indicator', 'true')
+    expect(localStorage.getItem('arena-hero.beacon-indicator-visible.player')).toBe('true')
+    expect(localStorage.getItem('arena-hero.core-indicator-visible.player')).toBe('true')
   })
 
   it('filters memory markers by unit type and remembers the filter set', async () => {

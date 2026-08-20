@@ -17,6 +17,7 @@ import { computeVisibility, positionKey } from '../../lib/visibility'
 import { WORLD_BACKGROUND_PATH } from '../../lib/worldArt'
 import { canvasPixelRatio, MAX_WORLD_CELL_SIZE, MIN_WORLD_CELL_SIZE, prioritizeSelectionCandidates, TERRAIN_CHUNK_CELLS, terrainChunkBounds, wheelZoomCell, type WorldCamera } from '../../lib/worldCanvasPerformance'
 import { BeaconDirectionIndicator } from './BeaconDirectionIndicator'
+import { CoreDirectionIndicator } from './CoreDirectionIndicator'
 import { MapFeatureInfo } from './MapFeatureInfo'
 import type { MapAnchor } from './UnitActionDialog'
 import { UnitArtIcon } from './UnitArtIcon'
@@ -41,6 +42,12 @@ interface Props {
   onAttackPosition?: (position: Position) => void
   onMoveDestination: (position: Position) => void
   onCenterBeacon: () => void
+  // Center on the player's own Core when its direction indicator is clicked.
+  onCenterCore?: () => void
+  // Visibility toggles for the two off-screen direction indicators; both
+  // default to shown so the tutorial page keeps its current behavior.
+  beaconIndicatorVisible?: boolean
+  coreIndicatorVisible?: boolean
   onAnchorChange: (anchor: MapAnchor | null) => void
   // Squad target map picking (⌖): while active, the next click reports the
   // cell to fill a squad's target X/Y instead of selecting anything.
@@ -94,7 +101,7 @@ interface TerrainTileCache {
 const unitSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedUnitSprite>>()
 const beaconSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedBeaconSprite>>()
 
-export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], memoryEnemies = [], preferredSelectionId }: Props) {
+export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onCenterCore = () => {}, beaconIndicatorVisible = true, coreIndicatorVisible = true, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], memoryEnemies = [], preferredSelectionId }: Props) {
   const backgroundCanvasRef = useRef<HTMLCanvasElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -124,6 +131,7 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
   const centeredCoreId = useRef<string | null>(null); const previousCenterRequest = useRef(centerRequest)
   const visible = useMemo(() => computeVisibility(state), [state])
   const entities = useMemo(() => state.objects.filter((object) => object.position), [state])
+  const homeCore = useMemo(() => entities.find((object) => object.kind === 'CORE' && object.controlled) ?? null, [entities])
   const entityGroupsByPosition = useMemo(() => groupEntitiesByPosition(state.objects), [state.objects])
   const visibleObstacleCells = useMemo(() => collectTerrainObjectPositions(state.objects, 'OBSTACLE'), [state.objects])
   const visibleResourceCells = useMemo(() => collectTerrainObjectPositions(state.objects, 'RESOURCE'), [state.objects])
@@ -398,7 +406,8 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
       const iconSize = Math.max(19, camera.cell * .46), left = from.left + px * side * camera.cell * .31 + ux * camera.cell * .1, top = from.top + py * side * camera.cell * .31 + uy * camera.cell * .1
       return <BowArrow key={marker.objectId} aria-hidden="true" size={iconSize} strokeWidth={1.8} style={{ left, top, transform: `translate(-50%, -50%) rotate(${Math.atan2(dy, dx) * 180 / Math.PI + 45}deg)` }} className={`pointer-events-none absolute z-10 ${marker.source === 'AGENT' ? 'text-violet-300 drop-shadow-[0_0_6px_rgba(143,145,199,.5)]' : 'text-cyan-signal drop-shadow-[0_0_6px_rgba(69,145,197,.5)]'}`} />
     })}
-    <BeaconDirectionIndicator beacon={state.champion_beacon} camera={camera} viewport={size} onCenter={onCenterBeacon} />
+    {beaconIndicatorVisible && <BeaconDirectionIndicator beacon={state.champion_beacon} camera={camera} viewport={size} onCenter={onCenterBeacon} />}
+    {coreIndicatorVisible && homeCore?.position && <CoreDirectionIndicator corePosition={homeCore.position} camera={camera} viewport={size} onCenter={onCenterCore} />}
     {inspectedFeatureView && featureAnchor && <MapFeatureInfo feature={inspectedFeatureView} anchor={featureAnchor} onClose={() => setInspectedFeature(null)} />}
   </div>
 }

@@ -8,6 +8,8 @@ interface CameraView { x: number; y: number; cell: number }
 interface Viewport { width: number; height: number }
 type ViewportEdge = 'top' | 'right' | 'bottom' | 'left'
 
+export type { CameraView, Viewport, ViewportEdge }
+
 export interface BeaconIndicatorPlacement {
   left: number
   top: number
@@ -15,11 +17,14 @@ export interface BeaconIndicatorPlacement {
   edge: ViewportEdge
 }
 
-export function offscreenBeaconPlacement(beacon: ChampionBeaconView, camera: CameraView, viewport: Viewport, inset = 30): BeaconIndicatorPlacement | null {
+// Shared edge-pinning math for every off-screen direction indicator (Beacon,
+// home Core): project the target, and while it is outside the viewport clamp
+// it to the nearest edge along the camera→target ray.
+export function offscreenPlacement(position: readonly [number, number], camera: CameraView, viewport: Viewport, inset = 30): BeaconIndicatorPlacement | null {
   if (viewport.width <= 0 || viewport.height <= 0 || camera.cell <= 0) return null
   const centerX = viewport.width / 2, centerY = viewport.height / 2
-  const targetX = centerX + (beacon.position[0] - camera.x) * camera.cell
-  const targetY = centerY + (beacon.position[1] - camera.y) * camera.cell
+  const targetX = centerX + (position[0] - camera.x) * camera.cell
+  const targetY = centerY + (position[1] - camera.y) * camera.cell
   if (targetX >= 0 && targetX <= viewport.width && targetY >= 0 && targetY <= viewport.height) return null
 
   const dx = targetX - centerX, dy = targetY - centerY
@@ -28,6 +33,10 @@ export function offscreenBeaconPlacement(beacon: ChampionBeaconView, camera: Cam
   const scale = Math.min(horizontalScale, verticalScale)
   const edge: ViewportEdge = horizontalScale < verticalScale ? dx > 0 ? 'right' : 'left' : dy > 0 ? 'bottom' : 'top'
   return { left: centerX + dx * scale, top: centerY + dy * scale, angle: Math.atan2(dy, dx) * 180 / Math.PI, edge }
+}
+
+export function offscreenBeaconPlacement(beacon: ChampionBeaconView, camera: CameraView, viewport: Viewport, inset = 30): BeaconIndicatorPlacement | null {
+  return offscreenPlacement(beacon.position, camera, viewport, inset)
 }
 
 export function BeaconDirectionIndicator({ beacon, camera, viewport, onCenter }: { beacon: ChampionBeaconView; camera: CameraView; viewport: Viewport; onCenter: () => void }) {
