@@ -36,7 +36,13 @@ const teams = vi.hoisted(() => ({
   config: { attack_mode: 'coords', attack_target_x: 10, attack_target_y: -4 } as Record<string, number | boolean | string>,
 }))
 vi.mock('../hooks/useUnitTeams', () => ({ useUnitTeams: () => ({ roster: {}, config: teams.config, assignTeam: vi.fn(), updateConfig: teams.updateConfig }) }))
-vi.mock('../hooks/useUnitNames', () => ({ useUnitNames: () => ({}) }))
+const unitNames = vi.hoisted(() => ({ names: {} as Record<string, string> }))
+vi.mock('../hooks/useUnitNames', () => ({ useUnitNames: () => unitNames.names }))
+const waypoints = vi.hoisted(() => ({
+  waypoints: {} as Record<string, { queue: [number, number][]; mode: 'attack' | 'rush' }>,
+  refresh: vi.fn(),
+}))
+vi.mock('../hooks/useWaypoints', () => ({ useWaypoints: () => waypoints }))
 const memory = vi.hoisted(() => ({
   // [3, 1] overlaps a live enemy and must be filtered out by the page.
   sightings: [
@@ -64,7 +70,7 @@ vi.mock('../components/game/WorldCanvas', () => ({
 }))
 
 describe('ArenaPage asset selection', () => {
-  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear() })
+  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear(); unitNames.names = {}; waypoints.waypoints = {}; waypoints.refresh.mockReset(); vi.unstubAllGlobals() })
 
   it('centers the map on a Unit selected from the asset list', async () => {
     render(<ArenaPage demo />)
@@ -208,5 +214,30 @@ describe('ArenaPage remembered enemies', () => {
 
     await user.click(vanguardFilter)
     expect(map.getAttribute('data-memory')).toContain('[8,4]')
+  })
+
+  it('adds a manual target by picking a map cell from the unit dialog', async () => {
+    unitNames.names = { worker: 'W1' }
+    waypoints.waypoints = { W1: { queue: [[7, -3]], mode: 'attack' } }
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true }) }) as Response)
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+
+    // With dashboard names loaded the asset list labels the Worker as W1.
+    await user.click(screen.getByRole('button', { name: /W1.*12, -7/ }))
+    expect(screen.getByText('Manual targets')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Choose target point' }))
+    expect(screen.queryByText('Manual targets')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Pick map cell' }))
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(path).toBe('/api/waypoint/set')
+    expect(JSON.parse(init.body as string)).toEqual({ name: 'W1', x: 7, y: -3, mode: 'attack' })
+    expect(waypoints.refresh).toHaveBeenCalled()
+    // The dialog reopens and shows the queue from the refreshed waypoint state.
+    expect(screen.getByText('[7, -3]')).toBeInTheDocument()
   })
 })

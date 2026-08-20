@@ -1,10 +1,11 @@
-import { PackagePlus, Trash2, X } from 'lucide-react'
+import { Crosshair, PackagePlus, Trash2, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { type ActionAvailability, type AvailableAction } from '../../lib/actionAvailability'
 import { unitCost } from '../../lib/gameRules'
 import type { CommandPlan, CoreAction, Position, StreamPhase, UnitAction, UnitActionType, UnitType, WorldObject } from '../../lib/types'
 import { unitDashboardName, type UnitNameMap } from '../../lib/unitNames'
+import type { WaypointMode } from '../../lib/waypoints'
 import { UnitArtIcon } from './UnitArtIcon'
 
 export interface MapAnchor { x: number; y: number; side: 'left' | 'right' | 'top' | 'bottom' }
@@ -24,6 +25,15 @@ interface Props {
   onSweepTargeting: () => void
   onMoveTargeting: () => void
   onCancelMovementGoal?: () => void
+  // Manual targets (the tactic dashboard's 手动目标): undefined onPickWaypoint
+  // hides the whole section (demo / tutorial); an empty waypointName disables
+  // the pick button until the tactic has named the unit (W1/V2/R3).
+  waypointName?: string
+  waypointQueue?: Position[]
+  waypointMode?: WaypointMode
+  onPickWaypoint?: () => void
+  onRemoveWaypoint?: (index: number) => void
+  onClearWaypoints?: () => void
   onUnitAction: (id: string, action: UnitAction | null) => void
   onCoreAction: (action: CoreAction | null) => void
 }
@@ -98,6 +108,21 @@ export function UnitActionDialog(props: Props) {
         </button>
       })}</div>
     </section>}
+    {props.selected.kind === 'UNIT' && props.onPickWaypoint && (() => {
+      const queue = props.waypointQueue ?? []
+      const pickDisabled = !props.waypointName
+      return <section aria-label={t('game.manualTargets')} className="mt-3 border-t border-white/[.07] pt-3">
+        <div className="mb-2 flex items-center justify-between gap-3 px-1">
+          <div className="flex items-center gap-2 text-xs font-medium text-zinc-300"><Crosshair size={14} className="text-cyan-signal" />{t('game.manualTargets')}</div>
+          {queue.length > 0 && <span className="font-mono text-[9px] text-zinc-500">{t(`game.waypointMode.${props.waypointMode ?? 'attack'}`)} · {queue.length}</span>}
+        </div>
+        {queue.length > 0 && <div className="mb-2 flex flex-wrap gap-1.5 px-1">
+          {queue.map((point, index) => <span key={`${point[0]},${point[1]},${index}`} className="flex items-center gap-1 rounded-full border border-cyan-signal/25 bg-cyan-signal/[.07] py-1 pl-2.5 pr-1 font-mono text-[10px] text-cyan-signal">[{point[0]}, {point[1]}]<button onClick={() => props.onRemoveWaypoint?.(index)} aria-label={`${t('game.removeWaypoint')} [${point[0]}, ${point[1]}]`} className="focus-ring grid size-6 place-items-center rounded-full text-zinc-500 hover:bg-white/10 hover:text-white"><X size={11} /></button></span>)}
+          <button onClick={() => { if (window.confirm(t('game.confirmClearWaypoints', { name: props.waypointName ?? name }))) props.onClearWaypoints?.() }} className="focus-ring min-h-7 rounded-full border border-coral-hostile/25 px-2.5 text-[10px] text-coral-hostile hover:bg-coral-hostile/[.08]">{t('game.clearWaypoints')}</button>
+        </div>}
+        <button onClick={props.onPickWaypoint} disabled={pickDisabled} title={pickDisabled ? t('game.waypointUnnamed') : undefined} className="secondary-button min-h-11 w-full px-2 text-xs disabled:cursor-not-allowed disabled:border-white/[.04] disabled:bg-white/[.015] disabled:text-zinc-700 disabled:opacity-60">{t('game.pickWaypoint')}</button>
+      </section>
+    })()}
     {props.movementGoal && <div className="mt-3 flex min-h-11 items-center justify-between rounded-gold border border-violet-cosmic/10 bg-indigo-deep/35 pl-3 font-mono text-[10px] text-blue-soft"><span>{t('game.routeTo', { x: props.movementGoal[0], y: props.movementGoal[1] })}</span><button onClick={props.onCancelMovementGoal} className="focus-ring grid size-11 place-items-center rounded-gold-sm hover:bg-white/5" aria-label={t('game.clearRoute')}><Trash2 size={14} /></button></div>}
     {currentAction && !props.movementGoal && <div className="mt-3 flex min-h-11 items-center justify-between rounded-gold border border-violet-cosmic/10 bg-indigo-deep/35 pl-3 font-mono text-[10px] text-blue-soft"><span>{currentAction.type}{'direction' in currentAction && currentAction.direction ? ` · ${currentAction.direction}` : ''}{'unit_type' in currentAction && currentAction.unit_type ? ` · ${currentAction.unit_type}` : ''}</span><button onClick={clear} className="focus-ring grid size-11 place-items-center rounded-gold-sm hover:bg-white/5" aria-label={t('game.clear')}><Trash2 size={14} /></button></div>}
   </div>

@@ -132,4 +132,40 @@ describe('UnitActionDialog', () => {
     await user.click(screen.getByRole('button', { name: 'Cancel route' }))
     expect(onCancelMovementGoal).toHaveBeenCalledOnce()
   })
+
+  it('lists manual targets and starts map picking for a named unit', async () => {
+    const user = userEvent.setup(); const onPickWaypoint = vi.fn(); const onRemoveWaypoint = vi.fn()
+    render(<UnitActionDialog anchor={{ x: 100, y: 100, side: 'right' }} selected={selected} plan={plan} phase="open" resources={0} availability={{ actions: { MOVE: true }, spawns: { WORKER: false, VANGUARD: false, RANGER: false } }} waypointName="W1" waypointQueue={[[4, 2], [5, 3]]} waypointMode="rush" onPickWaypoint={onPickWaypoint} onRemoveWaypoint={onRemoveWaypoint} onClose={() => undefined} onTargeting={() => undefined} onSweepTargeting={() => undefined} onMoveTargeting={() => undefined} onUnitAction={() => undefined} onCoreAction={() => undefined} />)
+    expect(screen.getByText('Manual targets')).toBeInTheDocument()
+    expect(screen.getByText('Rush · 2')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Choose target point' }))
+    expect(onPickWaypoint).toHaveBeenCalledOnce()
+    await user.click(screen.getByRole('button', { name: 'Remove this target [5, 3]' }))
+    expect(onRemoveWaypoint).toHaveBeenCalledWith(1)
+  })
+
+  it('clears the whole manual-target queue only after confirmation', async () => {
+    const user = userEvent.setup(); const onClearWaypoints = vi.fn()
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValueOnce(false).mockReturnValueOnce(true)
+    render(<UnitActionDialog anchor={{ x: 100, y: 100, side: 'right' }} selected={selected} plan={plan} phase="open" resources={0} availability={{ actions: { MOVE: true }, spawns: { WORKER: false, VANGUARD: false, RANGER: false } }} waypointName="W1" waypointQueue={[[4, 2]]} onPickWaypoint={() => undefined} onClearWaypoints={onClearWaypoints} onClose={() => undefined} onTargeting={() => undefined} onSweepTargeting={() => undefined} onMoveTargeting={() => undefined} onUnitAction={() => undefined} onCoreAction={() => undefined} />)
+    await user.click(screen.getByRole('button', { name: 'Clear' }))
+    expect(onClearWaypoints).not.toHaveBeenCalled()
+    await user.click(screen.getByRole('button', { name: 'Clear' }))
+    expect(onClearWaypoints).toHaveBeenCalledOnce()
+    confirm.mockRestore()
+  })
+
+  it('disables target-point picking until the tactic has named the unit', () => {
+    render(<UnitActionDialog anchor={{ x: 100, y: 100, side: 'right' }} selected={selected} plan={plan} phase="open" resources={0} availability={{ actions: { MOVE: true }, spawns: { WORKER: false, VANGUARD: false, RANGER: false } }} onPickWaypoint={() => undefined} onClose={() => undefined} onTargeting={() => undefined} onSweepTargeting={() => undefined} onMoveTargeting={() => undefined} onUnitAction={() => undefined} onCoreAction={() => undefined} />)
+    expect(screen.getByRole('button', { name: 'Choose target point' })).toBeDisabled()
+  })
+
+  it('hides manual targets on the Core and when picking is unsupported', () => {
+    const core = { kind: 'CORE' as const, id: 'core', controlled: true, position: [1, 1] as [number, number], hp: 5, shield: 5, state: 'NORMAL' as const }
+    const view = render(<UnitActionDialog anchor={{ x: 100, y: 100, side: 'right' }} selected={core} plan={plan} phase="open" resources={0} availability={{ actions: { WAIT: true }, spawns: { WORKER: false, VANGUARD: false, RANGER: false } }} onPickWaypoint={() => undefined} onClose={() => undefined} onTargeting={() => undefined} onSweepTargeting={() => undefined} onMoveTargeting={() => undefined} onUnitAction={() => undefined} onCoreAction={() => undefined} />)
+    expect(screen.queryByText('Manual targets')).not.toBeInTheDocument()
+    view.unmount()
+    render(<UnitActionDialog anchor={{ x: 100, y: 100, side: 'right' }} selected={selected} plan={plan} phase="open" resources={0} availability={{ actions: { MOVE: true }, spawns: { WORKER: false, VANGUARD: false, RANGER: false } }} onClose={() => undefined} onTargeting={() => undefined} onSweepTargeting={() => undefined} onMoveTargeting={() => undefined} onUnitAction={() => undefined} onCoreAction={() => undefined} />)
+    expect(screen.queryByText('Manual targets')).not.toBeInTheDocument()
+  })
 })
