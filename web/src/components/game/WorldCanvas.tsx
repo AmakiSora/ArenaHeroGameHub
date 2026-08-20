@@ -13,6 +13,7 @@ import { OBSTACLE_SPRITE_PATHS, obstacleCellShape, obstacleSpriteIndex, obstacle
 import { RESOURCE_SPRITE_PATHS, resourceSpriteIndex, resourceSpriteRect } from '../../lib/resourceArt'
 import type { PlayerState, Position, WorldObject } from '../../lib/types'
 import { UNIT_SPRITE_PATHS, unitArtType, unitSpriteRect, type UnitArtType } from '../../lib/unitArt'
+import { unitRouteColors, type UnitRoute } from '../../lib/unitRoutes'
 import { computeVisibility, positionKey } from '../../lib/visibility'
 import { WORLD_BACKGROUND_PATH } from '../../lib/worldArt'
 import { canvasPixelRatio, MAX_WORLD_CELL_SIZE, MIN_WORLD_CELL_SIZE, prioritizeSelectionCandidates, TERRAIN_CHUNK_CELLS, terrainChunkBounds, wheelZoomCell, type WorldCamera } from '../../lib/worldCanvasPerformance'
@@ -57,6 +58,9 @@ interface Props {
   // Last-known enemy positions from the tactic's map memory; drawn as dim
   // dashed markers (they may have moved), unlike live visible units.
   memoryEnemies?: EnemySighting[]
+  // Tactic bot's per-unit destinations + remaining paths; drawn as colored
+  // polylines + target rings, like the dashboard's 路径 layer.
+  unitRoutes?: UnitRoute[]
   preferredSelectionId?: string
 }
 
@@ -101,7 +105,7 @@ interface TerrainTileCache {
 const unitSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedUnitSprite>>()
 const beaconSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedBeaconSprite>>()
 
-export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onCenterCore = () => {}, beaconIndicatorVisible = true, coreIndicatorVisible = true, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], memoryEnemies = [], preferredSelectionId }: Props) {
+export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onCenterCore = () => {}, beaconIndicatorVisible = true, coreIndicatorVisible = true, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], memoryEnemies = [], unitRoutes = [], preferredSelectionId }: Props) {
   const backgroundCanvasRef = useRef<HTMLCanvasElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -376,6 +380,25 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
       onPointerUp={(event) => { if (drag.current && !drag.current.moved) choose(screenToWorld(event.clientX, event.clientY)); drag.current = null }}
       onPointerCancel={() => { drag.current = null }}
     />
+    {unitRoutes.length > 0 && <svg aria-hidden="true" className="pointer-events-none absolute inset-0 z-10" width={size.width} height={size.height}>
+      {(() => {
+        const colors = unitRouteColors(unitRoutes)
+        const half = camera.cell / 2
+        const toPoint = ([x, y]: Position) => { const point = worldToScreen([x, y]); return `${point.left + half},${point.top + half}` }
+        const ringRadius = Math.min(13, Math.max(7, camera.cell * .28))
+        return unitRoutes.map((route) => {
+          const color = colors.get(route.name) ?? '#78a9ff'
+          const targetPoint = route.target ? worldToScreen(route.target) : null
+          return <g key={`unit-route:${route.name}`}>
+            {route.path.length > 1 && <polyline points={route.path.map(toPoint).join(' ')} fill="none" stroke={color} strokeWidth={2.2} strokeLinejoin="round" strokeLinecap="round" opacity={.82} strokeDasharray={route.complete ? undefined : '5 4'} />}
+            {targetPoint && <>
+              <circle cx={targetPoint.left + half} cy={targetPoint.top + half} r={ringRadius} fill="none" stroke={color} strokeWidth={1.8} opacity={.9} />
+              <circle cx={targetPoint.left + half} cy={targetPoint.top + half} r={2.4} fill={color} />
+            </>}
+          </g>
+        })
+      })()}
+    </svg>}
     {highlightPositions.map((position) => {
       const point = worldToScreen(position)
       const diameter = Math.max(30, camera.cell * .78)

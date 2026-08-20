@@ -13,6 +13,7 @@ import { UnitActionDialog, type MapAnchor } from '../components/game/UnitActionD
 import { useGameStream } from '../hooks/useGameStream'
 import { useEnemyMemory } from '../hooks/useEnemyMemory'
 import { useUnitNames } from '../hooks/useUnitNames'
+import { useUnitRoutes } from '../hooks/useUnitRoutes'
 import { useUnitTeams } from '../hooks/useUnitTeams'
 import { useWaypoints } from '../hooks/useWaypoints'
 import { useAuth } from '../context/AuthContext'
@@ -66,11 +67,18 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   const enemyFilterStorageKey = `arena-hero.enemy-memory-filters.${demo ? 'demo' : user?.username ?? 'anonymous'}`
   const beaconIndicatorStorageKey = `arena-hero.beacon-indicator-visible.${demo ? 'demo' : user?.username ?? 'anonymous'}`
   const coreIndicatorStorageKey = `arena-hero.core-indicator-visible.${demo ? 'demo' : user?.username ?? 'anonymous'}`
+  const unitRoutesStorageKey = `arena-hero.unit-routes-visible.${demo ? 'demo' : user?.username ?? 'anonymous'}`
   const [coreDestroyer, setCoreDestroyer] = useState<string | null>(() => sessionStorage.getItem(destroyerStorageKey))
   const [coreSelfDestructed, setCoreSelfDestructed] = useState(() => sessionStorage.getItem(selfDestructStorageKey) === 'true')
   const [enemyMemoryVisible, setEnemyMemoryVisible] = useState(() => localStorage.getItem(enemyMemoryStorageKey) !== 'false')
   const [beaconIndicatorVisible, setBeaconIndicatorVisible] = useState(() => localStorage.getItem(beaconIndicatorStorageKey) !== 'false')
   const [coreIndicatorVisible, setCoreIndicatorVisible] = useState(() => localStorage.getItem(coreIndicatorStorageKey) !== 'false')
+  // The route filter starts hidden: it is an analysis overlay, not the
+  // default view (unlike enemy memory, which operators usually want on).
+  const [unitRoutesVisible, setUnitRoutesVisible] = useState(() => localStorage.getItem(unitRoutesStorageKey) === 'true')
+  // Per-unit destinations + planned routes (the dashboard's 路径 layer) for
+  // the map filter button; only fetched while the layer is shown.
+  const unitRoutes = useUnitRoutes(game.tick, !demo && unitRoutesVisible)
   const [enemyMemoryFilters, setEnemyMemoryFilters] = useState<EnemySightingType[]>(() => {
     try {
       const raw = localStorage.getItem(enemyFilterStorageKey)
@@ -199,6 +207,11 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     localStorage.setItem(coreIndicatorStorageKey, String(next))
     return next
   })
+  const toggleUnitRoutes = () => setUnitRoutesVisible((visible) => {
+    const next = !visible
+    localStorage.setItem(unitRoutesStorageKey, String(next))
+    return next
+  })
   const toggleEnemyMemoryFilter = (type: EnemySightingType) => setEnemyMemoryFilters((current) => {
     const next = current.includes(type) ? current.filter((item) => item !== type) : [...current, type]
     localStorage.setItem(enemyFilterStorageKey, JSON.stringify(next))
@@ -295,7 +308,7 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
       {!respawning && <GameHUD phase={game.phase} stateReceivedAt={game.stateReceivedAt} />}
       {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} sightings={memoryEnemyList} onJumpTo={jumpToMemoryEnemy} />}
       {!respawning && game.tick && <PendingCommands tick={game.tick} state={game.state} receipts={game.receipts} unitNames={unitNames} />}
-      <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onCenterCore={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} beaconIndicatorVisible={beaconIndicatorVisible} coreIndicatorVisible={coreIndicatorVisible} onAnchorChange={setAnchor} coordPicking={coordPick !== null || waypointPick !== null} onCoordPick={(position) => waypointPick ? completeWaypointPick(position) : completeCoordPick(position)} highlightPositions={[...coordPickHighlight, ...waypointPickHighlight]} memoryEnemies={memoryEnemies} />
+      <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onCenterCore={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} beaconIndicatorVisible={beaconIndicatorVisible} coreIndicatorVisible={coreIndicatorVisible} onAnchorChange={setAnchor} coordPicking={coordPick !== null || waypointPick !== null} onCoordPick={(position) => waypointPick ? completeWaypointPick(position) : completeCoordPick(position)} highlightPositions={[...coordPickHighlight, ...waypointPickHighlight]} memoryEnemies={memoryEnemies} unitRoutes={unitRoutesVisible ? unitRoutes : []} />
       {!respawning && <ResourceActivity events={game.state.events} />}
       {respawning && <RespawnOverlay destroyedBy={coreDestroyer} selfDestructed={coreSelfDestructed} />}
       {!respawning && selected?.controlled && anchor && actionAvailability && !targetMode && !moveSelecting && !waypointPick && <UnitActionDialog anchor={anchor} selected={selected} plan={plan} movementGoal={selected.id ? movementGoals[selected.id] : undefined} unitNames={unitNames} phase={game.phase} resources={game.state.resources} population={game.state.population} availability={actionAvailability} waypointName={selectedWaypointName} waypointQueue={selectedWaypointEntry?.queue} waypointMode={selectedWaypointEntry?.mode} onPickWaypoint={demo ? undefined : () => startWaypointPick(selected)} onRemoveWaypoint={demo || !selectedWaypointName ? undefined : (index) => changeWaypoints(selectedWaypointName, index)} onClearWaypoints={demo || !selectedWaypointName ? undefined : () => changeWaypoints(selectedWaypointName)} onClose={() => select(null)} onTargeting={() => { setMoveSelecting(false); setTargetMode('SHOOT') }} onSweepTargeting={() => { setMoveSelecting(false); setTargetMode('SWEEP') }} onMoveTargeting={() => { setTargetMode(null); setMovementError(null); setMoveSelecting(true) }} onCancelMovementGoal={() => cancelMovementGoal(selected)} onUnitAction={unitAction} onCoreAction={coreAction} />}
@@ -303,7 +316,7 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
       {moveSelecting && <div className={`panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs ${movementError ? 'text-coral-hostile' : 'text-cyan-signal'}`}><Move size={15} /><span>{t(movementError === 'UNKNOWN_DESTINATION' ? 'game.routeUnknown' : movementError ? 'game.routeBlocked' : 'game.moveHint')}</span><button onClick={() => { setMoveSelecting(false); setMovementError(null) }} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {coordPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.coordPickHint')}</span><button onClick={() => setCoordPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {waypointPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.waypointPickHint', { name: waypointPick.name })}</span><button onClick={() => setWaypointPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
-      {!respawning && <MapControls onCenter={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} onZoom={(direction) => setZoomRequest((value) => direction * (Math.abs(value) + 1))} beaconIndicatorVisible={beaconIndicatorVisible} onToggleBeaconIndicator={toggleBeaconIndicator} coreIndicatorVisible={coreIndicatorVisible} onToggleCoreIndicator={toggleCoreIndicator} memoryVisible={enemyMemoryVisible} onToggleMemory={toggleEnemyMemory} memoryFilters={new Set(enemyMemoryFilters)} onToggleMemoryFilter={toggleEnemyMemoryFilter} />}
+      {!respawning && <MapControls onCenter={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} onZoom={(direction) => setZoomRequest((value) => direction * (Math.abs(value) + 1))} beaconIndicatorVisible={beaconIndicatorVisible} onToggleBeaconIndicator={toggleBeaconIndicator} coreIndicatorVisible={coreIndicatorVisible} onToggleCoreIndicator={toggleCoreIndicator} memoryVisible={enemyMemoryVisible} onToggleMemory={toggleEnemyMemory} routesVisible={unitRoutesVisible} onToggleRoutes={demo ? undefined : toggleUnitRoutes} memoryFilters={new Set(enemyMemoryFilters)} onToggleMemoryFilter={toggleEnemyMemoryFilter} />}
       {game.error && <div role="alert" className="panel absolute bottom-4 right-4 z-30 max-w-[min(24rem,calc(100%-2rem))] px-4 py-3 text-xs leading-5 text-coral-hostile">{describeError(game.error)}</div>}
     </section>
   </div>

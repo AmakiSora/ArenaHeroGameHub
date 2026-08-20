@@ -44,6 +44,10 @@ const waypoints = vi.hoisted(() => ({
   refresh: vi.fn(),
 }))
 vi.mock('../hooks/useWaypoints', () => ({ useWaypoints: () => waypoints }))
+const unitRoutes = vi.hoisted(() => ({
+  routes: [] as Array<{ name: string; type: 'WORKER' | 'VANGUARD' | 'RANGER'; target: [number, number] | null; path: [number, number][]; complete: boolean }>,
+}))
+vi.mock('../hooks/useUnitRoutes', () => ({ useUnitRoutes: () => unitRoutes.routes }))
 const memory = vi.hoisted(() => ({
   // [3, 1] overlaps a live enemy and must be filtered out by the page.
   sightings: [
@@ -55,7 +59,7 @@ const memory = vi.hoisted(() => ({
 vi.mock('../hooks/useEnemyMemory', () => ({ useEnemyMemory: () => memory.sightings }))
 const originalMemorySightings = memory.sightings
 vi.mock('../components/game/WorldCanvas', () => ({
-  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, memoryEnemies = [], beaconIndicatorVisible = true, coreIndicatorVisible = true, onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; memoryEnemies?: Array<{ position: [number, number]; type: string }>; beaconIndicatorVisible?: boolean; coreIndicatorVisible?: boolean; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
+  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, memoryEnemies = [], unitRoutes = [], beaconIndicatorVisible = true, coreIndicatorVisible = true, onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; memoryEnemies?: Array<{ position: [number, number]; type: string }>; unitRoutes?: Array<{ name: string }>; beaconIndicatorVisible?: boolean; coreIndicatorVisible?: boolean; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
     useEffect(() => { onAnchorChange(selectedId ? { x: 100, y: 100, side: 'right' } : null) }, [onAnchorChange, selectedId])
     return <div
         data-testid="world-canvas"
@@ -64,6 +68,7 @@ vi.mock('../components/game/WorldCanvas', () => ({
         data-beacon-indicator={String(beaconIndicatorVisible)}
         data-core-indicator={String(coreIndicatorVisible)}
         data-memory={JSON.stringify(memoryEnemies)}
+        data-routes={JSON.stringify(unitRoutes)}
       >
         {attackPositions.some(([x, y]) => x === 3 && y === 0) && <button type="button" onClick={() => onAttackPosition?.([3, 0])}>Attack predicted cell</button>}
         {coordPicking && <button type="button" onClick={() => onCoordPick?.([7, -3])}>Pick map cell</button>}
@@ -72,7 +77,7 @@ vi.mock('../components/game/WorldCanvas', () => ({
 }))
 
 describe('ArenaPage asset selection', () => {
-  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear(); unitNames.names = {}; waypoints.waypoints = {}; waypoints.refresh.mockReset(); memory.sightings = originalMemorySightings; vi.unstubAllGlobals() })
+  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear(); unitNames.names = {}; waypoints.waypoints = {}; waypoints.refresh.mockReset(); memory.sightings = originalMemorySightings; unitRoutes.routes = []; vi.unstubAllGlobals() })
 
   it('centers the map on a Unit selected from the asset list', async () => {
     render(<ArenaPage demo />)
@@ -189,6 +194,26 @@ describe('ArenaPage remembered enemies', () => {
     expect(map).toHaveAttribute('data-core-indicator', 'true')
     expect(localStorage.getItem('arena-hero.beacon-indicator-visible.player')).toBe('true')
     expect(localStorage.getItem('arena-hero.core-indicator-visible.player')).toBe('true')
+  })
+
+  it('toggles unit routes from the bottom-left control and remembers the choice', async () => {
+    unitRoutes.routes = [{ name: 'W1', type: 'WORKER', target: [3, -2], path: [[0, 0], [3, -2]], complete: false }]
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+    const map = screen.getByTestId('world-canvas')
+
+    // The layer starts hidden even when route data is available.
+    expect(map).toHaveAttribute('data-routes', '[]')
+    expect(screen.getByRole('button', { name: 'Show unit destinations and routes' })).toHaveAttribute('aria-pressed', 'false')
+
+    await user.click(screen.getByRole('button', { name: 'Show unit destinations and routes' }))
+    expect(map.getAttribute('data-routes')).toContain('"W1"')
+    expect(screen.getByRole('button', { name: 'Hide unit destinations and routes' })).toHaveAttribute('aria-pressed', 'true')
+    expect(localStorage.getItem('arena-hero.unit-routes-visible.player')).toBe('true')
+
+    await user.click(screen.getByRole('button', { name: 'Hide unit destinations and routes' }))
+    expect(map).toHaveAttribute('data-routes', '[]')
+    expect(localStorage.getItem('arena-hero.unit-routes-visible.player')).toBe('false')
   })
 
   it('filters memory markers by unit type and remembers the filter set', async () => {

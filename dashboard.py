@@ -6027,6 +6027,42 @@ class Handler(BaseHTTPRequestHandler):
                 "names": unit_display_names(rec),
             })
             return
+        if path == "/api/unit-routes":
+            # Per-unit destinations + planned routes for the arena SPA's
+            # 路径 filter layer — the very data this dashboard's route/target
+            # layer draws: the remaining A* path (already trimmed of walked
+            # cells) plus the current target cell from the newest tick.
+            history = read_history(1)
+            rec = history[0] if history else {}
+            units = []
+            for group, etype in (("workers", "WORKER"),
+                                 ("vanguards", "VANGUARD"),
+                                 ("rangers", "RANGER")):
+                for index, raw in enumerate(rec.get(group) or []):
+                    if not isinstance(raw, dict):
+                        continue
+                    pos = raw.get("pos") or []
+                    target = raw.get("target") or []
+                    path = _remaining_path(raw)
+                    if len(target) != 2 and not path:
+                        continue
+                    units.append({
+                        "name": str(raw.get("name")
+                                    or f"{etype[0]}{index + 1}"),
+                        "type": etype,
+                        "pos": [int(pos[0]), int(pos[1])]
+                        if len(pos) == 2 else None,
+                        "target": [int(target[0]), int(target[1])]
+                        if len(target) == 2 else None,
+                        "path": path,
+                        "complete": bool(raw.get("path_complete")),
+                    })
+            self._send_json(200, {
+                "ok": True,
+                "tick": rec.get("tick"),
+                "units": units,
+            })
+            return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
