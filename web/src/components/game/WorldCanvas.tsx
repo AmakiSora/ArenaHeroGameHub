@@ -58,8 +58,9 @@ interface Props {
   // Last-known enemy positions from the tactic's map memory; drawn as dim
   // dashed markers (they may have moved), unlike live visible units.
   memoryEnemies?: EnemySighting[]
-  // Tactic bot's per-unit destinations + remaining paths; each walked cell
-  // gets a light tint of the unit's own color, plus a target ring.
+  // Tactic bot's per-unit destinations + remaining paths; the path cells get
+  // a light tint of the unit's own color baked into the terrain layer (below
+  // obstacles/units), and a target ring marks the destination.
   unitRoutes?: UnitRoute[]
   preferredSelectionId?: string
 }
@@ -93,6 +94,10 @@ interface TerrainScene {
   visibleResourceCells: Set<string>
   obstacleSprites: HTMLImageElement[]
   resourceSprites: HTMLImageElement[]
+  // Unit-route cell tints baked into the terrain tiles so they sit below
+  // obstacles, resources and units; routes change every tick, which retires
+  // the tile cache through the scene identity check.
+  unitRouteTints: Map<string, string>
 }
 interface CachedTerrainTile { canvas: HTMLCanvasElement; pixels: number; cell: number }
 interface TerrainTileCache {
@@ -144,6 +149,16 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
   const sweepMarkersByPosition = useMemo(() => groupMarkersByOrigin(sweepMarkers), [sweepMarkers])
   const shotMarkersByPosition = useMemo(() => groupMarkersByOrigin(shotMarkers), [shotMarkers])
   const attackPositionKeys = useMemo(() => new Set(attackPositions.map(positionKey)), [attackPositions])
+  const unitRouteTints = useMemo(() => {
+    const tints = new Map<string, string>()
+    if (!unitRoutes.length) return tints
+    const colors = unitRouteColors(unitRoutes)
+    for (const route of unitRoutes) {
+      const color = colors.get(route.name) ?? '#78a9ff'
+      for (const position of route.path) tints.set(positionKey(position), color)
+    }
+    return tints
+  }, [unitRoutes])
   const terrainScene = useMemo<TerrainScene>(() => ({
     explored,
     visible,
@@ -151,7 +166,8 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
     visibleResourceCells,
     obstacleSprites,
     resourceSprites,
-  }), [explored, obstacleSprites, resourceSprites, visible, visibleObstacleCells, visibleResourceCells])
+    unitRouteTints,
+  }), [explored, obstacleSprites, resourceSprites, unitRouteTints, visible, visibleObstacleCells, visibleResourceCells])
   const visibleShotMarkers = useMemo(() => shotMarkers.filter((marker) => positionInViewport(marker.from, camera, size, 1) || positionInViewport(marker.to, camera, size, 1)), [camera, shotMarkers, size])
   const inspectedFeatureView = useMemo(() => inspectedFeature ? mapFeaturesAt(inspectedFeature.position, state, explored).find((feature) => feature.kind === inspectedFeature.kind) ?? null : null, [explored, inspectedFeature, state])
 
@@ -383,23 +399,15 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
     {unitRoutes.length > 0 && <svg aria-hidden="true" className="pointer-events-none absolute inset-0 z-10" width={size.width} height={size.height}>
       {(() => {
         const colors = unitRouteColors(unitRoutes)
-        const half = camera.cell / 2
-        const inset = camera.cell * .08
         const ringRadius = Math.min(13, Math.max(7, camera.cell * .28))
-        return unitRoutes.map((route) => {
+        return unitRoutes.filter((route) => route.target).map((route) => {
+          // The cell tints themselves live in the terrain layer below; here
+          // only the destination ring floats above the map.
           const color = colors.get(route.name) ?? '#78a9ff'
-          const targetPoint = route.target ? worldToScreen(route.target) : null
+          const targetPoint = worldToScreen(route.target!)
           return <g key={`unit-route:${route.name}`}>
-            {route.path.map(([x, y]) => {
-              const point = worldToScreen([x, y])
-              // Slightly stronger tint once the path is complete, keeping the
-              // dashboard's solid-vs-dashed distinction in cell form.
-              return <rect key={`${x},${y}`} x={point.left + inset} y={point.top + inset} width={camera.cell - inset * 2} height={camera.cell - inset * 2} rx={Math.min(4, camera.cell * .12)} fill={color} opacity={route.complete ? .34 : .2} />
-            })}
-            {targetPoint && <>
-              <circle cx={targetPoint.left + half} cy={targetPoint.top + half} r={ringRadius} fill="none" stroke={color} strokeWidth={1.8} opacity={.9} />
-              <circle cx={targetPoint.left + half} cy={targetPoint.top + half} r={2.4} fill={color} />
-            </>}
+            <circle cx={targetPoint.left} cy={targetPoint.top} r={ringRadius} fill="none" stroke={color} strokeWidth={1.8} opacity={.9} />
+            <circle cx={targetPoint.left} cy={targetPoint.top} r={2.4} fill={color} />
           </g>
         })
       })()}
@@ -551,6 +559,18 @@ function drawWorldTerrain(ctx: CanvasRenderingContext2D, size: { width: number; 
     const [sx, sy] = toScreen([x, y]); const half = camera.cell / 2
     ctx.fillStyle = isVisible ? 'rgba(13,13,15,.82)' : 'rgba(5,5,5,.9)'; ctx.fillRect(sx - half, sy - half, camera.cell, camera.cell)
     ctx.strokeStyle = isVisible ? 'rgba(255,255,255,.12)' : 'rgba(255,255,255,.05)'; ctx.lineWidth = 1; ctx.strokeRect(sx - half + .5, sy - half + .5, camera.cell - 1, camera.cell - 1)
+  }
+  // Unit-route cell tints: painted right on the road so obstacle sprites,
+  // resources and (on the canvas above) units all stay visible on top.
+  for (const [key, color] of scene.unitRouteTints) {
+    const [x, y] = key.split(',').map(Number)
+    if (x < minX || x > maxX || y < minY || y > maxY) continue
+    if (!visible.has(key) && !explored.has(key)) continue
+    const [sx, sy] = toScreen([x, y]); const half = camera.cell / 2
+    const inset = camera.cell * .08
+    ctx.globalAlpha = .28; ctx.fillStyle = color
+    ctx.fillRect(sx - half + inset, sy - half + inset, camera.cell - inset * 2, camera.cell - inset * 2)
+    ctx.globalAlpha = 1
   }
   const renderedObstacles: ObstacleRenderCell[] = []
   const renderedResources: { position: Position; x: number; y: number; visible: boolean }[] = []
