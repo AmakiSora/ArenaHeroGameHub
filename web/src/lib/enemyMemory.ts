@@ -9,8 +9,8 @@ export type EnemySightingType = 'WORKER' | 'VANGUARD' | 'RANGER' | 'CORE' | 'ENE
 export interface EnemySighting {
   position: Position
   type: EnemySightingType
-  // Last tick an enemy was actually seen here; the server already ranks and
-  // caps the list by recency, this is kept for display/debugging only.
+  // Last tick an enemy was actually seen here; the server ranks by recency
+  // and caps each type separately, this is kept for display/debugging only.
   tick: number
 }
 

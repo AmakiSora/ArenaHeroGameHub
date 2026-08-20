@@ -653,6 +653,31 @@ def _parse_enemy_sighting(item) -> tuple[tuple[int, int], str, int] | None:
     return None
 
 
+# The arena's top-left strip caps its memory chips at 21 per enabled
+# filter combination, so the API must hand each type enough candidates:
+# cap per type (most recent first) instead of one global cutoff, which
+# let newer unit sightings push every older CORE entry out of the list.
+ENEMY_MEMORY_PER_TYPE_CAP = 21
+
+
+def _rank_enemy_sightings(parsed) -> list:
+    """Rank parsed sightings by last-seen tick (newest first), capped per type.
+
+    Every type keeps its ENEMY_MEMORY_PER_TYPE_CAP most recent entries, so a
+    filter combination on the arena page can always fill its own 21 slots
+    even when another type has far fresher sightings.
+    """
+    ranked = sorted(parsed, key=lambda s: s[2], reverse=True)
+    counts: dict[str, int] = {}
+    selected = []
+    for pos, etype, tick in ranked:
+        if counts.get(etype, 0) >= ENEMY_MEMORY_PER_TYPE_CAP:
+            continue
+        counts[etype] = counts.get(etype, 0) + 1
+        selected.append((pos, etype, tick))
+    return selected
+
+
 # load_map_memory() parses the full map_memory.json on every poll. The file only
 # changes when the tactic saves new discoveries or the dashboard edits it, so an
 # unchanged file (single stat()) must not cost a full re-parse. Cache by file
@@ -5968,8 +5993,8 @@ class Handler(BaseHTTPRequestHandler):
             # map_memory.json — the same data this dashboard draws as its
             # enemy-trace layer. Enemies currently visible in the latest
             # tick are skipped so the arena page never duplicates markers.
-            # Ranked by last-seen tick and capped at 20 so the overlay stays
-            # readable on long games with hundreds of stored sightings.
+            # Ranked by last-seen tick and capped per type so each filter
+            # combination on the arena page can fill its own 21 slots.
             memory = load_map_memory()
             history = read_history(1)
             rec = history[0] if history else {}
@@ -5985,10 +6010,9 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if s is not None and s[0] not in visible
             ]
-            parsed.sort(key=lambda s: s[2], reverse=True)
             sightings = [
                 {"pos": list(pos), "type": etype, "tick": tick}
-                for pos, etype, tick in parsed[:20]
+                for pos, etype, tick in _rank_enemy_sightings(parsed)
             ]
             self._send_json(200, {"ok": True, "sightings": sightings})
             return

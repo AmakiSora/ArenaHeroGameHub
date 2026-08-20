@@ -6477,6 +6477,24 @@ class EnemySightingsMemoryTests(unittest.TestCase):
             ((5, 6), "WORKER", 12),
         )
 
+    def test_dashboard_ranks_enemy_sightings_with_per_type_cap(self) -> None:
+        # The old global top-20 cutoff pushed every older CORE memory out
+        # once fresher unit sightings outnumbered them; each type must keep
+        # its own newest 21 entries so the arena's per-filter cap can fill.
+        parsed = (
+            [((i, 0), "CORE", i) for i in range(1, 26)]
+            + [((i, 100), "VANGUARD", 100 + i) for i in range(1, 26)]
+        )
+
+        ranked = dashboard._rank_enemy_sightings(parsed)
+
+        self.assertEqual(len(ranked), 42)
+        core_ticks = [tick for _, etype, tick in ranked if etype == "CORE"]
+        self.assertEqual(core_ticks, list(range(25, 4, -1)))
+        # The overall order still reads newest first across types.
+        self.assertEqual(ranked[0][2], 125)
+        self.assertEqual(ranked[21][2], 25)
+
     def test_ranger_within_own_radius_confirms_empty_and_clears(self) -> None:
         # Ranger vision is 5; standing 5 away with clear sight confirms the
         # cell is empty and the stale marker goes away.
