@@ -29,6 +29,11 @@ import { mergeCommandPlans, prepareManualUnitActionPlan } from '../lib/commandPl
 import type { CommandPlan, CoreAction, Position, UnitAction, WorldObject } from '../lib/types'
 import { positionKey } from '../lib/visibility'
 
+// Cap for the top-left remembered-enemy strip: 21 chips fill exactly three
+// rows of seven. The cap applies to whatever type-filter combination is
+// currently enabled, ranked by recency, so it is computed after filtering.
+const MEMORY_SIGHTINGS_MAX = 21
+
 export function ArenaPage({ demo = false }: { demo?: boolean }) {
   const { t } = useTranslation(); const { user } = useAuth(); const game = useGameStream(demo, demo ? 'demo' : user?.username ?? 'anonymous')
   // Tactic-dashboard display names (W1/V2/R3) so the arena page labels units
@@ -208,6 +213,14 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     const live = new Set((game.state?.objects ?? []).filter((object) => object.controlled === false && object.position).map((object) => positionKey(object.position!)))
     return enemyMemory.filter((sighting) => (sighting.type === 'ENEMY' || filters.has(sighting.type)) && !live.has(positionKey(sighting.position)))
   }, [enemyMemory, enemyMemoryFilters, enemyMemoryVisible, game.state])
+  // Top-left strip keeps at most MEMORY_SIGHTINGS_MAX entries, most recently
+  // seen first; the cap is relative to the already-filtered set, so a
+  // single-type filter and a multi-type filter each total 21 at most.
+  // The map markers below keep the full filtered set.
+  const memoryEnemyList = useMemo(() => memoryEnemies
+    .slice()
+    .sort((left, right) => right.tick - left.tick)
+    .slice(0, MEMORY_SIGHTINGS_MAX), [memoryEnemies])
   const setUnitAction = (id: string, action: UnitAction | null) => { const current = planRef.current; const unit_actions = { ...current.unit_actions }; if (action) unit_actions[id] = action; else delete unit_actions[id]; commitManualPlan({ ...current, unit_actions }) }
   const setCoreAction = (action: CoreAction | null) => { const current = planRef.current; if (action) { commitManualPlan({ ...current, core_action: action }); return } const next = { ...current }; delete next.core_action; commitManualPlan(next) }
   const unitAction = (id: string, action: UnitAction | null) => {
@@ -280,7 +293,7 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} teamRoster={teamRoster} onAssignTeam={demo ? undefined : assignTeam} teamConfig={teamConfig} onUpdateConfig={demo ? undefined : updateConfig} onPickCoords={demo ? undefined : startCoordPick} pickingCoordsField={coordPick?.xField ?? null} />
     <section className="relative min-h-0 overflow-hidden">
       {!respawning && <GameHUD phase={game.phase} stateReceivedAt={game.stateReceivedAt} />}
-      {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} sightings={memoryEnemies} onJumpTo={jumpToMemoryEnemy} />}
+      {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} sightings={memoryEnemyList} onJumpTo={jumpToMemoryEnemy} />}
       {!respawning && game.tick && <PendingCommands tick={game.tick} state={game.state} receipts={game.receipts} unitNames={unitNames} />}
       <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onCenterCore={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} beaconIndicatorVisible={beaconIndicatorVisible} coreIndicatorVisible={coreIndicatorVisible} onAnchorChange={setAnchor} coordPicking={coordPick !== null || waypointPick !== null} onCoordPick={(position) => waypointPick ? completeWaypointPick(position) : completeCoordPick(position)} highlightPositions={[...coordPickHighlight, ...waypointPickHighlight]} memoryEnemies={memoryEnemies} />
       {!respawning && <ResourceActivity events={game.state.events} />}

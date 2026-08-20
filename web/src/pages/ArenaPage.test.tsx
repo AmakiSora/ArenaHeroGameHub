@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useEffect } from 'react'
 import '../lib/i18n'
+import type { EnemySightingType } from '../lib/enemyMemory'
 import { ArenaPage } from './ArenaPage'
 
 const game = vi.hoisted(() => ({
@@ -49,9 +50,10 @@ const memory = vi.hoisted(() => ({
     { position: [8, 4] as [number, number], type: 'VANGUARD' as const, tick: 900 },
     { position: [3, 1] as [number, number], type: 'CORE' as const, tick: 905 },
     { position: [-6, 9] as [number, number], type: 'ENEMY' as const, tick: 910 },
-  ],
+  ] as Array<{ position: [number, number]; type: EnemySightingType; tick: number }>,
 }))
 vi.mock('../hooks/useEnemyMemory', () => ({ useEnemyMemory: () => memory.sightings }))
+const originalMemorySightings = memory.sightings
 vi.mock('../components/game/WorldCanvas', () => ({
   WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, memoryEnemies = [], beaconIndicatorVisible = true, coreIndicatorVisible = true, onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; memoryEnemies?: Array<{ position: [number, number]; type: string }>; beaconIndicatorVisible?: boolean; coreIndicatorVisible?: boolean; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
     useEffect(() => { onAnchorChange(selectedId ? { x: 100, y: 100, side: 'right' } : null) }, [onAnchorChange, selectedId])
@@ -70,7 +72,7 @@ vi.mock('../components/game/WorldCanvas', () => ({
 }))
 
 describe('ArenaPage asset selection', () => {
-  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear(); unitNames.names = {}; waypoints.waypoints = {}; waypoints.refresh.mockReset(); vi.unstubAllGlobals() })
+  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear(); unitNames.names = {}; waypoints.waypoints = {}; waypoints.refresh.mockReset(); memory.sightings = originalMemorySightings; vi.unstubAllGlobals() })
 
   it('centers the map on a Unit selected from the asset list', async () => {
     render(<ArenaPage demo />)
@@ -127,7 +129,7 @@ describe('ArenaPage asset selection', () => {
 })
 
 describe('ArenaPage remembered enemies', () => {
-  beforeEach(() => localStorage.clear())
+  beforeEach(() => { localStorage.clear(); memory.sightings = originalMemorySightings })
 
   it('shows memory markers on the map and dimmed chips, skipping cells a live enemy occupies', async () => {
     const user = userEvent.setup()
@@ -214,6 +216,59 @@ describe('ArenaPage remembered enemies', () => {
 
     await user.click(vanguardFilter)
     expect(map.getAttribute('data-memory')).toContain('[8,4]')
+  })
+
+  const memoryChips = () => screen.getAllByRole('button', { name: /· Last known position/ })
+
+  it('caps the top-left memory strip at the 21 most recent entries while the map keeps them all', () => {
+    memory.sightings = Array.from({ length: 30 }, (_, index) => ({
+      position: [index, 100 + index] as [number, number],
+      type: 'CORE' as const,
+      tick: index + 1,
+    }))
+    render(<ArenaPage />)
+
+    // Only the 21 most recently seen cores fill the strip (ticks 30..10).
+    const chips = memoryChips()
+    expect(chips).toHaveLength(21)
+    expect(chips[0].getAttribute('aria-label')).toBe('Core [29, 129] · Last known position')
+    expect(chips[20].getAttribute('aria-label')).toBe('Core [9, 109] · Last known position')
+    expect(screen.queryByRole('button', { name: 'Core [8, 108] · Last known position' })).not.toBeInTheDocument()
+
+    // The map markers are unaffected by the strip cap.
+    const map = screen.getByTestId('world-canvas')
+    expect(JSON.parse(map.getAttribute('data-memory') ?? '[]')).toHaveLength(30)
+  })
+
+  it('counts the 21-entry cap against the enabled filter combination only', async () => {
+    memory.sightings = [
+      ...Array.from({ length: 15 }, (_, index) => ({ position: [index, 100 + index] as [number, number], type: 'VANGUARD' as const, tick: 300 + index })),
+      ...Array.from({ length: 15 }, (_, index) => ({ position: [index, 200 + index] as [number, number], type: 'WORKER' as const, tick: 200 + index })),
+      ...Array.from({ length: 15 }, (_, index) => ({ position: [index, 300 + index] as [number, number], type: 'CORE' as const, tick: 100 + index })),
+    ]
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+
+    // All three filters on: 21 across the combined types (the newest 15
+    // vanguards + 6 workers), not 21 per type.
+    expect(memoryChips()).toHaveLength(21)
+    expect(memoryChips().some((chip) => chip.getAttribute('aria-label')!.startsWith('Core'))).toBe(false)
+
+    // Dropping the core filter keeps the cap relative to the remaining
+    // vanguard + worker pool (30 entries -> still 21).
+    await user.click(screen.getByRole('button', { name: 'Core memory filter' }))
+    expect(memoryChips()).toHaveLength(21)
+
+    // Vanguard-only: 15 entries fit under the cap, so all of them show.
+    await user.click(screen.getByRole('button', { name: 'Worker memory filter' }))
+    expect(memoryChips()).toHaveLength(15)
+    expect(memoryChips()[0].getAttribute('aria-label')).toBe('Vanguard [14, 114] · Last known position')
+
+    // Core-only: the cap restarts for that single-type combination.
+    await user.click(screen.getByRole('button', { name: 'Vanguard memory filter' }))
+    await user.click(screen.getByRole('button', { name: 'Core memory filter' }))
+    expect(memoryChips()).toHaveLength(15)
+    expect(memoryChips()[0].getAttribute('aria-label')).toBe('Core [14, 314] · Last known position')
   })
 
   it('adds a manual target by picking a map cell from the unit dialog', async () => {
