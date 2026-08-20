@@ -58,8 +58,8 @@ interface Props {
   // Last-known enemy positions from the tactic's map memory; drawn as dim
   // dashed markers (they may have moved), unlike live visible units.
   memoryEnemies?: EnemySighting[]
-  // Tactic bot's per-unit destinations + remaining paths; drawn as colored
-  // polylines + target rings, like the dashboard's 路径 layer.
+  // Tactic bot's per-unit destinations + remaining paths; each walked cell
+  // gets a light tint of the unit's own color, plus a target ring.
   unitRoutes?: UnitRoute[]
   preferredSelectionId?: string
 }
@@ -384,13 +384,18 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
       {(() => {
         const colors = unitRouteColors(unitRoutes)
         const half = camera.cell / 2
-        const toPoint = ([x, y]: Position) => { const point = worldToScreen([x, y]); return `${point.left + half},${point.top + half}` }
+        const inset = camera.cell * .08
         const ringRadius = Math.min(13, Math.max(7, camera.cell * .28))
         return unitRoutes.map((route) => {
           const color = colors.get(route.name) ?? '#78a9ff'
           const targetPoint = route.target ? worldToScreen(route.target) : null
           return <g key={`unit-route:${route.name}`}>
-            {route.path.length > 1 && <polyline points={route.path.map(toPoint).join(' ')} fill="none" stroke={color} strokeWidth={2.2} strokeLinejoin="round" strokeLinecap="round" opacity={.82} strokeDasharray={route.complete ? undefined : '5 4'} />}
+            {route.path.map(([x, y]) => {
+              const point = worldToScreen([x, y])
+              // Slightly stronger tint once the path is complete, keeping the
+              // dashboard's solid-vs-dashed distinction in cell form.
+              return <rect key={`${x},${y}`} x={point.left + inset} y={point.top + inset} width={camera.cell - inset * 2} height={camera.cell - inset * 2} rx={Math.min(4, camera.cell * .12)} fill={color} opacity={route.complete ? .34 : .2} />
+            })}
             {targetPoint && <>
               <circle cx={targetPoint.left + half} cy={targetPoint.top + half} r={ringRadius} fill="none" stroke={color} strokeWidth={1.8} opacity={.9} />
               <circle cx={targetPoint.left + half} cy={targetPoint.top + half} r={2.4} fill={color} />
