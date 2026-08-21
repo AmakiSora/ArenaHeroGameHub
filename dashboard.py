@@ -1355,16 +1355,24 @@ def render_config_panel(workers: int = 0, vanguards: int = 0, rangers: int = 0) 
         else:
             state_cls, state_text = "ok", "已达标"
         suffix = key.replace("target_", "").capitalize()  # Workers / Vanguards / Rangers
+        percent = min(100, round(current / target * 100)) if target > 0 else (100 if current > 0 else 0)
         return (
             f'<div class="production-target">'
             f'<label for="cfg-{key}">{label}</label>'
             f'<input id="cfg-{key}" name="{key}" type="number" data-kind="integer" '
             f'min="0" max="100" step="1" value="{target}" required>'
+            f'<div class="production-status">'
             f'<span class="production-current">'
             f'当前 <b id="prodCurrent{suffix}">{current}</b>'
             f' / 需求 <b id="prodTarget{suffix}">{target}</b>'
             f'<em id="prodState{suffix}" class="prod-state {state_cls}">{state_text}</em>'
-            f'</span></div>'
+            f'</span>'
+            f'<span class="production-bar" role="progressbar" aria-valuemin="0" '
+            f'aria-valuemax="{target}" aria-valuenow="{min(current, target)}" '
+            f'aria-label="{label}完成进度">'
+            f'<span class="production-bar-fill {state_cls}" id="prodBar{suffix}" '
+            f'style="width:{percent}%"></span>'
+            f'</span></div></div>'
         )
 
     target_rows = "".join([
@@ -2720,6 +2728,11 @@ body{margin:0;min-height:100vh;color:var(--text);
 .prod-state{padding:2px 8px;border-radius:999px;font-size:10px;font-style:normal;font-family:"Segoe UI","Microsoft YaHei",sans-serif}
 .prod-state.producing{background:rgba(87,214,163,.15);color:#8ef0c4}
 .prod-state.ok{background:rgba(110,168,255,.12);color:#a9c8ff}
+.production-status{display:flex;flex-direction:column;gap:5px;min-width:0}
+.production-bar{display:block;height:6px;border-radius:999px;background:rgba(255,255,255,.08);overflow:hidden}
+.production-bar-fill{display:block;height:100%;border-radius:999px;transition:width .3s ease}
+.production-bar-fill.producing{background:linear-gradient(90deg,#57d6a3,#8ef0c4)}
+.production-bar-fill.ok{background:linear-gradient(90deg,#6ea8ff,#a9c8ff)}
 .hero{display:none}
 .metrics{display:none}
 .layout{display:none}
@@ -3982,6 +3995,17 @@ JS = r"""
       else { text = '已达标'; cls = 'ok'; }
       el.textContent = text;
       el.className = 'prod-state ' + cls;
+      const bar = document.getElementById('prodBar' + row[0].slice('prodState'.length));
+      if(bar){
+        const pct = target > 0 ? Math.min(100, Math.round(current / target * 100)) : (current > 0 ? 100 : 0);
+        bar.style.width = pct + '%';
+        bar.className = 'production-bar-fill ' + cls;
+      }
+      const track = bar && bar.parentElement;
+      if(track && track.getAttribute('role') === 'progressbar'){
+        track.setAttribute('aria-valuemax', String(target));
+        track.setAttribute('aria-valuenow', String(Math.min(current, target)));
+      }
     });
   }
 
