@@ -44,6 +44,7 @@ LOG_FILE = _data_path("tactic_log.jsonl")
 MAP_FILE = _data_path("map_memory.json")
 WAYPOINTS_FILE = _data_path("waypoints.json")
 SELF_DESTRUCT_FILE = _data_path("self_destruct.json")
+HOLDS_FILE = _data_path("holds.json")
 BATTLE_LOG_FILE = _data_path("battle_log.jsonl")
 HOST = "0.0.0.0"
 PORT = 4399
@@ -1134,6 +1135,75 @@ def request_self_destruct(name: str) -> dict:
         "msg": f"自裁指令：{name}",
     }])
     return {"ok": True, "name": name, "pending": len(units)}
+
+
+# ── manual per-unit hold position (「驻守」toggle, shared with the tactic) ──
+# The dashboard toggles display names in holds.json; the tactic process reads
+# the file each Tick, pins those units in place (auto-attack in range, no
+# movement), and prunes entries whose unit is gone. Same cross-process lock
+# discipline as waypoints.json / self_destruct.json.
+
+
+def _read_holds_file() -> set[str]:
+    try:
+        with open(HOLDS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return set()
+    units = data.get("units") if isinstance(data, dict) else None
+    if not isinstance(units, list):
+        return set()
+    out: set[str] = set()
+    for name in units:
+        if isinstance(name, str) and _WAYPOINT_NAME_RE.fullmatch(name.upper()):
+            out.add(name.upper())
+    return out
+
+
+def _write_holds_file(units: set[str]) -> None:
+    atomic_write_text(HOLDS_FILE, json.dumps({
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "units": sorted(units),
+    }, ensure_ascii=False))
+
+
+def load_holds() -> set[str]:
+    """Read the current held-unit display names (for /api/holds + cards)."""
+    return _read_holds_file()
+
+
+def set_hold(name: str) -> dict:
+    """Enter 驻守模式 for one unit (display-name keyed)."""
+    name = _waypoint_name(name)
+    with file_lock(HOLDS_FILE):
+        units = _read_holds_file()
+        units.add(name)
+        _write_holds_file(units)
+    append_jsonl(BATTLE_LOG_FILE, [{
+        "tick": None,
+        "ts": time.time(),
+        "cat": "config",
+        "msg": f"驻守指令：{name}",
+    }])
+    return {"ok": True, "name": name, "held": len(units)}
+
+
+def clear_hold(name: str) -> dict:
+    """Cancel 驻守模式 for one unit (display-name keyed)."""
+    name = _waypoint_name(name)
+    with file_lock(HOLDS_FILE):
+        units = _read_holds_file()
+        before = len(units)
+        units.discard(name)
+        _write_holds_file(units)
+    if before > len(units):
+        append_jsonl(BATTLE_LOG_FILE, [{
+            "tick": None,
+            "ts": time.time(),
+            "cat": "config",
+            "msg": f"解除驻守：{name}",
+        }])
+    return {"ok": True, "name": name, "held": len(units)}
 
 
 TEAM_BOARD_KEYS = ("unassigned", "home", "attack", "kite", "guerrilla")
@@ -2339,6 +2409,12 @@ body{margin:0;min-height:100vh;color:var(--text);
  font-size:10px;line-height:1.4;padding:1px 7px;border-radius:999px;cursor:pointer;white-space:nowrap;
  transition:background .12s,border-color .12s}
 .sd-btn:hover{background:rgba(255,80,80,.42);color:#fff;border-color:rgba(255,120,120,.65)}
+.hold-btn{appearance:none;border:1px solid rgba(87,214,163,.35);background:rgba(87,214,163,.12);color:#8ef0c4;
+ font-size:10px;line-height:1.4;padding:1px 7px;border-radius:999px;cursor:pointer;white-space:nowrap;
+ transition:background .12s,border-color .12s}
+.hold-btn:hover{background:rgba(87,214,163,.35);color:#fff;border-color:rgba(120,240,190,.65)}
+.hold-btn.on{background:rgba(87,214,163,.32);color:#0b2e20;border-color:rgba(120,240,190,.8);font-weight:600}
+.unit.hold{border-color:rgba(87,214,163,.55)!important;box-shadow:0 0 0 1px rgba(87,214,163,.35) inset}
 .unit-facts{display:flex;align-items:center;gap:7px;min-width:0;margin-top:5px;color:var(--muted);font-size:10px;line-height:1.35}
 .unit-locator{min-width:0;flex:1;color:#c8d4eb;font:10.5px Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .unit-locator .arrow{padding:0 3px;color:rgb(var(--unit-tone))}
@@ -4768,14 +4844,38 @@ JS = r"""
     })
     .catch(function(){});
   });
+  // ── per-unit 驻守 (hold position) toggle buttons ───────────────────────
+  // Same delegation pattern: clicking 驻守 pins the unit in place (it stops
+  // following its program and auto-attacks enemies entering range); clicking
+  // 解除驻守 releases it back to the normal planner.
+  document.addEventListener('click', function(e){
+    const el = e.target;
+    if(!(el instanceof Element)) return;
+    const btn = el.closest ? el.closest('.hold-btn') : null;
+    if(!btn) return;
+    const name = btn.getAttribute('data-hold-unit');
+    if(!name) return;
+    const on = btn.classList.contains('on');
+    fetch((on ? '/api/hold/clear' : '/api/hold/set'), {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({name:name})
+    })
+    .then(function(res){ return res.json(); })
+    .then(function(data){
+      if(data && data.ok){ lastTick = null; softRefresh(); }
+    })
+    .catch(function(){});
+  });
   // ── click a unit card in the right rail → jump the map to the unit ─────
   // Cards re-render on every soft refresh, so bind once on the document and
   // delegate by the focus attributes each card carries.
   document.addEventListener('click', function(e){
     const el = e.target;
     if(!(el instanceof Element)) return;
-    // The 自裁 button lives inside the card; that click must not move the map.
-    if(el.closest('.sd-btn')) return;
+    // The 自裁 / 驻守 buttons live inside the card; those clicks must not move
+    // the map.
+    if(el.closest('.sd-btn') || el.closest('.hold-btn')) return;
     const card = el.closest('[data-focus-wx][data-focus-wy]');
     if(!card) return;
     const wx = Number(card.getAttribute('data-focus-wx'));
@@ -4853,6 +4953,8 @@ def build_parts(log_limit: int = 200):
     rcells = rec.get("resource_cells", [])
     mm = load_map_memory()
     waypoints = load_waypoints()
+    # Held (驻守) unit names — the per-unit cards render a 驻守 toggle for them.
+    holds = load_holds()
     # Combat hotspots drive both the alert strip above the map and the pulse
     # rings on it — compute once, reuse for both.
     hotspots = _combat_hotspots(rec)
@@ -4908,10 +5010,14 @@ def build_parts(log_limit: int = 200):
             f' data-focus-wx="{int(wpos[0])}" data-focus-wy="{int(wpos[1])}"'
             if len(wpos) == 2 else ""
         )
+        held = str(name).upper() in holds
+        hold_label = "解除驻守" if held else "驻守"
         return (
-            f'<div class="unit {kind}" title="{safe_act}"{focus_attr}><div class="unit-top">'
+            f'<div class="unit {kind}{" hold" if held else ""}" title="{safe_act}"{focus_attr}><div class="unit-top">'
             f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
             f'<span class="unit-actions"><span class="badge {kind}">{html.escape(str(badge))}</span>'
+            f'<button type="button" class="hold-btn{" on" if held else ""}" data-hold-unit="{safe_name}" '
+            f'aria-label="{hold_label} {safe_name}" title="{hold_label}（原地驻守，进入射程自动攻击）">{hold_label}</button>'
             f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '
             f'aria-label="自裁 {safe_name}" title="自裁">自裁</button></span></div>'
             f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(w.get("pos"))}'
@@ -4959,10 +5065,14 @@ def build_parts(log_limit: int = 200):
             f' data-focus-wx="{int(upos[0])}" data-focus-wy="{int(upos[1])}"'
             if len(upos) == 2 else ""
         )
+        held = str(name).upper() in holds
+        hold_label = "解除驻守" if held else "驻守"
         return (
-            f'<div class="unit {color_cls}" title="{safe_act}"{focus_attr}><div class="unit-top">'
+            f'<div class="unit {color_cls}{" hold" if held else ""}" title="{safe_act}"{focus_attr}><div class="unit-top">'
             f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
             f'<span class="unit-actions"><span class="badge {color_cls}">{label}</span>'
+            f'<button type="button" class="hold-btn{" on" if held else ""}" data-hold-unit="{safe_name}" '
+            f'aria-label="{hold_label} {safe_name}" title="{hold_label}（原地驻守，进入射程自动攻击）">{hold_label}</button>'
             f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '
             f'aria-label="自裁 {safe_name}" title="自裁">自裁</button></span></div>'
             f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(u.get("pos"))}</span>'
@@ -6012,6 +6122,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/waypoints":
             self._send_json(200, {"ok": True, "waypoints": load_waypoints()})
             return
+        if path == "/api/holds":
+            # Held (驻守) unit display names, for the arena SPA's unit dialog.
+            self._send_json(200, {"ok": True, "holds": sorted(load_holds())})
+            return
         if path == "/api/enemy-memory":
             # Remembered enemies (last-known positions) from the shared
             # map_memory.json — the same data this dashboard draws as its
@@ -6257,6 +6371,26 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"ok": False, "error": str(exc)})
                 return
             result = request_self_destruct(name)
+            self._send_json(200 if result.get("ok") else 400, result)
+            return
+
+        if path == "/api/hold/set":
+            try:
+                name = _waypoint_name(data.get("name"))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            result = set_hold(name)
+            self._send_json(200 if result.get("ok") else 400, result)
+            return
+
+        if path == "/api/hold/clear":
+            try:
+                name = _waypoint_name(data.get("name"))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            result = clear_hold(name)
             self._send_json(200 if result.get("ok") else 400, result)
             return
 

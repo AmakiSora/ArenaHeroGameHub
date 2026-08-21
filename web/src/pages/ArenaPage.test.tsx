@@ -44,6 +44,11 @@ const waypoints = vi.hoisted(() => ({
   refresh: vi.fn(),
 }))
 vi.mock('../hooks/useWaypoints', () => ({ useWaypoints: () => waypoints }))
+const holds = vi.hoisted(() => ({
+  holds: new Set<string>(),
+  refresh: vi.fn(),
+}))
+vi.mock('../hooks/useHolds', () => ({ useHolds: () => holds }))
 const unitRoutes = vi.hoisted(() => ({
   routes: [] as Array<{ name: string; type: 'WORKER' | 'VANGUARD' | 'RANGER'; target: [number, number] | null; path: [number, number][]; complete: boolean }>,
 }))
@@ -77,7 +82,7 @@ vi.mock('../components/game/WorldCanvas', () => ({
 }))
 
 describe('ArenaPage asset selection', () => {
-  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear(); unitNames.names = {}; waypoints.waypoints = {}; waypoints.refresh.mockReset(); memory.sightings = originalMemorySightings; unitRoutes.routes = []; vi.unstubAllGlobals() })
+  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear(); unitNames.names = {}; waypoints.waypoints = {}; waypoints.refresh.mockReset(); holds.holds = new Set(); holds.refresh.mockReset(); memory.sightings = originalMemorySightings; unitRoutes.routes = []; vi.unstubAllGlobals() })
 
   it('centers the map on a Unit selected from the asset list', async () => {
     render(<ArenaPage demo />)
@@ -360,5 +365,24 @@ describe('ArenaPage remembered enemies', () => {
     expect(waypoints.refresh).toHaveBeenCalled()
     // The dialog reopens and shows the queue from the refreshed waypoint state.
     expect(screen.getByText('[7, -3]')).toBeInTheDocument()
+  })
+
+  it('toggles hold position (驻守) for a unit from the dialog', async () => {
+    unitNames.names = { worker: 'W1' }
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true }) }) as Response)
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+
+    await user.click(screen.getByRole('button', { name: /W1.*12, -7/ }))
+    expect(screen.getByText('Manual targets')).toBeInTheDocument()
+
+    // Enter hold: POST /api/hold/set, then refresh the shared hold state.
+    await user.click(screen.getByRole('button', { name: 'Hold position' }))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(path).toBe('/api/hold/set')
+    expect(JSON.parse(init.body as string)).toEqual({ name: 'W1' })
+    expect(holds.refresh).toHaveBeenCalled()
   })
 })

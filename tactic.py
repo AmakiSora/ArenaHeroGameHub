@@ -47,6 +47,10 @@ BATTLE_LOG_PATH = _data_dir() / "battle_log.jsonl"
 WAYPOINTS_PATH = _data_dir() / "waypoints.json"
 # Manual per-unit self-destruct commands set from the dashboard (display-name keyed).
 SELF_DESTRUCT_PATH = _data_dir() / "self_destruct.json"
+# Manual per-unit hold-position (驻守) commands set from the dashboard
+# (display-name keyed): a held unit stands in place and auto-attacks enemies
+# entering its range instead of following its normal program.
+HOLDS_PATH = _data_dir() / "holds.json"
 
 # Display-name prefix per unit type (W / V / R), shared with the dashboard.
 _UNIT_NAME_PREFIX = {
@@ -1615,6 +1619,83 @@ def _plan_waypoint(
         return _finish("waypoint-unreachable")
     _record([tuple(pos), target], complete=True)
     return ("WAIT", f"waypoint-blocked {target}")
+
+
+def _plan_hold(
+    unit: Any,
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, Any],
+) -> tuple[str, str]:
+    """驻守模式: stand in place and auto-attack enemies entering range.
+
+    The unit never issues a MOVE: it holds its cell and only fires at hostile
+    units that are already inside its attack range (or that a motion-track
+    prediction puts inside it next Tick). Combat mirrors the kite policy's
+    predictive targeting — shoot/sweep the cell a moving enemy WILL occupy
+    after movement resolves, so a closing Vanguard/Ranger is hit on its
+    post-move position instead of the stale cell it just left.
+    """
+    pos = tuple(unit.position)
+    if getattr(unit, "unit_type", None) == UnitType.WORKER:
+        # Workers cannot fight; hold mode simply pins them in place.
+        unit.wait()
+        return ("WAIT", "hold-stationary")
+    attack_range = int(config.get("ranger_attack_range", 3))
+    threats = _combat_threats(enemies)
+    if unit.unit_type == UnitType.VANGUARD:
+        sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
+        if sweep is not None:
+            return sweep
+        # Predictive sweep: an advancing enemy is about to step into an
+        # adjacent cardinal cell — sweep that cell so the hit lands on its
+        # post-move position (movement resolves before combat).
+        for enemy in sorted(
+            threats, key=lambda e: _chebyshev(pos, tuple(e.position)),
+        ):
+            predicted = _kite_motion_info(enemy, pos).get("predicted")
+            if predicted is None or predicted in obstacle_cells:
+                continue
+            dx, dy = predicted[0] - pos[0], predicted[1] - pos[1]
+            if abs(dx) + abs(dy) != 1:
+                continue
+            direction = _cardinal_toward_delta(dx, dy)
+            if direction is None:
+                continue
+            unit.sweep(direction)
+            return (
+                "SWEEP",
+                f"{direction.name} hold-predict {predicted} "
+                f"enemy at {tuple(enemy.position)}",
+            )
+        unit.wait()
+        return ("WAIT", "hold-stationary")
+    # Ranger: first shoot where a moving threat will be next Tick (kite-style
+    # trajectory prediction), then fall back to the best current-position shot
+    # (catches stationary enemies / workers without a stable velocity).
+    for enemy in sorted(
+        threats, key=lambda e: _chebyshev(pos, tuple(e.position)),
+    ):
+        predicted = _kite_motion_info(enemy, pos).get("predicted")
+        if predicted is None:
+            continue
+        fired = _kite_ranger_fire(
+            unit, pos, enemy, predicted, obstacle_cells, attack_range,
+        )
+        if fired is not None:
+            return fired
+    shot = _ranger_best_shot(
+        unit,
+        pos,
+        enemies,
+        obstacle_cells,
+        attack_range,
+        lead_fire_enabled=bool(config.get("ranger_lead_fire_enabled", True)),
+    )
+    if shot is not None:
+        return shot
+    unit.wait()
+    return ("WAIT", "hold-stationary")
 
 
 def _assign_delivery_lease(workers: Any, core_pos: tuple[int, int]) -> str | None:
@@ -5467,6 +5548,65 @@ def _remove_self_destructs(names: set[str]) -> None:
         pass
 
 
+# ── manual per-unit hold position (dashboard 驻守 command) ───────────────────
+# Same cross-process file discipline as self_destruct.json: the dashboard
+# toggles display names in holds.json, and each Tick the tactic loads the held
+# set (pruning names whose unit no longer exists) and pins those units in
+# place. Hold is a persistent state, so the tactic never deletes entries — the
+# dashboard clears a name when the operator clicks the button again.
+
+
+def _load_holds_unlocked() -> set[str]:
+    """Read the held-unit display names from the shared file."""
+    if not HOLDS_PATH.exists():
+        return set()
+    try:
+        data = json.loads(HOLDS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    units = data.get("units") if isinstance(data, dict) else None
+    if not isinstance(units, list):
+        return set()
+    return {name for name in units if isinstance(name, str)}
+
+
+def _write_holds_unlocked(names: set[str]) -> None:
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "units": sorted(names),
+    }
+    atomic_write_text(HOLDS_PATH, json.dumps(payload, ensure_ascii=False))
+
+
+_holds_sig_cache: dict[str, tuple[int, int] | None] = {}
+_holds_cached: dict[str, set[str]] = {}
+
+
+def _load_and_prune_holds(alive_names: set[str]) -> set[str]:
+    """Load held-unit names, dropping entries whose unit is already gone.
+
+    Returns the names still alive that the planner should hold this Tick.
+    """
+    key = str(HOLDS_PATH)
+    sig = _file_signature(HOLDS_PATH)
+    if key in _holds_sig_cache and sig == _holds_sig_cache[key]:
+        cached = _holds_cached.get(key, set())
+        if not cached or cached <= alive_names:
+            return set(cached)  # steady state: unchanged file, all held alive
+        # A held unit died: fall through and persist the prune so a restart's
+        # name re-use can never inherit a stale hold.
+    with file_lock(HOLDS_PATH):
+        pending = _load_holds_unlocked()
+        remaining = {n for n in pending if n in alive_names}
+        if remaining != pending:
+            _write_holds_unlocked(remaining)
+            sig = _file_signature(HOLDS_PATH)
+        _holds_sig_cache[key] = sig
+        _holds_cached[key] = set(remaining)
+        return remaining
+
+
+
 
 def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
     """Accumulate permanent obstacles. Returns the stable known-obstacle set.
@@ -6075,6 +6215,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     }
     waypoints = _load_and_prune_waypoints(alive_names)
 
+    # Manual per-unit hold-position (驻守) commands set from the dashboard.
+    # Held units stand in place and auto-attack instead of following their
+    # normal program; the dashboard toggles the entry off to release them.
+    holds = _load_and_prune_holds(alive_names)
+
     # Manual per-unit self-destruct commands set from the dashboard. Commands
     # for units still alive are issued in the unit loop below, then removed.
     self_destructs = _load_and_prune_self_destructs(alive_names)
@@ -6653,6 +6798,19 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             unit.self_destruct()
             unit_actions_detail[uid] = "SELF_DESTRUCT:manual"
             commanded_self_destructs.add(name)
+            continue
+        # Dashboard 驻守 command: pin the unit in place. It never moves and
+        # auto-attacks enemies entering its range (with kite-style trajectory
+        # prediction). Hold outranks every program branch below except 自裁,
+        # so the operator can park a unit exactly where it stands.
+        if name in holds:
+            action, detail = _plan_hold(
+                unit,
+                enemies,
+                obstacle_cells,
+                config,
+            )
+            unit_actions_detail[uid] = f"{action}:{detail}[hold]"
             continue
         # Delivery priority: a healer (or any idle unit) squatting on the core
         # cell blocks the unloading chute. While cargo workers are queued up,

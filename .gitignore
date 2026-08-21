@@ -40,6 +40,11 @@ diagnose.py
 dash*.log
 nul
 _nul
+# Temp QA / remote diagnostic artifacts
+.workbuddy/
+_qa_*.png
+_remote_*.json
+_remote_*.jsonl
 # IDE
 .idea/
 

@@ -113,6 +113,8 @@ ArenaGame/
 | `map_memory.json` | tactic | 矿点坐标 + 敌人踪迹（跨重启持久） |
 | `game_stats.json` | tactic | 累计经济/生产/战斗统计（跨重启持久） |
 | `waypoints.json` | dashboard | 仪表盘手动设定的单位目标点 |
+| `self_destruct.json` | dashboard | 仪表盘手动自裁指令（队列，执行后清除） |
+| `holds.json` | dashboard | 仪表盘驻守开关（单位原地驻守，进入射程自动攻击） |
 | `tactic_play.log` | tactic | 控制台输出记录 |
 
 ---
@@ -269,6 +271,10 @@ curl -X POST http://localhost:4399/api/config/reset \
 | POST | `/api/teams` | 更新分队名单与设置 |
 | GET  | `/api/trends?seconds=N` | 最近 N 秒内的趋势数据点序列（时间过滤） |
 | GET/POST | `/api/waypoints` | 手动单位目标点 |
+| GET | `/api/holds` | 驻守单位列表（名称数组） |
+| POST | `/api/hold/set` | 让某单位进入驻守模式（原地驻守，射程内自动攻击） |
+| POST | `/api/hold/clear` | 解除某单位驻守，恢复程序行动 |
+| POST | `/api/unit/self_destruct` | 手动自裁某单位 |
 
 ### 鉴权
 

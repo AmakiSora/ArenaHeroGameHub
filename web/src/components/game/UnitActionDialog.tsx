@@ -34,6 +34,10 @@ interface Props {
   onPickWaypoint?: () => void
   onRemoveWaypoint?: (index: number) => void
   onClearWaypoints?: () => void
+  // Manual hold position (the dashboard's 驻守 toggle): a held unit stands in
+  // place and auto-attacks enemies entering range; clicking again releases it.
+  holdActive?: boolean
+  onToggleHold?: () => void
   onUnitAction: (id: string, action: UnitAction | null) => void
   onCoreAction: (action: CoreAction | null) => void
 }
@@ -107,6 +111,9 @@ export function UnitActionDialog(props: Props) {
           <span className={`mt-1 block font-mono text-[9px] ${canSpawn ? 'text-green-resource' : 'text-zinc-600'}`}>{t('game.unitCost', { cost })}</span>
         </button>
       })}</div>
+    </section>}
+    {props.selected.kind === 'UNIT' && props.onToggleHold && <section aria-label={t('game.holdPosition')} className="mt-3 border-t border-white/[.07] pt-3">
+      <button onClick={props.onToggleHold} aria-pressed={props.holdActive === true} className={`secondary-button min-h-11 w-full px-2 text-xs ${props.holdActive ? 'border-green-resource/40 bg-green-resource/[.1] text-green-resource hover:bg-green-resource/[.16]' : ''}`}>{props.holdActive ? t('game.releaseHold') : t('game.holdPosition')}</button>
     </section>}
     {props.selected.kind === 'UNIT' && props.onPickWaypoint && (() => {
       const queue = props.waypointQueue ?? []

@@ -6387,6 +6387,204 @@ class DashboardSelfDestructTests(unittest.TestCase):
         self.assertIn('data-focus-wx="-4" data-focus-wy="7"', parts["rgHtml"])
 
 
+class ManualHoldTests(unittest.TestCase):
+    """Dashboard「驻守」commands consumed by the tactic each Tick."""
+
+    def _hold_unit(self, uid, pos, unit_type):
+        actions = {"moves": [], "shoots": [], "sweeps": [], "waits": 0}
+
+        class U:
+            def __init__(self):
+                self.id = uid
+                self.position = pos
+                self.unit_type = unit_type
+
+            def move(self, direction):
+                actions["moves"].append(direction)
+
+            def shoot(self, target, expected_cell=None):
+                actions["shoots"].append((
+                    tuple(target.position),
+                    tuple(expected_cell) if expected_cell else None,
+                ))
+
+            def shoot_cell(self, cell):
+                actions["shoots"].append(("cell", tuple(cell)))
+
+            def sweep(self, direction):
+                actions["sweeps"].append(direction)
+
+            def wait(self):
+                actions["waits"] += 1
+
+        return U(), actions
+
+    def _enemy(self, uid, pos, etype="VANGUARD"):
+        return SimpleNamespace(id=uid, position=pos, unit_type=etype)
+
+    def test_worker_holds_stationary(self) -> None:
+        unit, actions = self._hold_unit("w1", (0, 0), UnitType.WORKER)
+        enemy = self._enemy("e1", (0, 1))
+        result = tactic._plan_hold(unit, (enemy,), frozenset(), {})
+        self.assertEqual(result[0], "WAIT")
+        self.assertIn("hold-stationary", result[1])
+        self.assertEqual(actions["waits"], 1)
+        self.assertEqual(actions["moves"], [])
+
+    def test_vanguard_sweeps_adjacent_enemy(self) -> None:
+        unit, actions = self._hold_unit("v1", (0, 0), UnitType.VANGUARD)
+        enemy = self._enemy("e1", (0, 1))
+        action, _ = tactic._plan_hold(unit, (enemy,), frozenset(), {})
+        self.assertEqual(action, "SWEEP")
+        self.assertEqual(actions["sweeps"], [Direction.DOWN])
+
+    def test_vanguard_predictive_sweep_of_incoming_enemy(self) -> None:
+        # Enemy at (0, 2) moving DOWN toward us -> predicted next cell (0, 1).
+        tactic._enemy_motion_tracks.clear()
+        tactic._enemy_motion_tracks["e1"] = [
+            (100, (0, 4)), (101, (0, 3)), (102, (0, 2)),
+        ]
+        unit, actions = self._hold_unit("v1", (0, 0), UnitType.VANGUARD)
+        enemy = self._enemy("e1", (0, 2))
+        try:
+            action, detail = tactic._plan_hold(unit, (enemy,), frozenset(), {})
+        finally:
+            tactic._enemy_motion_tracks.clear()
+        self.assertEqual(action, "SWEEP")
+        self.assertEqual(actions["sweeps"], [Direction.DOWN])
+        self.assertIn("hold-predict", detail)
+
+    def test_vanguard_waits_when_nothing_in_range(self) -> None:
+        unit, actions = self._hold_unit("v1", (0, 0), UnitType.VANGUARD)
+        enemy = self._enemy("e1", (5, 5))
+        result = tactic._plan_hold(unit, (enemy,), frozenset(), {})
+        self.assertEqual(result[0], "WAIT")
+        self.assertEqual(actions["waits"], 1)
+
+    def test_ranger_predictive_fire_at_moving_enemy(self) -> None:
+        # Enemy in range (Chebyshev 2) moving toward us: shoot the predicted
+        # next cell (1, 0) instead of the stale current cell (2, 0).
+        tactic._enemy_motion_tracks.clear()
+        tactic._enemy_motion_tracks["e1"] = [
+            (100, (4, 0)), (101, (3, 0)), (102, (2, 0)),
+        ]
+        unit, actions = self._hold_unit("r1", (0, 0), UnitType.RANGER)
+        enemy = self._enemy("e1", (2, 0))
+        try:
+            action, detail = tactic._plan_hold(unit, (enemy,), frozenset(), {})
+        finally:
+            tactic._enemy_motion_tracks.clear()
+        self.assertEqual(action, "SHOOT")
+        self.assertEqual(actions["shoots"][0], ((2, 0), (1, 0)))
+        self.assertIn("kite-lead", detail)
+
+    def test_ranger_waits_when_enemy_out_of_range(self) -> None:
+        unit, actions = self._hold_unit("r1", (0, 0), UnitType.RANGER)
+        enemy = self._enemy("e1", (9, 9))
+        result = tactic._plan_hold(unit, (enemy,), frozenset(), {})
+        self.assertEqual(result[0], "WAIT")
+        self.assertEqual(actions["waits"], 1)
+
+    def test_load_and_prune_drops_dead_units(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "holds.json"
+            with patch.object(tactic, "HOLDS_PATH", path):
+                tactic._holds_sig_cache.clear()
+                tactic._holds_cached.clear()
+                tactic._write_holds_unlocked({"W1", "V2", "R3"})
+                pending = tactic._load_and_prune_holds({"W1", "R3"})
+                persisted = tactic._load_holds_unlocked()
+
+        self.assertEqual(pending, {"W1", "R3"})
+        self.assertEqual(persisted, {"W1", "R3"})
+
+    def test_dashboard_request_flows_into_tactic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            holds_file = Path(temp_dir) / "holds.json"
+            with patch.object(dashboard, "HOLDS_FILE", str(holds_file)), \
+                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")), \
+                 patch.object(tactic, "HOLDS_PATH", holds_file):
+                self.assertTrue(dashboard.set_hold("W1")["ok"])
+                held = tactic._load_and_prune_holds({"W1"})
+                self.assertEqual(held, {"W1"})
+                self.assertTrue(dashboard.clear_hold("W1")["ok"])
+                held = tactic._load_and_prune_holds({"W1"})
+                self.assertEqual(held, set())
+
+
+class DashboardHoldTests(unittest.TestCase):
+    def test_set_and_clear_roundtrip_and_idempotency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            holds_file = Path(temp_dir) / "holds.json"
+            with patch.object(dashboard, "HOLDS_FILE", str(holds_file)), \
+                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")):
+                self.assertTrue(dashboard.set_hold("W3")["ok"])
+                self.assertTrue(dashboard.set_hold("W3")["ok"])  # idempotent
+                self.assertTrue(dashboard.set_hold("v2")["ok"])
+                self.assertEqual(dashboard.load_holds(), {"W3", "V2"})
+                self.assertTrue(dashboard.clear_hold("W3")["ok"])
+                self.assertEqual(dashboard.load_holds(), {"V2"})
+
+    def test_invalid_name_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            holds_file = Path(temp_dir) / "holds.json"
+            with patch.object(dashboard, "HOLDS_FILE", str(holds_file)):
+                with self.assertRaises(ValueError):
+                    dashboard.set_hold('<img onerror=alert(1)>')
+                with self.assertRaises(ValueError):
+                    dashboard.clear_hold("not-a-unit")
+
+    def test_unit_cards_render_hold_toggle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "tactic_log.jsonl"
+            rec = {
+                "tick": 1,
+                "plan_unit_actions": {},
+                "workers": [{
+                    "id": "aaaaaaaa", "name": "W1", "pos": [0, 0],
+                    "target": [2, 0], "path": [[0, 0], [1, 0], [2, 0]],
+                    "path_complete": True, "cargo": 0, "hp": 3,
+                }],
+                "vanguards": [{"id": "bbbbbbbb", "name": "V1", "pos": [1, 1], "hp": 5}],
+                "rangers": [{"id": "cccccccc", "name": "R1", "pos": [2, 2], "hp": 5}],
+                "resources": 0,
+                "resource_capacity": 50,
+                "visible_enemies": 0,
+                "resource_cells": [],
+                "core_pos": [0, 0],
+                "core_name": "C1",
+            }
+            log_path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+            game_stats_path = Path(temp_dir) / "game_stats.json"
+            config_path = Path(temp_dir) / "tactic_config.json"
+            holds_file = Path(temp_dir) / "holds.json"
+            holds_file.write_text(json.dumps({
+                "updated_at": "2025-01-01T00:00:00",
+                "units": ["V1"],
+            }), encoding="utf-8")
+            with patch.object(dashboard, "LOG_FILE", str(log_path)), \
+                 patch.object(dashboard, "MAP_FILE", str(Path(temp_dir) / "map_memory.json")), \
+                 patch.object(dashboard, "WAYPOINTS_FILE", str(Path(temp_dir) / "waypoints.json")), \
+                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")), \
+                 patch.object(dashboard, "HOLDS_FILE", str(holds_file)), \
+                 patch.object(game_stats, "STATS_PATH", game_stats_path), \
+                 patch.object(tactic_config, "CONFIG_PATH", config_path):
+                parts = dashboard.build_parts()
+
+        self.assertIsNotNone(parts)
+        for unit_name in ("W1", "V1", "R1"):
+            self.assertIn(
+                f'data-hold-unit="{unit_name}"',
+                parts["workersHtml"] + parts["vgHtml"] + parts["rgHtml"],
+                f"{unit_name} card should carry a 驻守 toggle",
+            )
+        # V1 is held: its card is highlighted and shows 解除驻守, the others 驻守.
+        self.assertIn('class="unit combat hold"', parts["vgHtml"])
+        self.assertIn("解除驻守", parts["vgHtml"])
+        self.assertNotIn("解除驻守", parts["workersHtml"])
+        self.assertIn("驻守", parts["workersHtml"])
+
+
 class EnemySightingsMemoryTests(unittest.TestCase):
     """Stale enemy sightings are removed only when a friendly unit can
     actually see the cell (its own vision radius + unobstructed line of
