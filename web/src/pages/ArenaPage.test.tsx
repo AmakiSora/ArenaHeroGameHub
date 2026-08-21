@@ -131,6 +131,24 @@ describe('ArenaPage asset selection', () => {
     expect(teams.updateConfig).toHaveBeenNthCalledWith(2, 'attack_target_y', -3)
     expect(screen.queryByText('Click the map to choose the target coordinates')).not.toBeInTheDocument()
   })
+
+  it('opens the strategy settings dialog from the bottom-right button', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ ok: true, config: {} }) }) as Response))
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Open strategy settings' }))
+    expect(await screen.findByRole('dialog', { name: 'Strategy settings' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+
+  it('hides the strategy settings button in demo mode', () => {
+    render(<ArenaPage demo />)
+    expect(screen.queryByRole('button', { name: 'Open strategy settings' })).not.toBeInTheDocument()
+  })
 })
 
 describe('ArenaPage remembered enemies', () => {

@@ -1,4 +1,4 @@
-import { Crosshair, Move, Sword } from 'lucide-react'
+import { Crosshair, Move, Settings, Sword } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { AssetList } from '../components/game/AssetList'
@@ -8,6 +8,7 @@ import { ENEMY_FILTER_TYPES, MapControls } from '../components/game/MapControls'
 import { PendingCommands } from '../components/game/PendingCommands'
 import { ResourceActivity } from '../components/game/ResourceActivity'
 import { RespawnOverlay } from '../components/game/RespawnOverlay'
+import { StrategyConfigDialog } from '../components/game/StrategyConfigDialog'
 import { WorldCanvas } from '../components/game/WorldCanvas'
 import { UnitActionDialog, type MapAnchor } from '../components/game/UnitActionDialog'
 import { useGameStream } from '../hooks/useGameStream'
@@ -59,6 +60,10 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   // Manual-target map picking (选择目标点 in the unit dialog): the next map
   // click appends that point to the unit's waypoint queue.
   const [waypointPick, setWaypointPick] = useState<{ name: string; mode: WaypointMode } | null>(null)
+  // Strategy settings dialog (配置 button, bottom-right): core/runtime/
+  // production fields the sidebar panels don't already cover.
+  const [strategyConfigOpen, setStrategyConfigOpen] = useState(false)
+  const strategyConfigButtonRef = useRef<HTMLButtonElement>(null)
   const [movementError, setMovementError] = useState<PathFailure | null>(null)
   const [anchor, setAnchor] = useState<MapAnchor | null>(null)
   const destroyerStorageKey = `arena-hero.core-destroyer.${demo ? 'demo' : user?.username ?? 'anonymous'}`
@@ -317,6 +322,8 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
       {coordPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.coordPickHint')}</span><button onClick={() => setCoordPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {waypointPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.waypointPickHint', { name: waypointPick.name })}</span><button onClick={() => setWaypointPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {!respawning && <MapControls onCenter={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} onZoom={(direction) => setZoomRequest((value) => direction * (Math.abs(value) + 1))} beaconIndicatorVisible={beaconIndicatorVisible} onToggleBeaconIndicator={toggleBeaconIndicator} coreIndicatorVisible={coreIndicatorVisible} onToggleCoreIndicator={toggleCoreIndicator} memoryVisible={enemyMemoryVisible} onToggleMemory={toggleEnemyMemory} routesVisible={unitRoutesVisible} onToggleRoutes={demo ? undefined : toggleUnitRoutes} memoryFilters={new Set(enemyMemoryFilters)} onToggleMemoryFilter={toggleEnemyMemoryFilter} />}
+      {!demo && !respawning && <button ref={strategyConfigButtonRef} type="button" onClick={() => setStrategyConfigOpen(true)} aria-label={t('game.openStrategyConfig')} title={t('game.openStrategyConfig')} className="focus-ring panel absolute bottom-4 right-4 z-20 grid size-11 place-items-center rounded-gold text-zinc-400 transition-colors hover:bg-white/[.06] hover:text-zinc-100"><Settings size={18} /></button>}
+      {!demo && strategyConfigOpen && <StrategyConfigDialog returnFocusRef={strategyConfigButtonRef} onClose={() => setStrategyConfigOpen(false)} />}
       {game.error && <div role="alert" className="panel absolute bottom-4 right-4 z-30 max-w-[min(24rem,calc(100%-2rem))] px-4 py-3 text-xs leading-5 text-coral-hostile">{describeError(game.error)}</div>}
     </section>
   </div>
