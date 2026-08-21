@@ -145,6 +145,29 @@ describe('ArenaPage asset selection', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
   })
 
+  it('picks the core target coordinates from the map via the strategy dialog', async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true, config: {} }) }) as Response)
+    vi.stubGlobal('fetch', fetchMock)
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+
+    await user.click(screen.getByRole('button', { name: 'Open strategy settings' }))
+    await user.click(await screen.findByRole('button', { name: 'Pick on map · Core target X' }))
+    // The modal closes so the map is clickable; the pick hint takes over.
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.getByText('Click the map to choose the target coordinates')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Pick map cell' }))
+
+    // X and Y are saved together in one /api/config patch.
+    const posts = (fetchMock.mock.calls as unknown as [string, RequestInit][]).filter(([, init]) => init.method === 'POST')
+    expect(posts).toHaveLength(1)
+    expect(posts[0][0]).toBe('/api/config')
+    expect(JSON.parse(posts[0][1].body as string)).toEqual({ core_target_x: 7, core_target_y: -3 })
+    // The dialog reopens after the save.
+    expect(await screen.findByRole('dialog', { name: 'Strategy settings' })).toBeInTheDocument()
+  })
+
   it('hides the strategy settings button in demo mode', () => {
     render(<ArenaPage demo />)
     expect(screen.queryByRole('button', { name: 'Open strategy settings' })).not.toBeInTheDocument()

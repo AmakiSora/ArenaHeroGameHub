@@ -67,4 +67,20 @@ describe('StrategyConfigDialog', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Save failed')
     expect(screen.getByLabelText('Allow shield repair')).not.toBeChecked()
   })
+
+  it('asks the page to pick the core target coordinates on the map', async () => {
+    setup()
+    const user = userEvent.setup()
+    const onPickCoords = vi.fn()
+    render(<StrategyConfigDialog returnFocusRef={createRef<HTMLButtonElement>()} onClose={vi.fn()} onPickCoords={onPickCoords} />)
+    await user.click(await screen.findByRole('button', { name: 'Pick on map · Core target X' }))
+    expect(onPickCoords).toHaveBeenCalledWith('core_target_x', 'core_target_y')
+  })
+
+  it('hides the map-pick button without a pick handler', async () => {
+    setup()
+    openDialog()
+    await screen.findByLabelText('Allow core movement')
+    expect(screen.queryByRole('button', { name: /Pick on map/ })).not.toBeInTheDocument()
+  })
 })

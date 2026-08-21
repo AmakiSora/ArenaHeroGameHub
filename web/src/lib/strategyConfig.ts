@@ -9,7 +9,7 @@ export type StrategyConfigValues = Record<string, StrategyFieldValue>
 
 export type StrategyField =
   | { kind: 'switch'; field: string; labelKey: string }
-  | { kind: 'number'; field: string; labelKey: string; min: number; max: number; step?: number }
+  | { kind: 'number'; field: string; labelKey: string; min: number; max: number; step?: number; pickYField?: string }
 
 export interface StrategyGroupSpec {
   key: string
@@ -27,7 +27,7 @@ export const STRATEGY_GROUPS: StrategyGroupSpec[] = [
       { kind: 'switch', field: 'core_movement_enabled', labelKey: 'coreMovementEnabled' },
       { kind: 'switch', field: 'prefer_resources_for_core', labelKey: 'preferResourcesForCore' },
       { kind: 'switch', field: 'core_target_enabled', labelKey: 'coreTargetEnabled' },
-      { kind: 'number', field: 'core_target_x', labelKey: 'coreTargetX', min: -1000, max: 1000 },
+      { kind: 'number', field: 'core_target_x', labelKey: 'coreTargetX', min: -1000, max: 1000, pickYField: 'core_target_y' },
       { kind: 'number', field: 'core_target_y', labelKey: 'coreTargetY', min: -1000, max: 1000 },
       { kind: 'number', field: 'cargo_wait_distance', labelKey: 'cargoWaitDistance', min: 0, max: 20 },
       { kind: 'switch', field: 'repair_enabled', labelKey: 'repairEnabled' },

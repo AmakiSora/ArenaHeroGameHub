@@ -1,19 +1,23 @@
 import { useEffect, useState } from 'react'
 import type { RefObject } from 'react'
 import { useTranslation } from 'react-i18next'
+import { Crosshair } from 'lucide-react'
 import { AccountDialog } from '../account/AccountDialog'
 import { loadStrategyValues, saveStrategyValues, STRATEGY_GROUPS, type StrategyConfigValues, type StrategyField } from '../../lib/strategyConfig'
 
 interface Props {
   returnFocusRef: RefObject<HTMLButtonElement | null>
   onClose: () => void
+  // Coordinate-pair map picking (core target X/Y): the arena page owns the
+  // pick flow because this modal must close while the map is clickable.
+  onPickCoords?: (xField: string, yField: string) => void
 }
 
 // Strategy settings dialog (核心/运行/生产): values load from /api/config on
 // open, switches commit at once, numbers on blur/Enter (no POST per
 // keystroke, same rhythm as the sidebar panels). A failed save rolls the
 // local value back and surfaces an error line.
-export function StrategyConfigDialog({ returnFocusRef, onClose }: Props) {
+export function StrategyConfigDialog({ returnFocusRef, onClose, onPickCoords }: Props) {
   const { t } = useTranslation()
   const [values, setValues] = useState<StrategyConfigValues>({})
   const [error, setError] = useState<string | null>(null)
@@ -45,7 +49,10 @@ export function StrategyConfigDialog({ returnFocusRef, onClose }: Props) {
           {group.fields.map((field) => field.kind === 'number'
             ? <label key={field.field} className="flex items-center justify-between gap-3 text-xs text-zinc-300">
               <span>{t(`game.strategyConfig.${field.labelKey}`)}</span>
-              <input type="number" min={field.min} max={field.max} step={field.step ?? 1} key={`${field.field}=${String(values[field.field] ?? '')}`} defaultValue={Number(values[field.field] ?? 0)} onBlur={(event) => commitNumber(field, event.currentTarget.value)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} className="w-20 shrink-0 rounded-gold-sm border border-white/[.08] bg-white/[.04] px-1.5 py-1 text-right font-mono text-xs text-zinc-200" />
+              <span className="flex shrink-0 items-center gap-1">
+                <input type="number" min={field.min} max={field.max} step={field.step ?? 1} key={`${field.field}=${String(values[field.field] ?? '')}`} defaultValue={Number(values[field.field] ?? 0)} onBlur={(event) => commitNumber(field, event.currentTarget.value)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} className="w-20 shrink-0 rounded-gold-sm border border-white/[.08] bg-white/[.04] px-1.5 py-1 text-right font-mono text-xs text-zinc-200" />
+                {field.pickYField && onPickCoords && <button type="button" onClick={(event) => { event.preventDefault(); onPickCoords(field.field, field.pickYField!) }} aria-label={`${t('game.teamSettings.pickOnMap')} · ${t(`game.strategyConfig.${field.labelKey}`)}`} title={t('game.teamSettings.pickOnMap')} className="focus-ring grid size-6 place-items-center rounded-gold-sm border border-white/[.08] bg-white/[.04] text-zinc-500 transition-colors hover:bg-white/[.08] hover:text-zinc-200"><Crosshair aria-hidden="true" size={11} /></button>}
+              </span>
             </label>
             : <label key={field.field} className="flex items-center justify-between gap-3 text-xs text-zinc-300">
               <span>{t(`game.strategyConfig.${field.labelKey}`)}</span>
