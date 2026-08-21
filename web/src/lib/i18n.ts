@@ -83,6 +83,7 @@ const resources = {
       units: { WORKER: 'Worker', VANGUARD: 'Vanguard', RANGER: 'Ranger', CORE: 'Core', ENEMY: 'Enemy' },
       unitGroups: { CORE: 'Core', WORKER: 'Worker Group', RANGER: 'Ranger Group', VANGUARD: 'Vanguard Group' },
       fleetTabs: { label: 'Fleet view', groups: 'Unit Groups', teams: 'Combat Squads' },
+      productionDemand: { title: 'Production demand', bar: '{{type}} production progress' },
       squads: { home: 'Home Squad', attack: 'Attack Squad', kite: 'Kite Squad', guerrilla: 'Guerrilla Squad', unassigned: 'Standby Pool', dropHere: 'Drop here' },
       teamSettings: {
         gear: 'Settings', close: 'Close settings', modeLegend: 'Attack mode', saved: 'Saved, effective next tick', pickOnMap: 'Pick on map',
@@ -245,6 +246,7 @@ const resources = {
       units: { WORKER: '工人', VANGUARD: '先锋', RANGER: '游侠', CORE: 'Core', ENEMY: '敌人' },
       unitGroups: { CORE: 'Core', WORKER: '工人组', RANGER: '游侠组', VANGUARD: '先锋组' },
       fleetTabs: { label: '编队视图', groups: '兵种组', teams: '战斗分队' },
+      productionDemand: { title: '生产需求', bar: '{{type}}生产进度' },
       squads: { home: '守家队', attack: '进攻队', kite: '风筝队', guerrilla: '游击队', unassigned: '待命池', dropHere: '拖到这里' },
       teamSettings: {
         gear: '设置', close: '关闭设置', modeLegend: '进攻方式', saved: '已保存，下个 Tick 生效', pickOnMap: '地图选点',

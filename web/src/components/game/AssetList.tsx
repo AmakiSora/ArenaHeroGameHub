@@ -14,6 +14,11 @@ import { UnitArtIcon } from './UnitArtIcon'
 const UNIT_GROUP_KEYS = ['CORE', 'WORKER', 'RANGER', 'VANGUARD'] as const
 type UnitGroupKey = typeof UNIT_GROUP_KEYS[number]
 
+// Production demand targets (the tactic dashboard's 生产需求 panel) mirrored
+// per unit type so the sidebar can draw current/target progress bars.
+const PRODUCTION_TARGET_FIELDS = { WORKER: 'target_workers', VANGUARD: 'target_vanguards', RANGER: 'target_rangers' } as const
+type ProductionType = keyof typeof PRODUCTION_TARGET_FIELDS
+
 function groupKeyOf(object: WorldObject): UnitGroupKey {
   if (object.kind === 'CORE') return 'CORE'
   const type: UnitType = object.unit_type ?? 'WORKER'
@@ -96,6 +101,17 @@ function SquadSettingsPanel({ spec, config, onUpdateConfig, onPickCoords, pickin
 export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {}, onAssignTeam, teamConfig = {}, onUpdateConfig, onPickCoords, pickingCoordsField = null }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster; onAssignTeam?: (name: string, team: TeamKey) => void; teamConfig?: TeamConfig; onUpdateConfig?: (field: string, value: number | boolean | string) => void; onPickCoords?: (xField: string, yField: string) => void; pickingCoordsField?: string | null }) {
   const { t } = useTranslation(); const controlled = useMemo(() => objects.filter((object) => object.controlled), [objects])
   const groups = useMemo(() => UNIT_GROUP_KEYS.map((key) => ({ key, members: controlled.filter((object) => groupKeyOf(object) === key) })), [controlled])
+  // Production demand (生产需求): live current/target per unit type, fed by
+  // the same /api/teams config poll as the squad panels. Empty (hidden) when
+  // no targets are served — demo mode and the offline fallback.
+  const productionDemand = useMemo(() => {
+    const rows = (Object.keys(PRODUCTION_TARGET_FIELDS) as ProductionType[]).map((type) => {
+      const raw = teamConfig[PRODUCTION_TARGET_FIELDS[type]]
+      const target = raw === undefined ? NaN : Number(raw)
+      return { type, current: controlled.filter((object) => groupKeyOf(object) === type).length, target: Number.isFinite(target) ? target : null }
+    })
+    return rows.some((row) => row.target !== null) ? rows : []
+  }, [controlled, teamConfig])
   // Squad view: only combat units have a team assignment. Membership is
   // looked up by the dashboard display name (V1/R2...) shared with the
   // tactic; unnamed or freshly spawned units land in the standby pool.
@@ -139,6 +155,21 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
   const coreRow = (object: WorldObject) => <button key={object.id} onClick={() => onSelect(object)} style={{ contentVisibility: 'auto', containIntrinsicSize: '44px' }} className={`focus-ring mb-0.5 flex min-h-11 w-full items-center gap-2 rounded-gold px-2.5 text-left transition-colors ${selectedId === object.id ? 'bg-indigo-deep/55 text-blue-soft' : 'text-zinc-400 hover:bg-white/[.04] hover:text-zinc-100'}`}>
     <span className="grid size-7 shrink-0 place-items-center rounded-gold-sm border border-violet-cosmic/15 bg-indigo-deep/45"><UnitArtIcon type="CORE" className="size-5" /></span><span className="flex min-w-0 flex-1 items-baseline gap-1.5"><span className="truncate text-xs font-medium">{t('game.units.CORE')}</span><span className="shrink-0 font-mono text-[9px] text-zinc-600">[{object.position?.join(', ') ?? '—'}]</span></span><span className="shrink-0 font-mono text-[9px]">{object.hp} HP</span>
   </button>
+  // One production-demand row: unit label + current/target counter + progress
+  // bar. Emerald while below target (补兵中), blue once reached/over — the
+  // same semantics as the tactic dashboard's 生产需求目标 panel.
+  const demandRow = ({ type, current, target }: { type: ProductionType; current: number; target: number | null }) => {
+    if (target === null) return null
+    const percent = target > 0 ? Math.min(100, Math.round((current / target) * 100)) : current > 0 ? 100 : 0
+    const producing = current < target
+    return <div key={type} className="flex items-center gap-2">
+      <span className="w-9 shrink-0 text-[9px] text-zinc-500">{t(`game.units.${type}`)}</span>
+      <div role="progressbar" aria-valuemin={0} aria-valuemax={target} aria-valuenow={Math.min(current, target)} aria-label={t('game.productionDemand.bar', { type: t(`game.units.${type}`) })} className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-white/[.08]">
+        <span style={{ width: `${percent}%` }} className={`block h-full rounded-full transition-[width] duration-300 ${producing ? 'bg-emerald-400' : 'bg-blue-soft'}`} />
+      </div>
+      <span className={`shrink-0 font-mono text-[9px] ${producing ? 'text-emerald-400' : 'text-blue-soft'}`}>{current}/{target}</span>
+    </div>
+  }
   return <aside className="panel-strong hidden h-full min-h-0 flex-col border-y-0 border-l-0 lg:flex">
     <div className="border-b border-white/[.07]">
       <div className="px-5 py-4"><Logo /><GameStats state={state} className="mt-4" /></div>
@@ -155,6 +186,10 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
       </div>
     </div>
     <div className="min-h-0 flex-1 overflow-y-auto p-2">
+      {productionDemand.length > 0 && <section aria-label={t('game.productionDemand.title')} className="mb-1.5 rounded-gold border border-white/[.07] bg-black/25 p-2">
+        <p className="mb-1.5 text-[10px] font-medium text-zinc-200">{t('game.productionDemand.title')}</p>
+        <div className="space-y-1.5">{productionDemand.map((row) => demandRow(row))}</div>
+      </section>}
       {sections.map(({ key, members }) => { const alwaysShown = view === 'teams' && ALWAYS_SHOWN_SQUADS.includes(key as TeamKey); const droppable = view === 'teams' && !!onAssignTeam; const spec = settingsSpecFor(key); const showGear = !!onUpdateConfig && !!spec; return members.length === 0 && !alwaysShown && !dragging ? null : <section key={key} aria-label={sectionLabel(key)} onDragOver={droppable ? (event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'; setDropTeam(key as TeamKey) } : undefined} onDragLeave={droppable ? (event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDropTeam(null) } : undefined} onDrop={droppable ? (event) => { event.preventDefault(); const name = event.dataTransfer?.getData('text/plain') || dragName; setDragName(null); setDropTeam(null); if (name) onAssignTeam?.(name, key as TeamKey) } : undefined} className={droppable && dropTeam === key ? 'rounded-gold outline outline-1 outline-blue-soft/60' : undefined}>
         <div className="mb-0.5 flex items-center gap-1">
           <button type="button" onClick={() => toggleSection(key)} aria-expanded={!collapsedSections[key]} className="focus-ring flex min-w-0 flex-1 items-center justify-between rounded-gold px-2.5 py-1.5 text-left transition-colors hover:bg-white/[.04]">

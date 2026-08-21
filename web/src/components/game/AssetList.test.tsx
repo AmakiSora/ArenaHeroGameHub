@@ -295,4 +295,52 @@ describe('AssetList', () => {
       expect(screen.queryByRole('button', { name: /Settings ·/ })).not.toBeInTheDocument()
     })
   })
+
+  describe('production demand', () => {
+    const workerUnits = Array.from({ length: 7 }, (_, index) => ({
+      kind: 'UNIT' as const, id: `w${index}aaaa-0000`, controlled: true,
+      position: [index, 0] as [number, number], hp: 2, unit_type: 'WORKER' as const, cargo: 0,
+    }))
+    const ranger = { kind: 'UNIT' as const, id: 'r1aaaaaa-0000', controlled: true, position: [0, 1] as [number, number], hp: 3, unit_type: 'RANGER' as const }
+
+    it('draws current/target progress bars from the dashboard production targets', () => {
+      render(<AssetList state={state} objects={[...workerUnits, ranger]} selectedId={null} onSelect={() => undefined} teamConfig={{ target_workers: 10, target_vanguards: 2, target_rangers: 2 }} />)
+
+      expect(screen.getByText('Production demand')).toBeInTheDocument()
+      const workerBar = screen.getByRole('progressbar', { name: 'Worker production progress' })
+      expect(workerBar).toHaveAttribute('aria-valuemax', '10')
+      expect(workerBar).toHaveAttribute('aria-valuenow', '7')
+      const workerFill = workerBar.firstElementChild as HTMLElement
+      expect(workerFill.style.width).toBe('70%')
+      expect(workerFill.className).toContain('bg-emerald-400')
+      expect(screen.getByText('7/10')).toBeInTheDocument()
+
+      // Vanguard at zero shows an empty bar; the counter still reads 0/2.
+      const vanguardBar = screen.getByRole('progressbar', { name: 'Vanguard production progress' })
+      expect((vanguardBar.firstElementChild as HTMLElement).style.width).toBe('0%')
+      expect(screen.getByText('0/2', { exact: true })).toBeInTheDocument()
+    })
+
+    it('fills the bar and switches tone once the target is reached or exceeded', () => {
+      const vanguards = Array.from({ length: 3 }, (_, index) => ({
+        kind: 'UNIT' as const, id: `v${index}aaaa-0000`, controlled: true,
+        position: [index, 2] as [number, number], hp: 4, unit_type: 'VANGUARD' as const,
+      }))
+      render(<AssetList state={state} objects={vanguards} selectedId={null} onSelect={() => undefined} teamConfig={{ target_vanguards: 2 }} />)
+
+      const bar = screen.getByRole('progressbar', { name: 'Vanguard production progress' })
+      // Over target: the value caps at the target and the bar stays full.
+      expect(bar).toHaveAttribute('aria-valuenow', '2')
+      const fill = bar.firstElementChild as HTMLElement
+      expect(fill.style.width).toBe('100%')
+      expect(fill.className).toContain('bg-blue-soft')
+      expect(screen.getByText('3/2')).toBeInTheDocument()
+    })
+
+    it('hides the panel when no production targets are served (demo mode)', () => {
+      render(<AssetList state={state} objects={[...workerUnits, ranger]} selectedId={null} onSelect={() => undefined} />)
+      expect(screen.queryByText('Production demand')).not.toBeInTheDocument()
+      expect(screen.queryByRole('progressbar')).not.toBeInTheDocument()
+    })
+  })
 })
