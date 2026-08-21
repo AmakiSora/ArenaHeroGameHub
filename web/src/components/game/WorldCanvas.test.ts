@@ -48,7 +48,7 @@ describe('wheelZoomCell', () => {
   })
 
   it('clamps zoom to the supported cell range', () => {
-    expect(wheelZoomCell(6, 10_000, 0, 720)).toBe(6)
+    expect(wheelZoomCell(3, 10_000, 0, 720)).toBe(3)
     expect(wheelZoomCell(78, -10_000, 0, 720)).toBe(78)
   })
 })
