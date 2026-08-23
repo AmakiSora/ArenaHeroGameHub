@@ -43,8 +43,22 @@ CONFIG_GROUPS = (
 
 CONFIG_FIELDS = (
     ConfigField("worker_bfs_enabled", "启用工人 BFS", "worker", "boolean", True),
-    ConfigField("bfs_max_steps", "BFS 搜索节点", "worker", "integer", 2500, 50, 8000, 50),
+    # Search-node budget for every A*/BFS route search that reads it: worker
+    # pathfinding AND the kite/guerrilla combat route + unstick searches
+    # (tactic.py passes int(config["bfs_max_steps"]) there). The remaining
+    # _move_towards call sites (home defense / attack / waypoints / holds)
+    # intentionally keep the built-in default of 2500 and ignore this field.
+    ConfigField(
+        "bfs_max_steps",
+        "BFS 搜索节点（工人+风筝/游击战斗寻路；其余分队固定 2500）",
+        "worker", "integer", 2500, 50, 8000, 50,
+    ),
     ConfigField("avoid_backtracking", "避免立即回头", "worker", "boolean", True),
+    # Roam oscillation escape: a roaming unit that shuttles between the same
+    # few cells (A-B-A against a wall) flips its bearing for a few ticks to
+    # break the loop. Detection window/thresholds stay module constants in
+    # tactic.py; this switch only enables/disables the policy.
+    ConfigField("roam_oscillation_escape", "漫游振荡逃逸", "worker", "boolean", True),
     ConfigField("backtrack_penalty", "载矿回头惩罚", "worker", "integer", 10, 0, 100, 1),
     ConfigField("enemy_threat_radius", "工人遇敌回避半径", "worker", "integer", 3, 0, 10, 1),
     ConfigField("worker_mine_max_distance", "工人采矿最大距离", "worker", "integer", 0, 0, 200, 1),

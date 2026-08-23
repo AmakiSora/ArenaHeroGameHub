@@ -35,7 +35,6 @@ _*.txt
 fix_*.py
 _dash*.py
 _patch*.py
-watchdog.py
 diagnose.py
 dash*.log
 nul

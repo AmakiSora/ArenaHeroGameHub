@@ -11,6 +11,9 @@ import json
 import os
 import time
 import traceback
+
+import watchdog
+
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, asdict
@@ -2451,35 +2454,121 @@ def _guerrilla_roam_goal(unit: Any, pos: tuple[int, int]) -> tuple[int, int]:
     return (pos[0] + dx * 1000, pos[1] + dy * 1000)
 
 
-def _guerrilla_roam(
-    unit: Any,
-    pos: tuple[int, int],
-    obstacle_cells: frozenset[tuple[int, int]],
-    config: dict[str, Any],
-    avoid_cells: Iterable[tuple[int, int]] = (),
-) -> tuple[str, str]:
-    """Take one safe step on this unit's independent eight-way bearing."""
-    avoided = frozenset(avoid_cells)
-    bearing = _stable_slot_index(str(unit.id), len(_EIGHT_WAY_DELTAS))
+def _roam_bearing_candidates(
+    bearing: int,
+    *,
+    tick_bit: int,
+    prefer: Direction | None = None,
+) -> tuple[Direction | None, ...]:
+    """Cardinal step order for one eight-way bearing.
+
+    Diagonal bearings alternate their two component axes each Tick (the same
+    rule _guerrilla_roam used inline before); cardinal bearings map directly.
+    When `prefer` is one of the two axes, that axis steps first regardless of
+    the tick parity (the escape uses this to bias toward leaving the
+    oscillation cells instead of zig-zagging back into them).
+    """
     dx, dy = _EIGHT_WAY_DELTAS[bearing]
-    label = _EIGHT_WAY_LABELS[bearing]
     if dx and dy:
-        tick_bit = int(getattr(turn_context, "tick", 0) or 0) & 1
-        primary = (
-            (Direction.RIGHT if dx > 0 else Direction.LEFT)
-            if tick_bit == 0
-            else (Direction.DOWN if dy > 0 else Direction.UP)
+        horizontal = Direction.RIGHT if dx > 0 else Direction.LEFT
+        vertical = Direction.DOWN if dy > 0 else Direction.UP
+        if prefer is not None and prefer in (horizontal, vertical):
+            other = vertical if prefer is horizontal else horizontal
+            return (prefer, other)
+        return (horizontal, vertical) if tick_bit == 0 else (vertical, horizontal)
+    return (_cardinal_toward_delta(dx, dy),)
+
+
+def _roam_update_stall(uid: str) -> bool:
+    """Detect a wall ping-pong from the recorded position history.
+
+    The caller records pos into _roam_pos_history each tick (consecutive
+    same-cell observations are folded, so the window counts position changes,
+    not ticks — a stationary unit never fills it and never triggers); this
+    returns True once the last _ROAM_STALL_WINDOW recorded positions only
+    span _ROAM_STALL_CELLS or fewer distinct cells (deterministic A-B-A wall
+    bouncing). Fully deterministic — no randomness anywhere in the escape.
+    On trigger, _roam_stall_cells remembers the whole recent region (the
+    bounce cells plus the approach cells), so the escape also avoids walking
+    straight back in, and _roam_stall_origin remembers the cell the unit just
+    came from — stepping back onto it would only replay the oscillation in
+    reverse, so escape candidates deprioritize it.
+    """
+    history = _roam_pos_history.setdefault(uid, [])
+    window = history[-_ROAM_STALL_WINDOW:]
+    if len(window) >= _ROAM_STALL_WINDOW and len(set(window)) <= _ROAM_STALL_CELLS:
+        _roam_stall_cells[uid] = frozenset(history)
+        _roam_stall_origin[uid] = window[-2] if len(window) >= 2 else window[-1]
+        history.clear()
+        return True
+    return False
+
+
+def _roam_bearing_choice(
+    pos: tuple[int, int],
+    bearing: int,
+    *,
+    tick_bit: int,
+    deflecting: bool,
+    stall_cells: frozenset[tuple[int, int]],
+    stall_origin: tuple[int, int] | None,
+    avoided: frozenset[tuple[int, int]],
+    obstacle_cells: frozenset[tuple[int, int]],
+    unit: Any,
+) -> tuple[Direction, tuple[int, int]] | None:
+    """One deterministic roam step: bearing moves, or deflections while
+    escaping an oscillation. Returns (direction, next_cell) or None."""
+    if deflecting:
+        # Deterministic deflection order: along the wall in both directions
+        # (+2 / -2 eighth-turns), then straight backwards (+4).
+        deflected = (
+            (bearing + 2) % len(_EIGHT_WAY_DELTAS),
+            (bearing + 6) % len(_EIGHT_WAY_DELTAS),
+            (bearing + 4) % len(_EIGHT_WAY_DELTAS),
         )
-        secondary = (
-            (Direction.DOWN if dy > 0 else Direction.UP)
-            if tick_bit == 0
-            else (Direction.RIGHT if dx > 0 else Direction.LEFT)
-        )
-        candidates = (primary, secondary)
+        candidates: list[tuple[int, Direction | None]] = []
+        for roam_bearing in deflected:
+            for direction in _roam_bearing_candidates(roam_bearing, tick_bit=tick_bit):
+                if direction is None:
+                    continue
+                next_cell = (
+                    pos[0] + direction.delta[0],
+                    pos[1] + direction.delta[1],
+                )
+                if next_cell not in stall_cells:
+                    # Leaving the region is the goal, so try every such
+                    # deflection first. Leaving cells can never be the origin
+                    # (the origin sits inside the remembered region), so no
+                    # further ordering is needed here.
+                    candidates.append((0, direction))
+        for roam_bearing in deflected:
+            prefer_dir: Direction | None = None
+            for direction in _roam_bearing_candidates(roam_bearing, tick_bit=tick_bit):
+                if direction is None:
+                    continue
+                next_cell = (
+                    pos[0] + direction.delta[0],
+                    pos[1] + direction.delta[1],
+                )
+                if next_cell in stall_cells:
+                    if next_cell != stall_origin:
+                        candidates.append((2, direction))
+                elif prefer_dir is None:
+                    # Bias the diagonal axis toward the leaving cell so the
+                    # escape does not zig-zag back into the oscillation.
+                    prefer_dir = direction
+            if prefer_dir is not None:
+                candidates.append((3, prefer_dir))
+        # Original bearing last: the unit is never worse off than before.
+        for direction in _roam_bearing_candidates(bearing, tick_bit=tick_bit):
+            candidates.append((4, direction))
     else:
-        candidates = (_cardinal_toward_delta(dx, dy),)
+        candidates = [
+            (0, direction)
+            for direction in _roam_bearing_candidates(bearing, tick_bit=tick_bit)
+        ]
     for avoid_dead_ends in (True, False):
-        for direction in candidates:
+        for _rank, direction in sorted(candidates, key=lambda item: item[0]):
             if direction is None:
                 continue
             next_cell = (
@@ -2495,8 +2584,113 @@ def _guerrilla_roam(
                 obstacle_cells,
                 avoid_dead_ends=avoid_dead_ends,
             ):
-                _kite_record_move_attempt(unit, pos, next_cell)
-                return ("MOVE", f"{direction.name} guerrilla-roam {label}")
+                return direction, next_cell
+    return None
+
+
+def _guerrilla_roam(
+    unit: Any,
+    pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    config: dict[str, Any],
+    avoid_cells: Iterable[tuple[int, int]] = (),
+) -> tuple[str, str]:
+    """Take one safe step on this unit's independent eight-way bearing.
+
+    Wall ping-pong escape: a fixed ID-derived bearing makes some units bounce
+    A-B-A along a wall forever (every single move accepted by the server).
+    Once the position history proves the oscillation, the escape runs in two
+    deterministic phases: while still inside the recent region the unit
+    deflects to the bearings perpendicular to its own (reversed bearing as
+    last resort); once outside, it keeps avoiding the region until the
+    _ROAM_ESCAPE_TICKS budget expires, then resumes normal roaming.
+    """
+    avoided = frozenset(avoid_cells)
+    uid = str(unit.id)
+    tick_bit = int(getattr(turn_context, "tick", 0) or 0) & 1
+    # The ID-derived base bearing plus any escape flips: after a successful
+    # escape the bearing is reversed, so the unit is no longer pulled straight
+    # back into the pocket it just left.
+    base_bearing = _stable_slot_index(uid, len(_EIGHT_WAY_DELTAS))
+    bearing = (base_bearing + _roam_bearing_offset.get(uid, 0)) % len(_EIGHT_WAY_DELTAS)
+    # Per-tick position record (independent of this call's outcome) so the
+    # oscillation window stays calibrated in ticks even when some ticks WAIT.
+    history = _roam_pos_history.setdefault(uid, [])
+    if not history or history[-1] != pos:
+        history.append(pos)
+        del history[:-_ROAM_STALL_REGION]
+    escaping = _roam_escape_left.get(uid, 0) > 0
+    # roam_oscillation_escape gates the whole detection/trigger entry point:
+    # with the switch off the unit keeps its original bearing-based roaming
+    # and no escape state is ever created (an escape already in progress is
+    # always allowed to finish its cooldown).
+    if (
+        not escaping
+        and bool(config.get("roam_oscillation_escape", True))
+        and _roam_update_stall(uid)
+    ):
+        escaping = True
+        _roam_escape_left[uid] = _ROAM_ESCAPE_TICKS
+    elif escaping:
+        _roam_escape_left[uid] -= 1
+        if _roam_escape_left[uid] <= 0:
+            # Budget spent: drop the escape state so normal roaming resumes
+            # and a fresh stall window can re-trigger if still oscillating.
+            # An escape that never got a confirmed exit keeps its bearing.
+            escaping = False
+            _roam_stall_cells.pop(uid, None)
+            _roam_stall_origin.pop(uid, None)
+            _roam_flip_pending.pop(uid, None)
+    stall_cells = _roam_stall_cells.get(uid, frozenset())
+    stall_origin = _roam_stall_origin.get(uid)
+    deflecting = escaping and pos in stall_cells
+    if (
+        escaping
+        and _roam_flip_pending.get(uid)
+        and pos not in stall_cells
+    ):
+        # A deflection step pointed out of the region last tick; this tick's
+        # pos proves the server actually accepted the move (a cancelled step
+        # would still be standing inside the region). Only now is the
+        # bearing flip confirmed — at most once per escape event, and at most
+        # once per unit's lifetime so repeated escapes in a long game cannot
+        # erode the eight-way bearing spread.
+        _roam_flip_pending.pop(uid, None)
+        if _roam_flips_used.get(uid, 0) < 1:
+            _roam_bearing_offset[uid] = (
+                _roam_bearing_offset.get(uid, 0) + len(_EIGHT_WAY_DELTAS) // 2
+            ) % len(_EIGHT_WAY_DELTAS)
+            _roam_flips_used[uid] = _roam_flips_used.get(uid, 0) + 1
+    if deflecting:
+        label = "escape"
+    else:
+        if escaping:
+            # Cooldown phase: already outside the region — keep away from it
+            # until the budget expires so the bearing does not pull the unit
+            # straight back into the bounce.
+            avoided = avoided | stall_cells
+        label = _EIGHT_WAY_LABELS[bearing]
+    choice = _roam_bearing_choice(
+        pos,
+        bearing,
+        tick_bit=tick_bit,
+        deflecting=deflecting,
+        stall_cells=stall_cells,
+        stall_origin=stall_origin,
+        avoided=avoided,
+        obstacle_cells=obstacle_cells,
+        unit=unit,
+    )
+    if choice is not None:
+        direction, next_cell = choice
+        if deflecting and next_cell not in stall_cells:
+            # The escape step points out of the region, but the server may
+            # still cancel the move. The 180-degree bearing flip is deferred
+            # until the next tick's pos confirms the unit really left (see
+            # the _roam_flip_pending confirmation above).
+            _roam_flip_pending[uid] = True
+        _kite_record_move_attempt(unit, pos, next_cell)
+        return ("MOVE", f"{direction.name} guerrilla-roam {label}")
     action, detail = _scout_cardinal(
         unit,
         pos,
@@ -2712,6 +2906,7 @@ def _move_towards(
     cell_counts: Mapping | None = None,
     extra_obstacles: Iterable[tuple[int, int]] = (),
     step_filter: Callable[[tuple[int, int]], bool] | None = None,
+    max_steps: int = 2500,
 ) -> tuple[str, str] | None:
     if pos == goal:
         _combat_path_cache.pop(str(unit.id), None)
@@ -2746,7 +2941,7 @@ def _move_towards(
             pos,
             goal,
             obstacle_cells,
-            max_steps=2500,
+            max_steps=max_steps,
             extras=transient_obstacles,
         )
         if path and len(path) > 1:
@@ -3779,6 +3974,7 @@ def _kite_bfs_unstick(
     *,
     extra_obstacles: Iterable[tuple[int, int]] = (),
     step_filter: Callable[[tuple[int, int]], bool] | None = None,
+    max_steps: int = 2500,
 ) -> tuple[str, str] | None:
     """Multi-step escape hatch for a kite unit pinned by walls.
 
@@ -3798,7 +3994,7 @@ def _kite_bfs_unstick(
         pos,
         goal,
         obstacle_cells,
-        max_steps=2500,
+        max_steps=max_steps,
         extras=transient_obstacles,
     )
     if not path or len(path) < 2:
@@ -3836,8 +4032,26 @@ def _kite_choose_move(
     *,
     must_move: bool,
     avoid_cells: Iterable[tuple[int, int]] = (),
+    stall_ticks: int = 0,
+    global_enemies: tuple = (),
 ) -> tuple[Direction | None, dict[str, Any], list[dict[str, Any]]]:
-    """Choose the safest cardinal cell, using goal progress only as a tie-break."""
+    """Choose the safest cardinal cell, using goal progress only as a tie-break.
+
+    ``stall_ticks`` is how many consecutive ticks this unit has failed to move.
+    Once that reaches _KITE_STALL_UNLOCK_TICKS with no visible threat at all,
+    progress stops outranking a safe detour step (progress=-1 versus WAIT's 0
+    froze units forever), so the risk-free tie-break ignores progress and any
+    safe non-dead-end step beats WAIT. Hit-count safety scoring is untouched:
+    the unlock only applies when there is no enemy threat whatsoever.
+
+    The unlock gate is deliberately global: ``global_enemies`` is the full
+    visible-enemy tuple of the whole army (not this unit's local sight), so a
+    threat outside this unit's vision still keeps the cover contract intact.
+    The unlock is also suppressed once the unit already stands on its goal —
+    arriving at a coordinate/beacon target is a deliberate hold, and letting
+    the unlock fire there would jitter the unit one cell every threshold
+    ticks.
+    """
     counts = cell_counts or {}
     enemy_cells = {tuple(enemy.position) for enemy in enemies}
     avoided = frozenset(avoid_cells)
@@ -3871,8 +4085,13 @@ def _kite_choose_move(
         risk_free = not (
             assessment["current_hits"] or assessment["predicted_hits"]
         )
+        stall_unlocked = (
+            stall_ticks >= _KITE_STALL_UNLOCK_TICKS
+            and not global_enemies
+            and pos != goal
+        )
         tactical_ties = (
-            (progress, assessment["nearest"])
+            ((0, assessment["nearest"]) if stall_unlocked else (progress, assessment["nearest"]))
             if risk_free
             else (assessment["nearest"], progress)
         )
@@ -4295,6 +4514,18 @@ def _plan_kite_combat(
     stable roaming bearing when no threat is present.
     """
     pos = tuple(unit.position)
+    uid = str(unit.id)
+    tick = int(getattr(turn_context, "tick", 0) or 0)
+    # Expire / relocate friendly-split memos kept from earlier ticks. The memo
+    # is sticky: it survives collision streak resets and only lapses when the
+    # unit has actually left the stacked cell (or the timer runs out).
+    friendly_memo = _kite_friendly_split.get(uid)
+    if friendly_memo is not None:
+        contested_m, origin_m, expire_m = friendly_memo
+        if expire_m <= tick or pos != origin_m:
+            _kite_friendly_split.pop(uid, None)
+            friendly_memo = None
+    friendly_memo_cells = (friendly_memo[0],) if friendly_memo is not None else ()
     if solo:
         mode = "guerrilla"
         objective = _guerrilla_roam_goal(unit, pos)
@@ -4344,6 +4575,7 @@ def _plan_kite_combat(
         _kite_log_decision(
             unit, unit_kind, mode, objective, threats, action, detail, target=target,
         )
+        _record_kite_stall(uid, pos)
         return action, detail
 
     # A solo guerrilla has no route leash or squad objective.  Its own local
@@ -4416,6 +4648,7 @@ def _plan_kite_combat(
                     unit, unit_kind, mode, objective, threats, "SWEEP", detail,
                     target=target,
                 )
+                _record_kite_stall(uid, pos)
                 return "SWEEP", detail
         if unit_kind == "ranger":
             shot = _kite_ranger_fire(
@@ -4428,6 +4661,7 @@ def _plan_kite_combat(
                     unit, unit_kind, mode, objective, threats, action, detail,
                     target=target,
                 )
+                _record_kite_stall(uid, pos)
                 return action, detail
     elif (
         collision is not None
@@ -4435,10 +4669,89 @@ def _plan_kite_combat(
         and collision[2] >= 2
         and target is None
     ):
-        # A contested move without a visible target is not an attack
-        # opportunity. Avoid that cell for this Tick and drop the marker
-        # instead of passing None into the Ranger fire planner.
-        collision_avoid = collision[1]
+        # A contested move without a visible target is a friendly collision:
+        # two stacked allies picked the same exit and the server cancelled the
+        # pair. Avoiding the cell for one tick only re-creates the identical
+        # choice next tick (the old deadlock), so assign the exits by a
+        # deterministic uid ordering that is symmetric from both sides: the
+        # lowest-ranked unit yields the contested exit and steps to the
+        # parity-rotated side cell, while the higher-ranked unit keeps
+        # planning normally. The memo makes the decision sticky until the
+        # pair actually separates. A lone unit with a residual collision
+        # count (no stacked ally) keeps the old behavior: avoid the contested
+        # cell for one tick and continue the full safety-assessed planning.
+        contested = collision[1]
+        collision_avoid = contested
+        my_rank = (_stable_slot_index(uid, 2), uid)
+        ally_ranks = [
+            (_stable_slot_index(str(ally.id), 2), str(ally.id))
+            for ally in getattr(turn_context, "units_view", ()) or ()
+            if str(ally.id) != uid and tuple(ally.position) == pos
+        ]
+        # Deterministic pair ordering: the rank key is computed from each
+        # unit's own id alone, so both sides see the same total order and
+        # exactly one of the stacked units ranks lowest — one yielder and one
+        # keeper, without any communication and without touching display
+        # names. A single unit (no stacked ally) never yields sideways.
+        yield_split = bool(ally_ranks) and my_rank <= min(ally_ranks)
+        if (
+            ally_ranks
+            and friendly_memo is not None
+            and friendly_memo[0] == contested
+        ):
+            # Sticky re-application: keep the already-decided split role.
+            yield_split = True
+        if yield_split:
+            _kite_friendly_split[uid] = (
+                contested,
+                pos,
+                tick + _KITE_FRIENDLY_SPLIT_TICKS,
+            )
+            split_dir: Direction | None = None
+            step_dir = _direction_for_step(pos, contested)
+            if step_dir is not None:
+                cardinal_order = (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT)
+                slot = cardinal_order.index(step_dir)
+                side = _stable_slot_index(uid, 2)
+                # Parity 0 rotates the contested exit clockwise, parity 1
+                # counter-clockwise (both sides compute the same rule from
+                # their own uid). The mapping constant is chosen so the
+                # common east-bound detour pair separates instead of both
+                # picking the route tie-break side.
+                side_dir = cardinal_order[(slot - 1) % 4] if side else cardinal_order[(slot + 1) % 4]
+                side_cell = (pos[0] + side_dir.delta[0], pos[1] + side_dir.delta[1])
+                side_assessment = _kite_cell_assessment(
+                    side_cell, threats, obstacle_cells, attack_range,
+                )
+                if (
+                    side_cell not in obstacle_cells
+                    and side_cell not in {tuple(enemy.position) for enemy in enemies}
+                    and (cell_counts or {}).get(side_cell, 0) < _CELL_UNIT_LIMIT
+                    and not (
+                        side_assessment["current_hits"]
+                        or side_assessment["predicted_hits"]
+                    )
+                ):
+                    split_dir = side_dir
+            # A threatened side cell aborts the split: fall through to the
+            # normal safety-assessed planning instead of dodging sideways
+            # into enemy fire (the memo stays armed and keeps the contested
+            # exit blocked for the route/single-step layers below).
+            if split_dir is not None:
+                split_cell = (
+                    pos[0] + split_dir.delta[0], pos[1] + split_dir.delta[1],
+                )
+                _kite_record_move_attempt(unit, pos, split_cell)
+                unit.move(split_dir)
+                detail = (
+                    f"{split_dir.name} kite-friendly-split contested={contested}"
+                )
+                _kite_log_decision(
+                    unit, unit_kind, mode, objective, threats, "MOVE", detail,
+                    target=target,
+                )
+                _record_kite_stall(uid, pos)
+                return "MOVE", detail
         _kite_clear_move_attempt(unit)
     if full_v_vs_r:
         dx = target.position[0] - pos[0]
@@ -4451,6 +4764,7 @@ def _plan_kite_combat(
             _kite_log_decision(
                 unit, unit_kind, mode, objective, threats, "SWEEP", detail, target=target,
             )
+            _record_kite_stall(uid, pos)
             return "SWEEP", detail
         direct = _cardinal_toward_delta(dx, dy)
         if direct is not None:
@@ -4471,6 +4785,7 @@ def _plan_kite_combat(
                     unit, unit_kind, mode, objective, threats, "MOVE", detail,
                     target=target,
                 )
+                _record_kite_stall(uid, pos)
                 return "MOVE", detail
         direction, assessment, candidates = _kite_choose_move(
             unit, pos, tuple(target.position), threats, obstacle_cells,
@@ -4491,6 +4806,7 @@ def _plan_kite_combat(
                 unit, unit_kind, mode, objective, threats, "MOVE", detail,
                 target=target, candidates=candidates,
             )
+            _record_kite_stall(uid, pos)
             return "MOVE", detail
 
     # Standing in any current enemy range always yields to movement. This is
@@ -4532,6 +4848,7 @@ def _plan_kite_combat(
                     unit, unit_kind, mode, objective, threats, action, detail,
                     target=target, candidates=candidates,
                 )
+                _record_kite_stall(uid, pos)
                 return action, detail
         if direction is not None:
             _kite_record_move_attempt(
@@ -4547,6 +4864,7 @@ def _plan_kite_combat(
                 unit, unit_kind, mode, objective, threats, "MOVE", detail,
                 target=target, candidates=candidates,
             )
+            _record_kite_stall(uid, pos)
             return "MOVE", detail
         _kite_clear_move_attempt(unit)
         unit.wait()
@@ -4558,6 +4876,7 @@ def _plan_kite_combat(
             unit, unit_kind, mode, objective, threats, "WAIT", detail,
             target=target, candidates=candidates,
         )
+        _record_kite_stall(uid, pos)
         return "WAIT", detail
 
     if target is not None and unit_kind == "vanguard":
@@ -4580,6 +4899,7 @@ def _plan_kite_combat(
                 _kite_log_decision(
                     unit, unit_kind, mode, objective, threats, "SWEEP", detail, target=target,
                 )
+                _record_kite_stall(uid, pos)
                 return "SWEEP", detail
         # Diagonal V vs V: cover the historically preferred bridge cell.
         if (
@@ -4600,6 +4920,7 @@ def _plan_kite_combat(
                 _kite_log_decision(
                     unit, unit_kind, mode, objective, threats, "SWEEP", detail, target=target,
                 )
+                _record_kite_stall(uid, pos)
                 return "SWEEP", detail
         if abs(dx) + abs(dy) == 1:
             # Workers cannot retaliate; combat targets would have triggered
@@ -4612,6 +4933,7 @@ def _plan_kite_combat(
                 _kite_log_decision(
                     unit, unit_kind, mode, objective, threats, "SWEEP", detail, target=target,
                 )
+                _record_kite_stall(uid, pos)
                 return "SWEEP", detail
 
     if target is not None and unit_kind == "ranger":
@@ -4630,19 +4952,22 @@ def _plan_kite_combat(
             _kite_log_decision(
                 unit, unit_kind, mode, objective, threats, action, detail, target=target,
             )
+            _record_kite_stall(uid, pos)
             return action, detail
 
     # No safe/valuable attack: kite units keep advancing their squad objective;
     # a solo guerrilla resumes its own bearing instead of converging on a
     # shared coordinate. Tactical evasion is per-unit in both modes.
     if solo and target is None:
-        return _guerrilla_roam(
+        roam_action, roam_detail = _guerrilla_roam(
             unit,
             pos,
             obstacle_cells,
             config,
             avoid_cells=(collision_avoid,) if collision_avoid is not None else (),
         )
+        _record_kite_stall(uid, pos)
+        return roam_action, roam_detail
     must_move = any(_enemy_unit_type_name(enemy) == "RANGER" for enemy in threats)
     move_goal = tuple(target.position) if target is not None else objective
     # Follow a real A* route toward the objective first. The single-step
@@ -4655,6 +4980,8 @@ def _plan_kite_combat(
 
     def _kite_route_step_allowed(cell: tuple[int, int]) -> bool:
         if collision_avoid is not None and cell == collision_avoid:
+            return False
+        if cell in friendly_memo_cells:
             return False
         if cell in route_enemy_cells:
             return False
@@ -4679,12 +5006,14 @@ def _plan_kite_combat(
             or not _kite_route_step_allowed(cell)
         ):
             route_blocked_steps.add(cell)
+    route_blocked_steps.update(friendly_memo_cells)
     bfs_step = _move_towards(
         unit, pos, move_goal, obstacle_cells,
         detail_prefix="kite-route",
         cell_counts=cell_counts,
         extra_obstacles=route_blocked_steps,
         step_filter=_kite_route_step_allowed,
+        max_steps=int(config.get("bfs_max_steps", 2500)),
     )
     if bfs_step is not None:
         action, detail = bfs_step
@@ -4703,6 +5032,7 @@ def _plan_kite_combat(
             unit, unit_kind, mode, objective, threats, action, detail,
             target=target,
         )
+        _record_kite_stall(uid, pos)
         return action, detail
     # No multi-step route (open field or A* exhausted): fall back to the
     # single-step safety/progress picker, then to a forced unstick step.
@@ -4710,7 +5040,12 @@ def _plan_kite_combat(
         unit, pos, move_goal, threats, obstacle_cells, attack_range,
         cell_counts,
         must_move=must_move,
-        avoid_cells=(collision_avoid,) if collision_avoid is not None else (),
+        avoid_cells=(
+            *((collision_avoid,) if collision_avoid is not None else ()),
+            *friendly_memo_cells,
+        ),
+        stall_ticks=_kite_stall_ticks.get(uid, 0),
+        global_enemies=enemies,
     )
     if direction is not None:
         _next_cell = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
@@ -4724,6 +5059,7 @@ def _plan_kite_combat(
             unit, unit_kind, mode, objective, threats, "MOVE", detail,
             target=target, candidates=candidates,
         )
+        _record_kite_stall(uid, pos)
         return "MOVE", detail
     # Single-step selection would WAIT here. When the unit is cornered by
     # walls (every adjacent cell is a dead end relative to the objective),
@@ -4733,6 +5069,7 @@ def _plan_kite_combat(
         unit, pos, move_goal, obstacle_cells, cell_counts,
         extra_obstacles=route_blocked_steps,
         step_filter=_kite_route_step_allowed,
+        max_steps=int(config.get("bfs_max_steps", 2500)),
     )
     if unstick is not None:
         action, detail = unstick
@@ -4740,6 +5077,7 @@ def _plan_kite_combat(
             unit, unit_kind, mode, objective, threats, action, detail,
             target=target, candidates=candidates,
         )
+        _record_kite_stall(uid, pos)
         return action, detail
     _kite_clear_move_attempt(unit)
     unit.wait()
@@ -4748,6 +5086,7 @@ def _plan_kite_combat(
         unit, unit_kind, mode, objective, threats, "WAIT", detail,
         target=target, candidates=candidates,
     )
+    _record_kite_stall(uid, pos)
     return "WAIT", detail
 
 
@@ -4950,6 +5289,65 @@ _combat_path_cache: dict[str, dict] = {}
 # shoot_cell) instead of retrying the doomed move.
 # {uid: (pos, contested_cell, count)}
 _kite_collision_streak: dict[str, tuple[tuple[int, int], tuple[int, int], int]] = {}
+# Consecutive ticks a kite/guerrilla unit did not end up moving, tracked by
+# the single entry point _record_kite_stall (called on EVERY exit path of
+# _plan_kite_combat, including early returns). Read-only stall input: once a
+# threat-free unit has been frozen for _KITE_STALL_UNLOCK_TICKS ticks,
+# _kite_choose_move stops letting WAIT's progress=0 beat a safe detour step's
+# progress=-1 (the remote scoring deadlock).
+_kite_stall_pos: dict[str, tuple[int, int]] = {}
+_kite_stall_ticks: dict[str, int] = {}
+_KITE_STALL_UNLOCK_TICKS = 12
+
+
+def _record_kite_stall(uid: str, pos: tuple[int, int]) -> None:
+    """Single entry point for the kite same-cell stall counter.
+
+    Called on every exit path of _plan_kite_combat (including early returns)
+    so a planned action that still left the unit on ``pos`` counts as a stall
+    tick and the WAIT-unlock threshold cannot be bypassed by any branch.
+    """
+    if _kite_stall_pos.get(uid) == pos:
+        _kite_stall_ticks[uid] = _kite_stall_ticks.get(uid, 0) + 1
+    else:
+        _kite_stall_pos[uid] = pos
+        _kite_stall_ticks[uid] = 0
+
+
+# Friendly same-cell split memos: {uid: (contested_cell, origin, expire_tick)}.
+# Two stacked allies picking the same exit cancel each other server-side every
+# tick; the loser of a deterministic display-name comparison keeps the
+# contested cell avoided (route/route-steps/roam) until expiry, and while it
+# still stands on ``origin`` the split decision is re-applied every tick —
+# collision events never reset it before the pair actually separates.
+_kite_friendly_split: dict[str, tuple[tuple[int, int], tuple[int, int], int]] = {}
+_KITE_FRIENDLY_SPLIT_TICKS = 6
+# Guerrilla roam wall ping-pong escape: recent positions per unit and a
+# countdown of deflected-bearing ticks once the oscillation is detected.
+_roam_pos_history: dict[str, list[tuple[int, int]]] = {}
+_roam_escape_left: dict[str, int] = {}
+_roam_stall_cells: dict[str, frozenset[tuple[int, int]]] = {}
+_roam_stall_origin: dict[str, tuple[int, int]] = {}
+_roam_bearing_offset: dict[str, int] = {}
+# Escape bearing-flip bookkeeping: a deflection step out of the oscillation
+# region only arms a pending flip; the flip itself executes once the NEXT
+# tick's pos confirms the server accepted the move (a cancelled first step
+# leaves the unit inside the region and the pending flag stays inert).
+# Lifetime flips are capped at one per unit so repeated escapes in a long
+# game cannot erode the eight-way bearing spread.
+_roam_flip_pending: dict[str, bool] = {}
+_roam_flips_used: dict[str, int] = {}
+# An 8-position-change window spanning <=2 cells proves an A-B-A bounce (the
+# window counts recorded position changes, not ticks; 8 also catches a
+# stationary unit, whose escape candidates just degrade into normal roaming,
+# so harmless). The region remembered on trigger keeps this many most-recent
+# cells so the escape also avoids the approach path back into the bounce.
+_ROAM_STALL_WINDOW = 8
+_ROAM_STALL_CELLS = 2
+# Keep a longer tail than the detection window so the remembered region also
+# covers the approach path into the bounce (the escape avoids re-entering it).
+_ROAM_STALL_REGION = 16
+_ROAM_ESCAPE_TICKS = 6
 # Consecutive ticks a worker has not moved — triggers un-stick recovery.
 # _worker_stuck_ticks counts consecutive same-position ticks; _worker_stuck_pos
 # remembers the position those ticks were counted at (independent of last-pos,
@@ -6085,6 +6483,26 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _waypoint_stuck.pop(dead_id, None)
     for dead_id in set(_kite_collision_streak) - alive_ids:
         _kite_collision_streak.pop(dead_id, None)
+    for dead_id in set(_kite_stall_pos) - alive_ids:
+        _kite_stall_pos.pop(dead_id, None)
+    for dead_id in set(_kite_stall_ticks) - alive_ids:
+        _kite_stall_ticks.pop(dead_id, None)
+    for dead_id in set(_kite_friendly_split) - alive_ids:
+        _kite_friendly_split.pop(dead_id, None)
+    for dead_id in set(_roam_pos_history) - alive_ids:
+        _roam_pos_history.pop(dead_id, None)
+    for dead_id in set(_roam_escape_left) - alive_ids:
+        _roam_escape_left.pop(dead_id, None)
+    for dead_id in set(_roam_stall_cells) - alive_ids:
+        _roam_stall_cells.pop(dead_id, None)
+    for dead_id in set(_roam_stall_origin) - alive_ids:
+        _roam_stall_origin.pop(dead_id, None)
+    for dead_id in set(_roam_bearing_offset) - alive_ids:
+        _roam_bearing_offset.pop(dead_id, None)
+    for dead_id in set(_roam_flip_pending) - alive_ids:
+        _roam_flip_pending.pop(dead_id, None)
+    for dead_id in set(_roam_flips_used) - alive_ids:
+        _roam_flips_used.pop(dead_id, None)
     for (prefix, obj_id), name in list(_object_names.items()):
         if prefix in ("W", "V", "R") and str(obj_id) not in alive_ids:
             _object_names.pop((prefix, obj_id), None)
@@ -6180,6 +6598,13 @@ def _unit_should_return_to_heal(
     return True
 
 
+# ── Stall alerting lives in watchdog.update_stall_tracking: choose_actions
+# feeds every Tick's full unit snapshot (uid, position, status) into it, and
+# the watchdog prints one [watchdog] stall_alert line per stall episode
+# (stdout -> tactic_play.log via docker-entrypoint.py). tactic.py keeps no
+# stall-alert state of its own.
+
+
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
     """Queue actions, return (core_action_name, {unit_id: action_detail})."""
     _phase = _PhaseTimer()
@@ -6233,7 +6658,17 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     for r in getattr(turn, "rangers", ()) or ():
         alive_ids.add(str(r.id))
     _prune_dead_unit_bookkeeping(alive_ids)
+    # Ally position view for the same-cell friendly-split ranking (read-only).
+    turn_context.units_view = tuple(turn.units)
     turn_context.kite_collision_snapshot = dict(_kite_collision_streak)
+
+    # Per-tick stall-alert feed: the watchdog tracks every unit's net
+    # displacement and prints one [watchdog] stall_alert line (stdout ->
+    # tactic_play.log via docker-entrypoint.py) once a live unit stays within
+    # one cell of its anchor for watchdog.STALL_ALERT_THRESHOLD ticks. This
+    # is the only producer of stall alerts — best-effort by contract, the
+    # watchdog swallows its own errors and never breaks the game loop.
+    watchdog.update_stall_tracking(turn.units, turn_context.tick)
 
     # ── Aggregate battle-report statistics ─────────────────────────────
     game_stats.sync_units(_game_stats, turn, turn_context.tick)

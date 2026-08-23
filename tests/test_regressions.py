@@ -20,6 +20,7 @@ import game_stats
 import status
 import tactic
 import tactic_config
+import watchdog
 from tactic_config import default_config
 
 
@@ -2640,7 +2641,12 @@ class KiteTeamPlannerTests(unittest.TestCase):
 
         self.assertEqual(action, "MOVE")
         self.assertNotEqual(ranger.arg, Direction.RIGHT)
+        # Review fix (restored contract): a contested move without a visible
+        # target AND without a stacked ally is a single-unit case: avoid the
+        # contested cell for one tick and keep the full safety-assessed route
+        # planning — never an unevaluated sideways split step.
         self.assertIn("kite-route", detail)
+        self.assertNotIn(str(ranger.id), tactic._kite_friendly_split)
 
     def test_guerrilla_roam_avoids_repeatedly_contested_cell(self):
         ranger = self.unit("guerrilla-r-contested", (0, 0), UnitType.RANGER)
@@ -2659,7 +2665,11 @@ class KiteTeamPlannerTests(unittest.TestCase):
         self.assertEqual(action, "MOVE")
         next_cell = ranger.arg.delta
         self.assertNotEqual(next_cell, contested)
+        # Review fix (restored contract): with no stacked ally this stays a
+        # single-unit case — the contested exit is avoided for one tick and
+        # the normal safety-assessed bearing roam picks a different cell.
         self.assertIn("guerrilla-roam", detail)
+        self.assertNotIn(str(ranger.id), tactic._kite_friendly_split)
 
     def test_kite_route_avoids_enemy_range_and_full_friendly_cell(self):
         ranger = self.unit("kite-r-safe-route", (0, 0), UnitType.RANGER)
@@ -7948,6 +7958,910 @@ class ArenaConsoleRoutingTests(unittest.TestCase):
             status, _, body = self._import_request('{"cookies": "arena_session=stale"}')
         self.assertEqual(status, 401)
         self.assertEqual(json.loads(body)["error"], "SESSION_IMPORT_EXPIRED")
+
+
+class WatchdogStallAlertTests(unittest.TestCase):
+    """Per-unit stall alerts: raised once a live unit sits within one cell of
+    its anchor for >= 50 consecutive ticks, deduped per stall episode, and
+    re-armable once the unit moves again.
+
+    Liveness is blacklist-based: everything except DEAD / disappearance from
+    the snapshot counts as alive, so a stall in COMBAT / RALLY / DROPPING /
+    UNLOADING / ... still accumulates instead of resetting the counter.
+    """
+
+    def setUp(self):
+        watchdog.reset_stall_watchdog()
+        self.lines: list[str] = []
+
+    def tearDown(self):
+        watchdog.reset_stall_watchdog()
+
+    def _feed(
+        self,
+        positions: dict[str, tuple[int, int]],
+        tick: int,
+        statuses: dict[str, str] | None = None,
+    ) -> list[dict]:
+        statuses = statuses or {}
+        snapshots = [
+            (uid, pos, statuses.get(uid)) for uid, pos in positions.items()
+        ]
+        return watchdog.update_stall_tracking(
+            snapshots, tick, writer=self.lines.append,
+        )
+
+    def test_alert_fires_exactly_at_threshold_not_before(self) -> None:
+        for tick in range(1, watchdog.STALL_ALERT_THRESHOLD):
+            self.assertEqual(self._feed({"u1": (3, 4)}, tick), [])
+        alerts = self._feed({"u1": (3, 4)}, watchdog.STALL_ALERT_THRESHOLD)
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["uid"], "u1")
+        self.assertEqual(alerts[0]["stalled_ticks"], watchdog.STALL_ALERT_THRESHOLD)
+        self.assertEqual(len(self.lines), 1)
+        self.assertIn("[watchdog] stall_alert", self.lines[0])
+        self.assertIn("unit=u1", self.lines[0])
+        self.assertIn("pos=(3, 4)", self.lines[0])
+
+    def test_jitter_within_one_cell_still_counts_as_stalled(self) -> None:
+        # A-B ping-pong between adjacent cells is a real stall: net
+        # displacement never exceeds 1 from the anchor.
+        for tick in range(1, watchdog.STALL_ALERT_THRESHOLD + 1):
+            pos = (0, 0) if tick % 2 == 0 else (0, 1)
+            alerts = self._feed({"u1": pos}, tick)
+        self.assertEqual(len(alerts), 1)
+
+    def test_no_repeat_alert_while_still_stalled(self) -> None:
+        all_alerts = []
+        for tick in range(1, watchdog.STALL_ALERT_THRESHOLD + 20):
+            all_alerts.extend(self._feed({"u1": (0, 0)}, tick))
+        self.assertEqual(len(all_alerts), 1)
+        self.assertEqual(len(self.lines), 1)
+
+    def test_recovery_rearms_the_alert_for_a_second_stall(self) -> None:
+        # Review fix: the dedup flag used to stick for the unit's whole life,
+        # so a unit that stalled, recovered, and stalled again only alerted
+        # once. Moving again (net displacement > 1) must clear the flag.
+        for tick in range(1, watchdog.STALL_ALERT_THRESHOLD + 1):
+            self._feed({"u1": (0, 0)}, tick)
+        self.assertTrue(watchdog.is_stall_alert_emitted("u1"))
+
+        # Recover: jump more than one cell away, then move on one step.
+        resume_tick = watchdog.STALL_ALERT_THRESHOLD + 1
+        self._feed({"u1": (10, 0)}, resume_tick)
+        self.assertFalse(watchdog.is_stall_alert_emitted("u1"))
+        self._feed({"u1": (11, 0)}, resume_tick + 1)
+
+        # Second stall episode alerts again at the threshold.
+        second_alert_tick = resume_tick + 1 + watchdog.STALL_ALERT_THRESHOLD
+        all_alerts = []
+        for tick in range(resume_tick + 2, second_alert_tick + 1):
+            all_alerts.extend(self._feed({"u1": (11, 0)}, tick))
+        self.assertEqual(len(all_alerts), 1)
+        self.assertEqual(all_alerts[0]["pos"], (11, 0))
+        self.assertEqual(len(self.lines), 2)
+
+    def test_every_live_state_accumulates_only_dead_is_excluded(self) -> None:
+        # Review fix: liveness must not be a WAIT/MOVING/HOLD/CAPTURING
+        # whitelist — COMBAT/RALLY/DROPPING/UNLOADING etc. count as alive.
+        live_states = (
+            "WAIT", "MOVING", "HOLD", "CAPTURING",
+            "COMBAT", "RALLY", "DROPPING", "UNLOADING",
+        )
+        for index, state in enumerate(live_states):
+            uid = f"unit-{state.lower()}"
+            self._feed({uid: (index, 0)}, 1, statuses={uid: state})
+            self._feed({uid: (index, 0)}, 2, statuses={uid: state})
+            self.assertEqual(
+                watchdog.get_stall_ticks(uid, 2), 2,
+                f"state {state} must keep accumulating stall ticks",
+            )
+        self._feed({"dead-unit": (9, 9)}, 1, statuses={"dead-unit": "DEAD"})
+        self.assertEqual(watchdog.get_stall_ticks("dead-unit", 1), 0)
+        self._feed({"dead-unit": (9, 9)}, 2, statuses={"dead-unit": "dead"})
+        self.assertEqual(watchdog.get_stall_ticks("dead-unit", 2), 0)
+        # And a DEAD unit never fires the alert even after the threshold.
+        for tick in range(1, watchdog.STALL_ALERT_THRESHOLD + 1):
+            alerts = self._feed(
+                {"dead-unit": (9, 9)}, tick, statuses={"dead-unit": "DEAD"},
+            )
+        self.assertEqual(alerts, [])
+
+    def test_unit_vanishing_from_the_snapshot_is_pruned(self) -> None:
+        self._feed({"u1": (0, 0), "u2": (5, 5)}, 1)
+        self.assertEqual(watchdog.get_stall_ticks("u1", 1), 1)
+        self.assertEqual(watchdog.get_stall_ticks("u2", 1), 1)
+        # u2 disappears (dead/gone): its window must be dropped so a unit
+        # reappearing under the same id starts from scratch.
+        self._feed({"u1": (0, 0)}, 2)
+        self.assertEqual(watchdog.get_stall_ticks("u2", 2), 0)
+        self._feed({"u2": (5, 5)}, 3)
+        self.assertEqual(watchdog.get_stall_ticks("u2", 3), 1)
+
+    def test_slow_drift_resets_the_anchor_and_never_alerts(self) -> None:
+        # A unit moving one cell per tick genuinely progresses: the anchor
+        # follows it and no alert fires within the horizon.
+        for tick in range(1, watchdog.STALL_ALERT_THRESHOLD + 30):
+            alerts = self._feed({"u1": (tick, 0)}, tick)
+            self.assertEqual(alerts, [])
+        self.assertFalse(watchdog.is_stall_alert_emitted("u1"))
+
+    def test_object_snapshots_and_reset(self) -> None:
+        unit = SimpleNamespace(id="u-obj", position=(2, 2), status="MOVING")
+        for tick in range(1, watchdog.STALL_ALERT_THRESHOLD + 1):
+            alerts = watchdog.update_stall_tracking(
+                [unit], tick, writer=self.lines.append,
+            )
+        self.assertEqual(len(alerts), 1)
+        watchdog.reset_stall_watchdog()
+        self.assertEqual(watchdog.get_stall_ticks("u-obj",
+                         watchdog.STALL_ALERT_THRESHOLD + 1), 0)
+        self.assertFalse(watchdog.is_stall_alert_emitted("u-obj"))
+
+    def test_choose_actions_feeds_the_watchdog_every_tick(self) -> None:
+        # Review fix: update_stall_tracking used to be dead code — nothing in
+        # the production path ever called it. choose_actions now pushes every
+        # tick's full unit snapshot, so a unit frozen for the whole
+        # threshold window produces a real [watchdog] stall_alert line on
+        # stdout (docker-entrypoint.py redirects it into tactic_play.log).
+        config = default_config()
+        vanguard = SimpleNamespace(
+            id="stall-wire", position=(4, 4), unit_type=UnitType.VANGUARD,
+            hp=4, status="WAIT",
+        )
+        vanguard.move = lambda direction: None
+        vanguard.wait = lambda: None
+        vanguard.sweep = lambda direction: None
+        vanguard.shoot = lambda target, expected_cell=None: None
+        prev_names = dict(tactic._object_names)
+        prev_counters = dict(tactic._object_name_counters)
+        prev_stall_pos = dict(tactic._kite_stall_pos)
+        prev_stall_ticks = dict(tactic._kite_stall_ticks)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            tactic._object_names.clear()
+            tactic._object_name_counters.clear()
+            core = SimpleNamespace(
+                id="core", position=(0, 0), hp=5, shield=10,
+                view=SimpleNamespace(state=SimpleNamespace(value="ALIVE")),
+                spawn=lambda unit_type: None,
+                heal=lambda: None,
+                repair_shield=lambda: None,
+                move=lambda *args, **kwargs: None,
+                wait=lambda: None,
+            )
+            beacon = SimpleNamespace(
+                position=None, status=SimpleNamespace(name="GROUND"),
+            )
+            stdout = io.StringIO()
+            tactic._map_dirty = False
+            try:
+                with patch.object(tactic, "load_config", return_value=config), \
+                     patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
+                     patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
+                     patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"), \
+                     patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"), \
+                     patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"), \
+                     contextlib.redirect_stdout(stdout):
+                    for tick in range(1, watchdog.STALL_ALERT_THRESHOLD + 1):
+                        turn = SimpleNamespace(
+                            tick=tick,
+                            units=(vanguard,),
+                            workers=(),
+                            vanguards=(vanguard,),
+                            rangers=(),
+                            visible_enemies=(),
+                            core=core,
+                            resources=50,
+                            resource_cells=frozenset(),
+                            resource_space=0,
+                            beacon=beacon,
+                            state=SimpleNamespace(population=8),
+                            events=(),
+                            obstacle_cells=frozenset(),
+                        )
+                        tactic.choose_actions(turn)
+            finally:
+                tactic._object_names.clear()
+                tactic._object_names.update(prev_names)
+                tactic._object_name_counters.clear()
+                tactic._object_name_counters.update(prev_counters)
+                tactic._kite_stall_pos.clear()
+                tactic._kite_stall_pos.update(prev_stall_pos)
+                tactic._kite_stall_ticks.clear()
+                tactic._kite_stall_ticks.update(prev_stall_ticks)
+        output = stdout.getvalue()
+        self.assertIn("[watchdog] stall_alert", output)
+        self.assertIn("unit=stall-wire", output)
+        self.assertTrue(watchdog.is_stall_alert_emitted("stall-wire"))
+
+
+class RoamOscillationConfigTests(unittest.TestCase):
+    """roam_oscillation_escape ships as a registered boolean config field."""
+
+    def test_field_registered_and_defaults_on(self) -> None:
+        keys = {field.key for field in tactic_config.CONFIG_FIELDS}
+        self.assertIn("roam_oscillation_escape", keys)
+        field = tactic_config._FIELDS_BY_KEY["roam_oscillation_escape"]
+        self.assertEqual(field.kind, "boolean")
+        self.assertTrue(default_config()["roam_oscillation_escape"])
+
+    def test_validation_rejects_non_boolean(self) -> None:
+        config = tactic_config.validate_config({"roam_oscillation_escape": False})
+        self.assertFalse(config["roam_oscillation_escape"])
+        with self.assertRaises(tactic_config.ConfigValidationError):
+            tactic_config.validate_config({"roam_oscillation_escape": "yes"})
+        with self.assertRaises(tactic_config.ConfigValidationError):
+            tactic_config.validate_config({"roam_oscillation_escape": 1})
+
+    def test_shipped_config_file_contains_the_field(self) -> None:
+        path = Path(__file__).parent.parent / "tactic_config.json"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        self.assertTrue(raw.get("roam_oscillation_escape"))
+
+
+class KiteStallUnlockRegressionTests(KiteTeamPlannerTests):
+    """Kite units frozen by the remote WAIT-vs-detour scoring deadlock must
+    unlock once they have stalled for _KITE_STALL_UNLOCK_TICKS threat-free
+    ticks (review: WAIT's progress=0 beat a safe detour's progress=-1
+    forever). The stall counter is fed by the single _record_kite_stall
+    entry point on every _plan_kite_combat exit path."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_stall_pos = dict(tactic._kite_stall_pos)
+        self._saved_stall_ticks = dict(tactic._kite_stall_ticks)
+        self._saved_combat_cache = dict(tactic._combat_path_cache)
+        self._saved_dead_obstacles = tactic._dead_obstacles
+        tactic._kite_stall_pos.clear()
+        tactic._kite_stall_ticks.clear()
+        tactic._combat_path_cache.clear()
+        tactic._dead_obstacles = None  # recompute dead ends for these walls
+
+    def tearDown(self):
+        tactic._kite_stall_pos.clear()
+        tactic._kite_stall_pos.update(self._saved_stall_pos)
+        tactic._kite_stall_ticks.clear()
+        tactic._kite_stall_ticks.update(self._saved_stall_ticks)
+        tactic._combat_path_cache.clear()
+        tactic._combat_path_cache.update(self._saved_combat_cache)
+        tactic._dead_obstacles = self._saved_dead_obstacles
+        super().tearDown()
+
+    def test_record_kite_stall_counts_same_cell_and_resets_on_move(self):
+        tactic._record_kite_stall("u", (1, 1))
+        self.assertEqual(tactic._kite_stall_ticks["u"], 0)
+        tactic._record_kite_stall("u", (1, 1))
+        self.assertEqual(tactic._kite_stall_ticks["u"], 1)
+        tactic._record_kite_stall("u", (1, 1))
+        self.assertEqual(tactic._kite_stall_ticks["u"], 2)
+        tactic._record_kite_stall("u", (2, 1))  # the unit finally moved
+        self.assertEqual(tactic._kite_stall_ticks["u"], 0)
+
+    def test_choose_move_waits_until_the_stall_unlock_threshold(self):
+        # Walled pocket: only DOWN/LEFT detours (progress=-1) exist; WAIT is
+        # progress=0. Below the threshold WAIT keeps winning, at the
+        # threshold the risk-free tie-break ignores progress and a safe
+        # detour step is chosen instead.
+        unit = self.unit("kite-unlock-score", (0, 0))
+        walls = frozenset({(1, 0), (0, -1)})
+        for stall_ticks in (0, tactic._KITE_STALL_UNLOCK_TICKS - 1):
+            direction, _, _ = tactic._kite_choose_move(
+                unit, (0, 0), (10, 0), (), walls, 3, {},
+                must_move=False, stall_ticks=stall_ticks,
+            )
+            self.assertIsNone(direction)
+        direction, _, _ = tactic._kite_choose_move(
+            unit, (0, 0), (10, 0), (), walls, 3, {},
+            must_move=False, stall_ticks=tactic._KITE_STALL_UNLOCK_TICKS,
+        )
+        self.assertIn(direction, (Direction.DOWN, Direction.LEFT))
+
+    def test_stall_unlock_is_suppressed_while_any_threat_is_visible(self):
+        unit = self.unit("kite-unlock-threat", (0, 0))
+        walls = frozenset({(1, 0), (0, -1)})
+        enemy = self.enemy("unlock-blocker", (10, 10))
+        direction, _, _ = tactic._kite_choose_move(
+            unit, (0, 0), (10, 0), (enemy,), walls, 3, {},
+            must_move=False, stall_ticks=tactic._KITE_STALL_UNLOCK_TICKS,
+            global_enemies=(enemy,),
+        )
+        self.assertIsNone(direction)
+
+    def test_stall_unlock_requires_the_global_enemy_pool_to_be_empty(self):
+        # Review fix: the unlock gate used to inspect only this unit's local
+        # threats, so an enemy visible to the rest of the army but outside
+        # this unit's sight still unlocked it from cover. The gate must use
+        # the full visible-enemy tuple the planner received.
+        unit = self.unit("kite-unlock-global", (0, 0))
+        walls = frozenset({(1, 0), (0, -1)})
+        far_enemy = self.enemy("far-visible", (30, 30))
+        direction, _, _ = tactic._kite_choose_move(
+            unit, (0, 0), (10, 0), (), walls, 3, {},
+            must_move=False, stall_ticks=tactic._KITE_STALL_UNLOCK_TICKS,
+            global_enemies=(far_enemy,),
+        )
+        self.assertIsNone(direction)
+
+    def test_stall_unlock_is_suppressed_once_the_goal_is_reached(self):
+        # Review fix: a kite squad that has arrived at its coordinate/beacon
+        # goal deliberately holds position; unlocking there would jitter the
+        # unit one cell every threshold ticks.
+        unit = self.unit("kite-unlock-goal", (0, 0))
+        walls = frozenset({(1, 0), (0, -1)})
+        direction, _, _ = tactic._kite_choose_move(
+            unit, (0, 0), (0, 0), (), walls, 3, {},
+            must_move=False, stall_ticks=tactic._KITE_STALL_UNLOCK_TICKS,
+        )
+        self.assertIsNone(direction)
+
+    def test_planner_stops_waiting_after_twelve_stall_ticks(self):
+        # End-to-end: every call plans but the unit never moves (its stall
+        # counter keeps climbing through the planner's own exit paths). With
+        # the route search budget exhausted (bfs_max_steps=1) there is no
+        # multi-step detour, so the single-step picker decides — and it must
+        # stop returning WAIT forever once the stall threshold is reached.
+        unit = self.unit("kite-unlock-plan", (0, 0))
+        walls = frozenset({(1, 0), (0, -1)})
+        config = dict(self.config)
+        config["bfs_max_steps"] = 1
+        actions = []
+        # The counter anchors at 0 on the first observation, so the planner
+        # needs _KITE_STALL_UNLOCK_TICKS + 1 more calls before the scorer
+        # reads the threshold. Loop long enough to see MOVE twice.
+        for _ in range(tactic._KITE_STALL_UNLOCK_TICKS + 3):
+            action, detail = tactic._plan_kite_combat(
+                unit,
+                unit_kind="vanguard",
+                enemies=(),
+                obstacle_cells=walls,
+                config=config,
+                cell_counts={},
+            )
+            actions.append(action)
+        self.assertEqual(
+            actions[:tactic._KITE_STALL_UNLOCK_TICKS + 1],
+            ["WAIT"] * (tactic._KITE_STALL_UNLOCK_TICKS + 1),
+        )
+        self.assertEqual(
+            actions[tactic._KITE_STALL_UNLOCK_TICKS + 1:],
+            ["MOVE", "MOVE"],
+        )
+        self.assertEqual(unit.action, "MOVE")
+
+    def test_stall_ticks_accumulate_on_the_directive_early_exit(self):
+        # Review fix: every exit path of _plan_kite_combat must record the
+        # stall, including early returns — otherwise a unit frozen on a
+        # branch that never reaches the scorer bypassed the unlock.
+        unit = self.unit("kite-stall-directive", (0, 0))
+        tactic.turn_context.kite_directives[str(unit.id)] = {
+            "kind": "move",
+            "direction": Direction.RIGHT,
+            "reason": "probe",
+        }
+        tactic._plan_kite_combat(
+            unit,
+            unit_kind="vanguard",
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            cell_counts={},
+        )
+        # First observation anchors the counter; every further same-cell
+        # observation increments it — the early exit is no exception.
+        self.assertEqual(tactic._kite_stall_ticks[str(unit.id)], 0)
+        tactic._plan_kite_combat(
+            unit,
+            unit_kind="vanguard",
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            cell_counts={},
+        )
+        self.assertEqual(tactic._kite_stall_ticks[str(unit.id)], 1)
+        tactic._plan_kite_combat(
+            unit,
+            unit_kind="vanguard",
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            cell_counts={},
+        )
+        self.assertEqual(tactic._kite_stall_ticks[str(unit.id)], 2)
+
+
+class FriendlySameCellSplitRegressionTests(KiteTeamPlannerTests):
+    """Two stacked allies whose same-exit moves keep cancelling server-side
+    must deterministically pick different exits, and the split decision is
+    sticky: collision events never reset it before the pair separates."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_split = dict(tactic._kite_friendly_split)
+        self._saved_units_view = getattr(tactic.turn_context, "units_view", ())
+        tactic._kite_friendly_split.clear()
+
+    def tearDown(self):
+        tactic._kite_friendly_split.clear()
+        tactic._kite_friendly_split.update(self._saved_split)
+        tactic.turn_context.units_view = self._saved_units_view
+        super().tearDown()
+
+    def _stacked_pair(self):
+        first = self.unit("vanguard-a", (0, 0))
+        second = self.unit("vanguard-b", (0, 0))
+        tactic.turn_context.units_view = (first, second)
+        return first, second
+
+    def _mark_friendly_collision(self, unit, contested=(1, 0)):
+        tactic._kite_collision_streak[str(unit.id)] = (
+            (0, 0), contested, 2,
+        )
+
+    def _plan_pair(self, first, second):
+        names = {"vanguard-a": "V1", "vanguard-b": "V2"}
+        with patch.object(
+            tactic,
+            "_object_name",
+            side_effect=lambda uid, prefix: names[str(uid)],
+        ):
+            first_action, first_detail = tactic._plan_kite_combat(
+                first,
+                unit_kind="vanguard",
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                cell_counts={},
+            )
+            second_action, second_detail = tactic._plan_kite_combat(
+                second,
+                unit_kind="vanguard",
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                cell_counts={},
+            )
+        return (first_action, first.arg, first_detail), (
+            second_action, second.arg, second_detail,
+        )
+
+    def test_two_stacked_allies_get_different_exits(self):
+        first, second = self._stacked_pair()
+        self._mark_friendly_collision(first)
+        self._mark_friendly_collision(second)
+        (a1, d1, det1), (a2, d2, det2) = self._plan_pair(first, second)
+        self.assertEqual((a1, a2), ("MOVE", "MOVE"))
+        # The deterministic uid ordering yields exactly one split move and
+        # one normal route move — never the same exit again.
+        self.assertIsNotNone(d1)
+        self.assertIsNotNone(d2)
+        self.assertNotEqual(d1, d2)
+        self.assertIn("kite-friendly-split", det1)
+        self.assertNotIn("kite-friendly-split", det2)
+        self.assertIn(str(first.id), tactic._kite_friendly_split)
+        self.assertNotIn(str(second.id), tactic._kite_friendly_split)
+
+    def test_exits_stay_different_across_consecutive_frames(self):
+        first, second = self._stacked_pair()
+        for tick in (5, 6, 7):
+            tactic.turn_context.tick = tick
+            self._mark_friendly_collision(first)
+            self._mark_friendly_collision(second)
+            (a1, d1, _), (a2, d2, _) = self._plan_pair(first, second)
+            self.assertEqual((a1, a2), ("MOVE", "MOVE"), f"tick={tick}")
+            self.assertEqual(d1, Direction.DOWN, f"tick={tick}")
+            self.assertEqual(d2, Direction.UP, f"tick={tick}")
+
+    def test_split_memo_is_sticky_through_collision_resets(self):
+        # Review fix: the collision streak used to be the only carrier of the
+        # split state, so a collision event reset it and the pair deadlocked
+        # again. The memo alone must keep the contested exit avoided while
+        # the unit still stands on the stacked cell, even with no collision
+        # streak at all.
+        first, second = self._stacked_pair()
+        self._mark_friendly_collision(first)
+        self._mark_friendly_collision(second)
+        self._plan_pair(first, second)  # creates the memo for the yielder
+        self.assertIn(str(first.id), tactic._kite_friendly_split)
+
+        for tick in (6, 7, 8):
+            tactic.turn_context.tick = tick
+            tactic._kite_collision_streak.clear()  # collision event reset
+            (a1, d1, det1), _ = self._plan_pair(first, second)
+            self.assertEqual(a1, "MOVE", f"tick={tick}")
+            # The memo keeps the contested exit (RIGHT) forbidden, so the
+            # route detours around it instead of retrying the doomed cell.
+            self.assertNotEqual(d1, Direction.RIGHT, f"tick={tick}")
+            self.assertEqual(d1, Direction.UP, f"tick={tick}")
+            self.assertIn(str(first.id), tactic._kite_friendly_split)
+
+    def test_split_memo_lapses_once_the_unit_leaves_the_stacked_cell(self):
+        first, second = self._stacked_pair()
+        self._mark_friendly_collision(first)
+        self._mark_friendly_collision(second)
+        self._plan_pair(first, second)
+        self.assertIn(str(first.id), tactic._kite_friendly_split)
+        # The yielder actually separated; on the next tick the memo expires.
+        first.position = (0, 1)
+        tactic.turn_context.tick = 6
+        tactic._kite_collision_streak.clear()
+        tactic._plan_kite_combat(
+            first,
+            unit_kind="vanguard",
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            cell_counts={},
+        )
+        self.assertNotIn(str(first.id), tactic._kite_friendly_split)
+
+    def test_single_unit_with_residual_collision_keeps_safety_planning(self):
+        # Review fix: a lone unit with a residual collision count (no ally on
+        # its cell) used to be forced into the sideways split branch,
+        # bypassing the safety assessment. It must keep the old behavior:
+        # avoid the contested cell for one tick and run the normal
+        # safety-assessed planning.
+        lone = self.unit("vanguard-lone", (0, 0))
+        tactic.turn_context.units_view = (lone,)
+        self._mark_friendly_collision(lone)
+        action, detail = tactic._plan_kite_combat(
+            lone,
+            unit_kind="vanguard",
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            cell_counts={},
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertNotEqual(lone.arg, Direction.RIGHT)
+        self.assertNotIn("kite-friendly-split", detail)
+        self.assertNotIn(str(lone.id), tactic._kite_friendly_split)
+
+    def test_side_step_is_blocked_when_the_side_cell_is_threatened(self):
+        # Review fix: the sideways target cell used to bypass
+        # _kite_cell_assessment entirely. With a visible enemy covering the
+        # side cell the split must abort and fall back to the normal
+        # safety-assessed planning instead of dodging sideways into fire.
+        first, second = self._stacked_pair()
+        # Below full HP so the full-vanguard-trade branch stays out of it.
+        first.hp = 3
+        self._mark_friendly_collision(first)
+        self._mark_friendly_collision(second)
+        # Ranger far enough away that (0,0) stays outside its range (4),
+        # while the yielder's side cell (0,1) is still covered (distance 3).
+        threat = self.enemy("side-threat", (3, 1), UnitType.RANGER)
+        action, detail = tactic._plan_kite_combat(
+            first,
+            unit_kind="vanguard",
+            enemies=(threat,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            cell_counts={},
+        )
+        self.assertNotIn("kite-friendly-split", detail)
+        if action == "MOVE":
+            next_cell = (
+                first.position[0] + first.arg.delta[0],
+                first.position[1] + first.arg.delta[1],
+            )
+            self.assertNotEqual(next_cell, (0, 1))
+
+    def test_yield_rank_key_is_symmetric_and_never_touches_display_names(self):
+        # Review fix: the ranking used to apply the planning unit's own
+        # unit-kind name prefix to every stacked ally (asymmetric across
+        # kinds: both sides of the pair could rank themselves first, and
+        # minting phantom display names advanced the name counter forever).
+        # The key is now (_stable_slot_index(uid, 2), uid): both sides
+        # compute the same total order and no display name is touched.
+        def rank(uid):
+            return (tactic._stable_slot_index(str(uid), 2), str(uid))
+
+        first, second = self._stacked_pair()
+        rank_a, rank_b = rank(first.id), rank(second.id)
+        self.assertNotEqual(rank_a, rank_b)
+        yielder_from_first = first.id if rank_a <= rank_b else second.id
+        yielder_from_second = second.id if rank_b <= rank_a else first.id
+        self.assertEqual(yielder_from_first, yielder_from_second)
+
+        self._mark_friendly_collision(first)
+        self._mark_friendly_collision(second)
+        names_before = set(tactic._object_names)
+        # Unpatched _object_name on purpose: the split branch must not mint
+        # any display names while deciding the yielder (decision logging may
+        # still mint each unit's OWN name — that is the pre-existing, kind
+        # correct naming path).
+        tactic._plan_kite_combat(
+            first,
+            unit_kind="vanguard",
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            cell_counts={},
+        )
+        tactic._plan_kite_combat(
+            second,
+            unit_kind="vanguard",
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=self.config,
+            cell_counts={},
+        )
+        new_entries = set(tactic._object_names) - names_before
+        for prefix, obj_id in new_entries:
+            if str(obj_id) in (str(first.id), str(second.id)):
+                self.assertEqual(
+                    prefix, "V",
+                    "split ranking minted a wrong-prefix name",
+                )
+        self.assertIn(str(yielder_from_first), tactic._kite_friendly_split)
+
+    def test_split_never_mints_cross_kind_phantom_names(self):
+        # Review fix: the old ranking applied the PLANNING unit's name
+        # prefix to every stacked ally, minting phantom display names for
+        # mixed-kind pairs (a Vanguard planning minted "V…" names for its
+        # Ranger ally) and permanently advancing the name counters. The
+        # uid-keyed ranking must never touch the display-name system.
+        vanguard = self.unit("mixed-v", (0, 0))
+        ranger = self.unit("mixed-r", (0, 0), UnitType.RANGER)
+        tactic.turn_context.units_view = (vanguard, ranger)
+        tactic._kite_collision_streak[str(vanguard.id)] = ((0, 0), (1, 0), 2)
+        tactic._kite_collision_streak[str(ranger.id)] = ((0, 0), (1, 0), 2)
+        for unit, kind in ((vanguard, "vanguard"), (ranger, "ranger")):
+            tactic._plan_kite_combat(
+                unit,
+                unit_kind=kind,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                cell_counts={},
+            )
+        # No cross-kind phantom: the Vanguard id never gets an "R" name and
+        # the Ranger id never gets a "V" name.
+        self.assertNotIn(("R", str(vanguard.id)), tactic._object_names)
+        self.assertNotIn(("V", str(ranger.id)), tactic._object_names)
+
+
+class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
+    """Guerrilla roam wall ping-pong: once the recorded position history
+    proves an A-B-A oscillation (window of _ROAM_STALL_WINDOW observations
+    spanning <= _ROAM_STALL_CELLS cells), the unit deflects its bearing
+    deterministically and its position actually changes; afterwards it keeps
+    avoiding the remembered region until the escape budget expires."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_history = {
+            uid: list(cells)
+            for uid, cells in tactic._roam_pos_history.items()
+        }
+        self._saved_escape = dict(tactic._roam_escape_left)
+        self._saved_cells = dict(tactic._roam_stall_cells)
+        self._saved_origin = dict(getattr(tactic, "_roam_stall_origin", {}))
+        self._saved_offset = dict(tactic._roam_bearing_offset)
+        self._saved_flip_pending = dict(tactic._roam_flip_pending)
+        self._saved_flips_used = dict(tactic._roam_flips_used)
+        self._saved_dead_obstacles = tactic._dead_obstacles
+        tactic._roam_pos_history.clear()
+        tactic._roam_escape_left.clear()
+        tactic._roam_stall_cells.clear()
+        if hasattr(tactic, "_roam_stall_origin"):
+            tactic._roam_stall_origin.clear()
+        tactic._roam_bearing_offset.clear()
+        tactic._roam_flip_pending.clear()
+        tactic._roam_flips_used.clear()
+        tactic._dead_obstacles = None
+
+    def tearDown(self):
+        tactic._roam_pos_history.clear()
+        tactic._roam_pos_history.update(self._saved_history)
+        tactic._roam_escape_left.clear()
+        tactic._roam_escape_left.update(self._saved_escape)
+        tactic._roam_stall_cells.clear()
+        tactic._roam_stall_cells.update(self._saved_cells)
+        if hasattr(tactic, "_roam_stall_origin"):
+            tactic._roam_stall_origin.clear()
+            tactic._roam_stall_origin.update(self._saved_origin)
+        tactic._roam_bearing_offset.clear()
+        tactic._roam_bearing_offset.update(self._saved_offset)
+        tactic._roam_flip_pending.clear()
+        tactic._roam_flip_pending.update(self._saved_flip_pending)
+        tactic._roam_flips_used.clear()
+        tactic._roam_flips_used.update(self._saved_flips_used)
+        tactic._dead_obstacles = self._saved_dead_obstacles
+        super().tearDown()
+
+    def _record_history(self, uid, positions):
+        """Mirror _guerrilla_roam's per-tick recording: one entry per tick,
+        consecutive duplicates collapsed, capped at the region tail."""
+        history = tactic._roam_pos_history.setdefault(uid, [])
+        for pos in positions:
+            if not history or history[-1] != pos:
+                history.append(pos)
+                del history[:-tactic._ROAM_STALL_REGION]
+        return history
+
+    def test_update_stall_triggers_exactly_at_the_window_threshold(self):
+        oscillating = ((0, 0), (0, 1))
+        # One short of a full window: no trigger.
+        self._record_history(
+            "probe",
+            [oscillating[i % 2] for i in range(tactic._ROAM_STALL_WINDOW - 1)],
+        )
+        self.assertFalse(tactic._roam_update_stall("probe"))
+        # A full window spanning only 2 cells proves the bounce.
+        self._record_history(
+            "probe", [oscillating[(tactic._ROAM_STALL_WINDOW - 1) % 2]],
+        )
+        self.assertTrue(tactic._roam_update_stall("probe"))
+        self.assertIn((0, 0), tactic._roam_stall_cells["probe"])
+        self.assertIn((0, 1), tactic._roam_stall_cells["probe"])
+        self.assertEqual(tactic._roam_pos_history["probe"], [])
+
+    def test_wandering_positions_never_trigger(self):
+        self._record_history(
+            "probe",
+            [(i, 0) for i in range(tactic._ROAM_STALL_WINDOW + 5)],
+        )
+        self.assertFalse(
+            tactic._roam_update_stall("probe"),
+        )
+
+    def test_oscillation_triggers_escape_and_position_changes(self):
+        unit = self.unit("roam-esc", (0, 1))
+        # Approach path into the bounce, then a full oscillation window.
+        bounce = [(0, 0), (0, 1)] * ((tactic._ROAM_STALL_WINDOW + 1) // 2)
+        self._record_history("roam-esc", [(-2, 1), (-1, 1)] + bounce)
+        simpos = (0, 1)
+        positions: list[tuple[int, int]] = [simpos]
+        for step in range(tactic._ROAM_ESCAPE_TICKS + 2):
+            action, detail = tactic._guerrilla_roam(
+                unit, simpos, frozenset({(0, 0)}), self.config,
+            )
+            self.assertEqual(action, "MOVE", f"step={step}")
+            self.assertIsNotNone(unit.arg, f"step={step}")
+            simpos = (
+                simpos[0] + unit.arg.delta[0],
+                simpos[1] + unit.arg.delta[1],
+            )
+            positions.append(simpos)
+            self._record_history("roam-esc", [simpos])
+        # The very first escape step leaves the bounce cells, so the unit's
+        # position genuinely changes instead of ping-ponging.
+        self.assertNotIn(positions[1], {(0, 0), (0, 1)})
+        # While the escape budget runs, every step keeps clear of the
+        # remembered region (bounce cells plus the approach path).
+        for cell in positions[1:-1]:
+            self.assertNotIn(
+                cell, {(-2, 1), (-1, 1), (0, 0), (0, 1)},
+            )
+        self.assertEqual(tactic._roam_escape_left.get("roam-esc"), 0)
+        self.assertNotIn("roam-esc", tactic._roam_stall_cells)
+        self.assertGreater(
+            len(set(positions)), tactic._ROAM_STALL_CELLS,
+            "the unit must cover more than the two bounce cells",
+        )
+        # Review fix: the escape's bearing flip is confirmed by the actual
+        # displacement — after the loop the unit really left the region, so
+        # the offset flipped exactly once (180 degrees = +4 of 8 slots).
+        self.assertEqual(tactic._roam_bearing_offset.get("roam-esc", 0), 4)
+        self.assertEqual(tactic._roam_flips_used.get("roam-esc"), 1)
+        self.assertNotIn("roam-esc", tactic._roam_flip_pending)
+
+    def test_first_escape_step_is_labelled_escape(self):
+        unit = self.unit("roam-esc-label", (0, 1))
+        bounce = [(0, 0), (0, 1)] * ((tactic._ROAM_STALL_WINDOW + 1) // 2)
+        self._record_history("roam-esc-label", bounce)
+        action, detail = tactic._guerrilla_roam(
+            unit, (0, 1), frozenset({(0, 0)}), self.config,
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("escape", detail)
+
+    def test_roam_escape_honors_the_roam_oscillation_escape_config(self):
+        # The shipped roam_oscillation_escape switch gates the escape
+        # mechanism: with it off, a proven oscillation must NOT trigger any
+        # escape state and the unit keeps its original bearing roaming.
+        unit = self.unit("roam-off", (0, 1))
+        bounce = [(0, 0), (0, 1)] * ((tactic._ROAM_STALL_WINDOW + 1) // 2)
+        self._record_history("roam-off", bounce)
+        config = dict(self.config)
+        config["roam_oscillation_escape"] = False
+        action, detail = tactic._guerrilla_roam(
+            unit,
+            (0, 1),
+            frozenset({(0, 0)}),
+            config,
+        )
+        self.assertNotIn("escape", detail)
+        self.assertNotIn(
+            "roam-off", tactic._roam_stall_cells,
+            "with the switch off, oscillation detection must stay inactive",
+        )
+        self.assertEqual(tactic._roam_escape_left.get("roam-off", 0), 0)
+
+        # Same history, switch on (the default): the escape triggers.
+        unit2 = self.unit("roam-on", (0, 1))
+        self._record_history("roam-on", bounce)
+        action2, detail2 = tactic._guerrilla_roam(
+            unit2,
+            (0, 1),
+            frozenset({(0, 0)}),
+            self.config,
+        )
+        self.assertEqual(action2, "MOVE")
+        self.assertIn("escape", detail2)
+
+    def test_flip_deferred_until_exit_confirmed_and_capped_at_one(self):
+        # Review fix: the bearing flip used to fire on planning intent, so a
+        # server-cancelled first escape step re-flipped on the next tick and
+        # the offset jittered 0<->4 until the escape budget ran out with a
+        # net-zero flip (silent no-op). The flip now waits for the confirmed
+        # exit, happens at most once per escape event, and at most once per
+        # unit lifetime so long games keep the eight-way bearing spread.
+        unit = self.unit("roam-flip", (0, 1))
+        bounce = [(0, 0), (0, 1)] * ((tactic._ROAM_STALL_WINDOW + 1) // 2)
+        self._record_history("roam-flip", bounce)
+
+        # Escape triggers and picks a step out of the region — but no flip
+        # yet: the server has not confirmed the move.
+        action, detail = tactic._guerrilla_roam(
+            unit, (0, 1), frozenset({(0, 0)}), self.config,
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("escape", detail)
+        self.assertEqual(tactic._roam_bearing_offset.get("roam-flip", 0), 0)
+        self.assertTrue(tactic._roam_flip_pending.get("roam-flip"))
+
+        # The first escape step is cancelled by the server: the unit still
+        # stands inside the region next tick, so the offset must NOT flip.
+        action, _ = tactic._guerrilla_roam(
+            unit, (0, 1), frozenset({(0, 0)}), self.config,
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(tactic._roam_bearing_offset.get("roam-flip", 0), 0)
+        self.assertTrue(tactic._roam_flip_pending.get("roam-flip"))
+
+        # Next tick the unit really is outside the region: exactly one flip.
+        outside = (
+            0 + unit.arg.delta[0],
+            1 + unit.arg.delta[1],
+        )
+        self.assertNotIn(outside, tactic._roam_stall_cells["roam-flip"])
+        tactic._guerrilla_roam(unit, outside, frozenset({(0, 0)}), self.config)
+        self.assertEqual(tactic._roam_bearing_offset["roam-flip"], 4)
+        self.assertNotIn("roam-flip", tactic._roam_flip_pending)
+        self.assertEqual(tactic._roam_flips_used["roam-flip"], 1)
+
+        # Spend the remaining cooldown budget outside the region.
+        pos = outside
+        while tactic._roam_escape_left.get("roam-flip", 0) > 0:
+            action, _ = tactic._guerrilla_roam(
+                unit, pos, frozenset({(0, 0)}), self.config,
+            )
+            if action == "MOVE" and unit.arg is not None:
+                pos = (
+                    pos[0] + unit.arg.delta[0],
+                    pos[1] + unit.arg.delta[1],
+                )
+        self.assertEqual(tactic._roam_escape_left.get("roam-flip", 0), 0)
+
+        # A fresh oscillation triggers a second escape event; even after its
+        # exit is confirmed the lifetime cap keeps the offset where it is.
+        self._record_history("roam-flip", bounce)
+        action, detail = tactic._guerrilla_roam(
+            unit, (0, 1), frozenset({(0, 0)}), self.config,
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("escape", detail)
+        outside2 = (
+            0 + unit.arg.delta[0],
+            1 + unit.arg.delta[1],
+        )
+        tactic._guerrilla_roam(
+            unit, outside2, frozenset({(0, 0)}), self.config,
+        )
+        self.assertEqual(tactic._roam_bearing_offset.get("roam-flip", 0), 4)
+        self.assertEqual(tactic._roam_flips_used.get("roam-flip", 0), 1)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ FILES = (
     "dashboard.py",
     "game_stats.py",
     "state_io.py",
+    "watchdog.py",
     "BEHAVIOR.md",
 )
 

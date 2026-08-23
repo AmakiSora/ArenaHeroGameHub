@@ -101,7 +101,8 @@ EXCLUDE_PATTERNS = [
     r"^battle_log\.jsonl\.lock$",
     r"^_.*\.py$",
     r"^fix_.*\.py$",
-    r"^watchdog\.py$",
+    # watchdog.py ships intentionally: tactic.choose_actions feeds it the
+    # per-tick unit snapshot for the stall_alert lines.
     r"^diagnose\.py$",
     r"^direct_wrapper\.py$",
     r"^nul$",

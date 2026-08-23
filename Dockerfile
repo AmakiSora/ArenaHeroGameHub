@@ -32,6 +32,7 @@ COPY dashboard.py \
      state_io.py \
      tactic_config.py \
      status.py \
+     watchdog.py \
      docker-entrypoint.py \
      ./
 
