@@ -22,7 +22,6 @@ tactic_log.jsonl
 direct_debug.json
 direct_play.log
 direct_wrapper.py
-watchdog.py
 diagnose.py
 fix_*.py
 _*.py
