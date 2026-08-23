@@ -8706,6 +8706,58 @@ class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
             tactic._roam_update_stall("probe"),
         )
 
+    def test_three_cell_loop_oscillation_triggers_escape(self):
+        # Field blind spot: unit 2a4d82bf cycled forever through three
+        # cells — (270,-744)/(270,-743)/(269,-744) — which the old
+        # <=_ROAM_STALL_CELLS (2 distinct) test never caught. A full window
+        # cycling through 3 cells with a tiny net displacement must trigger.
+        loop = [(270, -744), (270, -743), (269, -744)]
+        self._record_history(
+            "probe3",
+            [loop[i % 3] for i in range(tactic._ROAM_STALL_WINDOW)],
+        )
+        self.assertTrue(tactic._roam_update_stall("probe3"))
+        for cell in loop:
+            self.assertIn(cell, tactic._roam_stall_cells["probe3"])
+        self.assertEqual(tactic._roam_pos_history["probe3"], [])
+
+        # End to end through _guerrilla_roam: a fresh history filling one
+        # window and one more recorded step flips the unit into the escape
+        # phase (labelled "escape") with a full escape budget.
+        unit = self.unit("roam3", (269, -744))
+        self._record_history(
+            "roam3",
+            [loop[i % 3] for i in range(tactic._ROAM_STALL_WINDOW)],
+        )
+        action, detail = tactic._guerrilla_roam(
+            unit, (269, -744), frozenset(), self.config,
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("escape", detail)
+        self.assertEqual(
+            tactic._roam_escape_left.get("roam3"),
+            tactic._ROAM_ESCAPE_TICKS,
+        )
+
+    def test_genuine_outward_roaming_with_growing_displacement_never_triggers(self):
+        # False-positive guard: a roaming unit that covers more than 3
+        # distinct cells and keeps drifting outward (net displacement of
+        # every window grows) must never be mistaken for a 3-cell loop.
+        self._record_history(
+            "roamer",
+            [(i, i) for i in range(tactic._ROAM_STALL_WINDOW + 8)],
+        )
+        self.assertFalse(tactic._roam_update_stall("roamer"))
+        self.assertNotIn("roamer", tactic._roam_stall_cells)
+        # A staircase walk (two cells per new column) also keeps growing
+        # its net displacement and must stay untouched.
+        self._record_history(
+            "stair",
+            [(i // 2, i % 2) for i in range(tactic._ROAM_STALL_WINDOW + 8)],
+        )
+        self.assertFalse(tactic._roam_update_stall("stair"))
+        self.assertNotIn("stair", tactic._roam_stall_cells)
+
     def test_oscillation_triggers_escape_and_position_changes(self):
         unit = self.unit("roam-esc", (0, 1))
         # Approach path into the bounce, then a full oscillation window.

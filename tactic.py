@@ -2487,7 +2487,12 @@ def _roam_update_stall(uid: str) -> bool:
     not ticks — a stationary unit never fills it and never triggers); this
     returns True once the last _ROAM_STALL_WINDOW recorded positions only
     span _ROAM_STALL_CELLS or fewer distinct cells (deterministic A-B-A wall
-    bouncing). Fully deterministic — no randomness anywhere in the escape.
+    bouncing). Windows spanning _ROAM_STALL_CELLS + 1 cells also count, but
+    only when the net window displacement (Chebyshev distance between the
+    window's first and last position) is <= _ROAM_STALL_DRIFT — that catches
+    3-cell loop oscillations (A-B-C-A) while genuine roaming, which keeps
+    drifting outward, never trips the drift bound. Fully deterministic — no
+    randomness anywhere in the escape.
     On trigger, _roam_stall_cells remembers the whole recent region (the
     bounce cells plus the approach cells), so the escape also avoids walking
     straight back in, and _roam_stall_origin remembers the cell the unit just
@@ -2496,11 +2501,24 @@ def _roam_update_stall(uid: str) -> bool:
     """
     history = _roam_pos_history.setdefault(uid, [])
     window = history[-_ROAM_STALL_WINDOW:]
-    if len(window) >= _ROAM_STALL_WINDOW and len(set(window)) <= _ROAM_STALL_CELLS:
-        _roam_stall_cells[uid] = frozenset(history)
-        _roam_stall_origin[uid] = window[-2] if len(window) >= 2 else window[-1]
-        history.clear()
-        return True
+    if len(window) >= _ROAM_STALL_WINDOW:
+        distinct = set(window)
+        drift = max(
+            abs(window[-1][0] - window[0][0]),
+            abs(window[-1][1] - window[0][1]),
+        )
+        stalled = (
+            len(distinct) <= _ROAM_STALL_CELLS
+            or (
+                len(distinct) <= _ROAM_STALL_CELLS + 1
+                and drift <= _ROAM_STALL_DRIFT
+            )
+        )
+        if stalled:
+            _roam_stall_cells[uid] = frozenset(history)
+            _roam_stall_origin[uid] = window[-2] if len(window) >= 2 else window[-1]
+            history.clear()
+            return True
     return False
 
 
@@ -5340,10 +5358,15 @@ _roam_flips_used: dict[str, int] = {}
 # An 8-position-change window spanning <=2 cells proves an A-B-A bounce (the
 # window counts recorded position changes, not ticks; 8 also catches a
 # stationary unit, whose escape candidates just degrade into normal roaming,
-# so harmless). The region remembered on trigger keeps this many most-recent
+# so harmless). Windows spanning 3 cells also count, but only when the net
+# window displacement (Chebyshev) stays <= _ROAM_STALL_DRIFT: that catches
+# 3-cell loop oscillations (A-B-C-A, e.g. the (270,-744)/(270,-743)/(269,-744)
+# cycle) while genuine outward roaming keeps drifting beyond the bound and
+# never trips. The region remembered on trigger keeps this many most-recent
 # cells so the escape also avoids the approach path back into the bounce.
 _ROAM_STALL_WINDOW = 8
 _ROAM_STALL_CELLS = 2
+_ROAM_STALL_DRIFT = 2
 # Keep a longer tail than the detection window so the remembered region also
 # covers the approach path into the bounce (the escape avoids re-entering it).
 _ROAM_STALL_REGION = 16
