@@ -122,6 +122,7 @@ const resources = {
       enemySightings: 'Visible enemies', jumpToEnemy: 'Jump to this enemy',
       showEnemyMemory: 'Show remembered enemies', hideEnemyMemory: 'Hide remembered enemies', memoryEnemy: 'Last known position', enemyMemoryFilter: '{{type}} memory filter',
       showUnitRoutes: 'Show unit destinations and routes', hideUnitRoutes: 'Hide unit destinations and routes',
+      showObstacles: 'Show obstacles (slower with large explored areas)', hideObstacles: 'Hide obstacles (improves frame rate)',
       openStrategyConfig: 'Open strategy settings',
       strategyConfig: {
         eyebrow: 'Tactic dashboard', title: 'Strategy settings',
@@ -287,6 +288,7 @@ const resources = {
       enemySightings: '可见敌人', jumpToEnemy: '跳转到该敌人位置',
       showEnemyMemory: '显示记忆敌人', hideEnemyMemory: '隐藏记忆敌人', memoryEnemy: '最后已知位置', enemyMemoryFilter: '筛选记忆敌人·{{type}}',
       showUnitRoutes: '显示单位目的地与预计轨迹', hideUnitRoutes: '隐藏单位目的地与预计轨迹',
+      showObstacles: '显示障碍物（探索区域大时会变卡）', hideObstacles: '隐藏障碍物（提升流畅度）',
       openStrategyConfig: '打开策略配置',
       strategyConfig: {
         eyebrow: '战术仪表板', title: '策略配置',

@@ -62,6 +62,10 @@ interface Props {
   // a light tint of the unit's own color baked into the terrain layer (below
   // obstacles/units), and a target ring marks the destination.
   unitRoutes?: UnitRoute[]
+  // Obstacle sprites are the heaviest terrain layer (shadowed images on every
+  // explored cell); hiding them is the performance escape hatch once the
+  // explored area grows large. Defaults to shown.
+  obstaclesVisible?: boolean
   preferredSelectionId?: string
 }
 
@@ -94,6 +98,9 @@ interface TerrainScene {
   visibleResourceCells: Set<string>
   obstacleSprites: HTMLImageElement[]
   resourceSprites: HTMLImageElement[]
+  // Obstacle layer toggle: flipping it retires the tile cache through the
+  // scene identity check, so tiles re-render once without the obstacle art.
+  obstaclesVisible: boolean
   // Unit-route cell tints baked into the terrain tiles so they sit below
   // obstacles, resources and units; routes change every tick, which retires
   // the tile cache through the scene identity check.
@@ -110,7 +117,7 @@ interface TerrainTileCache {
 const unitSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedUnitSprite>>()
 const beaconSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedBeaconSprite>>()
 
-export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onCenterCore = () => {}, beaconIndicatorVisible = true, coreIndicatorVisible = true, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], memoryEnemies = [], unitRoutes = [], preferredSelectionId }: Props) {
+export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onCenterCore = () => {}, beaconIndicatorVisible = true, coreIndicatorVisible = true, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], memoryEnemies = [], unitRoutes = [], obstaclesVisible = true, preferredSelectionId }: Props) {
   const backgroundCanvasRef = useRef<HTMLCanvasElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -166,8 +173,9 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
     visibleResourceCells,
     obstacleSprites,
     resourceSprites,
+    obstaclesVisible,
     unitRouteTints,
-  }), [explored, obstacleSprites, resourceSprites, unitRouteTints, visible, visibleObstacleCells, visibleResourceCells])
+  }), [explored, obstacleSprites, obstaclesVisible, resourceSprites, unitRouteTints, visible, visibleObstacleCells, visibleResourceCells])
   const visibleShotMarkers = useMemo(() => shotMarkers.filter((marker) => positionInViewport(marker.from, camera, size, 1) || positionInViewport(marker.to, camera, size, 1)), [camera, shotMarkers, size])
   const inspectedFeatureView = useMemo(() => inspectedFeature ? mapFeaturesAt(inspectedFeature.position, state, explored).find((feature) => feature.kind === inspectedFeature.kind) ?? null : null, [explored, inspectedFeature, state])
 
@@ -548,7 +556,7 @@ function releaseTerrainTiles(cache: TerrainTileCache) {
 }
 
 function drawWorldTerrain(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, scene: TerrainScene) {
-  const { explored, visible, visibleObstacleCells, visibleResourceCells, obstacleSprites, resourceSprites } = scene
+  const { explored, visible, visibleObstacleCells, visibleResourceCells, obstacleSprites, resourceSprites, obstaclesVisible } = scene
   ctx.clearRect(0, 0, size.width, size.height); ctx.fillStyle = 'rgba(0,0,0,.18)'; ctx.fillRect(0, 0, size.width, size.height)
   const toScreen = ([x, y]: Position) => [size.width / 2 + (x - camera.x) * camera.cell, size.height / 2 + (y - camera.y) * camera.cell] as const
   const minX = Math.floor(camera.x - size.width / camera.cell / 2) - 1, maxX = Math.ceil(camera.x + size.width / camera.cell / 2) + 1
@@ -575,9 +583,13 @@ function drawWorldTerrain(ctx: CanvasRenderingContext2D, size: { width: number; 
   const renderedObstacles: ObstacleRenderCell[] = []
   const renderedResources: { position: Position; x: number; y: number; visible: boolean }[] = []
   const obstacleCells = new Set<string>()
-  for (let y = minY - 1; y <= maxY + 1; y++) for (let x = minX - 1; x <= maxX + 1; x++) {
-    const key = `${x},${y}`
-    if (visibleObstacleCells.has(key) || explored.get(key)?.kind === 'OBSTACLE') obstacleCells.add(key)
+  // Layer toggle: with obstacles hidden the cell scan and the shadowed
+  // sprite draws are skipped entirely (the perf win the toggle exists for).
+  if (obstaclesVisible) {
+    for (let y = minY - 1; y <= maxY + 1; y++) for (let x = minX - 1; x <= maxX + 1; x++) {
+      const key = `${x},${y}`
+      if (visibleObstacleCells.has(key) || explored.get(key)?.kind === 'OBSTACLE') obstacleCells.add(key)
+    }
   }
   for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
     const key = positionKey([x, y]), memory = explored.get(key), isVisible = visible.has(key)

@@ -64,7 +64,7 @@ const memory = vi.hoisted(() => ({
 vi.mock('../hooks/useEnemyMemory', () => ({ useEnemyMemory: () => memory.sightings }))
 const originalMemorySightings = memory.sightings
 vi.mock('../components/game/WorldCanvas', () => ({
-  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, memoryEnemies = [], unitRoutes = [], beaconIndicatorVisible = true, coreIndicatorVisible = true, onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; memoryEnemies?: Array<{ position: [number, number]; type: string }>; unitRoutes?: Array<{ name: string }>; beaconIndicatorVisible?: boolean; coreIndicatorVisible?: boolean; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
+  WorldCanvas: ({ centerPosition, centerRequest, selectedId, attackPositions = [], coordPicking = false, memoryEnemies = [], unitRoutes = [], beaconIndicatorVisible = true, coreIndicatorVisible = true, obstaclesVisible = true, onAttackPosition, onCoordPick, onAnchorChange }: { centerPosition?: [number, number] | null; centerRequest: number; selectedId: string | null; attackPositions?: [number, number][]; coordPicking?: boolean; memoryEnemies?: Array<{ position: [number, number]; type: string }>; unitRoutes?: Array<{ name: string }>; beaconIndicatorVisible?: boolean; coreIndicatorVisible?: boolean; obstaclesVisible?: boolean; onAttackPosition?: (position: [number, number]) => void; onCoordPick?: (position: [number, number]) => void; onAnchorChange: (anchor: { x: number; y: number; side: 'right' } | null) => void }) => {
     useEffect(() => { onAnchorChange(selectedId ? { x: 100, y: 100, side: 'right' } : null) }, [onAnchorChange, selectedId])
     return <div
         data-testid="world-canvas"
@@ -74,6 +74,7 @@ vi.mock('../components/game/WorldCanvas', () => ({
         data-core-indicator={String(coreIndicatorVisible)}
         data-memory={JSON.stringify(memoryEnemies)}
         data-routes={JSON.stringify(unitRoutes)}
+        data-obstacles={String(obstaclesVisible)}
       >
         {attackPositions.some(([x, y]) => x === 3 && y === 0) && <button type="button" onClick={() => onAttackPosition?.([3, 0])}>Attack predicted cell</button>}
         {coordPicking && <button type="button" onClick={() => onCoordPick?.([7, -3])}>Pick map cell</button>}
@@ -260,6 +261,25 @@ describe('ArenaPage remembered enemies', () => {
     await user.click(screen.getByRole('button', { name: 'Hide unit destinations and routes' }))
     expect(map).toHaveAttribute('data-routes', '[]')
     expect(localStorage.getItem('arena-hero.unit-routes-visible.player')).toBe('false')
+  })
+
+  it('toggles obstacles from the bottom-left control and remembers the choice', async () => {
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+    const map = screen.getByTestId('world-canvas')
+
+    // The obstacle layer starts shown.
+    expect(map).toHaveAttribute('data-obstacles', 'true')
+    expect(screen.getByRole('button', { name: /Hide obstacles/ })).toHaveAttribute('aria-pressed', 'true')
+
+    await user.click(screen.getByRole('button', { name: /Hide obstacles/ }))
+    expect(map).toHaveAttribute('data-obstacles', 'false')
+    expect(screen.getByRole('button', { name: /Show obstacles/ })).toHaveAttribute('aria-pressed', 'false')
+    expect(localStorage.getItem('arena-hero.obstacles-visible.player')).toBe('false')
+
+    await user.click(screen.getByRole('button', { name: /Show obstacles/ }))
+    expect(map).toHaveAttribute('data-obstacles', 'true')
+    expect(localStorage.getItem('arena-hero.obstacles-visible.player')).toBe('true')
   })
 
   it('filters memory markers by unit type and remembers the filter set', async () => {
