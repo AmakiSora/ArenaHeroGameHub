@@ -5307,29 +5307,42 @@ _combat_path_cache: dict[str, dict] = {}
 # shoot_cell) instead of retrying the doomed move.
 # {uid: (pos, contested_cell, count)}
 _kite_collision_streak: dict[str, tuple[tuple[int, int], tuple[int, int], int]] = {}
-# Consecutive ticks a kite/guerrilla unit did not end up moving, tracked by
+# Consecutive ticks a kite/guerrilla unit did not really advance, tracked by
 # the single entry point _record_kite_stall (called on EVERY exit path of
-# _plan_kite_combat, including early returns). Read-only stall input: once a
-# threat-free unit has been frozen for _KITE_STALL_UNLOCK_TICKS ticks,
-# _kite_choose_move stops letting WAIT's progress=0 beat a safe detour step's
-# progress=-1 (the remote scoring deadlock).
+# _plan_kite_combat, including early returns). _kite_stall_pos is the stall
+# anchor: the counter keeps accumulating while the unit stays within
+# _KITE_STALL_DRIFT Chebyshev of the anchor (MOVE_CONTESTED ±1 micro-jitter
+# must not restart the unlock window), and only a genuine move of at least
+# _KITE_STALL_DRIFT + 1 cells resets the counter and re-anchors. Read-only
+# stall input: once a threat-free unit has been frozen for
+# _KITE_STALL_UNLOCK_TICKS ticks, _kite_choose_move stops letting WAIT's
+# progress=0 beat a safe detour step's progress=-1 (the remote scoring
+# deadlock).
 _kite_stall_pos: dict[str, tuple[int, int]] = {}
 _kite_stall_ticks: dict[str, int] = {}
 _KITE_STALL_UNLOCK_TICKS = 12
+_KITE_STALL_DRIFT = 1
 
 
 def _record_kite_stall(uid: str, pos: tuple[int, int]) -> None:
-    """Single entry point for the kite same-cell stall counter.
+    """Single entry point for the kite anchor-based stall counter.
 
     Called on every exit path of _plan_kite_combat (including early returns)
-    so a planned action that still left the unit on ``pos`` counts as a stall
-    tick and the WAIT-unlock threshold cannot be bypassed by any branch.
+    so a planned action that still left the unit near its anchor counts as a
+    stall tick and the WAIT-unlock threshold cannot be bypassed by any
+    branch. Positions within _KITE_STALL_DRIFT Chebyshev of the anchor are
+    micro-jitter (e.g. the occasional ±1 MOVE_CONTESTED escape step) and keep
+    accumulating; only a net displacement of at least _KITE_STALL_DRIFT + 1
+    counts as a real move, resetting the counter and re-anchoring.
     """
-    if _kite_stall_pos.get(uid) == pos:
-        _kite_stall_ticks[uid] = _kite_stall_ticks.get(uid, 0) + 1
-    else:
-        _kite_stall_pos[uid] = pos
-        _kite_stall_ticks[uid] = 0
+    anchor = _kite_stall_pos.get(uid)
+    if anchor is not None:
+        drift = max(abs(pos[0] - anchor[0]), abs(pos[1] - anchor[1]))
+        if drift <= _KITE_STALL_DRIFT:
+            _kite_stall_ticks[uid] = _kite_stall_ticks.get(uid, 0) + 1
+            return
+    _kite_stall_pos[uid] = pos
+    _kite_stall_ticks[uid] = 0
 
 
 # Friendly same-cell split memos: {uid: (contested_cell, origin, expire_tick)}.

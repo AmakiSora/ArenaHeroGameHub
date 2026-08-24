@@ -8235,8 +8235,84 @@ class KiteStallUnlockRegressionTests(KiteTeamPlannerTests):
         self.assertEqual(tactic._kite_stall_ticks["u"], 1)
         tactic._record_kite_stall("u", (1, 1))
         self.assertEqual(tactic._kite_stall_ticks["u"], 2)
-        tactic._record_kite_stall("u", (2, 1))  # the unit finally moved
+        # ±1 micro-jitter stays inside the anchor drift bound and keeps
+        # accumulating instead of restarting the unlock window.
+        tactic._record_kite_stall("u", (2, 1))
+        self.assertEqual(tactic._kite_stall_ticks["u"], 3)
+        # A genuine move (net displacement > _KITE_STALL_DRIFT from the
+        # anchor) finally resets the counter and re-anchors.
+        tactic._record_kite_stall("u", (3, 1))
         self.assertEqual(tactic._kite_stall_ticks["u"], 0)
+        self.assertEqual(tactic._kite_stall_pos["u"], (3, 1))
+
+    def test_contested_micro_jitter_keeps_accumulating_to_the_unlock(self):
+        # Field blind spot (V15 vanguard e17ed270): the goal cell was
+        # MOVE_CONTESTED every tick while an occasional ±1 DOWN step
+        # succeeded; the old reset-on-any-move counter never reached the
+        # 12-tick threshold. With the anchor-based counter the stall window
+        # must keep accumulating through the jitter and actually cross the
+        # unlock gate.
+        anchor = (-145, -588)
+        micro = (-145, -587)
+        tactic._record_kite_stall("v15", anchor)
+        self.assertEqual(tactic._kite_stall_ticks["v15"], 0)
+        ticks_seen = []
+        for i in range(tactic._KITE_STALL_UNLOCK_TICKS + 4):
+            # Every 3rd observation the unit slips one cell (the observed
+            # once-every-3-4-ticks micro-move); every other tick stays put.
+            pos = micro if i % 3 == 2 else anchor
+            tactic._record_kite_stall("v15", pos)
+            ticks_seen.append(tactic._kite_stall_ticks["v15"])
+        self.assertEqual(
+            ticks_seen,
+            list(range(1, len(ticks_seen) + 1)),
+            "micro-jitter must never reset the stall window",
+        )
+        self.assertGreaterEqual(
+            ticks_seen[-1], tactic._KITE_STALL_UNLOCK_TICKS,
+        )
+        # The anchor never moved, so the unlock gate the scorer reads is the
+        # accumulated counter itself.
+        self.assertEqual(tactic._kite_stall_pos["v15"], anchor)
+        unit = self.unit("v15-unlock", anchor)
+        walls = frozenset({(-146, -588), (-145, -589)})
+        direction, _, _ = tactic._kite_choose_move(
+            unit, anchor, (-144, -588), (), walls, 3, {},
+            must_move=False,
+            stall_ticks=tactic._kite_stall_ticks["v15"],
+        )
+        self.assertIsNotNone(
+            direction,
+            "the accumulated stall must finally unlock a detour step",
+        )
+
+    def test_real_move_of_two_or_more_cells_resets_counter_and_anchor(self):
+        # False-trigger guard: once the unit genuinely breaks out (net
+        # displacement >= 2 from the anchor), the counter resets and the new
+        # position becomes the anchor for the next stall window.
+        tactic._record_kite_stall("u", (0, 0))
+        for _ in range(5):
+            tactic._record_kite_stall("u", (0, 0))
+        self.assertEqual(tactic._kite_stall_ticks["u"], 5)
+        tactic._record_kite_stall("u", (2, 0))
+        self.assertEqual(tactic._kite_stall_ticks["u"], 0)
+        self.assertEqual(tactic._kite_stall_pos["u"], (2, 0))
+        # A diagonal breakout beyond the drift bound (Chebyshev >= 2 from
+        # the anchor) resets just the same.
+        for _ in range(3):
+            tactic._record_kite_stall("u", (2, 0))
+        tactic._record_kite_stall("u", (4, 1))
+        self.assertEqual(tactic._kite_stall_ticks["u"], 0)
+        self.assertEqual(tactic._kite_stall_pos["u"], (4, 1))
+        # And a steady one-cell-per-tick advance never lets the window
+        # accumulate toward the threshold (each second step re-anchors).
+        tactic._record_kite_stall("w", (0, 0))
+        for i in range(1, tactic._KITE_STALL_UNLOCK_TICKS * 2):
+            tactic._record_kite_stall("w", (i, 0))
+            self.assertLessEqual(
+                tactic._kite_stall_ticks["w"], 1,
+                f"steady advance must never build a stall window (i={i})",
+            )
 
     def test_choose_move_waits_until_the_stall_unlock_threshold(self):
         # Walled pocket: only DOWN/LEFT detours (progress=-1) exist; WAIT is
