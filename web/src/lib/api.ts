@@ -23,6 +23,28 @@ export const getCSRF = () => localStorage.getItem(csrfKey) ?? ''
 export const setCSRF = (token: string) => localStorage.setItem(csrfKey, token)
 export const clearCSRF = () => localStorage.removeItem(csrfKey)
 
+// The pasted official-site credentials stay valid upstream until that session
+// expires, and re-importing them is idempotent — so a successful import
+// remembers both values; the login page prefills them and silently retries
+// the import instead of asking the operator to copy from DevTools again.
+const importDraftKey = 'arena-hero.import-draft'
+
+export interface ImportDraft { cookies: string; csrf: string }
+
+export function getImportDraft(): ImportDraft | null {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(importDraftKey) ?? 'null') as Partial<ImportDraft> | null
+    if (parsed && typeof parsed.cookies === 'string' && typeof parsed.csrf === 'string' && parsed.cookies.trim() && parsed.csrf.trim()) {
+      return { cookies: parsed.cookies, csrf: parsed.csrf }
+    }
+  } catch {
+    // Corrupt draft: treat as absent, it gets replaced on the next import.
+  }
+  return null
+}
+export const setImportDraft = (cookies: string, csrf: string) => localStorage.setItem(importDraftKey, JSON.stringify({ cookies, csrf }))
+export const clearImportDraft = () => localStorage.removeItem(importDraftKey)
+
 // crypto.randomUUID() exists only in secure contexts (https / localhost).
 // The dashboard is served over plain http, where it is undefined and every
 // command click threw before fetch even ran — so the Idempotency-Key needs a
@@ -70,6 +92,9 @@ export const api = {
   logout: async () => {
     await request<void>('/api/v1/auth/logout', { method: 'POST', headers: { 'X-CSRF-Token': getCSRF() } })
     clearCSRF()
+    // Logout invalidates the session upstream, so the remembered credentials
+    // would only fail on the next silent re-import — drop them too.
+    clearImportDraft()
   },
   // Dashboard-local: OAuth-only accounts (LINUX DO / GitHub) cannot log in
   // through the proxy, so their official-site session cookie is imported,
@@ -82,6 +107,7 @@ export const api = {
       body: JSON.stringify({ cookies, csrf }),
     })
     if (result.csrf_token) setCSRF(result.csrf_token)
+    setImportDraft(cookies, csrf)
     return result
   },
   submitCommands: (plan: CommandPlan) => request<Receipt>('/api/v1/game/commands', {

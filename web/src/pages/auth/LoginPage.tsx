@@ -1,10 +1,10 @@
 import { Eye, EyeOff, LoaderCircle } from 'lucide-react'
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router'
 import { AuthCard, FormError, FormField } from '../../components/auth/AuthCard'
 import { useAuth } from '../../context/AuthContext'
-import { api } from '../../lib/api'
+import { api, getImportDraft } from '../../lib/api'
 import { getErrorMessage } from '../../lib/errorMessage'
 
 type LoginMode = 'import' | 'password'
@@ -16,11 +16,36 @@ type LoginMode = 'import' | 'password'
 // tab. Either way a valid session routes manual commands into the MANUAL
 // plan slot, overriding the bot's AGENT plan object by object.
 export function LoginPage() {
-  const { t } = useTranslation(); const { login, refresh } = useAuth(); const navigate = useNavigate()
+  const { t } = useTranslation(); const { login, refresh, user, loading } = useAuth(); const navigate = useNavigate()
   const [mode, setMode] = useState<LoginMode>('import')
   const [email, setEmail] = useState(''); const [password, setPassword] = useState(''); const [showPassword, setShowPassword] = useState(false)
-  const [busy, setBusy] = useState(false); const [importBusy, setImportBusy] = useState(false); const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false); const [importBusy, setImportBusy] = useState(false); const [restoring, setRestoring] = useState(false); const [error, setError] = useState('')
   const [cookies, setCookies] = useState(''); const [csrf, setCsrf] = useState('')
+  const autoImportTried = useRef(false)
+  // A previous successful import remembers the pasted credentials; prefill
+  // them and silently re-import once, so an expired dashboard cookie alone
+  // never forces another DevTools copy session. If the upstream session has
+  // also expired, the prefilled fields stay — only the changed values need
+  // replacing before clicking "Import session" again.
+  useEffect(() => {
+    const draft = getImportDraft()
+    if (!draft) return
+    setCookies(draft.cookies); setCsrf(draft.csrf)
+    if (loading || user || autoImportTried.current) return
+    autoImportTried.current = true
+    setRestoring(true)
+    void (async () => {
+      try {
+        await api.importSession(draft.cookies, draft.csrf)
+        if (await refresh()) navigate('/', { replace: true })
+        else setError('SESSION_IMPORT_EXPIRED')
+      } catch (cause) {
+        setError(getErrorMessage(cause))
+      } finally {
+        setRestoring(false)
+      }
+    })()
+  }, [loading, user, refresh, navigate])
   const switchMode = (next: LoginMode) => { setMode(next); setError('') }
   const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); setError(''); try { await login(email, password); navigate('/') } catch (cause) { setError(getErrorMessage(cause)) } finally { setBusy(false) } }
   const importSession = async (event: FormEvent) => {
@@ -46,7 +71,7 @@ export function LoginPage() {
       <button type="button" role="tab" aria-selected={mode === 'password'} onClick={() => switchMode('password')} className={tabClass(mode === 'password')}>{t('auth.passwordTab')}</button>
     </div>
     {mode === 'import' && <form onSubmit={(event) => void importSession(event)} className="space-y-4">
-      <p className="text-xs leading-5 text-zinc-500">{t('auth.importHelp')}</p>
+      <p className="text-xs leading-5 text-zinc-500">{restoring ? t('auth.rememberedRestoring') : t('auth.importHelp')}</p>
       <textarea
         value={cookies}
         onChange={(event) => setCookies(event.target.value)}
@@ -69,7 +94,7 @@ export function LoginPage() {
         className="font-mono text-xs"
       />
       <FormError message={error} />
-      <button disabled={importBusy || busy || !cookies.trim() || !csrf.trim()} aria-busy={importBusy} className="primary-button flex w-full items-center justify-center gap-2">{importBusy && <LoaderCircle size={16} className="animate-spin" />}{t('auth.importAction')}</button>
+      <button disabled={restoring || importBusy || busy || !cookies.trim() || !csrf.trim()} aria-busy={importBusy || restoring} className="primary-button flex w-full items-center justify-center gap-2">{(importBusy || restoring) && <LoaderCircle size={16} className="animate-spin" />}{t('auth.importAction')}</button>
     </form>}
     {mode === 'password' && <form onSubmit={(event) => void submit(event)} className="space-y-4">
       <FormField label={t('auth.email')} name="email" type="email" autoComplete="email" required value={email} onChange={(event) => setEmail(event.target.value)} />

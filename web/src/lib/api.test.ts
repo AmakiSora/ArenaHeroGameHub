@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api, apiURL, setCSRF } from './api'
+import { api, apiURL, getImportDraft, setCSRF } from './api'
 
 describe('API URL', () => {
   it('keeps dashboard-proxied requests relative', () => {
@@ -15,6 +15,7 @@ describe('manual command API', () => {
   afterEach(() => {
     vi.restoreAllMocks()
     vi.unstubAllEnvs()
+    localStorage.clear()
   })
 
   it('loads the public leaderboard without authentication headers', async () => {
@@ -82,5 +83,36 @@ describe('manual command API', () => {
     expect(path).toBe('/api/v1/session/import')
     expect(JSON.parse(init?.body as string)).toEqual({ cookies: 'arena_session=abc; other=1', csrf: 'csrf-imported' })
     expect(localStorage.getItem('arena-hero.csrf')).toBe('csrf-imported')
+  })
+
+  it('remembers imported credentials so the next login can reuse them', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true, user: { username: 'operator' }, csrf_token: 'csrf-imported' }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await api.importSession('arena_session=abc; other=1', 'csrf-imported')
+
+    expect(getImportDraft()).toEqual({ cookies: 'arena_session=abc; other=1', csrf: 'csrf-imported' })
+  })
+
+  it('does not remember a failed import and ignores corrupt drafts', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: false, error: 'SESSION_IMPORT_EXPIRED' }), { status: 401, headers: { 'Content-Type': 'application/json' } }))
+
+    await expect(api.importSession('arena_session=stale', 'csrf-old')).rejects.toThrow('SESSION_IMPORT_EXPIRED')
+    expect(getImportDraft()).toBeNull()
+
+    localStorage.setItem('arena-hero.import-draft', '{not json')
+    expect(getImportDraft()).toBeNull()
+    localStorage.setItem('arena-hero.import-draft', JSON.stringify({ cookies: '  ', csrf: 'x' }))
+    expect(getImportDraft()).toBeNull()
+  })
+
+  it('drops the remembered credentials on logout', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }))
+    setCSRF('csrf-x')
+    localStorage.setItem('arena-hero.import-draft', JSON.stringify({ cookies: 'arena_session=abc', csrf: 'csrf-x' }))
+
+    await api.logout()
+
+    expect(localStorage.getItem('arena-hero.csrf')).toBeNull()
+    expect(getImportDraft()).toBeNull()
   })
 })
