@@ -2335,6 +2335,50 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(action, "MOVE")
         self.assertIn("guerrilla-roam", detail)
 
+    def test_guerrilla_skips_core_with_guard_outside_local_sight(self) -> None:
+        """A visible Core is not a target when another sighting reveals an
+        adjacent enemy combat unit guarding it."""
+        unit = self.CombatUnit("v-g-guarded-core", (0, 0))
+        enemies = (
+            SimpleNamespace(position=(4, 0), unit_type="CORE"),
+            # Outside this Vanguard's local sight (4), but adjacent to Core.
+            SimpleNamespace(position=(5, 0), unit_type="VANGUARD"),
+        )
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=enemies,
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="guerrilla",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("guerrilla-roam", detail)
+
+    def test_guerrilla_prefers_isolated_core_over_distant_worker(self) -> None:
+        """Once no combat threat is present, an exposed Core is the solo
+        guerrilla objective instead of an unrelated, distant worker."""
+        unit = self.CombatUnit("v-g-core-priority", (0, 0))
+        enemies = (
+            SimpleNamespace(position=(3, 0), unit_type="CORE"),
+            SimpleNamespace(position=(4, 0), unit_type="WORKER"),
+        )
+
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=enemies,
+            obstacle_cells=frozenset(),
+            config=self.config,
+            core_pos=(0, 0),
+            team="guerrilla",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("kite-route", detail)
+        self.assertNotIn("worker", detail.lower())
+
     def test_guerrilla_far_pack_does_not_trigger_retreat(self) -> None:
         """3 threats all beyond this unit's own sight do not count as a pack
         for this unit — the retreat threshold is local, not team-wide."""

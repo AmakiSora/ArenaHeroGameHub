@@ -2435,6 +2435,44 @@ _EIGHT_WAY_LABELS: tuple[str, ...] = ("N", "NE", "E", "SE", "S", "SW", "W", "NW"
 # Vision radius per guerrilla unit type (game rules; same values the
 # stale-sighting removal uses): Vanguard 4 / Ranger 5.
 _GUERRILLA_SIGHT: dict[str, int] = {"vanguard": 4, "ranger": 5}
+# A core is considered "isolated" when none of the eight cells immediately
+# around it contains an enemy unit that can deal combat damage.  Keep this
+# deliberately local: a Vanguard/Ranger elsewhere on the map is not a guard
+# for this target, while a combat unit in one of the surrounding cells is.
+_GUERRILLA_CORE_GUARD_RADIUS = 1
+
+
+def _guerrilla_core_isolated(
+    core: Any,
+    enemies: Iterable[Any],
+    *,
+    guard_radius: int = _GUERRILLA_CORE_GUARD_RADIUS,
+) -> bool:
+    """Return whether *core* has no nearby enemy combat-unit escort.
+
+    Enemy workers and cores do not count as guards.  Unknown enemy types are
+    treated as threats by :func:`_is_combat_threat`, so incomplete sightings
+    fail safely instead of making a defended core look exposed.
+    """
+    raw_core_pos = getattr(core, "position", None)
+    if raw_core_pos is None:
+        return False
+    core_pos = tuple(raw_core_pos)
+    if len(core_pos) != 2:
+        return False
+    radius = max(0, int(guard_radius))
+    for enemy in enemies:
+        if enemy is core:
+            continue
+        raw_enemy_pos = getattr(enemy, "position", None)
+        if raw_enemy_pos is None:
+            continue
+        enemy_pos = tuple(raw_enemy_pos)
+        if len(enemy_pos) != 2 or not _is_combat_threat(enemy):
+            continue
+        if _chebyshev(core_pos, enemy_pos) <= radius:
+            return False
+    return True
 
 
 def _guerrilla_roam_goal(unit: Any, pos: tuple[int, int]) -> tuple[int, int]:
@@ -4605,6 +4643,18 @@ def _plan_kite_combat(
         if solo
         else _kite_engage_pool(pos, objective, mode, enemies, config)
     )
+    if solo:
+        # Guerrillas hunt exposed enemy Cores, but do not walk into a Core
+        # that has a combat escort in its immediate neighbourhood.  Evaluate
+        # the escort against the complete visible set (rather than only this
+        # unit's local slice): another friendly scout may have revealed the
+        # guard even when this guerrilla cannot see it itself.
+        engage_pool = tuple(
+            enemy
+            for enemy in engage_pool
+            if _enemy_unit_type_name(enemy) != "CORE"
+            or _guerrilla_core_isolated(enemy, enemies)
+        )
     # A kite squad may not ignore an off-route enemy that is about to enter
     # its own range: route leashes only select long-distance objectives. Keep
     # every nearby combat threat in the tactical pool for pre-fire/spacing.
@@ -4617,8 +4667,27 @@ def _plan_kite_combat(
         for enemy in (*engage_pool, *local_pool)
     }
     combat_pool = _combat_threats(tuple(pool_by_id.values()))
+    target_pool = combat_pool or engage_pool
+    if solo and not combat_pool:
+        isolated_cores = tuple(
+            enemy for enemy in engage_pool
+            if _enemy_unit_type_name(enemy) == "CORE"
+            and _guerrilla_core_isolated(enemy, enemies)
+        )
+        if isolated_cores:
+            # Keep an immediately actionable worker/core in preference to a
+            # farther target (the old safe-sweep behaviour), but otherwise
+            # let an exposed Core define the guerrilla's objective instead of
+            # wandering toward an unrelated worker.
+            direct_non_core = tuple(
+                enemy for enemy in engage_pool
+                if _enemy_unit_type_name(enemy) != "CORE"
+                and _chebyshev(pos, tuple(enemy.position)) <= attack_range
+            )
+            if not direct_non_core:
+                target_pool = isolated_cores
     target = min(
-        combat_pool or engage_pool,
+        target_pool,
         key=lambda enemy: _manhattan(pos, tuple(enemy.position)),
         default=None,
     )
@@ -5121,8 +5190,9 @@ def _plan_guerrilla_combat(
 
     Unlike the kite squad, this planner never reads squad directives or a
     shared kite objective.  The common combat policy still handles danger-zone
-    avoidance, motion prediction, pre-fire, and target selection; the fallback
-    bearing is derived separately for each unit.
+    avoidance, motion prediction, pre-fire, and target selection; exposed
+    (unguarded) enemy Cores are the only Core targets admitted to its local
+    pool.  The fallback bearing is derived separately for each unit.
     """
     return _plan_kite_combat(
         unit,
