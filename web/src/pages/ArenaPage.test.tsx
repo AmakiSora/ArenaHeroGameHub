@@ -109,6 +109,18 @@ describe('ArenaPage asset selection', () => {
     expect(map).toHaveAttribute('data-center-request', '1')
   })
 
+  it('centers the map on a coordinate clicked in the battle-log panel', async () => {
+    render(<ArenaPage demo />)
+    const map = screen.getByTestId('world-canvas')
+
+    // Demo mode shows the panel's built-in sample rows; its kill row ends in
+    // a clickable (-6,9) coordinate.
+    await userEvent.click(screen.getByRole('button', { name: '(-6,9)' }))
+
+    expect(map).toHaveAttribute('data-center-position', '[-6,9]')
+    expect(map).toHaveAttribute('data-center-request', '1')
+  })
+
 	it('submits a Ranger cell shot without requiring a visible target', async () => {
     const user = userEvent.setup()
     render(<ArenaPage demo />)
@@ -378,8 +390,11 @@ describe('ArenaPage remembered enemies', () => {
     expect(screen.queryByText('Manual targets')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: 'Pick map cell' }))
 
-    expect(fetchMock).toHaveBeenCalledOnce()
-    const [path, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    // The battle-log panel also polls through the stubbed fetch; the
+    // assertion only counts the waypoint write itself.
+    const waypointCalls = (fetchMock.mock.calls as unknown as Array<[string, RequestInit]>).filter(([callPath]) => callPath === '/api/waypoint/set')
+    expect(waypointCalls).toHaveLength(1)
+    const [path, init] = waypointCalls[0]
     expect(path).toBe('/api/waypoint/set')
     expect(JSON.parse(init.body as string)).toEqual({ name: 'W1', x: 7, y: -3, mode: 'attack' })
     expect(waypoints.refresh).toHaveBeenCalled()
@@ -398,9 +413,12 @@ describe('ArenaPage remembered enemies', () => {
     expect(screen.getByText('Manual targets')).toBeInTheDocument()
 
     // Enter hold: POST /api/hold/set, then refresh the shared hold state.
+    // The battle-log panel also polls through the stubbed fetch, so count
+    // only the hold write itself.
     await user.click(screen.getByRole('button', { name: 'Hold position' }))
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    const [path, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    const holdCalls = (fetchMock.mock.calls as unknown as Array<[string, RequestInit]>).filter(([callPath]) => callPath === '/api/hold/set')
+    expect(holdCalls).toHaveLength(1)
+    const [path, init] = holdCalls[0]
     expect(path).toBe('/api/hold/set')
     expect(JSON.parse(init.body as string)).toEqual({ name: 'W1' })
     expect(holds.refresh).toHaveBeenCalled()

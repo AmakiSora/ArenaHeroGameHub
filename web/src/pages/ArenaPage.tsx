@@ -2,6 +2,7 @@ import { Crosshair, Move, Settings, Sword } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { AssetList } from '../components/game/AssetList'
+import { BattleLogPanel } from '../components/game/BattleLogPanel'
 import { EnemySightings } from '../components/game/EnemySightings'
 import { GameHUD } from '../components/game/GameHUD'
 import { ENEMY_FILTER_TYPES, MapControls } from '../components/game/MapControls'
@@ -207,7 +208,8 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     setCenterRequest((value) => value + 1)
   }
   // Remembered enemies have no live object to select; just center the camera.
-  const jumpToMemoryEnemy = (position: Position) => {
+  // Battle-log coordinates jump the same way.
+  const jumpToPosition = (position: Position) => {
     setCenterPosition(position)
     setCenterRequest((value) => value + 1)
   }
@@ -348,8 +350,11 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
     <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} teamRoster={teamRoster} onAssignTeam={demo ? undefined : assignTeam} teamConfig={teamConfig} onUpdateConfig={demo ? undefined : updateConfig} onPickCoords={demo ? undefined : startCoordPick} pickingCoordsField={coordPick?.xField ?? null} />
     <section className="relative min-h-0 overflow-hidden">
       {!respawning && <GameHUD phase={game.phase} stateReceivedAt={game.stateReceivedAt} />}
-      {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} sightings={memoryEnemyList} onJumpTo={jumpToMemoryEnemy} />}
-      {!respawning && game.tick && <PendingCommands tick={game.tick} state={game.state} receipts={game.receipts} unitNames={unitNames} />}
+      {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} sightings={memoryEnemyList} onJumpTo={jumpToPosition} />}
+      {!respawning && <div className="pointer-events-none absolute right-3 top-16 z-20 flex w-[min(19rem,calc(100%-1.5rem))] flex-col gap-2">
+        {game.tick && <PendingCommands tick={game.tick} state={game.state} receipts={game.receipts} unitNames={unitNames} />}
+        <BattleLogPanel tick={game.tick} enabled={!demo} onJump={jumpToPosition} />
+      </div>}
       <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onCenterCore={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} beaconIndicatorVisible={beaconIndicatorVisible} coreIndicatorVisible={coreIndicatorVisible} onAnchorChange={setAnchor} coordPicking={coordPick !== null || waypointPick !== null || strategyPick !== null} onCoordPick={(position) => waypointPick ? completeWaypointPick(position) : strategyPick ? completeStrategyPick(position) : completeCoordPick(position)} highlightPositions={[...coordPickHighlight, ...waypointPickHighlight]} memoryEnemies={memoryEnemies} unitRoutes={unitRoutesVisible ? unitRoutes : []} obstaclesVisible={obstaclesVisible} />
       {!respawning && <ResourceActivity events={game.state.events} />}
       {respawning && <RespawnOverlay destroyedBy={coreDestroyer} selfDestructed={coreSelfDestructed} />}

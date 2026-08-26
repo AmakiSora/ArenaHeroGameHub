@@ -45,7 +45,9 @@ export function PendingCommands({ tick, state, receipts, unitNames = {} }: Props
   const latestUpdate = sections.reduce((latest, section) =>
     section.receivedAt > latest ? section.receivedAt : latest, '')
 
-  return <section aria-live="polite" className="panel pointer-events-auto absolute right-3 top-16 z-20 w-[min(19rem,calc(100%-1.5rem))] overflow-hidden rounded-gold-lg shadow-[0_18px_48px_rgba(0,0,0,.38)]">
+  // Positioned by the top-right overlay stack in ArenaPage (shared with the
+  // battle-log panel), so no absolute placement of its own.
+  return <section aria-live="polite" className="panel pointer-events-auto w-full overflow-hidden rounded-gold-lg shadow-[0_18px_48px_rgba(0,0,0,.38)]">
     <button
       type="button"
       aria-expanded={expanded}
@@ -61,7 +63,7 @@ export function PendingCommands({ tick, state, receipts, unitNames = {} }: Props
       </span>
       <ChevronDown size={15} className={`shrink-0 text-zinc-500 transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`} />
     </button>
-    {expanded && <div className="max-h-[min(52dvh,27rem)] overflow-y-auto border-t border-white/[.07]">
+    {expanded && <div className="max-h-[min(38dvh,20rem)] overflow-y-auto border-t border-white/[.07]">
       {sections.map((section) => {
         const Icon = section.source === 'AGENT' ? Bot : UserRound
         const sourceTone = section.source === 'AGENT' ? 'text-violet-300' : 'text-blue-soft'

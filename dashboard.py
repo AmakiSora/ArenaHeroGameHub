@@ -325,6 +325,24 @@ def read_battle_log(n: int = 200) -> list[dict]:
     return out
 
 
+def battle_log_json_entries(limit: int = 200) -> list[dict]:
+    """Normalized tick/ts/cat/msg rows for the arena SPA's battle-log panel.
+
+    The server-rendered dashboard gets HTML rows from /api/log; the arena
+    page under /arena renders its own panel and needs plain JSON. Only the
+    four fields the panel uses are sent, so raw rows never leak extra keys.
+    """
+    return [
+        {
+            "tick": entry.get("tick"),
+            "ts": entry.get("ts"),
+            "cat": str(entry.get("cat", "")),
+            "msg": str(entry.get("msg", "")),
+        }
+        for entry in read_battle_log(limit)
+    ]
+
+
 def _config_log_message(updates: dict) -> str:
     """Human-readable summary of which config keys changed, newest-named."""
     if not updates:
@@ -6089,6 +6107,11 @@ class Handler(BaseHTTPRequestHandler):
             # the next tick (softRefresh skips re-renders while tick is idle).
             log_html, log_count = _battle_log_html(_clamp_log_limit(self))
             self._send_json(200, {"ok": True, "html": log_html, "count": log_count})
+            return
+        if path == "/api/battle-log":
+            # JSON rows for the arena SPA's battle-log panel (the HTML
+            # /api/log endpoint stays with the server-rendered dashboard).
+            self._send_json(200, {"ok": True, "entries": battle_log_json_entries(_clamp_log_limit(self))})
             return
         if path == "/api/config":
             self._send_json(200, {"ok": True, "config": load_config(CONFIG_PATH)})

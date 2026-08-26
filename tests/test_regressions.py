@@ -7132,6 +7132,27 @@ class BattleLogTests(unittest.TestCase):
         self.assertIn("tick 6", html)
         self.assertNotIn("tick 5", html)
 
+    def test_battle_log_json_entries_normalize_rows(self) -> None:
+        """The arena SPA's /api/battle-log gets plain tick/ts/cat/msg rows
+        (newest first); raw battle-log records never leak extra keys."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "battle_log.jsonl"
+            path.write_text(
+                json.dumps({"tick": 1, "ts": 100.0, "cat": "economy",
+                            "msg": "挖矿 (1,2)", "extra": "secret"})
+                + "\n" + json.dumps({"tick": None, "ts": 200.0, "cat": "config", "msg": "配置调整"})
+                + "\nnot-json\n",
+                encoding="utf-8",
+            )
+            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
+                entries = dashboard.battle_log_json_entries(limit=10)
+        self.assertEqual(entries, [
+            {"tick": None, "ts": 200.0, "cat": "config", "msg": "配置调整"},
+            {"tick": 1, "ts": 100.0, "cat": "economy", "msg": "挖矿 (1,2)"},
+        ])
+        for entry in entries:
+            self.assertEqual(set(entry), {"tick", "ts", "cat", "msg"})
+
     def test_clamp_log_limit_bounds_query(self) -> None:
         import types
         req = types.SimpleNamespace(path="/api/state?log=999999")
