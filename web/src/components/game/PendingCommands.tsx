@@ -1,5 +1,5 @@
 import { Bot, ChevronDown, ListChecks, UserRound } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { CommandReceipts } from '../../lib/commandPlans'
 import type {
@@ -26,7 +26,17 @@ interface CommandRow {
   overridesAgent: boolean
 }
 
-export function PendingCommands({ tick, state, receipts, unitNames = {} }: Props) {
+interface Section {
+  source: CommandSource
+  receivedAt: string
+  rows: CommandRow[]
+}
+
+// Shared default so the memo deps below stay stable between renders (a fresh
+// `{}` literal per render would invalidate the memo and loop the effect).
+const EMPTY_UNIT_NAMES: UnitNameMap = {}
+
+export function PendingCommands({ tick, state, receipts, unitNames = EMPTY_UNIT_NAMES }: Props) {
   const { t, i18n } = useTranslation()
   const [expanded, setExpanded] = useState(true)
   const sections = useMemo(() => (['AGENT', 'MANUAL'] as CommandSource[])
@@ -39,10 +49,20 @@ export function PendingCommands({ tick, state, receipts, unitNames = {} }: Props
         rows: commandRows(receipt.plan, source, receipts.AGENT?.tick === tick ? receipts.AGENT.plan : undefined, state, t, unitNames),
       }]
     }), [receipts, state, t, tick, unitNames])
-  if (!sections.length) return null
+  // The panel stays up across the tick boundary: between a new tick arriving
+  // and its receipt following, the previous tick's plans keep showing instead
+  // of the panel blinking away for a moment.
+  const [lastReceived, setLastReceived] = useState<{ tick: number; sections: Section[] } | null>(null)
+  useEffect(() => {
+    if (!sections.length) return
+    // Identity guard: re-render churn must not retrigger the effect.
+    setLastReceived((current) => (current && current.sections === sections ? current : { tick, sections }))
+  }, [sections, tick])
+  const shown = sections.length ? sections : lastReceived?.sections ?? []
+  if (!shown.length) return null
 
-  const effectiveCount = effectiveCommandCount(sections.flatMap((section) => section.rows))
-  const latestUpdate = sections.reduce((latest, section) =>
+  const effectiveCount = effectiveCommandCount(shown.flatMap((section) => section.rows))
+  const latestUpdate = shown.reduce((latest, section) =>
     section.receivedAt > latest ? section.receivedAt : latest, '')
 
   // Positioned by the top-right overlay stack in ArenaPage (shared with the
@@ -64,7 +84,7 @@ export function PendingCommands({ tick, state, receipts, unitNames = {} }: Props
       <ChevronDown size={15} className={`shrink-0 text-zinc-500 transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`} />
     </button>
     {expanded && <div className="max-h-[min(38dvh,20rem)] overflow-y-auto border-t border-white/[.07]">
-      {sections.map((section) => {
+      {shown.map((section) => {
         const Icon = section.source === 'AGENT' ? Bot : UserRound
         const sourceTone = section.source === 'AGENT' ? 'text-violet-300' : 'text-blue-soft'
         return <div key={section.source} className="px-3.5 py-3">
@@ -84,7 +104,7 @@ export function PendingCommands({ tick, state, receipts, unitNames = {} }: Props
           </ul> : <p className="py-1 text-[11px] leading-5 text-zinc-500">{t('game.emptySourcePlan')}</p>}
         </div>
       })}
-      {sections.some((section) => section.rows.some((row) => row.overridesAgent)) && <p className="border-t border-white/[.07] px-3.5 py-2.5 text-[10px] leading-4 text-zinc-500">
+      {shown.some((section) => section.rows.some((row) => row.overridesAgent)) && <p className="border-t border-white/[.07] px-3.5 py-2.5 text-[10px] leading-4 text-zinc-500">
         {t('game.manualOverrideHint')}
       </p>}
     </div>}

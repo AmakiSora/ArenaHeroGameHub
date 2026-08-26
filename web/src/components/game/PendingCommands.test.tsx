@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 import '../../lib/i18n'
 import i18n from '../../lib/i18n'
+import type { CommandReceipts } from '../../lib/commandPlans'
 import { demoState } from '../../lib/demo'
 import { PendingCommands } from './PendingCommands'
 
@@ -49,20 +50,27 @@ describe('PendingCommands', () => {
     expect(screen.queryByText('Move · Right')).not.toBeInTheDocument()
   })
 
-  it('stays hidden when the current Tick has no received plan', () => {
-    const { container } = render(<PendingCommands
-      tick={43}
-      state={demoState}
-      receipts={{
-        AGENT: {
-          tick: 42,
-          source: 'AGENT',
-          received_at: '2026-07-26T00:00:00Z',
-          plan: { tick: 42, unit_actions: {} },
-        },
-      }}
-    />)
+  it('stays hidden when no plan has ever been received', () => {
+    const { container } = render(<PendingCommands tick={43} state={demoState} receipts={{}} />)
     expect(container).toBeEmptyDOMElement()
+  })
+
+  it('keeps the previous plans visible across the tick boundary until new receipts arrive', () => {
+    const receipts: CommandReceipts = {
+      AGENT: {
+        tick: 42,
+        source: 'AGENT',
+        received_at: '2026-07-26T00:00:00Z',
+        plan: { tick: 42, unit_actions: { [workerID]: { type: 'MOVE', direction: 'RIGHT' } } },
+      },
+    }
+    const { rerender } = render(<PendingCommands tick={42} state={demoState} receipts={receipts} />)
+    expect(screen.getByText('Move · Right')).toBeInTheDocument()
+
+    // The next tick arrives before its receipt: the panel must not blink away.
+    rerender(<PendingCommands tick={43} state={demoState} receipts={receipts} />)
+    expect(screen.getByText('Pending orders')).toBeInTheDocument()
+    expect(screen.getByText('Move · Right')).toBeInTheDocument()
   })
 
   it('labels unit actors with the tactic-dashboard names when provided', () => {

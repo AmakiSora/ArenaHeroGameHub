@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useEffect } from 'react'
@@ -114,8 +114,10 @@ describe('ArenaPage asset selection', () => {
     const map = screen.getByTestId('world-canvas')
 
     // Demo mode shows the panel's built-in sample rows; its kill row ends in
-    // a clickable (-6,9) coordinate.
-    await userEvent.click(screen.getByRole('button', { name: '(-6,9)' }))
+    // a clickable (-6,9) coordinate. Scope to the log panel: the sightings
+    // chip for [-6, 9] carries the same accessible name.
+    const logPanel = screen.getByRole('region', { name: 'Battle log' })
+    await userEvent.click(within(logPanel).getByRole('button', { name: '(-6,9)' }))
 
     expect(map).toHaveAttribute('data-center-position', '[-6,9]')
     expect(map).toHaveAttribute('data-center-request', '1')
