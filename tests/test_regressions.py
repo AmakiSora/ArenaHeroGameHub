@@ -9057,6 +9057,185 @@ class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
         self.assertEqual(tactic._roam_flips_used.get("roam-flip", 0), 1)
 
 
+class SquadTargetQueueTests(unittest.TestCase):
+    """进攻队/风筝队目标队列：多点进攻按序推进，到达且肃清后自动下一个。"""
+
+    def setUp(self) -> None:
+        self._prev_enemy_memory = set(tactic._enemy_memory)
+        self._prev_attack_queue = tactic.turn_context.attack_queue_target
+        self._prev_kite_queue = tactic.turn_context.kite_queue_target
+
+    def tearDown(self) -> None:
+        tactic._enemy_memory.clear()
+        tactic._enemy_memory.update(self._prev_enemy_memory)
+        tactic.turn_context.attack_queue_target = self._prev_attack_queue
+        tactic.turn_context.kite_queue_target = self._prev_kite_queue
+
+    def test_parse_squad_targets_payload_normalizes(self) -> None:
+        parsed = tactic._parse_squad_targets_payload({
+            "attack": [[1, 2], ["x", 3], (4, 5)],
+            "kite": [],
+            "bogus": [[1, 1]],
+        })
+        self.assertEqual(parsed, {"attack": [(1, 2), (4, 5)]})
+
+    def test_advance_pops_arrived_and_cleared_head(self) -> None:
+        logs: list = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "squad_targets.json"
+            path.write_text(json.dumps({"attack": [[5, 0], [10, 0]]}), encoding="utf-8")
+            with patch.object(tactic, "SQUAD_TARGETS_PATH", path):
+                current, remaining = tactic._advance_squad_target_queue(
+                    "attack", [(5, 0), (10, 0)], (5, 0), (), logs,
+                )
+                saved = tactic._load_squad_targets_unlocked()
+        self.assertEqual(current, (10, 0))
+        self.assertEqual(remaining, [(10, 0)])
+        self.assertEqual(saved, {"attack": [(10, 0)]})
+        self.assertEqual(len(logs), 1)
+        self.assertIn("进攻队目标肃清 (5,0)", logs[0]["msg"])
+        self.assertIn("(10,0)", logs[0]["msg"])
+
+    def test_advance_keeps_head_while_visible_enemy_near(self) -> None:
+        enemy = SimpleNamespace(position=(6, 0))
+        logs: list = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "squad_targets.json"
+            path.write_text(json.dumps({"attack": [[5, 0], [10, 0]]}), encoding="utf-8")
+            with patch.object(tactic, "SQUAD_TARGETS_PATH", path):
+                current, remaining = tactic._advance_squad_target_queue(
+                    "attack", [(5, 0), (10, 0)], (5, 0), (enemy,), logs,
+                )
+                saved = tactic._load_squad_targets_unlocked()
+        self.assertEqual(current, (5, 0))
+        self.assertEqual(remaining, [(5, 0), (10, 0)])
+        self.assertEqual(saved["attack"], [(5, 0), (10, 0)])
+        self.assertEqual(logs, [])
+
+    def test_advance_keeps_head_while_memory_enemy_near(self) -> None:
+        tactic._enemy_memory.add((5, 2))
+        logs: list = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "squad_targets.json"
+            path.write_text(json.dumps({"kite": [[5, 0]]}), encoding="utf-8")
+            with patch.object(tactic, "SQUAD_TARGETS_PATH", path):
+                current, _ = tactic._advance_squad_target_queue(
+                    "kite", [(5, 0)], (5, 0), (), logs,
+                )
+        self.assertEqual(current, (5, 0))
+        self.assertEqual(logs, [])
+
+    def test_advance_keeps_head_until_arrived(self) -> None:
+        logs: list = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "squad_targets.json"
+            path.write_text(json.dumps({"attack": [[5, 0]]}), encoding="utf-8")
+            with patch.object(tactic, "SQUAD_TARGETS_PATH", path):
+                current, _ = tactic._advance_squad_target_queue(
+                    "attack", [(5, 0)], (0, 0), (), logs,
+                )
+        self.assertEqual(current, (5, 0))
+        self.assertEqual(logs, [])
+
+    def test_advance_never_moves_for_wiped_squad(self) -> None:
+        logs: list = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "squad_targets.json"
+            path.write_text(json.dumps({"attack": [[5, 0]]}), encoding="utf-8")
+            with patch.object(tactic, "SQUAD_TARGETS_PATH", path):
+                current, _ = tactic._advance_squad_target_queue(
+                    "attack", [(5, 0)], None, (), logs,
+                )
+                saved = tactic._load_squad_targets_unlocked()
+        self.assertEqual(current, (5, 0))
+        self.assertEqual(saved["attack"], [(5, 0)])
+
+    def test_advance_pops_consecutive_cleared_heads(self) -> None:
+        logs: list = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "squad_targets.json"
+            path.write_text(json.dumps({"attack": [[5, 0], [5, 1]]}), encoding="utf-8")
+            with patch.object(tactic, "SQUAD_TARGETS_PATH", path):
+                current, remaining = tactic._advance_squad_target_queue(
+                    "attack", [(5, 0), (5, 1)], (5, 0), (), logs,
+                )
+                saved = tactic._load_squad_targets_unlocked()
+        self.assertIsNone(current)
+        self.assertEqual(remaining, [])
+        self.assertEqual(saved, {})
+        self.assertEqual(len(logs), 2)
+        self.assertIn("目标队列已清空", logs[-1]["msg"])
+
+    def test_queue_head_overrides_static_attack_coords(self) -> None:
+        config = default_config()
+        config["attack_target_x"] = 99
+        config["attack_target_y"] = 99
+        unit = CombatTeamPlannerTests.CombatUnit("v-queue", (0, 0))
+        tactic.turn_context.attack_queue_target = (8, 0)
+        action, detail = tactic._plan_vanguard(
+            unit,
+            enemies=(),
+            obstacle_cells=frozenset(),
+            config=config,
+            core_pos=(0, 0),
+            team="attack",
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("attack-march-coords (8, 0)", detail)
+
+    def test_kite_queue_head_overrides_static_coords(self) -> None:
+        config = default_config()
+        config["kite_mode"] = "coords"
+        config["kite_target_x"] = 99
+        config["kite_target_y"] = 99
+        tactic.turn_context.kite_queue_target = (7, 2)
+        mode, target = tactic._kite_mode_target((0, 0), config)
+        self.assertEqual((mode, target), ("coords", (7, 2)))
+        # 非 coords 模式不消费队列。
+        config["kite_mode"] = "beacon"
+        tactic.turn_context.beacon_pos = (1, 1)
+        try:
+            mode, target = tactic._kite_mode_target((0, 0), config)
+            self.assertEqual((mode, target), ("beacon", (1, 1)))
+        finally:
+            tactic.turn_context.beacon_pos = None
+
+
+class DashboardSquadTargetTests(unittest.TestCase):
+    def test_add_remove_clear_roundtrip_and_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            st_file = Path(temp_dir) / "squad_targets.json"
+            log_file = Path(temp_dir) / "battle_log.jsonl"
+            with patch.object(dashboard, "SQUAD_TARGETS_FILE", str(st_file)), \
+                 patch.object(dashboard, "BATTLE_LOG_FILE", str(log_file)):
+                self.assertTrue(dashboard.add_squad_target("attack", -2000, -2000)["ok"])
+                self.assertEqual(
+                    dashboard.load_squad_targets(), {"attack": [[-2000, -2000]]},
+                )
+                self.assertTrue(dashboard.add_squad_target("attack", 7, 2)["ok"])
+                self.assertEqual(dashboard.load_squad_targets(), {
+                    "attack": [[-2000, -2000], [7, 2]],
+                })
+                self.assertTrue(dashboard.add_squad_target("kite", 1, 1)["ok"])
+                self.assertTrue(dashboard.remove_squad_target("attack", index=0)["ok"])
+                self.assertEqual(dashboard.load_squad_targets(), {
+                    "attack": [[7, 2]], "kite": [[1, 1]],
+                })
+                # Removing the last target drops the squad's entry entirely.
+                self.assertTrue(dashboard.remove_squad_target("attack", index=0)["ok"])
+                self.assertEqual(dashboard.load_squad_targets(), {"kite": [[1, 1]]})
+                self.assertFalse(dashboard.remove_squad_target("attack")["ok"])
+                self.assertFalse(dashboard.remove_squad_target("attack", index=3)["ok"])
+                with self.assertRaises(ValueError):
+                    dashboard.add_squad_target("bogus", 0, 0)
+                self.assertTrue(dashboard.clear_squad_targets("kite")["ok"])
+                self.assertEqual(dashboard.load_squad_targets(), {})
+                # Queue length cap.
+                for i in range(dashboard._SQUAD_TARGET_LIMIT):
+                    self.assertTrue(dashboard.add_squad_target("attack", i, 0)["ok"])
+                self.assertFalse(dashboard.add_squad_target("attack", 999, 0)["ok"])
+
+
 class CoreDriftLeashTests(unittest.TestCase):
     """Core-movement regressions from the remote battle log: the base chased
     far-flung explorers 2800+ cells with no restoring force, and one

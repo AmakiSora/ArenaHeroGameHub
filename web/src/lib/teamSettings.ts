@@ -20,6 +20,10 @@ export interface SquadSettingsSpec {
   // only render while that mode is active, mirroring the dashboard form.
   modeField?: string
   beaconNoteKey?: string
+  // When set, the panel shows this squad's attack-target queue (目标队列,
+  // squad_targets.json): pick points on the map, the bot takes them one by
+  // one in coords mode. Only attack / kite squads have queues.
+  targetQueue?: 'attack' | 'kite'
   fields: TeamSettingField[]
 }
 
@@ -40,6 +44,7 @@ export const TEAM_SETTINGS: Partial<Record<string, SquadSettingsSpec>> = {
     subtitleKey: 'attackSubtitle',
     modeField: 'attack_mode',
     beaconNoteKey: 'attackBeaconNote',
+    targetQueue: 'attack',
     fields: [
       { kind: 'mode', field: 'attack_mode' },
       { kind: 'number', field: 'attack_target_x', labelKey: 'targetX', min: -10000, max: 10000, modes: ['coords'], pickYField: 'attack_target_y' },
@@ -58,6 +63,7 @@ export const TEAM_SETTINGS: Partial<Record<string, SquadSettingsSpec>> = {
     subtitleKey: 'kiteSubtitle',
     modeField: 'kite_mode',
     beaconNoteKey: 'kiteBeaconNote',
+    targetQueue: 'kite',
     fields: [
       { kind: 'mode', field: 'kite_mode' },
       { kind: 'number', field: 'kite_target_x', labelKey: 'targetX', min: -10000, max: 10000, modes: ['coords'], pickYField: 'kite_target_y' },

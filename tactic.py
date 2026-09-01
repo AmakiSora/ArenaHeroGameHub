@@ -54,6 +54,11 @@ SELF_DESTRUCT_PATH = _data_dir() / "self_destruct.json"
 # (display-name keyed): a held unit stands in place and auto-attacks enemies
 # entering its range instead of following its normal program.
 HOLDS_PATH = _data_dir() / "holds.json"
+# Ordered attack-target queues per combat squad ("attack" / "kite"), set from
+# the dashboard / web console: {"attack": [[x, y], ...], "kite": [...]}. Only
+# the coords mode consumes a queue; the head pops once the squad arrived and
+# the area is cleared (see _advance_squad_target_queue).
+SQUAD_TARGETS_PATH = _data_dir() / "squad_targets.json"
 
 # Display-name prefix per unit type (W / V / R), shared with the dashboard.
 _UNIT_NAME_PREFIX = {
@@ -3770,7 +3775,11 @@ def _plan_attack_combat(
                 key=lambda p: _manhattan(p, core_pos) + _manhattan(p, squad_pos),
             )
     else:
-        target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
+        # A queued squad target (队首) outranks the static attack coordinates;
+        # an empty queue falls back to them.
+        target = getattr(turn_context, "attack_queue_target", None) or (
+            int(config["attack_target_x"]), int(config["attack_target_y"])
+        )
 
     # Outnumbered-retreat policy (auto mode only): disengage away from the
     # enemy cluster centroid and re-target. This deliberately overrides the
@@ -4183,6 +4192,11 @@ def _kite_mode_target(
         int(config.get("kite_target_x", 0)),
         int(config.get("kite_target_y", 0)),
     )
+    if mode == "coords":
+        # A queued squad target (队首) outranks the static kite coordinates.
+        queue_target = getattr(turn_context, "kite_queue_target", None)
+        if queue_target is not None:
+            return mode, queue_target
     if mode == "beacon":
         return mode, getattr(turn_context, "beacon_pos", None) or fallback
     if mode == "auto" and _enemy_memory:
@@ -5989,6 +6003,129 @@ def _load_and_prune_waypoints(alive_names: set[str]) -> dict[str, dict]:
         return targets
 
 
+# ── squad attack-target queues (进攻队/风筝队 目标队列) ──────────────────
+# Ordered coordinate queues per squad in squad_targets.json. Only the coords
+# mode consumes them: each Tick the head is "cleared" (popped) once the squad
+# centroid has arrived and no visible or remembered enemy lingers around it,
+# so the squad marches on to the next point. The tactic pops while the
+# dashboard appends — both sides read-modify-write under the file lock so a
+# concurrent operator edit is never clobbered.
+_SQUAD_ARRIVE_RADIUS = 2
+_SQUAD_CLEAR_RADIUS = 3
+_SQUAD_QUEUE_LABELS = {"attack": "进攻队", "kite": "风筝队"}
+
+_squad_targets_sig_cache: dict[str, tuple[int, int] | None] = {}
+_squad_targets_cached: dict[str, dict[str, list[tuple[int, int]]]] = {}
+
+
+def _parse_squad_targets_payload(data: Any) -> dict[str, list[tuple[int, int]]]:
+    """Normalize a squad_targets.json payload; empty queues stay out."""
+    out: dict[str, list[tuple[int, int]]] = {}
+    if not isinstance(data, dict):
+        return out
+    for squad in ("attack", "kite"):
+        raw = data.get(squad)
+        if not isinstance(raw, (list, tuple)):
+            continue
+        queue: list[tuple[int, int]] = []
+        for point in raw:
+            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                try:
+                    queue.append((int(point[0]), int(point[1])))
+                except (TypeError, ValueError):
+                    continue
+        if queue:
+            out[squad] = queue
+    return out
+
+
+def _load_squad_targets_unlocked() -> dict[str, list[tuple[int, int]]]:
+    if not SQUAD_TARGETS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(SQUAD_TARGETS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return _parse_squad_targets_payload(data)
+
+
+def _load_squad_targets() -> dict[str, list[tuple[int, int]]]:
+    """Read the squad target queues; an unchanged file costs no re-read."""
+    key = str(SQUAD_TARGETS_PATH)
+    sig = _file_signature(SQUAD_TARGETS_PATH)
+    if key in _squad_targets_sig_cache and sig == _squad_targets_sig_cache[key]:
+        cached = _squad_targets_cached.get(key, {})
+        return {squad: list(queue) for squad, queue in cached.items()}
+    targets = _load_squad_targets_unlocked()
+    _squad_targets_sig_cache[key] = sig
+    _squad_targets_cached[key] = {
+        squad: list(queue) for squad, queue in targets.items()
+    }
+    return targets
+
+
+def _pop_squad_target(squad: str, head: tuple[int, int]) -> list[tuple[int, int]]:
+    """Persist the removal of a completed queue head; returns the rest."""
+    with file_lock(SQUAD_TARGETS_PATH):
+        targets = _load_squad_targets_unlocked()
+        queue = targets.get(squad, [])
+        # Only pop while the head still matches: a concurrent dashboard edit
+        # (the operator re-ordered the queue) takes precedence.
+        if queue and queue[0] == head:
+            queue = queue[1:]
+        if queue:
+            targets[squad] = queue
+        else:
+            targets.pop(squad, None)
+        atomic_write_text(SQUAD_TARGETS_PATH, json.dumps(targets, ensure_ascii=False))
+        remaining = list(queue)
+    # The write bumps mtime, so the next Tick's signature check misses and
+    # reloads — no manual cache invalidation needed.
+    return remaining
+
+
+def _advance_squad_target_queue(
+    squad: str,
+    queue: list[tuple[int, int]],
+    squad_pos: tuple[int, int] | None,
+    enemies: tuple,
+    log_entries: list[dict],
+) -> tuple[tuple[int, int] | None, list[tuple[int, int]]]:
+    """Pop arrived-and-cleared queue heads; returns (current head, queue now).
+
+    A head completes only when the squad centroid sits within
+    _SQUAD_ARRIVE_RADIUS AND no visible or remembered enemy remains within
+    _SQUAD_CLEAR_RADIUS of it. A wiped squad (squad_pos is None) never
+    advances: respawned or re-enlisted units must still converge on the head.
+    """
+    while queue:
+        head = queue[0]
+        if squad_pos is None or _manhattan(squad_pos, head) > _SQUAD_ARRIVE_RADIUS:
+            break
+        contested = any(
+            _manhattan(tuple(e.position), head) <= _SQUAD_CLEAR_RADIUS
+            for e in enemies
+        ) or any(
+            _manhattan(p, head) <= _SQUAD_CLEAR_RADIUS for p in _enemy_memory
+        )
+        if contested:
+            break
+        queue = _pop_squad_target(squad, head)
+        label = _SQUAD_QUEUE_LABELS.get(squad, squad)
+        if queue:
+            nxt = queue[0]
+            msg = f"{label}目标肃清 ({head[0]},{head[1]})，下一个 ({nxt[0]},{nxt[1]})"
+        else:
+            msg = f"{label}目标肃清 ({head[0]},{head[1]})，目标队列已清空"
+        log_entries.append({
+            "tick": getattr(turn_context, "tick", 0),
+            "ts": time.time(),
+            "cat": "config",
+            "msg": msg,
+        })
+    return (queue[0] if queue else None), queue
+
+
 # ── manual per-unit self-destruct (dashboard 自裁 command) ───────────────────
 # Same cross-process file discipline as waypoints.json: the dashboard appends
 # display names here, and each Tick the tactic issues SELF_DESTRUCT for units
@@ -6492,9 +6629,11 @@ turn_context = type(
         "attack_retreat": False,
         "attack_retreat_from": None,
         "attack_forbidden_targets": frozenset(),
+        "attack_queue_target": None,
         "kite_squad_pos": None,
         "kite_directives": {},
         "kite_decisions": [],
+        "kite_queue_target": None,
         "guerrilla_decisions": [],
         "kite_collision_snapshot": None,
         "kite_ranger_range": 3,
@@ -6890,6 +7029,33 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.kite_directives = _prepare_kite_coordination(
         turn.units, enemies, config, obstacle_cells,
     )
+
+    # ── Squad target queues (到达且肃清后推进下一个) ──────────────
+    # Only the coords mode consumes a queue; auto/beacon keep their own
+    # targeting. Advancement pops completed heads from squad_targets.json and
+    # logs the progression into the battle log (best-effort, like all rows).
+    squad_targets = _load_squad_targets()
+    turn_context.attack_queue_target = None
+    turn_context.kite_queue_target = None
+    queue_log_entries: list[dict] = []
+    for squad, mode_key, squad_pos, attr in (
+        ("attack", "attack_mode", turn_context.attack_squad_pos, "attack_queue_target"),
+        ("kite", "kite_mode", turn_context.kite_squad_pos, "kite_queue_target"),
+    ):
+        if str(config.get(mode_key, "coords")) != "coords":
+            continue
+        queue = squad_targets.get(squad) or []
+        if not queue:
+            continue
+        current, _ = _advance_squad_target_queue(
+            squad, queue, squad_pos, enemies, queue_log_entries,
+        )
+        setattr(turn_context, attr, current)
+    if queue_log_entries:
+        try:
+            append_jsonl(BATTLE_LOG_PATH, queue_log_entries)
+        except OSError:
+            pass
 
     # Squad-wide auto-attack retreat decision (computed once per Tick so every
     # attack-team member acts on the same verdict). In auto mode, when the

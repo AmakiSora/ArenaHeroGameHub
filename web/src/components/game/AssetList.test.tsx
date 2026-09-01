@@ -259,6 +259,36 @@ describe('AssetList', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Pick on map · Target X' }))
       expect(picks).toEqual([['kite_target_x', 'kite_target_y']])
     })
+
+    it('renders the squad target queue with pick, remove and clear actions', () => {
+      const picks: Array<'attack' | 'kite'> = []
+      const removals: Array<['attack' | 'kite', number]> = []
+      const clears: Array<'attack' | 'kite'> = []
+      render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{ V1: 'attack' }} teamConfig={baseConfig} onUpdateConfig={() => undefined} squadTargets={{ attack: [[-2000, -2000], [7, 2]] }} onPickSquadTarget={(squad) => picks.push(squad)} onRemoveSquadTarget={(squad, index) => removals.push([squad, index])} onClearSquadTargets={(squad) => clears.push(squad)} />)
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Attack Squad' }))
+
+      expect(screen.getByText('Target queue')).toBeInTheDocument()
+      // The head carries the ▶ marker; both chips render their coordinates.
+      expect(screen.getByText('▶ (-2000, -2000)')).toBeInTheDocument()
+      expect(screen.getByText('(7, 2)')).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Remove this target (7, 2)' }))
+      expect(removals).toEqual([['attack', 1]])
+      fireEvent.click(screen.getByRole('button', { name: 'Clear' }))
+      expect(clears).toEqual(['attack'])
+      fireEvent.click(screen.getByRole('button', { name: 'Add point' }))
+      expect(picks).toEqual(['attack'])
+    })
+
+    it('shows the empty queue hint without a clear button', () => {
+      render(<AssetList state={state} objects={[vanguard]} selectedId={null} onSelect={() => undefined} unitNames={{ v1aaaaaa: 'V1' }} teamRoster={{ V1: 'kite' }} teamConfig={{ kite_mode: 'coords', kite_target_x: 0, kite_target_y: 0 }} onUpdateConfig={() => undefined} squadTargets={{}} onPickSquadTarget={() => undefined} onClearSquadTargets={() => undefined} />)
+      fireEvent.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Settings · Kite Squad' }))
+
+      expect(screen.getByText(/pick map points with/i)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Clear' })).not.toBeInTheDocument()
+    })
   })
 
   describe('worker strategy settings', () => {

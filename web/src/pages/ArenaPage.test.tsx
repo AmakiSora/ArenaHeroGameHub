@@ -44,6 +44,17 @@ const waypoints = vi.hoisted(() => ({
   refresh: vi.fn(),
 }))
 vi.mock('../hooks/useWaypoints', () => ({ useWaypoints: () => waypoints }))
+const squadTargets = vi.hoisted(() => ({
+  squadTargets: {} as Partial<Record<'attack' | 'kite', [number, number][]>>,
+  refresh: vi.fn(),
+}))
+vi.mock('../hooks/useSquadTargets', () => ({ useSquadTargets: () => squadTargets }))
+const squadTargetApi = vi.hoisted(() => ({
+  addSquadTarget: vi.fn(async () => true),
+  removeSquadTarget: vi.fn(async () => true),
+  clearSquadTargets: vi.fn(async () => true),
+}))
+vi.mock('../lib/squadTargets', () => squadTargetApi)
 const holds = vi.hoisted(() => ({
   holds: new Set<string>(),
   refresh: vi.fn(),
@@ -83,7 +94,7 @@ vi.mock('../components/game/WorldCanvas', () => ({
 }))
 
 describe('ArenaPage asset selection', () => {
-  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear(); unitNames.names = {}; waypoints.waypoints = {}; waypoints.refresh.mockReset(); holds.holds = new Set(); holds.refresh.mockReset(); memory.sightings = originalMemorySightings; unitRoutes.routes = []; vi.unstubAllGlobals() })
+  beforeEach(() => { game.submit.mockReset(); teams.updateConfig.mockReset(); localStorage.clear(); unitNames.names = {}; waypoints.waypoints = {}; waypoints.refresh.mockReset(); squadTargets.squadTargets = {}; squadTargets.refresh.mockReset(); squadTargetApi.addSquadTarget.mockClear(); squadTargetApi.removeSquadTarget.mockClear(); squadTargetApi.clearSquadTargets.mockClear(); holds.holds = new Set(); holds.refresh.mockReset(); memory.sightings = originalMemorySightings; unitRoutes.routes = []; vi.unstubAllGlobals() })
 
   it('centers the map on a Unit selected from the asset list', async () => {
     render(<ArenaPage demo />)
@@ -150,6 +161,21 @@ describe('ArenaPage asset selection', () => {
     expect(teams.updateConfig).toHaveBeenNthCalledWith(1, 'attack_target_x', 7)
     expect(teams.updateConfig).toHaveBeenNthCalledWith(2, 'attack_target_y', -3)
     expect(screen.queryByText('Click the map to choose the target coordinates')).not.toBeInTheDocument()
+  })
+
+  it('appends the picked map cell to the attack squad target queue', async () => {
+    const user = userEvent.setup()
+    render(<ArenaPage />)
+
+    await user.click(screen.getByRole('tab', { name: 'Combat Squads' }))
+    await user.click(screen.getByRole('button', { name: 'Settings · Attack Squad' }))
+    await user.click(screen.getByRole('button', { name: 'Add point' }))
+    expect(screen.getByText('Click the map to add an attack target for Attack Squad')).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Pick map cell' }))
+    expect(squadTargetApi.addSquadTarget).toHaveBeenCalledWith('attack', 7, -3)
+    expect(squadTargets.refresh).toHaveBeenCalled()
+    expect(screen.queryByText('Click the map to add an attack target for Attack Squad')).not.toBeInTheDocument()
   })
 
   it('opens the strategy settings dialog from the bottom-right button', async () => {

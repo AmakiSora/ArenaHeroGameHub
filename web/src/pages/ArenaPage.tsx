@@ -18,10 +18,12 @@ import { useUnitNames } from '../hooks/useUnitNames'
 import { useUnitRoutes } from '../hooks/useUnitRoutes'
 import { useUnitTeams } from '../hooks/useUnitTeams'
 import { useWaypoints } from '../hooks/useWaypoints'
+import { useSquadTargets } from '../hooks/useSquadTargets'
 import { useHolds } from '../hooks/useHolds'
 import { useAuth } from '../context/AuthContext'
 import type { EnemySightingType } from '../lib/enemyMemory'
 import { addUnitWaypoint, removeUnitWaypoint, type WaypointMode } from '../lib/waypoints'
+import { addSquadTarget, clearSquadTargets, removeSquadTarget, type SquadKey } from '../lib/squadTargets'
 import { clearUnitHold, setUnitHold } from '../lib/holds'
 import { saveStrategyValues } from '../lib/strategyConfig'
 import { unitDashboardName } from '../lib/unitNames'
@@ -55,6 +57,9 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   // Manual per-unit target queues (the dashboard's 手动目标 panel) — the unit
   // dialog edits them through /api/waypoint/* exactly like the dashboard.
   const { waypoints, refresh: refreshWaypoints } = useWaypoints(game.tick, !demo)
+  // Attack/kite squad target queues (进攻目标队列): the sidebar squad panels
+  // edit them through /api/squad-target/*; the bot takes them one by one.
+  const { squadTargets, refresh: refreshSquadTargets } = useSquadTargets(game.tick, !demo)
   // Manual per-unit hold position (the dashboard's 驻守 toggle) — a held unit
   // stands in place and auto-attacks enemies entering its range.
   const { holds, refresh: refreshHolds } = useHolds(game.tick, !demo)
@@ -67,6 +72,9 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   // Manual-target map picking (选择目标点 in the unit dialog): the next map
   // click appends that point to the unit's waypoint queue.
   const [waypointPick, setWaypointPick] = useState<{ name: string; mode: WaypointMode } | null>(null)
+  // Squad target-queue picking (目标队列 ⌖ in the squad settings): the next
+  // map click appends that point to the squad's attack-target queue.
+  const [squadTargetPick, setSquadTargetPick] = useState<SquadKey | null>(null)
   // Strategy settings dialog (配置 button, bottom-right): core/runtime/
   // production fields the sidebar panels don't already cover.
   const [strategyConfigOpen, setStrategyConfigOpen] = useState(false)
@@ -321,6 +329,15 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   }
   const changeWaypoints = (name: string, index?: number) => void removeUnitWaypoint(name, index).then((ok) => { if (ok) refreshWaypoints() })
   const waypointPickHighlight = useMemo<Position[]>(() => waypointPick ? waypoints[waypointPick.name]?.queue ?? [] : [], [waypointPick, waypoints])
+  const startSquadTargetPick = (squad: SquadKey) => { setTargetMode(null); setMoveSelecting(false); setSelectedId(null); setSquadTargetPick(squad) }
+  const completeSquadTargetPick = (position: Position) => {
+    if (!squadTargetPick) return
+    const squad = squadTargetPick
+    setSquadTargetPick(null)
+    void addSquadTarget(squad, position[0], position[1]).then((ok) => { if (ok) refreshSquadTargets() })
+  }
+  const changeSquadTargets = (squad: SquadKey, index?: number) => void (index === undefined ? clearSquadTargets(squad) : removeSquadTarget(squad, index)).then((ok) => { if (ok) refreshSquadTargets() })
+  const squadTargetPickHighlight = useMemo<Position[]>(() => squadTargetPick ? squadTargets[squadTargetPick] ?? [] : [], [squadTargetPick, squadTargets])
   const chooseMoveDestination = (target: Position) => {
     if (!game.state || !selected?.id || !selected.position) return
     if (selected.position[0] === target[0] && selected.position[1] === target[1]) { removeMovementGoal(selected.id); if (selected.kind === 'CORE') setCoreAction(null); else setUnitAction(selected.id, null); select(null); return }
@@ -347,7 +364,7 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   }
   if (!game.state) return <div className="grid h-dvh place-items-center"><div className="text-center"><div className="mx-auto mb-4 size-2 animate-pulse rounded-full bg-cyan-signal shadow-[0_0_14px_rgba(69,145,197,.45)]" /><p className="font-mono text-xs tracking-[.2em] text-zinc-500">{t(`game.${game.phase}`)}</p>{game.error && <p role="alert" className="mt-3 text-xs text-coral-hostile">{describeError(game.error)}</p>}</div></div>
   return <div className="grid h-dvh min-h-[560px] grid-cols-1 overflow-hidden lg:grid-cols-[260px_1fr]">
-    <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} teamRoster={teamRoster} onAssignTeam={demo ? undefined : assignTeam} teamConfig={teamConfig} onUpdateConfig={demo ? undefined : updateConfig} onPickCoords={demo ? undefined : startCoordPick} pickingCoordsField={coordPick?.xField ?? null} />
+    <AssetList state={game.state} objects={game.state.objects} selectedId={selectedId} onSelect={selectFromAssetList} unitNames={unitNames} teamRoster={teamRoster} onAssignTeam={demo ? undefined : assignTeam} teamConfig={teamConfig} onUpdateConfig={demo ? undefined : updateConfig} onPickCoords={demo ? undefined : startCoordPick} pickingCoordsField={coordPick?.xField ?? null} squadTargets={squadTargets} onPickSquadTarget={demo ? undefined : startSquadTargetPick} onRemoveSquadTarget={demo ? undefined : (squad, index) => changeSquadTargets(squad, index)} onClearSquadTargets={demo ? undefined : (squad) => changeSquadTargets(squad)} pickingSquadTarget={squadTargetPick} />
     <section className="relative min-h-0 overflow-hidden">
       {!respawning && <GameHUD phase={game.phase} stateReceivedAt={game.stateReceivedAt} />}
       {!respawning && <EnemySightings state={game.state} onJump={jumpToEnemy} sightings={memoryEnemyList} onJumpTo={jumpToPosition} />}
@@ -355,7 +372,7 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
         <BattleLogPanel tick={game.tick} enabled={!demo} onJump={jumpToPosition} />
         {game.tick && <PendingCommands tick={game.tick} state={game.state} receipts={game.receipts} unitNames={unitNames} />}
       </div>}
-      <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onCenterCore={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} beaconIndicatorVisible={beaconIndicatorVisible} coreIndicatorVisible={coreIndicatorVisible} onAnchorChange={setAnchor} coordPicking={coordPick !== null || waypointPick !== null || strategyPick !== null} onCoordPick={(position) => waypointPick ? completeWaypointPick(position) : strategyPick ? completeStrategyPick(position) : completeCoordPick(position)} highlightPositions={[...coordPickHighlight, ...waypointPickHighlight]} memoryEnemies={memoryEnemies} unitRoutes={unitRoutesVisible ? unitRoutes : []} obstaclesVisible={obstaclesVisible} />
+      <WorldCanvas state={game.state} explored={game.explored} selectedId={selectedId} targeting={targetMode !== null} destinationSelecting={moveSelecting} attackPositions={attackPositions} targetableIds={targetableIds} routeDestinations={routeDestinations} moveArrows={moveArrows} sweepMarkers={sweepMarkers} shotMarkers={shotMarkers} centerPosition={centerPosition} centerRequest={centerRequest} zoomRequest={zoomRequest} onSelect={select} onTarget={chooseTarget} onAttackPosition={chooseAttackPosition} onMoveDestination={chooseMoveDestination} onCenterBeacon={() => { setCenterPosition(game.state!.champion_beacon.position); setCenterRequest((value) => value + 1) }} onCenterCore={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} beaconIndicatorVisible={beaconIndicatorVisible} coreIndicatorVisible={coreIndicatorVisible} onAnchorChange={setAnchor} coordPicking={coordPick !== null || waypointPick !== null || strategyPick !== null || squadTargetPick !== null} onCoordPick={(position) => squadTargetPick ? completeSquadTargetPick(position) : waypointPick ? completeWaypointPick(position) : strategyPick ? completeStrategyPick(position) : completeCoordPick(position)} highlightPositions={[...coordPickHighlight, ...waypointPickHighlight, ...squadTargetPickHighlight]} memoryEnemies={memoryEnemies} unitRoutes={unitRoutesVisible ? unitRoutes : []} obstaclesVisible={obstaclesVisible} />
       {!respawning && <ResourceActivity events={game.state.events} />}
       {respawning && <RespawnOverlay destroyedBy={coreDestroyer} selfDestructed={coreSelfDestructed} />}
       {!respawning && selected?.controlled && anchor && actionAvailability && !targetMode && !moveSelecting && !waypointPick && <UnitActionDialog anchor={anchor} selected={selected} plan={plan} movementGoal={selected.id ? movementGoals[selected.id] : undefined} unitNames={unitNames} phase={game.phase} resources={game.state.resources} population={game.state.population} availability={actionAvailability} waypointName={selectedWaypointName} waypointQueue={selectedWaypointEntry?.queue} waypointMode={selectedWaypointEntry?.mode} onPickWaypoint={demo ? undefined : () => startWaypointPick(selected)} onRemoveWaypoint={demo || !selectedWaypointName ? undefined : (index) => changeWaypoints(selectedWaypointName, index)} onClearWaypoints={demo || !selectedWaypointName ? undefined : () => changeWaypoints(selectedWaypointName)} holdActive={selectedHoldActive} onToggleHold={demo || !selectedWaypointName ? undefined : toggleSelectedHold} onClose={() => select(null)} onTargeting={() => { setMoveSelecting(false); setTargetMode('SHOOT') }} onSweepTargeting={() => { setMoveSelecting(false); setTargetMode('SWEEP') }} onMoveTargeting={() => { setTargetMode(null); setMovementError(null); setMoveSelecting(true) }} onCancelMovementGoal={() => cancelMovementGoal(selected)} onUnitAction={unitAction} onCoreAction={coreAction} />}
@@ -364,6 +381,7 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
       {coordPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.coordPickHint')}</span><button onClick={() => setCoordPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {strategyPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.coordPickHint')}</span><button onClick={cancelStrategyPick} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {waypointPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.waypointPickHint', { name: waypointPick.name })}</span><button onClick={() => setWaypointPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
+      {squadTargetPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.squadTargetPickHint', { squad: t(`game.teamSettings.${squadTargetPick === 'attack' ? 'attackQueueName' : 'kiteQueueName'}`) })}</span><button onClick={() => setSquadTargetPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {!respawning && <MapControls onCenter={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} onZoom={(direction) => setZoomRequest((value) => direction * (Math.abs(value) + 1))} beaconIndicatorVisible={beaconIndicatorVisible} onToggleBeaconIndicator={toggleBeaconIndicator} coreIndicatorVisible={coreIndicatorVisible} onToggleCoreIndicator={toggleCoreIndicator} memoryVisible={enemyMemoryVisible} onToggleMemory={toggleEnemyMemory} routesVisible={unitRoutesVisible} onToggleRoutes={demo ? undefined : toggleUnitRoutes} obstaclesVisible={obstaclesVisible} onToggleObstacles={toggleObstacles} memoryFilters={new Set(enemyMemoryFilters)} onToggleMemoryFilter={toggleEnemyMemoryFilter} />}
       {!demo && !respawning && <button ref={strategyConfigButtonRef} type="button" onClick={() => setStrategyConfigOpen(true)} aria-label={t('game.openStrategyConfig')} title={t('game.openStrategyConfig')} className="focus-ring panel absolute bottom-4 right-4 z-20 grid size-11 place-items-center rounded-gold text-zinc-400 transition-colors hover:bg-white/[.06] hover:text-zinc-100"><Settings size={18} /></button>}
       {!demo && strategyConfigOpen && <StrategyConfigDialog returnFocusRef={strategyConfigButtonRef} onClose={() => setStrategyConfigOpen(false)} onPickCoords={startStrategyCoordPick} />}

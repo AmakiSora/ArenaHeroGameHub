@@ -1,7 +1,8 @@
-import { ChevronDown, Crosshair, Settings } from 'lucide-react'
+import { ChevronDown, Crosshair, Settings, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { maximumHealth } from '../../lib/gameRules'
+import type { SquadKey, SquadTargetMap } from '../../lib/squadTargets'
 import type { PlayerState, UnitType, WorldObject } from '../../lib/types'
 import { TEAM_KEYS, teamOfName, type TeamKey, type TeamRoster } from '../../lib/teamRoster'
 import { MODE_OPTIONS, settingsSpecFor, type ModeValue, type SquadSettingsSpec, type TeamConfig, type TeamSettingField } from '../../lib/teamSettings'
@@ -54,7 +55,7 @@ function hpTone(object: WorldObject): string {
 // /api/teams, worker strategy fields to /api/config (routed by the hook).
 // Coordinate X rows carry a ⌖ button (onPickCoords) that asks the map for a
 // point, filling X and Y together like the dashboard's pick buttons.
-function SquadSettingsPanel({ spec, config, onUpdateConfig, onPickCoords, pickingCoordsField }: { spec: SquadSettingsSpec; config: TeamConfig; onUpdateConfig: (field: string, value: number | boolean | string) => void; onPickCoords?: (xField: string, yField: string) => void; pickingCoordsField?: string | null }) {
+function SquadSettingsPanel({ spec, config, onUpdateConfig, onPickCoords, pickingCoordsField, squadTargets = {}, onPickSquadTarget, onRemoveSquadTarget, onClearSquadTargets, pickingSquadTarget = null }: { spec: SquadSettingsSpec; config: TeamConfig; onUpdateConfig: (field: string, value: number | boolean | string) => void; onPickCoords?: (xField: string, yField: string) => void; pickingCoordsField?: string | null; squadTargets?: SquadTargetMap; onPickSquadTarget?: (squad: SquadKey) => void; onRemoveSquadTarget?: (squad: SquadKey, index: number) => void; onClearSquadTargets?: (squad: SquadKey) => void; pickingSquadTarget?: SquadKey | null }) {
   const { t } = useTranslation()
   const mode = spec.modeField ? String(config[spec.modeField] ?? 'coords') as ModeValue : null
   const commitNumber = (field: TeamSettingField & { kind: 'number' }, raw: string) => {
@@ -94,11 +95,30 @@ function SquadSettingsPanel({ spec, config, onUpdateConfig, onPickCoords, pickin
       </label>
     })}
     {mode === 'beacon' && spec.beaconNoteKey && <p className="text-[9px] text-zinc-600">{t(`game.teamSettings.${spec.beaconNoteKey}`)}</p>}
+    {spec.targetQueue && (() => {
+      const squad = spec.targetQueue
+      const queue = squadTargets[squad] ?? []
+      return <div className="border-t border-white/[.07] pt-1.5">
+        <div className="flex items-center justify-between gap-1">
+          <span className="flex min-w-0 items-center gap-1 text-[10px] font-medium text-zinc-300"><Crosshair aria-hidden="true" size={11} className="shrink-0 text-cyan-signal" />{t('game.teamSettings.targetQueueTitle')}<span className="font-mono text-[9px] text-zinc-600">{queue.length || ''}</span></span>
+          <span className="flex shrink-0 items-center gap-1">
+            {queue.length > 0 && onClearSquadTargets && <button type="button" onClick={() => onClearSquadTargets(squad)} className="focus-ring rounded-gold-sm border border-coral-hostile/25 px-1.5 py-0.5 text-[9px] text-coral-hostile hover:bg-coral-hostile/[.08]">{t('game.teamSettings.targetQueueClear')}</button>}
+            {onPickSquadTarget && <button type="button" onClick={() => onPickSquadTarget(squad)} aria-label={t('game.teamSettings.targetQueueAdd')} aria-pressed={pickingSquadTarget === squad} className={`focus-ring flex items-center gap-0.5 rounded-gold-sm border px-1.5 py-0.5 text-[9px] transition-colors ${pickingSquadTarget === squad ? 'border-cyan-signal/50 bg-cyan-signal/[.12] text-cyan-signal' : 'border-white/[.08] text-zinc-400 hover:bg-white/[.06] hover:text-zinc-200'}`}><Crosshair aria-hidden="true" size={9} />{t('game.teamSettings.targetQueueAdd')}</button>}
+          </span>
+        </div>
+        {queue.length > 0
+          ? <div className="mt-1 flex flex-wrap gap-1">
+            {queue.map((point, index) => <span key={`${index}:${point[0]},${point[1]}`} className={`flex items-center gap-0.5 rounded-full border py-0.5 pl-2 pr-0.5 font-mono text-[9px] ${index === 0 ? 'border-cyan-signal/40 bg-cyan-signal/[.1] text-cyan-signal' : 'border-white/[.08] bg-white/[.03] text-zinc-400'}`}>{index === 0 ? '▶ ' : ''}({point[0]}, {point[1]}){onRemoveSquadTarget && <button type="button" onClick={() => onRemoveSquadTarget(squad, index)} aria-label={`${t('game.teamSettings.targetQueueRemove')} (${point[0]}, ${point[1]})`} className="focus-ring grid size-4 place-items-center rounded-full text-zinc-500 hover:bg-white/10 hover:text-white"><X aria-hidden="true" size={9} /></button>}</span>)}
+          </div>
+          : <p className="mt-1 text-[9px] text-zinc-600">{t('game.teamSettings.targetQueueEmpty')}</p>}
+        <p className="mt-1 text-[9px] text-zinc-700">{t('game.teamSettings.targetQueueHint')}</p>
+      </div>
+    })()}
     <p className="text-[9px] text-zinc-700">{t('game.teamSettings.saved')}</p>
   </div>
 }
 
-export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {}, onAssignTeam, teamConfig = {}, onUpdateConfig, onPickCoords, pickingCoordsField = null }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster; onAssignTeam?: (name: string, team: TeamKey) => void; teamConfig?: TeamConfig; onUpdateConfig?: (field: string, value: number | boolean | string) => void; onPickCoords?: (xField: string, yField: string) => void; pickingCoordsField?: string | null }) {
+export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {}, onAssignTeam, teamConfig = {}, onUpdateConfig, onPickCoords, pickingCoordsField = null, squadTargets = {}, onPickSquadTarget, onRemoveSquadTarget, onClearSquadTargets, pickingSquadTarget = null }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster; onAssignTeam?: (name: string, team: TeamKey) => void; teamConfig?: TeamConfig; onUpdateConfig?: (field: string, value: number | boolean | string) => void; onPickCoords?: (xField: string, yField: string) => void; pickingCoordsField?: string | null; squadTargets?: SquadTargetMap; onPickSquadTarget?: (squad: SquadKey) => void; onRemoveSquadTarget?: (squad: SquadKey, index: number) => void; onClearSquadTargets?: (squad: SquadKey) => void; pickingSquadTarget?: SquadKey | null }) {
   const { t } = useTranslation(); const controlled = useMemo(() => objects.filter((object) => object.controlled), [objects])
   const groups = useMemo(() => UNIT_GROUP_KEYS.map((key) => ({ key, members: controlled.filter((object) => groupKeyOf(object) === key) })), [controlled])
   // Production demand (生产需求): live current/target per unit type, fed by
@@ -198,7 +218,7 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
           </button>
           {showGear && spec && <button type="button" onClick={() => setOpenSettings((current) => current === key ? null : key)} aria-expanded={openSettings === key} aria-label={`${t('game.teamSettings.gear')} · ${sectionLabel(key)}`} className={`focus-ring grid size-6 shrink-0 place-items-center rounded-gold-sm transition-colors ${openSettings === key ? 'bg-indigo-deep/55 text-blue-soft' : 'text-zinc-600 hover:bg-white/[.05] hover:text-zinc-300'}`}><Settings aria-hidden="true" size={12} /></button>}
         </div>
-        {openSettings === key && spec && onUpdateConfig && <SquadSettingsPanel spec={spec} config={teamConfig} onUpdateConfig={onUpdateConfig} onPickCoords={onPickCoords} pickingCoordsField={pickingCoordsField} />}
+        {openSettings === key && spec && onUpdateConfig && <SquadSettingsPanel spec={spec} config={teamConfig} onUpdateConfig={onUpdateConfig} onPickCoords={onPickCoords} pickingCoordsField={pickingCoordsField} squadTargets={squadTargets} onPickSquadTarget={onPickSquadTarget} onRemoveSquadTarget={onRemoveSquadTarget} onClearSquadTargets={onClearSquadTargets} pickingSquadTarget={pickingSquadTarget} />}
         {!collapsedSections[key] && (members.length > 0 ? <div className="flex flex-wrap gap-1 px-1 pb-1.5">{members.map((object) => object.kind === 'CORE' ? coreRow(object) : unitChip(object))}</div> : <p className="px-2.5 py-1.5 text-[10px] text-zinc-600">{dragging ? t('game.squads.dropHere') : '—'}</p>)}
       </section> })}
     </div>

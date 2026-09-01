@@ -1111,7 +1111,118 @@ def clear_waypoints() -> dict:
     return {"ok": True, "cleared": True, "waypoint_count": 0}
 
 
-# ── manual per-unit self-destruct (「自裁」command, shared with the tactic) ──
+# ── squad attack-target queues (进攻队/风筝队 目标队列) ──────────────────
+# Ordered coordinate queues per squad in squad_targets.json, consumed by the
+# tactic in coords mode: the head pops once the squad arrived and the area is
+# cleared. The dashboard only appends/removes; both sides lock the file, so
+# operator edits and the tactic's pops never clobber each other.
+SQUAD_TARGETS_FILE = _data_path("squad_targets.json")
+_SQUAD_KEYS = ("attack", "kite")
+_SQUAD_TARGET_LIMIT = 20
+_SQUAD_TARGET_BOUND = 10000
+_SQUAD_LABELS = {"attack": "进攻队", "kite": "风筝队"}
+
+
+def _squad_key(raw: object) -> str:
+    squad = str(raw or "").strip().lower()
+    if squad not in _SQUAD_KEYS:
+        raise ValueError("分队不存在")
+    return squad
+
+
+def _normalize_squad_queue(raw: object) -> list[list[int]]:
+    queue: list[list[int]] = []
+    if isinstance(raw, (list, tuple)):
+        for point in raw:
+            if not isinstance(point, (list, tuple)) or len(point) < 2:
+                continue
+            try:
+                queue.append([int(point[0]), int(point[1])])
+            except (TypeError, ValueError):
+                continue
+    return queue
+
+
+def load_squad_targets() -> dict[str, list[list[int]]]:
+    """Load squad target queues as {squad: [[x, y], ...]}; empty queues drop."""
+    try:
+        data = json.loads(Path(SQUAD_TARGETS_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, list[list[int]]] = {}
+    if isinstance(data, dict):
+        for squad in _SQUAD_KEYS:
+            queue = _normalize_squad_queue(data.get(squad))
+            if queue:
+                out[squad] = queue
+    return out
+
+
+def _squad_target_mutation(func):
+    @wraps(func)
+    def locked(*args, **kwargs):
+        with file_lock(SQUAD_TARGETS_FILE):
+            return func(*args, **kwargs)
+
+    return locked
+
+
+def _write_squad_targets_file(targets: dict[str, list[list[int]]]) -> None:
+    atomic_write_text(SQUAD_TARGETS_FILE, json.dumps(targets, ensure_ascii=False))
+
+
+@_squad_target_mutation
+def add_squad_target(squad: str, x: int, y: int) -> dict:
+    """Append one coordinate to a squad's attack-target queue."""
+    squad = _squad_key(squad)
+    targets = load_squad_targets()
+    queue = targets.get(squad, [])
+    if len(queue) >= _SQUAD_TARGET_LIMIT:
+        return {"ok": False, "error": f"目标队列已达上限 {_SQUAD_TARGET_LIMIT} 个"}
+    queue = queue + [[int(x), int(y)]]
+    targets[squad] = queue
+    _write_squad_targets_file(targets)
+    append_jsonl(BATTLE_LOG_FILE, [{
+        "tick": None,
+        "ts": time.time(),
+        "cat": "config",
+        "msg": f"{_SQUAD_LABELS[squad]}新增目标 ({int(x)},{int(y)})，队列第 {len(queue)} 个",
+    }])
+    return {"ok": True, "squad": squad, "targets": targets}
+
+
+@_squad_target_mutation
+def remove_squad_target(squad: str, index: int | None = None) -> dict:
+    """Remove one queued target by index, or the squad's whole queue."""
+    squad = _squad_key(squad)
+    targets = load_squad_targets()
+    queue = targets.get(squad)
+    if not queue:
+        return {"ok": False, "error": "目标不存在"}
+    if index is None:
+        del targets[squad]
+    else:
+        if not 0 <= index < len(queue):
+            return {"ok": False, "error": "目标不存在"}
+        queue.pop(index)
+        if queue:
+            targets[squad] = queue
+        else:
+            del targets[squad]
+    _write_squad_targets_file(targets)
+    return {"ok": True, "squad": squad, "targets": targets}
+
+
+@_squad_target_mutation
+def clear_squad_targets(squad: str) -> dict:
+    squad = _squad_key(squad)
+    targets = load_squad_targets()
+    targets.pop(squad, None)
+    _write_squad_targets_file(targets)
+    return {"ok": True, "squad": squad, "targets": targets}
+
+
+# ── manual per-unit self-destruct (「自裁」 command, shared with the tactic) ──
 # The dashboard appends display names here; the tactic process reads the file
 # each Tick, issues SELF_DESTRUCT for units that are still alive, then prunes
 # the names. Same cross-process lock discipline as waypoints.json.
@@ -1561,10 +1672,10 @@ def render_teams_panel() -> str:
         '<label class="team-field" data-field-wrap="attack_target_x" for="teamAttackX">'
         '<span>目标坐标<small>点击地图按钮可同时填写 X / Y</small></span>'
         '<span class="coord-input">'
-        f'<input id="teamAttackX" name="attack_target_x" type="number" min="-1000" max="1000" '
+        f'<input id="teamAttackX" name="attack_target_x" type="number" min="-10000" max="10000" '
         f'step="1" value="{config["attack_target_x"]}" required aria-label="进攻目标 X">'
         '<span class="coord-divider">,</span>'
-        f'<input id="teamAttackY" name="attack_target_y" type="number" min="-1000" max="1000" '
+        f'<input id="teamAttackY" name="attack_target_y" type="number" min="-10000" max="10000" '
         f'step="1" value="{config["attack_target_y"]}" required aria-label="进攻目标 Y">'
         '<button type="button" class="pick-btn" id="pickAttackBtn" '
         'title="点击地图选择进攻坐标（X 与 Y 一起填入）">⌖</button></span>'
@@ -1594,10 +1705,10 @@ def render_teams_panel() -> str:
         '<label class="team-field" data-field-wrap="kite_target_x" for="teamKiteX">'
         '<span>目标坐标<small>点击地图按钮可同时填写 X / Y</small></span>'
         '<span class="coord-input">'
-        f'<input id="teamKiteX" name="kite_target_x" type="number" min="-1000" max="1000" '
+        f'<input id="teamKiteX" name="kite_target_x" type="number" min="-10000" max="10000" '
         f'step="1" value="{config["kite_target_x"]}" required aria-label="风筝队目标 X">'
         '<span class="coord-divider">,</span>'
-        f'<input id="teamKiteY" name="kite_target_y" type="number" min="-1000" max="1000" '
+        f'<input id="teamKiteY" name="kite_target_y" type="number" min="-10000" max="10000" '
         f'step="1" value="{config["kite_target_y"]}" required aria-label="风筝队目标 Y">'
         '<button type="button" class="pick-btn" id="pickKiteBtn" '
         'title="点击地图选择风筝队坐标（X 与 Y 一起填入）">⌖</button></span>'
@@ -6145,6 +6256,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/waypoints":
             self._send_json(200, {"ok": True, "waypoints": load_waypoints()})
             return
+        if path == "/api/squad-targets":
+            self._send_json(200, {"ok": True, "targets": load_squad_targets()})
+            return
         if path == "/api/holds":
             # Held (驻守) unit display names, for the arena SPA's unit dialog.
             self._send_json(200, {"ok": True, "holds": sorted(load_holds())})
@@ -6350,8 +6464,8 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError) as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
                 return
-            x = max(-1000, min(1000, x))
-            y = max(-1000, min(1000, y))
+            x = max(-10000, min(10000, x))
+            y = max(-10000, min(10000, y))
             result = set_waypoint(name, x, y, mode=data.get("mode"))
             self._send_json(200 if result.get("ok") else 400, result)
             return
@@ -6385,6 +6499,46 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/waypoint/clear":
             self._send_json(200, clear_waypoints())
+            return
+
+        if path == "/api/squad-target/add":
+            try:
+                squad = _squad_key(data.get("squad"))
+                x = int(data.get("x"))
+                y = int(data.get("y"))
+            except (TypeError, ValueError) as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            x = max(-_SQUAD_TARGET_BOUND, min(_SQUAD_TARGET_BOUND, x))
+            y = max(-_SQUAD_TARGET_BOUND, min(_SQUAD_TARGET_BOUND, y))
+            result = add_squad_target(squad, x, y)
+            self._send_json(200 if result.get("ok") else 400, result)
+            return
+
+        if path == "/api/squad-target/remove":
+            try:
+                squad = _squad_key(data.get("squad"))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            index = data.get("index")
+            if index is not None and not isinstance(index, bool):
+                try:
+                    index = int(index)
+                except (TypeError, ValueError):
+                    index = None
+            result = remove_squad_target(squad, index=index)
+            self._send_json(200 if result.get("ok") else 400, result)
+            return
+
+        if path == "/api/squad-target/clear":
+            try:
+                squad = _squad_key(data.get("squad"))
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            result = clear_squad_targets(squad)
+            self._send_json(200, result)
             return
 
         if path == "/api/unit/self_destruct":
