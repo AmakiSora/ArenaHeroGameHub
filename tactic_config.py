@@ -66,8 +66,8 @@ CONFIG_FIELDS = (
     ConfigField("core_movement_enabled", "允许核心移动", "core", "boolean", True),
     ConfigField("prefer_resources_for_core", "核心优先靠近矿点", "core", "boolean", True),
     ConfigField("core_target_enabled", "启用核心目标坐标", "core", "boolean", False),
-    ConfigField("core_target_x", "核心目标 X", "core", "integer", 0, -1000, 1000, 1),
-    ConfigField("core_target_y", "核心目标 Y", "core", "integer", 0, -1000, 1000, 1),
+    ConfigField("core_target_x", "核心目标 X", "core", "integer", 0, -10000, 10000, 1),
+    ConfigField("core_target_y", "核心目标 Y", "core", "integer", 0, -10000, 10000, 1),
     # Drift leash for the automatic Core-movement heuristic: the base used to
     # chase far-flung explorers forever (2800+ cells observed). 0 disables it;
     # an explicit 核心目标坐标 bypasses the leash.
@@ -132,8 +132,8 @@ CONFIG_FIELDS = (
         20,
         1,
     ),
-    ConfigField("attack_target_x", "进攻目标 X", "combat", "integer", 0, -1000, 1000, 1),
-    ConfigField("attack_target_y", "进攻目标 Y", "combat", "integer", 0, -1000, 1000, 1),
+    ConfigField("attack_target_x", "进攻目标 X", "combat", "integer", 0, -10000, 10000, 1),
+    ConfigField("attack_target_y", "进攻目标 Y", "combat", "integer", 0, -10000, 10000, 1),
     ConfigField(
         "attack_mode",
         "进攻方式",
@@ -143,8 +143,8 @@ CONFIG_FIELDS = (
         options=("coords", "auto", "beacon"),
     ),
     ConfigField("attack_auto_radius", "自动进攻半径(0=不限)", "combat", "integer", 100, 0, 1000, 1),
-    ConfigField("kite_target_x", "风筝队目标 X", "combat", "integer", 0, -1000, 1000, 1),
-    ConfigField("kite_target_y", "风筝队目标 Y", "combat", "integer", 0, -1000, 1000, 1),
+    ConfigField("kite_target_x", "风筝队目标 X", "combat", "integer", 0, -10000, 10000, 1),
+    ConfigField("kite_target_y", "风筝队目标 Y", "combat", "integer", 0, -10000, 10000, 1),
     ConfigField(
         "kite_mode",
         "风筝队进攻方式",
