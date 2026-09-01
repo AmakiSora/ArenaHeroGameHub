@@ -5355,6 +5355,10 @@ _home_engage_target: dict[str, tuple[str, int]] = {}
 _pending_shot_predictions: list[dict[str, Any]] = []
 # Last applied dashboard enemy-clear sequence from map_memory.json.
 _enemy_clear_seq: int = 0
+# Drift-leash anchor for the Core: the spot the automatic movement heuristic
+# may not drift beyond (see core_max_drift). Persisted to map_memory.json so a
+# restart never re-anchors an already-migrated base.
+_core_anchor: tuple[int, int] | None = None
 # Signature of the last dashboard map edits we absorbed (avoid re-applying every tick).
 _last_dashboard_map_sig: tuple | None = None
 # Track each worker's previous position to avoid backtracking
@@ -5580,7 +5584,8 @@ def _enemy_sightings_from_payload(raw) -> tuple[set[tuple[int, int]], dict[tuple
 def _load_map_memory() -> None:
     """Load permanent obstacle/resource/enemy memory from disk."""
     global _resource_memory, _obstacle_memory, _enemy_memory, _enemy_memory_types, \
-        _enemy_memory_ticks, _enemy_clear_seq, _last_dashboard_map_sig, _known_obstacles
+        _enemy_memory_ticks, _enemy_clear_seq, _last_dashboard_map_sig, _known_obstacles, \
+        _core_anchor
     if not MAP_MEMORY_PATH.exists():
         return
     try:
@@ -5596,6 +5601,12 @@ def _load_map_memory() -> None:
             data.get("enemy_sightings")
         )
         _enemy_clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
+        raw_anchor = data.get("core_anchor")
+        _core_anchor = (
+            (int(raw_anchor[0]), int(raw_anchor[1]))
+            if isinstance(raw_anchor, (list, tuple)) and len(raw_anchor) == 2
+            else None
+        )
         _last_dashboard_map_sig = _dashboard_map_sig(data)
         # Wholesale reload: rebase the stable obstacle view and defer the batch
         # dead-end build to the first _ensure_dead_structure() of the next tick.
@@ -5798,6 +5809,7 @@ def _save_map_memory(
         "manual_count": len(manual),
         "enemy_sighting_count": len(_enemy_memory),
         "enemy_clear_seq": _enemy_clear_seq,
+        "core_anchor": list(_core_anchor) if _core_anchor is not None else None,
     }
     atomic_write_text(MAP_MEMORY_PATH, json.dumps(payload, ensure_ascii=False))
     _map_dirty = False
@@ -7032,6 +7044,13 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 
     # ── Core movement ────────────────────────────────────────────────────
     if not core_done and config["core_movement_enabled"]:
+        # A Core migration spans several Ticks (state stays MOVING until the
+        # step lands). Re-issuing START_MOVE mid-step is rejected as
+        # CORE_ALREADY_MOVING and used to flood the battle log with one warn
+        # row per Tick — let the step finish, then re-pick the heading.
+        core_mid_move = (
+            getattr(getattr(core, "view", None), "state", None) == CoreState.MOVING
+        )
         # Stop if a cargo worker is close (any carrying worker heads home to
         # deposit), otherwise move toward them
         close_cargo = any(
@@ -7039,7 +7058,23 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             and _manhattan(w.position, core_pos) <= int(config["cargo_wait_distance"])
             for w in turn.workers
         )
-        if not close_cargo:
+        if not close_cargo and not core_mid_move:
+            global _core_anchor, _map_dirty
+            # Drift leash: the automatic heuristic chases the worker/resource
+            # mass center, and far-flung explorers keep pulling it outward
+            # while the mining radius (worker_mine_max_distance) follows the
+            # Core — the whole base migrates forever (observed 2800+ cells).
+            # Clamp every automatic step to a persisted anchor instead. 0
+            # disables the leash; a manual core target bypasses it.
+            max_drift = max(0, int(config.get("core_max_drift", 200)))
+            if _core_anchor is None:
+                _core_anchor = tuple(core_pos)
+                _map_dirty = True
+            elif max_drift > 0 and _manhattan(tuple(core_pos), _core_anchor) > max_drift:
+                # Only a respawn/teleport can land outside the leash, since
+                # normal steps are clamped below — re-anchor there.
+                _core_anchor = tuple(core_pos)
+                _map_dirty = True
             # Determine movement target
             core_target_enabled = config.get("core_target_enabled", False)
             if core_target_enabled:
@@ -7089,6 +7124,12 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             for d in dirs:
                 nx, ny = core_pos[0] + d.delta[0], core_pos[1] + d.delta[1]
                 if (nx, ny) in obstacle_cells:
+                    continue
+                if (
+                    max_drift > 0
+                    and not core_target_enabled
+                    and _manhattan((nx, ny), _core_anchor) > max_drift
+                ):
                     continue
                 if _is_dead_end_step((nx, ny), obstacle_cells, allow=(target,)):
                     continue

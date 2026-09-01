@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from arena_hero import Direction, UnitType
+from arena_hero import CoreState, Direction, UnitType
 
 import dashboard
 import game_stats
@@ -9055,6 +9055,192 @@ class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
         )
         self.assertEqual(tactic._roam_bearing_offset.get("roam-flip", 0), 4)
         self.assertEqual(tactic._roam_flips_used.get("roam-flip", 0), 1)
+
+
+class CoreDriftLeashTests(unittest.TestCase):
+    """Core-movement regressions from the remote battle log: the base chased
+    far-flung explorers 2800+ cells with no restoring force, and one
+    CORE_ALREADY_MOVING warn row landed every Tick because START_MOVE was
+    re-issued while a multi-Tick migration was still in progress."""
+
+    def _run_choose_actions(
+        self, *, core_pos, worker_pos, core_state, config, anchor=None,
+    ):
+        """One Tick with a single worker pulling the Core; returns
+        (core_action, issued_start_moves, anchor_after)."""
+        moves: list = []
+        core = SimpleNamespace(
+            id="core", position=core_pos, hp=5, shield=10,
+            view=SimpleNamespace(state=core_state),
+            spawn=lambda unit_type: None,
+            heal=lambda: None,
+            repair_shield=lambda: None,
+            pickup_beacon=lambda: None,
+            start_move=lambda direction: moves.append(direction),
+            wait=lambda: None,
+        )
+        worker = SimpleNamespace(
+            id="worker-1", unit_type=UnitType.WORKER, position=worker_pos,
+            cargo=0, direction=None,
+        )
+        worker.move = lambda direction: None
+        worker.wait = lambda: None
+        beacon = SimpleNamespace(
+            position=None, status=SimpleNamespace(name="GROUND"),
+        )
+        turn = SimpleNamespace(
+            tick=1,
+            units=(worker,),
+            workers=(worker,),
+            vanguards=(),
+            rangers=(),
+            visible_enemies=(),
+            core=core,
+            resources=50,
+            resource_cells=frozenset(),
+            resource_space=0,
+            beacon=beacon,
+            state=SimpleNamespace(population=8),
+            events=(),
+            obstacle_cells=frozenset(),
+        )
+        # Targets exactly met so production never grabs the Core action.
+        config["target_workers"] = 1
+        config["target_vanguards"] = 0
+        config["target_rangers"] = 0
+        prev_anchor = tactic._core_anchor
+        prev_names = dict(tactic._object_names)
+        prev_counters = dict(tactic._object_name_counters)
+        tactic._core_anchor = anchor
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            tactic._object_names.clear()
+            tactic._object_name_counters.clear()
+            with patch.object(tactic, "load_config", return_value=config), \
+                 patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
+                 patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
+                 patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"), \
+                 patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"), \
+                 patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"):
+                tactic._map_dirty = False
+                try:
+                    core_action, _ = tactic.choose_actions(turn)
+                    anchor_after = tactic._core_anchor
+                finally:
+                    tactic._core_anchor = prev_anchor
+                    tactic._object_names.clear()
+                    tactic._object_names.update(prev_names)
+                    tactic._object_name_counters.clear()
+                    tactic._object_name_counters.update(prev_counters)
+        return core_action, moves, anchor_after
+
+    def test_start_move_not_reissued_while_core_is_moving(self) -> None:
+        config = default_config()
+        config["core_max_drift"] = 0  # isolate from the leash
+        action, moves, _ = self._run_choose_actions(
+            core_pos=(0, 0), worker_pos=(500, 0),
+            core_state=CoreState.MOVING, config=config,
+        )
+        self.assertEqual(moves, [])
+        self.assertEqual(action, "WAIT")
+
+    def test_start_move_still_issued_when_core_is_normal(self) -> None:
+        action, moves, _ = self._run_choose_actions(
+            core_pos=(0, 0), worker_pos=(500, 0),
+            core_state=CoreState.NORMAL, config=default_config(),
+        )
+        self.assertEqual(moves, [Direction.RIGHT])
+        self.assertEqual(action, "MOVE_RIGHT")
+
+    def test_leash_blocks_step_beyond_anchor(self) -> None:
+        config = default_config()
+        config["core_max_drift"] = 2
+        action, moves, anchor_after = self._run_choose_actions(
+            core_pos=(2, 0), worker_pos=(500, 0),
+            core_state=CoreState.NORMAL, config=config, anchor=(0, 0),
+        )
+        self.assertEqual(moves, [])
+        self.assertEqual(action, "WAIT")
+        self.assertEqual(anchor_after, (0, 0))
+
+    def test_leash_allows_step_toward_anchor(self) -> None:
+        config = default_config()
+        config["core_max_drift"] = 2
+        action, moves, _ = self._run_choose_actions(
+            core_pos=(2, 0), worker_pos=(-500, 0),
+            core_state=CoreState.NORMAL, config=config, anchor=(0, 0),
+        )
+        self.assertEqual(moves, [Direction.LEFT])
+        self.assertEqual(action, "MOVE_LEFT")
+
+    def test_anchor_initialized_on_first_moving_tick(self) -> None:
+        config = default_config()
+        config["core_max_drift"] = 2
+        _, _, anchor_after = self._run_choose_actions(
+            core_pos=(7, -3), worker_pos=(500, 0),
+            core_state=CoreState.NORMAL, config=config, anchor=None,
+        )
+        self.assertEqual(anchor_after, (7, -3))
+
+    def test_core_far_outside_leash_reanchors_instead_of_walking_home(self) -> None:
+        # A respawn/teleport (or a legacy long migration) may land the Core far
+        # beyond the leash; re-anchor there instead of marching thousands of
+        # cells back toward the stale anchor.
+        config = default_config()
+        config["core_max_drift"] = 2
+        action, moves, anchor_after = self._run_choose_actions(
+            core_pos=(100, 0), worker_pos=(600, 0),
+            core_state=CoreState.NORMAL, config=config, anchor=(0, 0),
+        )
+        self.assertEqual(anchor_after, (100, 0))
+        self.assertEqual(moves, [Direction.RIGHT])
+
+    def test_manual_core_target_bypasses_the_leash(self) -> None:
+        config = default_config()
+        config["core_max_drift"] = 2
+        config["core_target_enabled"] = True
+        config["core_target_x"] = 500
+        config["core_target_y"] = 0
+        action, moves, _ = self._run_choose_actions(
+            core_pos=(2, 0), worker_pos=(-500, 0),
+            core_state=CoreState.NORMAL, config=config, anchor=(0, 0),
+        )
+        self.assertEqual(moves, [Direction.RIGHT])
+        self.assertEqual(action, "MOVE_RIGHT")
+
+    def test_core_anchor_round_trips_through_map_memory(self) -> None:
+        prev = (
+            tactic._core_anchor, tactic._map_dirty,
+            set(tactic._resource_memory), set(tactic._obstacle_memory),
+            set(tactic._enemy_memory), tactic._enemy_clear_seq,
+            tactic._known_obstacles,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                path = Path(temp_dir) / "map_memory.json"
+                path.write_text(json.dumps({
+                    "obstacles": [], "resources": [], "manual_resources": [],
+                    "forgotten_resources": [], "enemy_sightings": [],
+                    "enemy_clear_seq": 0, "core_anchor": [7, -9],
+                }), encoding="utf-8")
+                with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                    tactic._load_map_memory()
+                    self.assertEqual(tactic._core_anchor, (7, -9))
+                    tactic._core_anchor = (1, 2)
+                    tactic._map_dirty = True
+                    tactic._save_map_memory(force=True)
+                saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["core_anchor"], [1, 2])
+        finally:
+            (tactic._core_anchor, tactic._map_dirty) = prev[:2]
+            tactic._resource_memory.clear()
+            tactic._resource_memory.update(prev[2])
+            tactic._obstacle_memory.clear()
+            tactic._obstacle_memory.update(prev[3])
+            tactic._enemy_memory.clear()
+            tactic._enemy_memory.update(prev[4])
+            tactic._enemy_clear_seq = prev[5]
+            tactic._known_obstacles = prev[6]
 
 
 if __name__ == "__main__":

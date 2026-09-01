@@ -68,6 +68,10 @@ CONFIG_FIELDS = (
     ConfigField("core_target_enabled", "启用核心目标坐标", "core", "boolean", False),
     ConfigField("core_target_x", "核心目标 X", "core", "integer", 0, -1000, 1000, 1),
     ConfigField("core_target_y", "核心目标 Y", "core", "integer", 0, -1000, 1000, 1),
+    # Drift leash for the automatic Core-movement heuristic: the base used to
+    # chase far-flung explorers forever (2800+ cells observed). 0 disables it;
+    # an explicit 核心目标坐标 bypasses the leash.
+    ConfigField("core_max_drift", "核心漂移缰绳(0=不限)", "core", "integer", 200, 0, 1000, 10),
     ConfigField("cargo_wait_distance", "等待载矿工人距离", "core", "integer", 5, 0, 20, 1),
     ConfigField("repair_enabled", "允许修盾", "core", "boolean", True),
     ConfigField("heal_enabled", "允许战后回血", "core", "boolean", True),

@@ -41,6 +41,18 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(config["kite_auto_radius"], 100)
         self.assertEqual(config["combat_heal_hp_threshold"], 2)
         self.assertEqual(config["combat_heal_return_limit"], 1)
+        self.assertEqual(config["core_max_drift"], 200)
+
+    def test_core_max_drift_validation(self) -> None:
+        # 0 = 不限漂移；1..1000 为曼哈顿缰绳半径；越界拒绝。
+        self.assertEqual(validate_config({"core_max_drift": 0})["core_max_drift"], 0)
+        self.assertEqual(
+            validate_config({"core_max_drift": 1000})["core_max_drift"], 1000
+        )
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"core_max_drift": -1})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"core_max_drift": 1001})
 
     def test_combat_heal_threshold_validation(self) -> None:
         # 0 disables the home-team retreat-to-heal; 1..4 pick the HP cutoff.
