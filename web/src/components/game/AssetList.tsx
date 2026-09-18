@@ -64,6 +64,10 @@ function SquadSettingsPanel({ spec, config, onUpdateConfig, onPickCoords, pickin
     const clamped = Math.min(field.max, Math.max(field.min, parsed))
     if (clamped !== Number(config[field.field] ?? 0)) onUpdateConfig(field.field, clamped)
   }
+  const commitText = (field: TeamSettingField & { kind: 'text' }, raw: string) => {
+    const value = raw.trim()
+    if (value !== String(config[field.field] ?? '')) onUpdateConfig(field.field, value)
+  }
   const fieldLabel = (labelKey: string, hintKey?: string) => <span className="min-w-0"><span className="block truncate text-[10px] text-zinc-300">{t(`game.teamSettings.${labelKey}`)}</span>{hintKey && <span className="block truncate text-[9px] text-zinc-600">{t(`game.teamSettings.${hintKey}`)}</span>}</span>
   return <div className="mx-1 mb-1.5 space-y-1.5 rounded-gold border border-white/[.07] bg-black/25 p-2">
     <div className="border-b border-white/[.06] pb-1">
@@ -88,6 +92,10 @@ function SquadSettingsPanel({ spec, config, onUpdateConfig, onPickCoords, pickin
         <select value={Number(config[field.field] ?? field.options[0])} onChange={(event) => onUpdateConfig(field.field, Number(event.target.value))} className="shrink-0 rounded-gold-sm border border-white/[.08] bg-white/[.04] px-1 py-0.5 font-mono text-[10px] text-zinc-200">
           {field.options.map((option) => <option key={option} value={option}>{option}</option>)}
         </select>
+      </label>
+      if (field.kind === 'text') return <label key={field.field} className="flex items-center justify-between gap-2">
+        {fieldLabel(field.labelKey, field.hintKey)}
+        <input type="text" inputMode="numeric" placeholder={field.placeholder} key={`${field.field}=${String(config[field.field] ?? '')}`} defaultValue={String(config[field.field] ?? '')} onBlur={(event) => commitText(field, event.currentTarget.value)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }} className="w-20 shrink-0 rounded-gold-sm border border-white/[.08] bg-white/[.04] px-1.5 py-0.5 text-right font-mono text-[10px] text-zinc-200" />
       </label>
       return <label key={field.field} className="flex items-center justify-between gap-2">
         {fieldLabel(field.labelKey, field.hintKey)}

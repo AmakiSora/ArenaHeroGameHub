@@ -42,6 +42,36 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(config["combat_heal_hp_threshold"], 2)
         self.assertEqual(config["combat_heal_return_limit"], 1)
         self.assertEqual(config["core_max_drift"], 200)
+        self.assertEqual(config["combat_team_ratio"], "2:1:1:1")
+
+    def test_team_ratio_parse_and_validation(self) -> None:
+        from tactic_config import parse_team_ratio
+
+        # Full/short forms, full-width colons, missing entries pad with 0.
+        self.assertEqual(parse_team_ratio("2:1:1:1"), (2, 1, 1, 1))
+        self.assertEqual(parse_team_ratio(" 2：1 "), (2, 1, 0, 0))
+        self.assertEqual(parse_team_ratio("0"), (0, 0, 0, 0))
+        self.assertEqual(parse_team_ratio("1:2:3:4"), (1, 2, 3, 4))
+        # Empty/unset and garbage mean "off" for the runtime caller.
+        self.assertIsNone(parse_team_ratio(""))
+        self.assertIsNone(parse_team_ratio(None))
+        self.assertIsNone(parse_team_ratio("a:b"))
+        self.assertIsNone(parse_team_ratio("1:2:3:4:5"))
+        self.assertIsNone(parse_team_ratio("1:-2"))
+
+        # Empty stays valid (= off); malformed ratios are rejected on save.
+        self.assertEqual(validate_config({"combat_team_ratio": ""})["combat_team_ratio"], "")
+        self.assertEqual(
+            validate_config({"combat_team_ratio": "0"})["combat_team_ratio"], "0",
+        )
+        self.assertEqual(
+            validate_config({"combat_team_ratio": " 2:1:1:1 "})["combat_team_ratio"],
+            "2:1:1:1",
+        )
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"combat_team_ratio": "2:1:1:1:1"})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"combat_team_ratio": "two:1:1:1"})
 
     def test_core_max_drift_validation(self) -> None:
         # 0 = 不限漂移；1..1000 为曼哈顿缰绳半径；越界拒绝。

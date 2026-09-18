@@ -1167,6 +1167,8 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(tactic._combat_team_for("V9", config), "unassigned")
 
     def test_new_combat_units_auto_join_home_team(self) -> None:
+        # Ratio off ("0" = all-zero): the legacy behavior keeps every new
+        # combat unit in the home roster.
         tactic._object_names.clear()
         tactic._object_name_counters.clear()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1174,6 +1176,7 @@ class CombatTeamPlannerTests(unittest.TestCase):
             config = default_config()
             config["home_team"] = "V1"
             config["attack_team"] = "V2"
+            config["combat_team_ratio"] = "0"
             from tactic_config import save_config, load_config
 
             save_config(config, path)
@@ -1202,8 +1205,76 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(updated["attack_team"], "V2")
         self.assertEqual(loaded["home_team"], "R1, V1, V3")
         self.assertEqual(tactic._combat_team_for("V2", updated), "attack")
-        self.assertEqual(tactic._combat_team_for("V3", updated), "home")
-        self.assertEqual(tactic._combat_team_for("R1", updated), "home")
+
+    def test_new_combat_units_follow_team_ratio(self) -> None:
+        # Ratio 1:1:1:1 with empty rosters: four new units spread one per
+        # squad (home first, then attack / kite / guerrilla).
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tactic_config.json"
+            config = default_config()
+            config["combat_team_ratio"] = "1:1:1:1"
+            from tactic_config import save_config, load_config
+
+            save_config(config, path)
+            turn = SimpleNamespace(
+                vanguards=tuple(
+                    SimpleNamespace(id=f"vang-{n}") for n in range(1, 5)
+                ),
+                rangers=(),
+            )
+            with patch.object(
+                tactic,
+                "mutate_config",
+                side_effect=lambda mutator, _path: tactic_config.mutate_config(mutator, path),
+            ), \
+                 patch.object(tactic, "CONFIG_PATH", path):
+                updated = tactic._auto_enlist_new_combat_units(turn, load_config(path))
+
+        self.assertEqual(updated["home_team"], "V1")
+        self.assertEqual(updated["attack_team"], "V2")
+        self.assertEqual(updated["kite_team"], "V3")
+        self.assertEqual(updated["guerrilla_team"], "V4")
+
+    def test_team_ratio_fills_the_most_understaffed_squad(self) -> None:
+        # Roster already 1/1/0/0 with ratio 2:1:1:1: the next unit goes where
+        # the deficit against the configured share is largest (kite vs
+        # guerrilla tie resolves in squad order home→attack→kite→guerrilla).
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tactic_config.json"
+            config = default_config()
+            config["home_team"] = "V1"
+            config["attack_team"] = "V2"
+            config["combat_team_ratio"] = "2:1:1:1"
+            from tactic_config import save_config, load_config
+
+            save_config(config, path)
+            turn = SimpleNamespace(
+                vanguards=(
+                    SimpleNamespace(id="vang-1"),
+                    SimpleNamespace(id="vang-2"),
+                    SimpleNamespace(id="vang-3"),
+                ),
+                rangers=(),
+            )
+            with patch.object(
+                tactic,
+                "mutate_config",
+                side_effect=lambda mutator, _path: tactic_config.mutate_config(mutator, path),
+            ), \
+                 patch.object(tactic, "CONFIG_PATH", path):
+                updated = tactic._auto_enlist_new_combat_units(turn, load_config(path))
+
+        # Counts 1/1/0/0: first deficit pick is kite (ties beat guerrilla on
+        # order), then the second pick is guerrilla.
+        self.assertEqual(updated["kite_team"], "V3")
+        self.assertEqual(updated["guerrilla_team"], "")
+        self.assertEqual(updated["home_team"], "V1")
+        self.assertEqual(updated["attack_team"], "V2")
+        self.assertEqual(tactic._combat_team_for("V3", updated), "kite")
 
     def test_home_team_returns_inside_patrol_radius(self) -> None:
         unit = self.CombatUnit("v-home", (20, 0))

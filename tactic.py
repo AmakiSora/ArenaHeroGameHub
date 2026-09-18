@@ -34,7 +34,7 @@ from arena_hero import (
 from arena_hero.errors import APIError, ProtocolError, TransportError
 import game_stats
 from state_io import append_jsonl, atomic_write_text, file_lock
-from tactic_config import CONFIG_PATH, load_config, mutate_config
+from tactic_config import CONFIG_PATH, load_config, mutate_config, parse_team_ratio
 
 def _data_dir() -> Path:
     raw = os.environ.get("ARENA_DATA_DIR", "").strip()
@@ -2838,7 +2838,14 @@ def _ensure_home_team_membership(
     config: dict[str, Any],
     unit_names: Iterable[str],
 ) -> dict[str, Any]:
-    """Auto-enlist unassigned Vanguards/Rangers into the home team roster."""
+    """Auto-enlist unassigned Vanguards/Rangers, balancing the four combat
+    rosters toward the configured 新兵分队比例 (combat_team_ratio, 守:攻:筝:游).
+
+    Each new unit joins the team with the largest deficit against its
+    configured share, counting living members only (integer math keeps ties
+    exact; ties resolve home → attack → kite → guerrilla). An unset, invalid
+    or all-zero ratio keeps the legacy behavior: everything joins home.
+    """
     normalized_names = {
         str(raw_name).strip().upper()
         for raw_name in unit_names
@@ -2862,19 +2869,41 @@ def _ensure_home_team_membership(
         attack = _parse_team_names(latest.get("attack_team", ""))
         kite = _parse_team_names(latest.get("kite_team", ""))
         guerrilla = _parse_team_names(latest.get("guerrilla_team", ""))
-        assigned = home | attack | kite | guerrilla
-        added.extend(sorted(normalized_names - assigned))
-        if not added:
+        assigned_now = home | attack | kite | guerrilla
+        pending = sorted(normalized_names - assigned_now)
+        if not pending:
             return None
-        home.update(added)
+        added.extend(pending)
+        rosters = (home, attack, kite, guerrilla)
+        # Off (empty/invalid) or all-zero ratio falls back to (1, 0, 0, 0):
+        # the legacy home-only enlistment.
+        weights = parse_team_ratio(latest.get("combat_team_ratio"))
+        if not weights or not sum(weights):
+            weights = (1, 0, 0, 0)
+        total_weight = sum(weights)
+        counts = [len(roster & normalized_names) for roster in rosters]
+        for name in pending:
+            total_after = sum(counts) + 1
+            best = max(
+                range(4),
+                key=lambda t: total_after * weights[t] - counts[t] * total_weight,
+            )
+            rosters[best].add(name)
+            counts[best] += 1
         latest["home_team"] = _format_team_roster(home)
+        latest["attack_team"] = _format_team_roster(attack)
+        latest["kite_team"] = _format_team_roster(kite)
+        latest["guerrilla_team"] = _format_team_roster(guerrilla)
         return latest
 
     try:
         saved = mutate_config(apply, CONFIG_PATH)
         if added:
             print(
-                f"[team] auto-enlisted {', '.join(added)} -> home_team={saved['home_team']}",
+                f"[team] auto-enlisted {', '.join(added)} by ratio "
+                f"{saved.get('combat_team_ratio', '')!r} -> "
+                f"home={saved['home_team']} | attack={saved['attack_team']} | "
+                f"kite={saved['kite_team']} | guerrilla={saved['guerrilla_team']}",
                 flush=True,
             )
         return saved

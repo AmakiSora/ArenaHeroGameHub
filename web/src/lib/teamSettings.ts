@@ -12,6 +12,9 @@ export type TeamSettingField =
   | { kind: 'mode'; field: string }
   | { kind: 'select'; field: string; labelKey: string; hintKey?: string; options: number[] }
   | { kind: 'switch'; field: string; labelKey: string; hintKey?: string }
+  // Free-form text (e.g. the 守:攻:筝:游 enlistment ratio); commits on
+  // blur/Enter like numbers, validated server-side on save.
+  | { kind: 'text'; field: string; labelKey: string; hintKey?: string; placeholder?: string }
 
 export interface SquadSettingsSpec {
   titleKey: string
@@ -56,6 +59,9 @@ export const TEAM_SETTINGS: Partial<Record<string, SquadSettingsSpec>> = {
       // shared panel, so it stays reachable here, flagged via the subtitle.
       { kind: 'select', field: 'ranger_attack_range', labelKey: 'rangerRange', hintKey: 'rangerRangeHint', options: [1, 2, 3] },
       { kind: 'switch', field: 'ranger_lead_fire_enabled', labelKey: 'leadFire', hintKey: 'leadFireHint' },
+      // Army-wide enlistment ratio for newly produced combat units
+      // (守:攻:筝:游); empty disables balancing (everything joins home).
+      { kind: 'text', field: 'combat_team_ratio', labelKey: 'combatRatio', hintKey: 'combatRatioHint', placeholder: '2:1:1:1' },
     ],
   },
   kite: {

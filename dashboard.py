@@ -1737,7 +1737,7 @@ def render_teams_panel() -> str:
         '<div class="panel-title"><span>战斗分队</span>'
         '<span class="count" id="teamsState">已同步</span></div>'
         '<form id="teamsForm">'
-        '<p class="teams-hint">拖动单位调整编队；虚线单位表示仅存在于配置。新单位默认进入守家队。</p>'
+        '<p class="teams-hint">拖动单位调整编队；虚线单位表示仅存在于配置。新单位按「新兵分队比例」(守:攻:筝:游) 自动编入各队。</p>'
         f'<div class="team-board">{"".join(columns)}</div>'
         '<div class="team-parameter-head"><div><b>战斗参数</b>'
         '<span>按职责归类；无关的进攻参数会自动隐藏</span></div></div>'
@@ -1765,6 +1765,11 @@ def render_teams_panel() -> str:
         f'<input id="teamLeadFire" name="ranger_lead_fire_enabled" type="checkbox"{lead_checked}>'
         '<span class="team-switch-ui" aria-hidden="true"></span>'
         '<em class="team-field-error" data-field-error="ranger_lead_fire_enabled"></em></label>'
+        '<label class="team-field" data-field-wrap="combat_team_ratio" for="teamCombatRatio">'
+        '<span>新兵分队比例<small>守:攻:筝:游，如 2:1:1:1；留空=全进守家队</small></span>'
+        f'<input id="teamCombatRatio" name="combat_team_ratio" type="text" '
+        f'value="{config["combat_team_ratio"]}" placeholder="2:1:1:1">'
+        '<em class="team-field-error" data-field-error="combat_team_ratio"></em></label>'
         '</div></section></div></div>'
         '<section class="team-setting-group tone-attack team-attack-group" aria-labelledby="teamAttackTitle">'
         '<div class="team-setting-title"><b id="teamAttackTitle">进攻策略</b><span>选择方式后只显示相关参数</span></div>'
@@ -4329,6 +4334,7 @@ JS = r"""
       attack_retreat_radius: Number((document.getElementById('teamRetreatRadius') || {}).value || 5),
       attack_auto_radius: Number((document.getElementById('teamAutoRadius') || {}).value || 0),
       attack_march_engage_radius: Number((document.getElementById('teamMarchRadius') || {}).value || 0),
+      combat_team_ratio: String((document.getElementById('teamCombatRatio') || {}).value || '').trim(),
       guerrilla_engage_radius: Number((document.getElementById('teamGuerrillaSight') || {}).value || 0)
     };
   }
@@ -4370,6 +4376,7 @@ JS = r"""
       attack_retreat_radius: 'teamRetreatRadius',
       attack_auto_radius: 'teamAutoRadius',
       attack_march_engage_radius: 'teamMarchRadius',
+      combat_team_ratio: 'teamCombatRatio',
       kite_target_x: 'teamKiteX',
       kite_target_y: 'teamKiteY',
       kite_auto_radius: 'teamKiteAutoRadius',
@@ -4435,6 +4442,7 @@ JS = r"""
       attack_retreat_radius: settings.attack_retreat_radius,
       attack_auto_radius: settings.attack_auto_radius,
       attack_march_engage_radius: settings.attack_march_engage_radius,
+      combat_team_ratio: settings.combat_team_ratio,
       guerrilla_engage_radius: settings.guerrilla_engage_radius
     };
   }

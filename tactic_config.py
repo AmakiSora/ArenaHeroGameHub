@@ -110,6 +110,17 @@ CONFIG_FIELDS = (
         "",
         placeholder="例如 V3,R3",
     ),
+    # Enlistment ratio for NEWLY produced Vanguards/Rangers (守:攻:筝:游).
+    # Empty or all-zero disables balancing and keeps the legacy behavior of
+    # enlisting everything into the home roster.
+    ConfigField(
+        "combat_team_ratio",
+        "新兵分队比例(守:攻:筝:游)",
+        "combat",
+        "string",
+        "2:1:1:1",
+        placeholder="例如 2:1:1:1，留空=全进守家队",
+    ),
     ConfigField(
         "guerrilla_engage_radius",
         "游击队感知半径(0=按视野)",
@@ -238,6 +249,33 @@ class ConfigValidationError(ValueError):
         self.errors = errors
 
 
+def parse_team_ratio(raw: object) -> tuple[int, int, int, int] | None:
+    """Parse the 新兵分队比例 "守:攻:筝:游" into four non-negative ints.
+
+    Returns None when unset (empty) or malformed — callers treat None as the
+    legacy behavior (everything enlists into the home roster). A parsed but
+    all-zero ratio is a valid explicit "off" value with the same effect.
+    Accepts half/full-width colons and 1-4 entries; missing entries are 0.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip().replace("：", ":")
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) > 4:
+        return None
+    weights: list[int] = []
+    for part in parts:
+        value = part.strip()
+        if not value or not value.isdigit():
+            return None
+        weights.append(int(value))
+    while len(weights) < 4:
+        weights.append(0)
+    return weights[0], weights[1], weights[2], weights[3]
+
+
 def default_config() -> dict[str, int | bool | str]:
     return {field.key: field.default for field in CONFIG_FIELDS}
 
@@ -291,6 +329,8 @@ def validate_config(
                 errors[key] = "不能超过 200 个字符"
                 continue
             config[key] = raw_value.strip()
+            if field.key == "combat_team_ratio" and config[key] and parse_team_ratio(config[key]) is None:
+                errors[key] = "格式应为 守:攻:筝:游，如 2:1:1:1"
             continue
 
         if isinstance(raw_value, bool) or not isinstance(raw_value, int):
