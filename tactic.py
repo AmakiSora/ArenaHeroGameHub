@@ -1582,6 +1582,7 @@ def _plan_waypoint(
                     tuple(nearest.position),
                     obstacle_cells,
                     detail_prefix="waypoint-engage",
+                    cell_counts=cell_counts,
                 )
                 if moved is not None:
                     _waypoint_stuck.pop(uid, None)
@@ -3604,6 +3605,7 @@ def _plan_home_combat(
             tuple(nearest.position),
             obstacle_cells,
             detail_prefix=prefix,
+            cell_counts=cell_counts,
         )
         if moved is not None:
             return moved
@@ -3642,6 +3644,7 @@ def _plan_home_combat(
                         last_pos,
                         obstacle_cells,
                         detail_prefix="home-intercept",
+                        cell_counts=cell_counts,
                     )
                     if moved is not None:
                         return moved
@@ -3649,7 +3652,12 @@ def _plan_home_combat(
     dist_home = _manhattan(pos, core_pos)
     if dist_home > return_radius:
         moved = _move_towards(
-            unit, pos, core_pos, obstacle_cells, detail_prefix="home-return",
+            unit,
+            pos,
+            core_pos,
+            obstacle_cells,
+            detail_prefix="home-return",
+            cell_counts=cell_counts,
         )
         if moved is not None:
             return moved
@@ -3696,7 +3704,12 @@ def _plan_home_combat(
         return ("WAIT", f"home-hold {goal}")
     if pos != goal:
         moved = _move_towards(
-            unit, pos, goal, obstacle_cells, detail_prefix="home-patrol",
+            unit,
+            pos,
+            goal,
+            obstacle_cells,
+            detail_prefix="home-patrol",
+            cell_counts=cell_counts,
         )
         if moved is not None:
             return moved
@@ -3713,6 +3726,7 @@ def _plan_attack_combat(
     enemies: tuple,
     obstacle_cells: frozenset[tuple[int, int]],
     config: dict[str, Any],
+    cell_counts: Mapping | None = None,
 ) -> tuple[str, str]:
     """March as a group toward the configured destination; engage en route.
 
@@ -3861,6 +3875,7 @@ def _plan_attack_combat(
                 tuple(nearest.position),
                 obstacle_cells,
                 detail_prefix="attack-engage",
+                cell_counts=cell_counts,
             )
             if moved is not None:
                 return moved
@@ -3870,7 +3885,12 @@ def _plan_attack_combat(
         return ("WAIT", f"attack-hold-{mode} {target}")
 
     moved = _move_towards(
-        unit, pos, target, obstacle_cells, detail_prefix=f"attack-march-{mode}",
+        unit,
+        pos,
+        target,
+        obstacle_cells,
+        detail_prefix=f"attack-march-{mode}",
+        cell_counts=cell_counts,
     )
     if moved is not None:
         return moved
@@ -5247,6 +5267,7 @@ def _plan_vanguard(
             enemies=enemies,
             obstacle_cells=obstacle_cells,
             config=config,
+            cell_counts=cell_counts,
         )
     if team == "kite":
         return _plan_kite_combat(
@@ -5305,6 +5326,7 @@ def _plan_ranger(
             enemies=enemies,
             obstacle_cells=obstacle_cells,
             config=config,
+            cell_counts=cell_counts,
         )
     if team == "kite":
         return _plan_kite_combat(
@@ -5373,6 +5395,21 @@ _enemy_clear_seq: int = 0
 # may not drift beyond (see core_max_drift). Persisted to map_memory.json so a
 # restart never re-anchors an already-migrated base.
 _core_anchor: tuple[int, int] | None = None
+# Last core step we issued: (pos, direction, tick). A CORE_DESTINATION_
+# TERRAIN_BLOCKED rejection on the next Tick is attributed to pos+delta so the
+# blocked cell lands in obstacle memory instead of being re-issued forever
+# (observed: 4900+ identical rejections while the base sat next to a wall).
+_core_pending_move: tuple[tuple[int, int], "Direction", int] | None = None
+# Tick until which automatic core movement is suppressed after a
+# CORE_ALREADY_MOVING rejection (usually a manual/auto command race): yield to
+# the other driver instead of re-issuing the same rejected start_move.
+_core_move_hold_until_tick: int = 0
+# Worker MOVE_CONTESTED repeat tracker: {uid: (pos, contested_cell, count)}.
+# Two workers whose deterministic plans submit the same cell every Tick cancel
+# both moves every Tick (observed 30+ identical rejections); after two
+# identical (pos, cell) rejections the worker backs off for one Tick so the
+# peer's move can finally land.
+_worker_contest_streak: dict[str, tuple[tuple[int, int], tuple[int, int], int]] = {}
 # Signature of the last dashboard map edits we absorbed (avoid re-applying every tick).
 _last_dashboard_map_sig: tuple | None = None
 # Track each worker's previous position to avoid backtracking
@@ -7217,6 +7254,56 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         core_mid_move = (
             getattr(getattr(core, "view", None), "state", None) == CoreState.MOVING
         )
+        global _core_pending_move, _core_move_hold_until_tick
+        global _core_anchor, _map_dirty
+        # Learn from last Tick's core move rejections. A terrain-blocked
+        # destination is a permanent wall the vision snapshot never reported,
+        # so record it in obstacle memory; otherwise the heading heuristic
+        # deterministically re-picks the same blocked step every Tick
+        # (observed 4900+ identical CORE_DESTINATION_TERRAIN_BLOCKED rows).
+        core_blocked_now: set[tuple[int, int]] = set()
+        for _ev in getattr(turn, "events", ()) or ():
+            if getattr(_ev, "actor_id", None) != core.id:
+                continue
+            if getattr(_ev, "event_type", "") not in (
+                "CORE_MOVE_FAILED",
+                "CORE_MOVE_START_FAILED",
+                "CORE_ACTION_FAILED",
+            ):
+                continue
+            _reason = getattr(_ev, "reason_code", None) or ""
+            if _reason != "CORE_DESTINATION_TERRAIN_BLOCKED":
+                if _reason == "CORE_ALREADY_MOVING":
+                    # Usually a manual/auto command race: yield the movement
+                    # slot briefly instead of re-issuing the rejected move.
+                    _core_move_hold_until_tick = turn_context.tick + 2
+                continue
+            _dest: tuple[int, int] | None = None
+            _pos_attr = getattr(_ev, "position", None)
+            if _pos_attr is not None:
+                _dest = (
+                    tuple(_pos_attr) if not isinstance(_pos_attr, tuple) else _pos_attr
+                )
+            _pending = _core_pending_move
+            if _dest is None or _manhattan(_dest, core_pos) != 1:
+                # The event cell is not the attempted destination (it may be
+                # the core's own cell); fall back to the remembered heading.
+                if _pending is not None and _pending[2] == turn_context.tick - 1:
+                    _dest = (
+                        _pending[0][0] + _pending[1].delta[0],
+                        _pending[0][1] + _pending[1].delta[1],
+                    )
+                else:
+                    _dest = None
+            if (
+                _dest is not None
+                and _manhattan(_dest, core_pos) == 1
+                and _dest not in _obstacle_memory
+                and _dest not in _resource_memory
+            ):
+                _obstacle_memory.add(_dest)
+                _map_dirty = True
+                core_blocked_now.add(_dest)
         # Stop if a cargo worker is close (any carrying worker heads home to
         # deposit), otherwise move toward them
         close_cargo = any(
@@ -7224,8 +7311,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             and _manhattan(w.position, core_pos) <= int(config["cargo_wait_distance"])
             for w in turn.workers
         )
-        if not close_cargo and not core_mid_move:
-            global _core_anchor, _map_dirty
+        if (
+            not close_cargo
+            and not core_mid_move
+            and turn_context.tick >= _core_move_hold_until_tick
+        ):
             # Drift leash: the automatic heuristic chases the worker/resource
             # mass center, and far-flung explorers keep pulling it outward
             # while the mining radius (worker_mine_max_distance) follows the
@@ -7289,7 +7379,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             # Try each direction (obstacle + dead-end aware)
             for d in dirs:
                 nx, ny = core_pos[0] + d.delta[0], core_pos[1] + d.delta[1]
-                if (nx, ny) in obstacle_cells:
+                if (nx, ny) in obstacle_cells or (nx, ny) in core_blocked_now:
                     continue
                 if (
                     max_drift > 0
@@ -7300,6 +7390,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 if _is_dead_end_step((nx, ny), obstacle_cells, allow=(target,)):
                     continue
                 core.start_move(d)
+                _core_pending_move = (tuple(core_pos), d, turn_context.tick)
                 core_action_name = f"MOVE_{d.name}"
                 core_done = True
                 break
@@ -7343,6 +7434,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     # from scratch every Tick (only repeat offenders survive), so it stays
     # bounded by the unit count and never carries stale entries.
     global _cell_limit_streak, _healing_units_prev, _heal_return_inflight
+    global _worker_contest_streak
     _failed_again: set[str] = set()
     for _ev in getattr(turn, "events", ()) or ():
         if (
@@ -7353,6 +7445,35 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             _failed_again.add(str(_ev.actor_id))
     _cell_limit_streak = {
         _key: _cell_limit_streak.get(_key, 0) + 1 for _key in _failed_again
+    }
+
+    # Worker MOVE_CONTESTED repeat bookkeeping: two workers whose deterministic
+    # plans submit the same cell every Tick cancel both moves every Tick. A
+    # worker rejected twice in a row from the same cell toward the same
+    # destination backs off for one Tick (worker branch below) so the peer's
+    # move can land. Same rebuild-from-scratch semantics as the streak above.
+    _worker_pos_by_id = {str(w.id): tuple(w.position) for w in turn.workers}
+    _contested_now: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {}
+    for _ev in getattr(turn, "events", ()) or ():
+        if (
+            getattr(_ev, "event_type", "") == "UNIT_MOVE_FAILED"
+            and getattr(_ev, "reason_code", None) == "MOVE_CONTESTED"
+            and getattr(_ev, "position", None) is not None
+        ):
+            _key = str(getattr(_ev, "actor_id", None))
+            _wpos = _worker_pos_by_id.get(_key)
+            if _wpos is None:
+                continue  # non-worker actors: kite has its own breaker
+            _contested_now[_key] = (_wpos, tuple(_ev.position))
+    _worker_contest_streak = {
+        _key: (
+            _cell,
+            _dest,
+            (_worker_contest_streak[_key][2] + 1)
+            if _worker_contest_streak.get(_key, ("", ""))[:2] == (_cell, _dest)
+            else 1,
+        )
+        for _key, (_cell, _dest) in _contested_now.items()
     }
 
     # Serialize core deliveries: exactly one carrier may contest the chute
@@ -7633,6 +7754,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 core_pos,
                 obstacle_cells,
                 detail_prefix="home-heal-return",
+                cell_counts=friendly_cell_counts,
             )
             if moved is not None:
                 unit_actions_detail[uid] = f"MOVE:{moved[1]}[heal-return]"
@@ -7684,6 +7806,18 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             unit_actions_detail[uid] = f"{action}:{detail}[waypoint]"
             continue
         if unit.unit_type == UnitType.WORKER:
+            # MOVE_CONTESTED backoff: rejected twice in a row from the same
+            # cell toward the same destination means a deterministic head-on
+            # with a peer worker. Sit this Tick out so the peer's move lands
+            # instead of cancelling both again; normal planning resumes next
+            # Tick (the streak resets once no contested rejection recurs).
+            _contest = _worker_contest_streak.get(uid)
+            if _contest is not None and _contest[2] >= 2:
+                unit.wait()
+                unit_actions_detail[uid] = (
+                    f"WAIT:contested-backoff {_contest[1]}"
+                )
+                continue
             _ut0 = time.monotonic()
             action, detail = _plan_worker(
                 unit, core,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import os
@@ -9420,6 +9421,384 @@ class CoreDriftLeashTests(unittest.TestCase):
             tactic._enemy_memory.update(prev[4])
             tactic._enemy_clear_seq = prev[5]
             tactic._known_obstacles = prev[6]
+
+
+class CoreTerrainBlockedLearningTests(unittest.TestCase):
+    """Regression from the remote battle log: a core step rejected with
+    CORE_DESTINATION_TERRAIN_BLOCKED was re-issued every Tick (4900+ identical
+    warn rows) because the blocked destination never reached obstacle memory.
+    The rejected cell must be learned once and the heading must move on."""
+
+    GLOBALS = (
+        "_dead_obstacles", "_dead_open_count", "_dead_set", "_dead_view",
+        "_dead_structure_built", "_known_obstacles", "_obstacle_memory",
+        "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
+        "_path_blockers_union", "_core_anchor", "_core_pending_move",
+        "_core_move_hold_until_tick", "_map_dirty", "_object_names",
+        "_object_name_counters",
+    )
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name))
+                      for name in self.GLOBALS}
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            # Shallow-copy mutable snapshots: several globals (obstacle memory,
+            # name registries, path caches) are mutated in place by the code
+            # under test, so restoring the original reference would be a no-op.
+            setattr(tactic, name, copy.copy(val))
+
+    def _run(self, *, core_pos, worker_pos, tick, events=(), config=None,
+             anchor=None):
+        """One Tick; returns (core_action, issued_start_moves, details)."""
+        moves: list = []
+        core = SimpleNamespace(
+            id="core", position=core_pos, hp=5, shield=10,
+            view=SimpleNamespace(state=CoreState.NORMAL),
+            spawn=lambda unit_type: None,
+            heal=lambda: None,
+            repair_shield=lambda: None,
+            pickup_beacon=lambda: None,
+            start_move=lambda direction: moves.append(direction),
+            wait=lambda: None,
+        )
+        worker = SimpleNamespace(
+            id="worker-1", unit_type=UnitType.WORKER, position=worker_pos,
+            cargo=0, direction=None,
+        )
+        worker.move = lambda direction: None
+        worker.wait = lambda: None
+        beacon = SimpleNamespace(
+            position=None, status=SimpleNamespace(name="GROUND"),
+        )
+        turn = SimpleNamespace(
+            tick=tick,
+            units=(worker,),
+            workers=(worker,),
+            vanguards=(),
+            rangers=(),
+            visible_enemies=(),
+            core=core,
+            resources=50,
+            resource_cells=frozenset(),
+            resource_space=0,
+            beacon=beacon,
+            state=SimpleNamespace(population=8),
+            events=tuple(events),
+            obstacle_cells=frozenset(),
+        )
+        config = config or default_config()
+        config["target_workers"] = 1
+        config["target_vanguards"] = 0
+        config["target_rangers"] = 0
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        tactic._core_anchor = anchor
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            with patch.object(tactic, "load_config", return_value=config), \
+                 patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
+                 patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
+                 patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"), \
+                 patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"), \
+                 patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"):
+                tactic._map_dirty = False
+                core_action, details = tactic.choose_actions(turn)
+        return core_action, moves, details
+
+    def test_blocked_destination_is_learned_and_skipped(self) -> None:
+        config = default_config()
+        config["core_max_drift"] = 0
+        self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=1, config=config,
+        )
+        self.assertEqual(tactic._core_pending_move, ((0, 0), Direction.RIGHT, 1))
+
+        event = SimpleNamespace(
+            event_type="CORE_MOVE_FAILED",
+            reason_code="CORE_DESTINATION_TERRAIN_BLOCKED",
+            actor_id="core", target_id=None, position=(1, 0), values={},
+        )
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=2, events=[event],
+            config=config,
+        )
+        self.assertIn((1, 0), tactic._obstacle_memory)
+        self.assertEqual(moves, [])
+        self.assertEqual(action, "WAIT")
+
+    def test_blocked_destination_derived_from_pending_move(self) -> None:
+        # Server reports the failure on the core's own cell instead of the
+        # destination: the remembered heading (pos + delta) must be learned.
+        config = default_config()
+        config["core_max_drift"] = 0
+        self._run(core_pos=(0, 0), worker_pos=(500, 0), tick=1, config=config)
+
+        event = SimpleNamespace(
+            event_type="CORE_MOVE_START_FAILED",
+            reason_code="CORE_DESTINATION_TERRAIN_BLOCKED",
+            actor_id="core", target_id=None, position=(0, 0), values={},
+        )
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=2, events=[event],
+            config=config,
+        )
+        self.assertIn((1, 0), tactic._obstacle_memory)
+        self.assertEqual(moves, [])
+
+    def test_unknown_destination_without_fresh_pending_is_not_learned(self) -> None:
+        # No prior step this Tick-1 and the event cell is not adjacent to the
+        # core: nothing may be guessed into obstacle memory.
+        config = default_config()
+        config["core_max_drift"] = 0
+        event = SimpleNamespace(
+            event_type="CORE_MOVE_FAILED",
+            reason_code="CORE_DESTINATION_TERRAIN_BLOCKED",
+            actor_id="core", target_id=None, position=(0, 0), values={},
+        )
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=7, events=[event],
+            config=config,
+        )
+        self.assertNotIn((1, 0), tactic._obstacle_memory)
+        self.assertEqual(moves, [Direction.RIGHT])
+
+    def test_already_moving_event_engages_short_cooldown(self) -> None:
+        config = default_config()
+        config["core_max_drift"] = 0
+        event = SimpleNamespace(
+            event_type="CORE_MOVE_FAILED",
+            reason_code="CORE_ALREADY_MOVING",
+            actor_id="core", target_id=None, position=(0, 0), values={},
+        )
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=1, events=[event],
+            config=config,
+        )
+        self.assertEqual(tactic._core_move_hold_until_tick, 3)
+        self.assertEqual(moves, [])
+        self.assertEqual(action, "WAIT")
+
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=2, config=config,
+        )
+        self.assertEqual(moves, [])
+
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=3, config=config,
+        )
+        self.assertEqual(moves, [Direction.RIGHT])
+        self.assertEqual(action, "MOVE_RIGHT")
+
+    def test_blocked_resource_cell_is_never_learned(self) -> None:
+        # A protocol quirk must not wall off a remembered mine permanently.
+        config = default_config()
+        config["core_max_drift"] = 0
+        original_resources = set(tactic._resource_memory)
+        tactic._resource_memory.add((1, 0))
+        try:
+            event = SimpleNamespace(
+                event_type="CORE_MOVE_FAILED",
+                reason_code="CORE_DESTINATION_TERRAIN_BLOCKED",
+                actor_id="core", target_id=None, position=(1, 0), values={},
+            )
+            action, moves, _ = self._run(
+                core_pos=(0, 0), worker_pos=(500, 0), tick=2, events=[event],
+                config=config,
+            )
+            self.assertNotIn((1, 0), tactic._obstacle_memory)
+            self.assertEqual(moves, [Direction.RIGHT])
+        finally:
+            tactic._resource_memory.clear()
+            tactic._resource_memory.update(original_resources)
+
+
+class WorkerContestedBackoffTests(unittest.TestCase):
+    """Two workers whose deterministic plans submit the same cell every Tick
+    cancel both moves every Tick (MOVE_CONTESTED). After two identical
+    (pos, destination) rejections a worker must sit one Tick out."""
+
+    GLOBALS = (
+        "_dead_obstacles", "_dead_open_count", "_dead_set", "_dead_view",
+        "_dead_structure_built", "_known_obstacles", "_obstacle_memory",
+        "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
+        "_path_blockers_union", "_core_anchor", "_worker_contest_streak",
+        "_cell_limit_streak", "_object_names", "_object_name_counters",
+        "_worker_path_cache", "_combat_path_cache", "_worker_last_pos",
+        "_worker_recent", "_resource_assignments",
+    )
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name))
+                      for name in self.GLOBALS}
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            # Shallow-copy mutable snapshots: several globals (obstacle memory,
+            # name registries, path caches) are mutated in place by the code
+            # under test, so restoring the original reference would be a no-op.
+            setattr(tactic, name, copy.copy(val))
+
+    def _run(self, *, tick, events=()):
+        """One Tick with one cargo worker heading home; returns details."""
+        core = SimpleNamespace(
+            id="core", position=(0, 0), hp=5, shield=10,
+            view=SimpleNamespace(state=CoreState.NORMAL),
+            spawn=lambda unit_type: None,
+            heal=lambda: None,
+            repair_shield=lambda: None,
+            pickup_beacon=lambda: None,
+            start_move=lambda direction: None,
+            wait=lambda: None,
+        )
+        worker = SimpleNamespace(
+            id="worker-1", unit_type=UnitType.WORKER, position=(5, 0),
+            cargo=1, direction=None,
+        )
+        worker.move = lambda direction: None
+        worker.wait = lambda: None
+        beacon = SimpleNamespace(
+            position=None, status=SimpleNamespace(name="GROUND"),
+        )
+        turn = SimpleNamespace(
+            tick=tick,
+            units=(worker,),
+            workers=(worker,),
+            vanguards=(),
+            rangers=(),
+            visible_enemies=(),
+            core=core,
+            resources=50,
+            resource_cells=frozenset(),
+            resource_space=3,
+            beacon=beacon,
+            state=SimpleNamespace(population=8),
+            events=tuple(events),
+            obstacle_cells=frozenset(),
+        )
+        config = default_config()
+        config["target_workers"] = 1
+        config["target_vanguards"] = 0
+        config["target_rangers"] = 0
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            with patch.object(tactic, "load_config", return_value=config), \
+                 patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
+                 patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
+                 patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"), \
+                 patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"), \
+                 patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"):
+                tactic._map_dirty = False
+                _, details = tactic.choose_actions(turn)
+        return details
+
+    @staticmethod
+    def _contested_event() -> SimpleNamespace:
+        return SimpleNamespace(
+            event_type="UNIT_MOVE_FAILED",
+            reason_code="MOVE_CONTESTED",
+            actor_id="worker-1", target_id=None, position=(4, 0), values={},
+        )
+
+    def test_repeat_contested_rejection_backs_off_one_tick(self) -> None:
+        # Tick 1: first contested rejection -> streak 1 -> normal planning.
+        details = self._run(tick=1, events=[self._contested_event()])
+        self.assertEqual(tactic._worker_contest_streak["worker-1"][2], 1)
+        self.assertTrue(
+            any(v.startswith("MOVE") for v in details.values()), details,
+        )
+
+        # Tick 2: same cell, same destination -> streak 2 -> backoff wait.
+        details = self._run(tick=2, events=[self._contested_event()])
+        self.assertEqual(tactic._worker_contest_streak["worker-1"][2], 2)
+        self.assertIn("worker-1", details)
+        self.assertTrue(
+            details["worker-1"].startswith("WAIT:contested-backoff"), details,
+        )
+
+        # Tick 3: no fresh rejection -> streak resets -> normal planning.
+        details = self._run(tick=3)
+        self.assertEqual(tactic._worker_contest_streak, {})
+        self.assertTrue(
+            any(v.startswith("MOVE") for v in details.values()), details,
+        )
+
+    def test_non_worker_actors_never_enter_the_worker_tracker(self) -> None:
+        event = SimpleNamespace(
+            event_type="UNIT_MOVE_FAILED",
+            reason_code="MOVE_CONTESTED",
+            actor_id="vanguard-9", target_id=None, position=(4, 0), values={},
+        )
+        self._run(tick=1, events=[event])
+        self.assertEqual(tactic._worker_contest_streak, {})
+
+
+class CapacityAwareCombatMoveTests(unittest.TestCase):
+    """Home/heal/attack planners must not steer into a cell the server will
+    reject as CELL_UNIT_LIMIT: _move_towards callers now pass cell_counts."""
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name)) for name in (
+            "_combat_path_cache", "_worker_last_pos",
+        )}
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            # Shallow-copy mutable snapshots: several globals (obstacle memory,
+            # name registries, path caches) are mutated in place by the code
+            # under test, so restoring the original reference would be a no-op.
+            setattr(tactic, name, copy.copy(val))
+
+    def _unit(self, moves: list):
+        unit = SimpleNamespace(id="u1", position=(0, 0))
+        unit.move = lambda direction: moves.append(direction)
+        return unit
+
+    def test_packed_next_cell_blocks_a_straight_corridor(self) -> None:
+        # Goal due east through a packed cell with no side street: no move at
+        # all beats re-issuing the doomed step every Tick.
+        moves: list = []
+        result = tactic._move_towards(
+            self._unit(moves),
+            (0, 0),
+            (2, 0),
+            frozenset(),
+            detail_prefix="test",
+            cell_counts={(1, 0): tactic._CELL_UNIT_LIMIT},
+        )
+        self.assertIsNone(result)
+        self.assertEqual(moves, [])
+
+    def test_packed_next_cell_reroutes_to_a_free_axis(self) -> None:
+        # Goal (2,2) with (1,0) packed: the planner must step DOWN (the free
+        # axis) instead of pushing into the packed cell.
+        moves: list = []
+        result = tactic._move_towards(
+            self._unit(moves),
+            (0, 0),
+            (2, 2),
+            frozenset(),
+            detail_prefix="test",
+            cell_counts={(1, 0): tactic._CELL_UNIT_LIMIT},
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(moves, [Direction.DOWN])
+
+    def test_unpacked_corridor_still_moves(self) -> None:
+        moves: list = []
+        result = tactic._move_towards(
+            self._unit(moves),
+            (0, 0),
+            (2, 0),
+            frozenset(),
+            detail_prefix="test",
+            cell_counts={(1, 0): 1},
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(moves, [Direction.RIGHT])
 
 
 if __name__ == "__main__":
