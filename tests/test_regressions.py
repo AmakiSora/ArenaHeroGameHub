@@ -10007,7 +10007,7 @@ class AttackRegroupTests(unittest.TestCase):
         "_dead_structure_built", "_known_obstacles", "_obstacle_memory",
         "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
         "_path_blockers_union", "_combat_path_cache", "_worker_last_pos",
-        "_object_names", "_object_name_counters",
+        "_object_names", "_object_name_counters", "_attack_regroup_ids",
     )
 
     def setUp(self) -> None:
@@ -10108,6 +10108,76 @@ class AttackRegroupTests(unittest.TestCase):
         )
         self.assertIsNone(result)
         self.assertEqual(moves, [])
+
+    def test_long_march_step_avoids_immediate_backtrack(self) -> None:
+        # The unit came from the north (its only strictly-closer cell): the
+        # anti-backtrack pass must steer sideways instead of bouncing.
+        moves: list = []
+        unit = self._unit((0, 0), moves, [])
+        tactic._worker_last_pos["u1"] = (0, -1)
+        result = tactic._long_march_step(
+            unit, (0, 0), (0, -5), frozenset(),
+            detail_prefix="test",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(moves, [Direction.RIGHT])
+
+    def test_long_march_step_backtracks_only_when_boxed(self) -> None:
+        # Every forward/side cell walled: going back is allowed as last resort.
+        moves: list = []
+        unit = self._unit((0, 0), moves, [])
+        tactic._worker_last_pos["u1"] = (0, -1)
+        result = tactic._long_march_step(
+            unit, (0, 0), (0, -5), frozenset({(1, 0), (0, 1), (-1, 0)}),
+            detail_prefix="test",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(moves, [Direction.UP])
+
+    def test_regroup_is_sticky_until_core_arrival(self) -> None:
+        # Once the march failed and regrouping started, the target march must
+        # NOT be re-attempted each Tick (that A-B-A'd at wall corners).
+        moves: list = []
+        waits: list = []
+        unit = self._unit((5000, -6000), moves, waits)
+        calls: list = []
+
+        def fake_move_towards(*args, **kwargs):
+            calls.append(1)
+            return None
+
+        config = self._config((-337, -800))
+        with patch.object(tactic, "_move_towards", side_effect=fake_move_towards):
+            tactic._plan_attack_combat(
+                unit, unit_kind="ranger", enemies=(),
+                obstacle_cells=frozenset(), config=config,
+                core_pos=(-245, -239),
+            )
+            tactic._plan_attack_combat(
+                unit, unit_kind="ranger", enemies=(),
+                obstacle_cells=frozenset(), config=config,
+                core_pos=(-245, -239),
+            )
+        self.assertEqual(len(calls), 1)  # march attempted only before the flag
+        self.assertEqual(moves, [Direction.DOWN, Direction.DOWN])
+        self.assertIn("u1", tactic._attack_regroup_ids)
+        self.assertEqual(waits, [])
+
+    def test_regroup_arrival_clears_flag(self) -> None:
+        moves: list = []
+        waits: list = []
+        unit = self._unit((-245, -239), moves, waits)
+        tactic._attack_regroup_ids.add("u1")
+        with patch.object(tactic, "_move_towards", return_value=None):
+            action, detail = tactic._plan_attack_combat(
+                unit, unit_kind="ranger", enemies=(),
+                obstacle_cells=frozenset(), config=self._config((-337, -800)),
+                core_pos=(-245, -239),
+            )
+        self.assertNotIn("u1", tactic._attack_regroup_ids)
+        self.assertEqual(moves, [])
+        self.assertEqual(waits, [True])
+        self.assertIn("attack-blocked", detail)
 
 
 if __name__ == "__main__":

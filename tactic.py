@@ -3153,19 +3153,30 @@ def _long_march_step(
     best: Direction | None = None
     best_dist: int | None = None
     blocked = frozenset(extra_obstacles)
-    for direction in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
-        npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
-        if npos in obstacle_cells or npos in blocked:
-            continue
-        if cell_counts is not None:
-            if cell_counts.get(npos, 0) >= _CELL_UNIT_LIMIT:
+    last = _worker_last_pos.get(str(unit.id))
+    # Two passes: the first skips the cell the unit just came from so a
+    # two-cell pocket cannot bounce the step back and forth; the second pass
+    # allows going back when every forward cell is walled (boxed in).
+    for allow_backtrack in (False, True):
+        best = None
+        best_dist = None
+        for direction in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+            npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+            if npos in obstacle_cells or npos in blocked:
                 continue
-        if _is_dead_end_step(npos, obstacle_cells):
-            continue
-        dist = _manhattan(npos, goal)
-        if best_dist is None or dist < best_dist:
-            best_dist = dist
-            best = direction
+            if not allow_backtrack and last is not None and npos == last:
+                continue
+            if cell_counts is not None:
+                if cell_counts.get(npos, 0) >= _CELL_UNIT_LIMIT:
+                    continue
+            if _is_dead_end_step(npos, obstacle_cells):
+                continue
+            dist = _manhattan(npos, goal)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = direction
+        if best is not None:
+            break
     if best is None:
         return None
     unit.move(best)
@@ -3825,6 +3836,28 @@ def _plan_attack_combat(
 
     mode = str(config.get("attack_mode", "coords"))
     attack_radius = max(int(config.get("attack_auto_radius", 0) or 0), 0)
+    # Sticky home-recovery: once this unit's march has failed it keeps walking
+    # to the Core and must NOT re-attempt the target march each Tick — at a
+    # wall corner the two planners otherwise flip the unit back and forth
+    # forever (observed: UP regroup / DOWN march alternating 60+ Ticks).
+    # Recovery clears on arrival at the Core cell, where the passive HEAL
+    # repairs it and the target is back within pathing budget.
+    if str(unit.id) in _attack_regroup_ids:
+        if core_pos is None or pos == tuple(core_pos):
+            _attack_regroup_ids.discard(str(unit.id))
+        else:
+            step = _long_march_step(
+                unit,
+                pos,
+                core_pos,
+                obstacle_cells,
+                detail_prefix="attack-regroup",
+                cell_counts=cell_counts,
+            )
+            if step is not None:
+                return step
+            unit.wait()
+            return ("WAIT", f"attack-regroup-boxed {core_pos}")
     # Squad-wide outnumbered-retreat verdict (set once per Tick in
     # choose_actions from the full enemy view + squad centroid). In auto mode a
     # True verdict short-circuits all engagement: the squad disengages away from
@@ -3974,9 +4007,10 @@ def _plan_attack_combat(
     # neighbours are walled): switch to home-squad recovery instead of waiting
     # forever. Walk toward the Core with the distance-independent greedy step,
     # heal on the Core cell once arrived, and re-march the target when it is
-    # back within pathing budget. Near the Core the plain blocked-wait stands —
-    # wandering into the chute ring would disrupt unloading.
-    if core_pos is not None and _manhattan(pos, core_pos) > 2:
+    # back within pathing budget. The regroup flag is sticky (see top of this
+    # function) so the two planners cannot flip-flop at a wall corner.
+    if core_pos is not None and _manhattan(pos, core_pos) > 0:
+        _attack_regroup_ids.add(str(unit.id))
         regroup = _long_march_step(
             unit,
             pos,
@@ -5505,6 +5539,13 @@ _core_move_hold_until_tick: int = 0
 # identical (pos, cell) rejections the worker backs off for one Tick so the
 # peer's move can finally land.
 _worker_contest_streak: dict[str, tuple[tuple[int, int], tuple[int, int], int]] = {}
+# Attack-team units currently in sticky home-recovery (regroup) mode: once a
+# march has failed, keep walking home until the Core cell is reached instead of
+# re-attempting the target march every Tick (that A-B-A'd against the regroup
+# step at wall corners — observed 60+ identical UP/DOWN flips). Entries linger
+# after unit death (bounded by total units ever regrouped; new units carry
+# fresh UUIDs so stale ids can never mis-arm a respawn).
+_attack_regroup_ids: set[str] = set()
 # Signature of the last dashboard map edits we absorbed (avoid re-applying every tick).
 _last_dashboard_map_sig: tuple | None = None
 # Track each worker's previous position to avoid backtracking
