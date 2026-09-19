@@ -3200,12 +3200,15 @@ def _attack_regroup_step(
     2x2 box beside a diagonal wall line — every westward cell walled, so the
     distance-ranked greedy lapped the box with no escape). Instead run a real
     A* with a budget scaled to the distance; the found path is cached per
-    unit+goal so the one-off cost amortises across Ticks. The all-direction
-    greedy step remains the fallback when even the scaled budget finds no
-    path (or the unit is boxed), and its anti-backtrack passes still beat
-    waiting in place.
+    unit+goal so the one-off cost amortises across Ticks. The budget must be
+    generous: A* fills the equal-f plateau around concave wall clusters near
+    the start, needing ~40-60x the Manhattan distance in expansions even for
+    a near-straight path (observed: a 11539-cell beeline required ~500k
+    expansions; 4x distance failed). The all-direction greedy step remains
+    the fallback when even the scaled budget finds no path (or the unit is
+    boxed), and its anti-backtrack passes still beat waiting in place.
     """
-    budget = min(60000, _manhattan(pos, core_pos) * 4 + 2000)
+    budget = min(1_500_000, max(50_000, _manhattan(pos, core_pos) * 60))
     moved = _move_towards(
         unit,
         pos,
