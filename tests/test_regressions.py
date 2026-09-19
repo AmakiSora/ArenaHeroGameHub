@@ -9582,14 +9582,21 @@ class CoreAxisDegenerateTargetTests(unittest.TestCase):
                 core_action, _ = tactic.choose_actions(turn)
         return core_action, moves
 
-    def test_row_aligned_target_with_walled_east_cell_sidesteps(self) -> None:
-        # Target due east, east neighbour walled: must sidestep (DOWN/UP)
-        # instead of waiting forever.
+    def test_row_aligned_target_with_walled_east_cell_routes_via_ast(self) -> None:
+        # Target due east, east neighbour walled: the Core takes the first step
+        # of the real A* detour (cached) instead of jittering perpendicular.
         action, moves = self._run(
             core_pos=(0, 0), target=(500, 0), walls={(1, 0)},
         )
-        self.assertEqual(moves, [Direction.DOWN])
-        self.assertEqual(action, "MOVE_DOWN")
+        self.assertEqual(len(moves), 1)
+        self.assertNotEqual(moves[0], Direction.RIGHT)
+        self.assertEqual(action, f"MOVE_{moves[0].name}")
+        cpath = tactic._core_target_path_cache.get("path") or []
+        # Loose bound: near-optimal route past the wall (dead-end closure may
+        # stretch the optimum by a few cells; exact length is tie-break).
+        self.assertLessEqual(len(cpath), 510)
+        self.assertNotIn((1, 0), cpath)  # route avoids the wall
+        self.assertEqual(moves[0].delta, (cpath[1][0], cpath[1][1]))
 
     def test_column_aligned_target_with_walled_south_cell_sidesteps(self) -> None:
         action, moves = self._run(
@@ -9604,15 +9611,20 @@ class CoreAxisDegenerateTargetTests(unittest.TestCase):
         self.assertEqual(moves, [Direction.RIGHT])
         self.assertEqual(action, "MOVE_RIGHT")
 
-    def test_perpendicular_candidates_respect_walls_too(self) -> None:
-        # East walled AND both perpendicular cells walled: no candidate left,
-        # the Core legitimately waits (fully boxed row).
+    def test_perpendicular_candidates_walled_routes_around_via_ast(self) -> None:
+        # East walled AND both perpendicular cells walled: the local box no
+        # longer traps the Core — A* routes around the wall cluster entirely
+        # (the old greedy behaviour waited forever in this spot).
         action, moves = self._run(
             core_pos=(0, 0), target=(500, 0),
             walls={(1, 0), (0, 1), (0, -1)},
         )
-        self.assertEqual(moves, [])
-        self.assertEqual(action, "WAIT")
+        self.assertEqual(len(moves), 1)
+        self.assertNotIn(moves[0], (Direction.RIGHT, Direction.DOWN, Direction.UP))
+        cpath = tactic._core_target_path_cache.get("path") or []
+        self.assertTrue(cpath)
+        self.assertFalse(set(cpath) & {(1, 0), (0, 1), (0, -1)})
+        self.assertEqual(moves[0].delta, (cpath[1][0], cpath[1][1]))
 
 
 class CoreTerrainBlockedLearningTests(unittest.TestCase):
@@ -10204,6 +10216,129 @@ class AttackRegroupTests(unittest.TestCase):
         self.assertEqual(moves, [])
         self.assertEqual(waits, [True])
         self.assertIn("attack-blocked", detail)
+
+
+class CoreManualTargetAstDetourTests(unittest.TestCase):
+    """Regression: with a manual core target sharing the core's row, a wall
+    band spanning the perpendicular fallback made the Core jitter vertically
+    forever (observed: bouncing (-225,-238)/(-225,-239), zero eastward
+    progress for a whole window). The Core must route with a real A* toward
+    the target when its primary heading is walled."""
+
+    GLOBALS = (
+        "_dead_obstacles", "_dead_open_count", "_dead_set", "_dead_view",
+        "_dead_structure_built", "_known_obstacles", "_obstacle_memory",
+        "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
+        "_path_blockers_union", "_core_anchor", "_core_pending_move",
+        "_core_move_hold_until_tick", "_map_dirty", "_object_names",
+        "_object_name_counters", "_core_target_path_cache",
+    )
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name))
+                      for name in self.GLOBALS}
+        tactic._obstacle_memory = set()
+        tactic._known_obstacles = frozenset()
+        tactic._reset_dead_structure(frozenset())
+        tactic._dead_end_cache_key = None
+        tactic._dead_end_cache = frozenset()
+        tactic._path_blockers_union_key = None
+        tactic._path_blockers_union = frozenset()
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    def _run(self, *, core_pos, target, walls=(), tick=1):
+        moves: list = []
+        core = SimpleNamespace(
+            id="core", position=core_pos, hp=5, shield=10,
+            view=SimpleNamespace(state=CoreState.NORMAL),
+            spawn=lambda unit_type: None,
+            heal=lambda: None,
+            repair_shield=lambda: None,
+            pickup_beacon=lambda: None,
+            start_move=lambda direction: moves.append(direction),
+            wait=lambda: None,
+        )
+        worker = SimpleNamespace(
+            id="worker-1", unit_type=UnitType.WORKER, position=(-500, -500),
+            cargo=0, direction=None,
+        )
+        worker.move = lambda direction: None
+        worker.wait = lambda: None
+        beacon = SimpleNamespace(
+            position=None, status=SimpleNamespace(name="GROUND"),
+        )
+        turn = SimpleNamespace(
+            tick=tick,
+            units=(worker,),
+            workers=(worker,),
+            vanguards=(),
+            rangers=(),
+            visible_enemies=(),
+            core=core,
+            resources=50,
+            resource_cells=frozenset(),
+            resource_space=0,
+            beacon=beacon,
+            state=SimpleNamespace(population=8),
+            events=(),
+            obstacle_cells=frozenset(),
+        )
+        config = default_config()
+        config["target_workers"] = 1
+        config["target_vanguards"] = 0
+        config["target_rangers"] = 0
+        config["core_max_drift"] = 0
+        config["core_target_enabled"] = True
+        config["core_target_x"] = target[0]
+        config["core_target_y"] = target[1]
+        tactic._obstacle_memory = set(walls)
+        tactic._known_obstacles = frozenset(walls)
+        tactic._reset_dead_structure(frozenset(walls))
+        tactic._dead_end_cache_key = None
+        tactic._dead_end_cache = frozenset()
+        tactic._path_blockers_union_key = None
+        tactic._path_blockers_union = frozenset()
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        tactic._core_anchor = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            with patch.object(tactic, "load_config", return_value=config),                  patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"),                  patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"),                  patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"),                  patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"),                  patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"):
+                tactic._map_dirty = False
+                core_action, _ = tactic.choose_actions(turn)
+        return core_action, moves
+
+    def test_walled_east_band_routes_via_ast_detour(self) -> None:
+        # East heading walled by a vertical band: the Core must take the A*
+        # detour step (not the perpendicular jitter, which would bounce
+        # forever between the two cells beside the wall).
+        walls = {(1, 0), (1, 1), (1, -1)}
+        action, moves = self._run(core_pos=(0, 0), target=(10, 0), walls=walls)
+        self.assertEqual(len(moves), 1)
+        expected_path = tactic._bfs_path(
+            (0, 0), (10, 0), frozenset(walls), max_steps=50_000,
+        )
+        self.assertIsNotNone(expected_path)
+        first_step = expected_path[1]
+        self.assertEqual(moves[0].delta, (first_step[0], first_step[1]))
+        self.assertTrue(tactic._core_target_path_cache.get("path"))
+        self.assertEqual(action, f"MOVE_{moves[0].name}")
+
+    def test_open_east_heading_skips_ast(self) -> None:
+        moves: list = []
+        calls: list = []
+
+        def fake_bfs(*args, **kwargs):
+            calls.append(1)
+            return None
+
+        with patch.object(tactic, "_bfs_path", side_effect=fake_bfs):
+            action, moves = self._run(core_pos=(0, 0), target=(10, 0))
+        self.assertEqual(moves, [Direction.RIGHT])
+        self.assertEqual(calls, [])  # straight heading needs no pathfinding
 
 
 if __name__ == "__main__":

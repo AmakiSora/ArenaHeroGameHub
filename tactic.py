@@ -5590,6 +5590,10 @@ _worker_contest_streak: dict[str, tuple[tuple[int, int], tuple[int, int], int]] 
 # after unit death (bounded by total units ever regrouped; new units carry
 # fresh UUIDs so stale ids can never mis-arm a respawn).
 _attack_regroup_ids: set[str] = set()
+# Cached A* path for the manual core target (goal + full cell path). Reused
+# while the Core stays on it; recomputed when the target changes, the Core
+# leaves the path, or a newly learned wall blocks the next step.
+_core_target_path_cache: dict[str, Any] = {}
 # Signature of the last dashboard map edits we absorbed (avoid re-applying every tick).
 _last_dashboard_map_sig: tuple | None = None
 # Track each worker's previous position to avoid backtracking
@@ -7567,8 +7571,65 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 dirs.extend((Direction.DOWN, Direction.UP))
             elif dy != 0 and dx == 0:
                 dirs.extend((Direction.RIGHT, Direction.LEFT))
-            # Try each direction (obstacle + dead-end aware)
-            for d in dirs:
+            # Manual-target mode with the primary heading walled: the
+            # perpendicular fallback candidates only jitter the Core vertically
+            # when the wall spans them too (observed: core bouncing between
+            # (-225,-238)/(-225,-239) with zero eastward progress against a
+            # two-cell wall band). Route with a real A* toward the target —
+            # budget scaled to distance, path cached per goal and recomputed
+            # when the Core leaves the cached path or a new wall blocks it.
+            # Auto mode keeps the greedy heading (it is leash-constrained).
+            _core_astep = None
+            if (
+                core_target_enabled
+                and dirs
+                and (
+                    (core_pos[0] + dirs[0].delta[0], core_pos[1] + dirs[0].delta[1])
+                    in obstacle_cells
+                    or _is_dead_end_step(
+                        (core_pos[0] + dirs[0].delta[0], core_pos[1] + dirs[0].delta[1]),
+                        obstacle_cells,
+                        allow=(target,),
+                    )
+                )
+            ):
+                cpos = tuple(core_pos)
+                nxt = None
+                if _core_target_path_cache.get("goal") == tuple(target):
+                    cpath = _core_target_path_cache.get("path") or []
+                    if cpos in cpath:
+                        cidx = cpath.index(cpos)
+                        if (
+                            0 <= cidx < len(cpath) - 1
+                            and cpath[cidx + 1] not in obstacle_cells
+                        ):
+                            nxt = cpath[cidx + 1]
+                if nxt is None:
+                    budget = min(
+                        1_500_000,
+                        max(50_000, _manhattan(cpos, tuple(target)) * 60),
+                    )
+                    cpath = _bfs_path(
+                        cpos, tuple(target), obstacle_cells, max_steps=budget
+                    )
+                    if cpath and len(cpath) > 1:
+                        _core_target_path_cache.update(
+                            {"goal": tuple(target), "path": cpath}
+                        )
+                        nxt = cpath[1]
+                if nxt is not None:
+                    _core_astep = (nxt[0] - core_pos[0], nxt[1] - core_pos[1])
+            if _core_astep is not None:
+                for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+                    if d.delta == _core_astep:
+                        core.start_move(d)
+                        _core_pending_move = (tuple(core_pos), d, turn_context.tick)
+                        core_action_name = f"MOVE_{d.name}"
+                        core_done = True
+                        break
+            # Try each direction (obstacle + dead-end aware). Skipped when the
+            # A* detour already issued this Tick's core move.
+            for d in (dirs if _core_astep is None else []):
                 nx, ny = core_pos[0] + d.delta[0], core_pos[1] + d.delta[1]
                 if (nx, ny) in obstacle_cells or (nx, ny) in core_blocked_now:
                     continue
