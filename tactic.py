@@ -3154,10 +3154,12 @@ def _long_march_step(
     best_dist: int | None = None
     blocked = frozenset(extra_obstacles)
     last = _worker_last_pos.get(str(unit.id))
-    # Two passes: the first skips the cell the unit just came from so a
-    # two-cell pocket cannot bounce the step back and forth; the second pass
-    # allows going back when every forward cell is walled (boxed in).
-    for allow_backtrack in (False, True):
+    # Three escalating passes: (1) the normal step — no backtrack, no dead-end
+    # cells; (2) escape pass — allow dead-end cells, because a unit that is
+    # already INSIDE a pocket can only leave through its flagged mouth (this
+    # trapped the regroup march in a 2x2 box, cycling forever); (3) last
+    # resort — also allow stepping back the way it came.
+    for allow_dead_end, allow_backtrack in ((False, False), (True, False), (True, True)):
         best = None
         best_dist = None
         for direction in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
@@ -3169,7 +3171,7 @@ def _long_march_step(
             if cell_counts is not None:
                 if cell_counts.get(npos, 0) >= _CELL_UNIT_LIMIT:
                     continue
-            if _is_dead_end_step(npos, obstacle_cells):
+            if not allow_dead_end and _is_dead_end_step(npos, obstacle_cells):
                 continue
             dist = _manhattan(npos, goal)
             if best_dist is None or dist < best_dist:

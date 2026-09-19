@@ -10122,6 +10122,29 @@ class AttackRegroupTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(moves, [Direction.RIGHT])
 
+    def test_long_march_step_escapes_through_dead_end_mouth(self) -> None:
+        # Unit sits inside a dead-end pocket with every non-mouth cell walled.
+        # The mouth cell is flagged dead-end, but it is the only way out — the
+        # escape pass must take it instead of cycling inside the pocket
+        # (observed: R4 boxed in a 2x2 pocket, cycling 4 cells forever).
+        moves: list = []
+        unit = self._unit((0, 0), moves, [])
+        walls = {(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1), (2, 0), (-1, 0)}
+        tactic._obstacle_memory = set(walls)
+        tactic._known_obstacles = frozenset()
+        tactic._reset_dead_structure(frozenset())
+        tactic._dead_end_cache_key = None
+        tactic._dead_end_cache = frozenset()
+        tactic._path_blockers_union_key = None
+        tactic._path_blockers_union = frozenset()
+        tactic._update_obstacle_memory(SimpleNamespace(obstacle_cells=walls))
+        result = tactic._long_march_step(
+            unit, (0, 0), (10, 0), frozenset(walls),
+            detail_prefix="test",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(moves, [Direction.RIGHT])
+
     def test_long_march_step_backtracks_only_when_boxed(self) -> None:
         # Every forward/side cell walled: going back is allowed as last resort.
         moves: list = []
