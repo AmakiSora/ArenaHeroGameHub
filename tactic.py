@@ -3128,6 +3128,51 @@ def _move_towards(
     return None
 
 
+def _long_march_step(
+    unit: Any,
+    pos: tuple[int, int],
+    goal: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    *,
+    detail_prefix: str,
+    cell_counts: Mapping | None = None,
+    extra_obstacles: Iterable[tuple[int, int]] = (),
+) -> tuple[str, str] | None:
+    """Distance-independent local march: one step toward ``goal``, any axis.
+
+    A* pathing (``_move_towards``) has a bounded expansion budget; a goal
+    thousands of cells away exceeds it every Tick and the unit stalls forever
+    (observed: attack-team units scattered up to 11k cells from the target
+    sat at ``attack-blocked`` for hours with no warn row at all). This helper
+    replaces pathing with a plain greedy step: rank the four neighbours by
+    Manhattan distance to the goal and take the best walkable one, so a unit
+    trapped far from home keeps making progress and the budget-free home
+    march eventually brings it back. Walls, enemy/packed cells and dead-end
+    pockets are still filtered; returns None only when fully boxed in.
+    """
+    best: Direction | None = None
+    best_dist: int | None = None
+    blocked = frozenset(extra_obstacles)
+    for direction in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
+        npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+        if npos in obstacle_cells or npos in blocked:
+            continue
+        if cell_counts is not None:
+            if cell_counts.get(npos, 0) >= _CELL_UNIT_LIMIT:
+                continue
+        if _is_dead_end_step(npos, obstacle_cells):
+            continue
+        dist = _manhattan(npos, goal)
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best = direction
+    if best is None:
+        return None
+    unit.move(best)
+    _worker_last_pos[str(unit.id)] = pos
+    return ("MOVE", f"{best.name} {detail_prefix} {goal}")
+
+
 def _vanguard_adjacent_sweep(
     vanguard: Any,
     pos: tuple[int, int],
@@ -3756,6 +3801,7 @@ def _plan_attack_combat(
     obstacle_cells: frozenset[tuple[int, int]],
     config: dict[str, Any],
     cell_counts: Mapping | None = None,
+    core_pos: tuple[int, int] | None = None,
 ) -> tuple[str, str]:
     """March as a group toward the configured destination; engage en route.
 
@@ -3923,6 +3969,24 @@ def _plan_attack_combat(
     )
     if moved is not None:
         return moved
+
+    # March failed (goal beyond the A* expansion budget, or the goal-ward
+    # neighbours are walled): switch to home-squad recovery instead of waiting
+    # forever. Walk toward the Core with the distance-independent greedy step,
+    # heal on the Core cell once arrived, and re-march the target when it is
+    # back within pathing budget. Near the Core the plain blocked-wait stands —
+    # wandering into the chute ring would disrupt unloading.
+    if core_pos is not None and _manhattan(pos, core_pos) > 2:
+        regroup = _long_march_step(
+            unit,
+            pos,
+            core_pos,
+            obstacle_cells,
+            detail_prefix="attack-regroup",
+            cell_counts=cell_counts,
+        )
+        if regroup is not None:
+            return regroup
 
     unit.wait()
     return ("WAIT", f"attack-blocked-{mode} {target}")
@@ -5297,6 +5361,7 @@ def _plan_vanguard(
             obstacle_cells=obstacle_cells,
             config=config,
             cell_counts=cell_counts,
+            core_pos=core_pos,
         )
     if team == "kite":
         return _plan_kite_combat(
@@ -5356,6 +5421,7 @@ def _plan_ranger(
             obstacle_cells=obstacle_cells,
             config=config,
             cell_counts=cell_counts,
+            core_pos=core_pos,
         )
     if team == "kite":
         return _plan_kite_combat(

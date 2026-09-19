@@ -9996,5 +9996,119 @@ class CapacityAwareCombatMoveTests(unittest.TestCase):
         self.assertEqual(moves, [Direction.RIGHT])
 
 
+class AttackRegroupTests(unittest.TestCase):
+    """Regression: attack-team units scattered beyond the A* expansion budget
+    (observed 11k cells) sat at WAIT:attack-blocked forever with no warn row
+    and never healed. On a failed march the unit must switch to home-squad
+    recovery: a distance-independent greedy march home, healing on arrival."""
+
+    GLOBALS = (
+        "_dead_obstacles", "_dead_open_count", "_dead_set", "_dead_view",
+        "_dead_structure_built", "_known_obstacles", "_obstacle_memory",
+        "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
+        "_path_blockers_union", "_combat_path_cache", "_worker_last_pos",
+        "_object_names", "_object_name_counters",
+    )
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name))
+                      for name in self.GLOBALS}
+        # Reset the persistent dead-end structure to an empty map.
+        tactic._obstacle_memory = set()
+        tactic._known_obstacles = frozenset()
+        tactic._reset_dead_structure(frozenset())
+        tactic._dead_end_cache_key = None
+        tactic._dead_end_cache = frozenset()
+        tactic._path_blockers_union_key = None
+        tactic._path_blockers_union = frozenset()
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    def _unit(self, pos, moves, waits):
+        unit = SimpleNamespace(id="u1", position=pos)
+        unit.move = lambda direction: moves.append(direction)
+        unit.wait = lambda: waits.append(True)
+        return unit
+
+    def _config(self, target):
+        config = default_config()
+        config["attack_mode"] = "coords"
+        config["attack_target_x"] = target[0]
+        config["attack_target_y"] = target[1]
+        return config
+
+    def test_blocked_march_far_from_core_regroups_home(self) -> None:
+        moves: list = []
+        waits: list = []
+        unit = self._unit((5000, -6000), moves, waits)
+        with patch.object(tactic, "_move_towards", return_value=None):
+            action, detail = tactic._plan_attack_combat(
+                unit,
+                unit_kind="ranger",
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self._config((-337, -800)),
+                core_pos=(-245, -239),
+            )
+        self.assertEqual(moves, [Direction.DOWN])
+        self.assertEqual(waits, [])
+        self.assertIn("attack-regroup", detail)
+
+    def test_blocked_march_at_core_keeps_waiting(self) -> None:
+        moves: list = []
+        waits: list = []
+        unit = self._unit((-245, -239), moves, waits)
+        with patch.object(tactic, "_move_towards", return_value=None):
+            action, detail = tactic._plan_attack_combat(
+                unit,
+                unit_kind="ranger",
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self._config((-337, -800)),
+                core_pos=(-245, -239),
+            )
+        self.assertEqual(moves, [])
+        self.assertEqual(waits, [True])
+        self.assertIn("attack-blocked", detail)
+
+    def test_long_march_step_picks_best_of_four_directions(self) -> None:
+        # Straight-ahead cell walled, diagonal goal: the other distance-
+        # reducing axis must be picked even though it is not the primary.
+        moves: list = []
+        unit = self._unit((0, 0), moves, [])
+        result = tactic._long_march_step(
+            unit, (0, 0), (5, 10), frozenset({(0, 1)}),
+            detail_prefix="test",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(moves, [Direction.RIGHT])
+
+    def test_long_march_step_respects_capacity(self) -> None:
+        # Both distance-reducing cells unavailable (wall + packed): the best
+        # remaining step is taken over waiting (sidestep out of the pocket).
+        moves: list = []
+        unit = self._unit((0, 0), moves, [])
+        result = tactic._long_march_step(
+            unit, (0, 0), (5, 10), frozenset({(0, 1)}),
+            detail_prefix="test",
+            cell_counts={(1, 0): tactic._CELL_UNIT_LIMIT},
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(moves, [Direction.UP])
+
+    def test_long_march_step_returns_none_when_boxed(self) -> None:
+        moves: list = []
+        unit = self._unit((0, 0), moves, [])
+        result = tactic._long_march_step(
+            unit, (0, 0), (0, 10),
+            frozenset({(0, 1), (1, 0), (0, -1), (-1, 0)}),
+            detail_prefix="test",
+        )
+        self.assertIsNone(result)
+        self.assertEqual(moves, [])
+
+
 if __name__ == "__main__":
     unittest.main()
