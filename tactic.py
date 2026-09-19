@@ -3186,6 +3186,47 @@ def _long_march_step(
     return ("MOVE", f"{best.name} {detail_prefix} {goal}")
 
 
+def _attack_regroup_step(
+    unit: Any,
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    *,
+    cell_counts: Mapping | None = None,
+) -> tuple[str, str] | None:
+    """One step of the attack-team home-recovery march toward the Core.
+
+    Pure greedy orbits around wall clusters forever (observed: R4 circled a
+    2x2 box beside a diagonal wall line — every westward cell walled, so the
+    distance-ranked greedy lapped the box with no escape). Instead run a real
+    A* with a budget scaled to the distance; the found path is cached per
+    unit+goal so the one-off cost amortises across Ticks. The all-direction
+    greedy step remains the fallback when even the scaled budget finds no
+    path (or the unit is boxed), and its anti-backtrack passes still beat
+    waiting in place.
+    """
+    budget = min(60000, _manhattan(pos, core_pos) * 4 + 2000)
+    moved = _move_towards(
+        unit,
+        pos,
+        core_pos,
+        obstacle_cells,
+        detail_prefix="attack-regroup",
+        cell_counts=cell_counts,
+        max_steps=budget,
+    )
+    if moved is not None:
+        return moved
+    return _long_march_step(
+        unit,
+        pos,
+        core_pos,
+        obstacle_cells,
+        detail_prefix="attack-regroup",
+        cell_counts=cell_counts,
+    )
+
+
 def _vanguard_adjacent_sweep(
     vanguard: Any,
     pos: tuple[int, int],
@@ -3848,12 +3889,11 @@ def _plan_attack_combat(
         if core_pos is None or pos == tuple(core_pos):
             _attack_regroup_ids.discard(str(unit.id))
         else:
-            step = _long_march_step(
+            step = _attack_regroup_step(
                 unit,
                 pos,
                 core_pos,
                 obstacle_cells,
-                detail_prefix="attack-regroup",
                 cell_counts=cell_counts,
             )
             if step is not None:
@@ -4013,12 +4053,11 @@ def _plan_attack_combat(
     # function) so the two planners cannot flip-flop at a wall corner.
     if core_pos is not None and _manhattan(pos, core_pos) > 0:
         _attack_regroup_ids.add(str(unit.id))
-        regroup = _long_march_step(
+        regroup = _attack_regroup_step(
             unit,
             pos,
             core_pos,
             obstacle_cells,
-            detail_prefix="attack-regroup",
             cell_counts=cell_counts,
         )
         if regroup is not None:

@@ -10158,15 +10158,16 @@ class AttackRegroupTests(unittest.TestCase):
         self.assertEqual(moves, [Direction.UP])
 
     def test_regroup_is_sticky_until_core_arrival(self) -> None:
-        # Once the march failed and regrouping started, the target march must
-        # NOT be re-attempted each Tick (that A-B-A'd at wall corners).
+        # Once the march failed and regrouping started, the TARGET march must
+        # NOT be re-attempted each Tick (that A-B-A'd at wall corners); the
+        # recovery march homes on the Core with a distance-scaled A* budget.
         moves: list = []
         waits: list = []
         unit = self._unit((5000, -6000), moves, waits)
         calls: list = []
 
-        def fake_move_towards(*args, **kwargs):
-            calls.append(1)
+        def fake_move_towards(unit_arg, pos, goal, *args, **kwargs):
+            calls.append((goal, kwargs.get("max_steps")))
             return None
 
         config = self._config((-337, -800))
@@ -10181,7 +10182,9 @@ class AttackRegroupTests(unittest.TestCase):
                 obstacle_cells=frozenset(), config=config,
                 core_pos=(-245, -239),
             )
-        self.assertEqual(len(calls), 1)  # march attempted only before the flag
+        self.assertEqual(calls[0][0], (-337, -800))  # first: target march
+        self.assertEqual(calls[1][0], (-245, -239))  # then: regroup home
+        self.assertGreater(calls[1][1], 2500)        # scaled budget, not default
         self.assertEqual(moves, [Direction.DOWN, Direction.DOWN])
         self.assertIn("u1", tactic._attack_regroup_ids)
         self.assertEqual(waits, [])
