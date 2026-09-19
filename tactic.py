@@ -7405,6 +7405,17 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 elif dy < 0: dirs.append(Direction.UP)
                 if dx > 0: dirs.append(Direction.RIGHT)
                 elif dx < 0: dirs.append(Direction.LEFT)
+            # Axis-degenerate fallback: when the target shares the Core's row or
+            # column, the builder above yields a single heading. If that cell is
+            # walled the candidate list empties and the Core waits forever
+            # (observed: target (362,-239) vs core (-292,-239) with the east
+            # cell in obstacle memory — silent stall, no warn rows at all).
+            # Offer the perpendicular axis as sidestep candidates; the obstacle/
+            # leash/dead-end checks below still filter each one.
+            if dx != 0 and dy == 0:
+                dirs.extend((Direction.DOWN, Direction.UP))
+            elif dy != 0 and dx == 0:
+                dirs.extend((Direction.RIGHT, Direction.LEFT))
             # Try each direction (obstacle + dead-end aware)
             for d in dirs:
                 nx, ny = core_pos[0] + d.delta[0], core_pos[1] + d.delta[1]

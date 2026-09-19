@@ -9494,6 +9494,127 @@ class CoreDriftLeashTests(unittest.TestCase):
             tactic._known_obstacles = prev[6]
 
 
+class CoreAxisDegenerateTargetTests(unittest.TestCase):
+    """Regression: a core target sharing the core's row/column yields a single
+    heading; when that cell is walled the candidate list empties and the Core
+    waits forever (silent stall — no warn rows). The perpendicular axis must be
+    offered as sidestep candidates so the Core can route around the wall."""
+
+    GLOBALS = (
+        "_dead_obstacles", "_dead_open_count", "_dead_set", "_dead_view",
+        "_dead_structure_built", "_known_obstacles", "_obstacle_memory",
+        "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
+        "_path_blockers_union", "_core_anchor", "_core_pending_move",
+        "_core_move_hold_until_tick", "_map_dirty", "_object_names",
+        "_object_name_counters",
+    )
+
+    def setUp(self) -> None:
+        # Copy at snapshot time: these globals are mutated in place by the
+        # code under test, so a reference snapshot would capture the pollution.
+        self._snap = {name: copy.copy(getattr(tactic, name))
+                      for name in self.GLOBALS}
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    def _run(self, *, core_pos, target, walls=(), tick=1):
+        moves: list = []
+        core = SimpleNamespace(
+            id="core", position=core_pos, hp=5, shield=10,
+            view=SimpleNamespace(state=CoreState.NORMAL),
+            spawn=lambda unit_type: None,
+            heal=lambda: None,
+            repair_shield=lambda: None,
+            pickup_beacon=lambda: None,
+            start_move=lambda direction: moves.append(direction),
+            wait=lambda: None,
+        )
+        worker = SimpleNamespace(
+            id="worker-1", unit_type=UnitType.WORKER, position=(-500, -500),
+            cargo=0, direction=None,
+        )
+        worker.move = lambda direction: None
+        worker.wait = lambda: None
+        beacon = SimpleNamespace(
+            position=None, status=SimpleNamespace(name="GROUND"),
+        )
+        turn = SimpleNamespace(
+            tick=tick,
+            units=(worker,),
+            workers=(worker,),
+            vanguards=(),
+            rangers=(),
+            visible_enemies=(),
+            core=core,
+            resources=50,
+            resource_cells=frozenset(),
+            resource_space=0,
+            beacon=beacon,
+            state=SimpleNamespace(population=8),
+            events=(),
+            obstacle_cells=frozenset(),
+        )
+        config = default_config()
+        config["target_workers"] = 1
+        config["target_vanguards"] = 0
+        config["target_rangers"] = 0
+        config["core_max_drift"] = 0
+        config["core_target_enabled"] = True
+        config["core_target_x"] = target[0]
+        config["core_target_y"] = target[1]
+        # Reset the persistent dead-end structure to cover exactly `walls`.
+        tactic._obstacle_memory = set(walls)
+        tactic._known_obstacles = frozenset()
+        tactic._reset_dead_structure(frozenset())
+        tactic._dead_end_cache_key = None
+        tactic._dead_end_cache = frozenset()
+        tactic._path_blockers_union_key = None
+        tactic._path_blockers_union = frozenset()
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        tactic._core_anchor = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            with patch.object(tactic, "load_config", return_value=config),                  patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"),                  patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"),                  patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"),                  patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"),                  patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"):
+                tactic._map_dirty = False
+                core_action, _ = tactic.choose_actions(turn)
+        return core_action, moves
+
+    def test_row_aligned_target_with_walled_east_cell_sidesteps(self) -> None:
+        # Target due east, east neighbour walled: must sidestep (DOWN/UP)
+        # instead of waiting forever.
+        action, moves = self._run(
+            core_pos=(0, 0), target=(500, 0), walls={(1, 0)},
+        )
+        self.assertEqual(moves, [Direction.DOWN])
+        self.assertEqual(action, "MOVE_DOWN")
+
+    def test_column_aligned_target_with_walled_south_cell_sidesteps(self) -> None:
+        action, moves = self._run(
+            core_pos=(0, 0), target=(0, 500), walls={(0, 1)},
+        )
+        self.assertEqual(moves, [Direction.RIGHT])
+        self.assertEqual(action, "MOVE_RIGHT")
+
+    def test_free_straight_heading_is_unchanged(self) -> None:
+        # No wall on the direct heading: behaviour identical to before.
+        action, moves = self._run(core_pos=(0, 0), target=(500, 0))
+        self.assertEqual(moves, [Direction.RIGHT])
+        self.assertEqual(action, "MOVE_RIGHT")
+
+    def test_perpendicular_candidates_respect_walls_too(self) -> None:
+        # East walled AND both perpendicular cells walled: no candidate left,
+        # the Core legitimately waits (fully boxed row).
+        action, moves = self._run(
+            core_pos=(0, 0), target=(500, 0),
+            walls={(1, 0), (0, 1), (0, -1)},
+        )
+        self.assertEqual(moves, [])
+        self.assertEqual(action, "WAIT")
+
+
 class CoreTerrainBlockedLearningTests(unittest.TestCase):
     """Regression from the remote battle log: a core step rejected with
     CORE_DESTINATION_TERRAIN_BLOCKED was re-issued every Tick (4900+ identical
@@ -9596,8 +9717,10 @@ class CoreTerrainBlockedLearningTests(unittest.TestCase):
             config=config,
         )
         self.assertIn((1, 0), tactic._obstacle_memory)
-        self.assertEqual(moves, [])
-        self.assertEqual(action, "WAIT")
+        # Learned wall removes the straight heading; the axis-degenerate
+        # fallback must sidestep (perpendicular axis) instead of stalling.
+        self.assertEqual(moves, [Direction.DOWN])
+        self.assertEqual(action, "MOVE_DOWN")
 
     def test_blocked_destination_derived_from_pending_move(self) -> None:
         # Server reports the failure on the core's own cell instead of the
@@ -9616,7 +9739,8 @@ class CoreTerrainBlockedLearningTests(unittest.TestCase):
             config=config,
         )
         self.assertIn((1, 0), tactic._obstacle_memory)
-        self.assertEqual(moves, [])
+        self.assertEqual(moves, [Direction.DOWN])
+        self.assertEqual(action, "MOVE_DOWN")
 
     def test_unknown_destination_without_fresh_pending_is_not_learned(self) -> None:
         # No prior step this Tick-1 and the event cell is not adjacent to the
