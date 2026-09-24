@@ -10020,6 +10020,7 @@ class AttackRegroupTests(unittest.TestCase):
         "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
         "_path_blockers_union", "_combat_path_cache", "_worker_last_pos",
         "_object_names", "_object_name_counters", "_attack_regroup_ids",
+        "_chute_in_demand",
     )
 
     def setUp(self) -> None:
@@ -10216,6 +10217,69 @@ class AttackRegroupTests(unittest.TestCase):
         self.assertEqual(moves, [])
         self.assertEqual(waits, [True])
         self.assertIn("attack-blocked", detail)
+
+    def test_regroup_ring_holds_when_chute_in_demand(self) -> None:
+        # Observed 1588+ Tick chute deadlock: two full-HP attack units kept
+        # re-boarding the core cell from the ring (regroup target = the cell
+        # itself), winning the server's cell race against the queued carrier
+        # every Tick — zero deposits, spawn squatter-blocked, economy frozen.
+        # With carriers hauling, a full-HP regroup unit adjacent to the Core
+        # must hold at the ring instead of stepping onto the chute.
+        moves: list = []
+        waits: list = []
+        unit = self._unit((-244, -239), moves, waits)
+        unit.hp = 2  # full HP for the default max — no heal reason to board
+        tactic._attack_regroup_ids.add("u1")
+        tactic._chute_in_demand = True
+        with patch.object(tactic, "_move_towards", return_value=None):
+            action, detail = tactic._plan_attack_combat(
+                unit, unit_kind="ranger", enemies=(),
+                obstacle_cells=frozenset(), config=self._config((-337, -800)),
+                core_pos=(-245, -239),
+            )
+        self.assertEqual(moves, [])
+        self.assertEqual(waits, [True])
+        self.assertIn("attack-regroup-ring", detail)
+        # The failed march re-arms the sticky flag; next Tick re-holds cheaply.
+        self.assertIn("u1", tactic._attack_regroup_ids)
+
+    def test_wounded_regroup_still_claims_core_cell(self) -> None:
+        # A wounded regroup unit adjacent to the Core keeps boarding the chute:
+        # on-cell passive healing outranks the deposit queue (healer-hold).
+        moves: list = []
+        waits: list = []
+        unit = self._unit((-244, -239), moves, waits)
+        unit.hp = 1
+        tactic._attack_regroup_ids.add("u1")
+        tactic._chute_in_demand = True
+        with patch.object(tactic, "_move_towards", return_value=None):
+            action, detail = tactic._plan_attack_combat(
+                unit, unit_kind="ranger", enemies=(),
+                obstacle_cells=frozenset(), config=self._config((-337, -800)),
+                core_pos=(-245, -239),
+            )
+        self.assertEqual(moves, [Direction.LEFT])
+        self.assertEqual(waits, [])
+        self.assertIn("attack-regroup", detail)
+
+    def test_regroup_ring_requires_carrier_demand(self) -> None:
+        # Without hauling carriers there is no chute contention: the ring hold
+        # must not fire and the unit walks onto the Core cell as before.
+        moves: list = []
+        waits: list = []
+        unit = self._unit((-244, -239), moves, waits)
+        unit.hp = 2
+        tactic._attack_regroup_ids.add("u1")
+        tactic._chute_in_demand = False
+        with patch.object(tactic, "_move_towards", return_value=None):
+            action, detail = tactic._plan_attack_combat(
+                unit, unit_kind="ranger", enemies=(),
+                obstacle_cells=frozenset(), config=self._config((-337, -800)),
+                core_pos=(-245, -239),
+            )
+        self.assertEqual(moves, [Direction.LEFT])
+        self.assertEqual(waits, [])
+        self.assertIn("attack-regroup", detail)
 
 
 class CoreManualTargetAstDetourTests(unittest.TestCase):

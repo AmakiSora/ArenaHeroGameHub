@@ -3186,6 +3186,14 @@ def _long_march_step(
     return ("MOVE", f"{best.name} {detail_prefix} {goal}")
 
 
+def _regroup_needs_core_cell(unit: Any, config: Mapping) -> bool:
+    """True when a regrouping unit still has a reason to stand on the core
+    cell itself (healing); False when stopping at the ring loses nothing."""
+    return bool(config.get("heal_enabled", True)) and int(
+        getattr(unit, "hp", 0) or 0
+    ) < _unit_max_hp(unit)
+
+
 def _attack_regroup_step(
     unit: Any,
     pos: tuple[int, int],
@@ -3193,6 +3201,7 @@ def _attack_regroup_step(
     obstacle_cells: frozenset[tuple[int, int]],
     *,
     cell_counts: Mapping | None = None,
+    config: Mapping | None = None,
 ) -> tuple[str, str] | None:
     """One step of the attack-team home-recovery march toward the Core.
 
@@ -3208,6 +3217,21 @@ def _attack_regroup_step(
     the fallback when even the scaled budget finds no path (or the unit is
     boxed), and its anti-backtrack passes still beat waiting in place.
     """
+    if (
+        config is not None
+        and _chute_in_demand
+        and _manhattan(pos, core_pos) <= 1
+        and not _regroup_needs_core_cell(unit, config)
+    ):
+        # Deposit-chute priority: with carriers hauling, the core cell belongs
+        # to the delivery pipeline. A full-HP regroup unit stepping onto it
+        # wins the server's cell race against the queued carrier every Tick
+        # (observed: two full-HP attack units swap-occupied the chute 1588+
+        # Ticks — zero deposits, spawn squatter-blocked, the whole economy
+        # frozen). Stop at the ring; a wounded unit still claims the cell.
+        unit.wait()
+        _set_unit_route(unit, core_pos, [tuple(pos)], complete=True)
+        return ("WAIT", f"attack-regroup-ring {core_pos}")
     budget = min(1_500_000, max(50_000, _manhattan(pos, core_pos) * 60))
     moved = _move_towards(
         unit,
@@ -3889,7 +3913,20 @@ def _plan_attack_combat(
     # Recovery clears on arrival at the Core cell, where the passive HEAL
     # repairs it and the target is back within pathing budget.
     if str(unit.id) in _attack_regroup_ids:
-        if core_pos is None or pos == tuple(core_pos):
+        if (
+            core_pos is None
+            or pos == tuple(core_pos)
+            or (
+                _chute_in_demand
+                and _manhattan(pos, core_pos) <= 1
+                and not _regroup_needs_core_cell(unit, config)
+            )
+        ):
+            # Arrival clears recovery. With carriers hauling the chute, the
+            # ring already counts as home: recovery must release the unit so
+            # the march (or engagement) is re-planned instead of pressing the
+            # core cell every Tick — the deposit queue never wins that cell
+            # race (observed 1588+ Tick chute deadlock).
             _attack_regroup_ids.discard(str(unit.id))
         else:
             step = _attack_regroup_step(
@@ -3898,6 +3935,7 @@ def _plan_attack_combat(
                 core_pos,
                 obstacle_cells,
                 cell_counts=cell_counts,
+                config=config,
             )
             if step is not None:
                 return step
@@ -4062,6 +4100,7 @@ def _plan_attack_combat(
             core_pos,
             obstacle_cells,
             cell_counts=cell_counts,
+            config=config,
         )
         if regroup is not None:
             return regroup
