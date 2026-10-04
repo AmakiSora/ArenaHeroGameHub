@@ -1257,6 +1257,40 @@ def _worker_cached_path_step(
     return ("MOVE", f"{bfs_dir.name} -> {goal}")
 
 
+def _cargo_home_budget(
+    uid: str,
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    min_budget: int,
+) -> int | None:
+    """A* expansion budget for a loaded worker's route home, or None to skip the search.
+
+    The flat ``bfs_max_steps`` (2500) is exhausted long before the Core on any
+    real return trip, and the greedy fallback that then takes over laps an
+    8-cell box beside a wall band instead of closing distance (observed: 7
+    carriers 270..1083 cells out, each burning exactly the 2500-expansion cap
+    every Tick for an hour; 6 deposits in 343 Ticks, storage 44 -> 2). A* fills
+    the equal-f plateau around concave wall clusters, so the budget scales with
+    the distance the way the attack-regroup march does — 29..32x was what the
+    real map memory actually needed.
+
+    A far miss is remembered at the distance it happened: wall memory only ever
+    grows, so re-searching is only worth its cost once the carrier has closed
+    ``_CARGO_HOME_RETRY_GAP`` cells since. Near home the suppression is off,
+    because there a miss is usually transient congestion (the chute ring is
+    packed) rather than a wall, and freezing the route would strand the cargo.
+    """
+    dist = _manhattan(pos, core_pos)
+    failed_at = _cargo_route_miss_dist.get(uid)
+    if (
+        dist > _CARGO_HOME_MISS_FAR
+        and failed_at is not None
+        and failed_at - dist < _CARGO_HOME_RETRY_GAP
+    ):
+        return None
+    return min(_CARGO_HOME_BUDGET_MAX, max(min_budget, dist * _CARGO_HOME_BUDGET_FACTOR))
+
+
 def _enemy_unit_type_name(enemy: Any) -> str | None:
     """Return WORKER/VANGUARD/RANGER/CORE/None for a visible enemy object."""
     kind = getattr(enemy, "kind", None)
@@ -2172,6 +2206,7 @@ def _plan_worker(
     _worker_stuck_ticks[uid] = stuck
     if stuck >= _STUCK_THRESHOLD:
         _worker_path_cache.pop(uid, None)
+        _cargo_route_miss_dist.pop(uid, None)
         if not carrying or explore_mode:
             if goal is not None and tuple(goal) != core_pos:
                 _forget_resource(goal)
@@ -2216,13 +2251,35 @@ def _plan_worker(
                 # dead((O | X) - {g}) == dead(O | (X - {g})) when g not in O,
                 # so the blocked set is byte-identical — but no new frozenset.
                 extras_here = move_blocked - {goal}
-        path = _bfs_path(
-            pos,
-            goal,
-            obstacles_here,
-            max_steps=int(config["bfs_max_steps"]),
-            extras=extras_here,
+        cargo_home = carrying and goal == core_pos
+        search_budget = int(config["bfs_max_steps"])
+        run_search = True
+        if cargo_home:
+            scaled_budget = _cargo_home_budget(
+                uid, pos, core_pos, int(config["bfs_max_steps"])
+            )
+            if scaled_budget is None:
+                run_search = False
+            else:
+                search_budget = scaled_budget
+        path = (
+            _bfs_path(
+                pos,
+                goal,
+                obstacles_here,
+                max_steps=search_budget,
+                extras=extras_here,
+            )
+            if run_search
+            else None
         )
+        if cargo_home and run_search:
+            if path and len(path) > 1:
+                # Clear on any success: a stale miss record from a nearer cell
+                # would otherwise suppress every far retry for this carrier.
+                _cargo_route_miss_dist.pop(uid, None)
+            elif _manhattan(pos, core_pos) > _CARGO_HOME_MISS_FAR:
+                _cargo_route_miss_dist[uid] = _manhattan(pos, core_pos)
         if path and len(path) > 1:
             _worker_path_cache[uid] = {
                 "goal": tuple(goal),
@@ -3857,6 +3914,16 @@ def _plan_home_combat(
         unit.wait()
         _set_unit_route(unit, goal, [pos], complete=True)
         return ("WAIT", f"home-hold {goal}")
+    if _chute_in_demand and dist_home > 1 and _manhattan(goal, core_pos) <= 1:
+        # Chute hysteresis: chute-clear above pushed this defender outward to
+        # keep the unloading ring free, so it must not walk straight back onto
+        # it while carriers are still queued. Without this the two rules take
+        # turns every Tick (observed V8/V3: ``LEFT home-patrol`` / ``RIGHT
+        # chute-clear`` on 100% of Ticks, and the re-entry was itself rejected
+        # often enough to log 967 CELL_UNIT_LIMIT warns per 3000 Ticks).
+        unit.wait()
+        _set_unit_route(unit, goal, [pos], complete=False)
+        return ("WAIT", f"home-chute-hold {goal}")
     if pos != goal:
         moved = _move_towards(
             unit,
@@ -4350,6 +4417,12 @@ def _kite_choose_move(
     counts = cell_counts or {}
     enemy_cells = {tuple(enemy.position) for enemy in enemies}
     avoided = frozenset(avoid_cells)
+    # The cell this unit stood on when it last planned. Stepping back onto it is
+    # the A-B-A shuttle: with the stall unlock active every safe cell ties on
+    # progress, and the scan order (UP first) then sends the unit straight back
+    # where it came from (observed V11/V6: ``kite-route`` one Tick, ``kite-position``
+    # the reverse the next, 98% of Ticks, net displacement zero).
+    came_from = _kite_prev_pos.get(str(unit.id))
     choices: list[tuple[tuple, Direction | None, tuple[int, int], dict[str, Any]]] = []
     directions: tuple[Direction | None, ...] = (
         Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT, None,
@@ -4373,6 +4446,9 @@ def _kite_choose_move(
             direction is not None
             and _is_dead_end_step(cell, obstacle_cells, allow=(goal,))
         )
+        backtrack = int(
+            direction is not None and came_from is not None and cell == came_from
+        )
         # Never trade safety for progress. Once two cells are equally safe,
         # however, keep advancing instead of backing away forever from a
         # stationary/retreating melee target. Distance remains the stronger
@@ -4395,6 +4471,7 @@ def _kite_choose_move(
             -assessment["predicted_hits"],
             *tactical_ties,
             -dead_end,
+            -backtrack,
             int(direction is not None),
         )
         choices.append((score, direction, cell, {**assessment, "progress": progress}))
@@ -5643,6 +5720,18 @@ _resource_assignments: dict[str, tuple[int, int]] = {}
 # Worker A* path cache: reuse a computed path across ticks instead of recomputing
 # from scratch every tick. Keyed by full str(worker.id); entry {goal, path}.
 _worker_path_cache: dict[str, dict] = {}
+# Loaded workers whose far-from-home A* route to the Core missed, at the
+# distance where it missed. Wall memory only grows, so re-running a search that
+# costs tens of thousands of expansions is only worth it after real progress.
+_cargo_route_miss_dist: dict[str, int] = {}
+_CARGO_HOME_BUDGET_FACTOR = 60
+# Kept below the attack-regroup march's 1.5M cap: up to target_workers carriers
+# can each search in one Tick, so one route home must stay ~1s of planning.
+_CARGO_HOME_BUDGET_MAX = 200_000
+_CARGO_HOME_RETRY_GAP = 15
+# Within this range of the Core a missed route is usually transient congestion
+# around the unloading chute, not a wall, so the miss is not recorded at all.
+_CARGO_HOME_MISS_FAR = 30
 # Combat units use the same map search but keep a separate cache because their
 # goals change independently as enemies move or team assignments change.
 _combat_path_cache: dict[str, dict] = {}
@@ -5670,6 +5759,9 @@ _kite_stall_pos: dict[str, tuple[int, int]] = {}
 _kite_stall_ticks: dict[str, int] = {}
 _KITE_STALL_UNLOCK_TICKS = 12
 _KITE_STALL_DRIFT = 1
+# Where each kite unit stood when it last planned, so the single-step chooser
+# can rank a step back onto that cell below every other equally safe step.
+_kite_prev_pos: dict[str, tuple[int, int]] = {}
 
 
 def _record_kite_stall(uid: str, pos: tuple[int, int]) -> None:
@@ -5684,13 +5776,16 @@ def _record_kite_stall(uid: str, pos: tuple[int, int]) -> None:
     counts as a real move, resetting the counter and re-anchoring.
     """
     anchor = _kite_stall_pos.get(uid)
-    if anchor is not None:
-        drift = max(abs(pos[0] - anchor[0]), abs(pos[1] - anchor[1]))
-        if drift <= _KITE_STALL_DRIFT:
-            _kite_stall_ticks[uid] = _kite_stall_ticks.get(uid, 0) + 1
-            return
-    _kite_stall_pos[uid] = pos
-    _kite_stall_ticks[uid] = 0
+    if (
+        anchor is not None
+        and max(abs(pos[0] - anchor[0]), abs(pos[1] - anchor[1]))
+        <= _KITE_STALL_DRIFT
+    ):
+        _kite_stall_ticks[uid] = _kite_stall_ticks.get(uid, 0) + 1
+    else:
+        _kite_stall_pos[uid] = pos
+        _kite_stall_ticks[uid] = 0
+    _kite_prev_pos[uid] = pos
 
 
 # Friendly same-cell split memos: {uid: (contested_cell, origin, expire_tick)}.
@@ -5788,6 +5883,25 @@ _CELL_UNIT_LIMIT = 2
 # again survive), so it can neither grow unbounded nor go stale.
 _cell_limit_streak: dict[str, int] = {}
 _CELL_LIMIT_DETOUR_AFTER = 3
+# uid -> (cell, trips, valid_until_tick). One sidestep is not a break: the
+# patrol plan re-issues the rejected move the next Tick, so the breaker kept
+# producing one CELL_UNIT_LIMIT every _CELL_LIMIT_DETOUR_AFTER Ticks for 27,000
+# Ticks (V3 onto (685,-302)). While the window is open the cell is a wall for
+# this unit only; each repeat trip on the same cell doubles the window (up to
+# 8x), so a permanently packed cell is retried ever more rarely. Entries are
+# dropped with the unit itself (see _prune_dead_unit_state).
+_cell_limit_blocked: dict[str, tuple[tuple[int, int], int, int]] = {}
+_CELL_LIMIT_BLOCK_TICKS = 40
+
+
+def _cell_limit_block_cell(uid: str, tick: int) -> tuple[int, int] | None:
+    """The cell ``uid`` must treat as a wall this Tick, or None."""
+    block = _cell_limit_blocked.get(uid)
+    if block is None or block[2] <= tick:
+        return None
+    return block[0]
+
+
 # Cache of per-name home-team patrol slot indices. Keyed by (radius, sorted
 # roster tuple) so changing the roster or radius recomputes the assignment.
 # Prevents multiple home defenders from hashing onto the same patrol slot and
@@ -6988,6 +7102,10 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _resource_assignments.pop(dead_id, None)
     for dead_id in set(_worker_path_cache) - alive_ids:
         _worker_path_cache.pop(dead_id, None)
+    for dead_id in set(_cargo_route_miss_dist) - alive_ids:
+        _cargo_route_miss_dist.pop(dead_id, None)
+    for dead_id in set(_cell_limit_blocked) - alive_ids:
+        _cell_limit_blocked.pop(dead_id, None)
     for dead_id in set(_combat_path_cache) - alive_ids:
         _combat_path_cache.pop(dead_id, None)
     for dead_id in set(_home_engage_target) - alive_ids:
@@ -7004,6 +7122,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _kite_stall_pos.pop(dead_id, None)
     for dead_id in set(_kite_stall_ticks) - alive_ids:
         _kite_stall_ticks.pop(dead_id, None)
+    for dead_id in set(_kite_prev_pos) - alive_ids:
+        _kite_prev_pos.pop(dead_id, None)
     for dead_id in set(_kite_friendly_split) - alive_ids:
         _kite_friendly_split.pop(dead_id, None)
     for dead_id in set(_roam_pos_history) - alive_ids:
@@ -7724,9 +7844,10 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     # unit was rejected for moving onto a packed cell. The dict is rebuilt
     # from scratch every Tick (only repeat offenders survive), so it stays
     # bounded by the unit count and never carries stale entries.
-    global _cell_limit_streak, _healing_units_prev, _heal_return_inflight
-    global _worker_contest_streak
+    global _cell_limit_streak, _healing_units_prev
+    global _heal_return_inflight, _worker_contest_streak
     _failed_again: set[str] = set()
+    _failed_cell: dict[str, tuple[int, int]] = {}
     for _ev in getattr(turn, "events", ()) or ():
         if (
             getattr(_ev, "event_type", "") == "UNIT_MOVE_FAILED"
@@ -7734,6 +7855,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             and getattr(_ev, "actor_id", None) is not None
         ):
             _failed_again.add(str(_ev.actor_id))
+            if getattr(_ev, "position", None) is not None:
+                _failed_cell[str(_ev.actor_id)] = tuple(_ev.position)
     _cell_limit_streak = {
         _key: _cell_limit_streak.get(_key, 0) + 1 for _key in _failed_again
     }
@@ -8054,7 +8177,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         # CELL_UNIT_LIMIT retry breaker: rejected 3+ consecutive Ticks means
         # the planner deterministically re-issues the same blocked move. Force
         # one sidestep into any under-limit non-wall neighbour to break the
-        # loop; normal planning resumes once the unit stops being rejected.
+        # loop, and block that cell for this unit for a while so the planner
+        # stops re-issuing the move the moment the sidestep is over.
         # Workers are exempt: the delivery lease already rotates stuck
         # carriers and a forced detour would derail the chute pipeline.
         if (
@@ -8063,12 +8187,25 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             >= _CELL_LIMIT_DETOUR_AFTER
         ):
             _dpos = tuple(unit.position)
+            _rejected_cell = _failed_cell.get(str(unit.id))
+            if _rejected_cell is not None:
+                _prior = _cell_limit_blocked.get(str(unit.id))
+                _trips = (
+                    _prior[1] if _prior and _prior[0] == _rejected_cell else 0
+                )
+                _cell_limit_blocked[str(unit.id)] = (
+                    _rejected_cell,
+                    _trips + 1,
+                    turn.tick + _CELL_LIMIT_BLOCK_TICKS * min(2 ** _trips, 8),
+                )
             _detour_dir: Direction | None = None
             for _d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
                 _npos = (_dpos[0] + _d.delta[0], _dpos[1] + _d.delta[1])
                 if _npos in obstacle_cells or _npos in enemy_cells:
                     continue
                 if friendly_cell_counts.get(_npos, 0) >= _CELL_UNIT_LIMIT:
+                    continue
+                if _npos == _rejected_cell:
                     continue
                 _detour_dir = _d
                 break
@@ -8126,11 +8263,17 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             unit_actions_detail[uid] = f"{action}:{detail}"
         elif unit.unit_type == UnitType.VANGUARD:
             team = _combat_team_for(name, config)
+            _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
+            _unit_obstacles = (
+                obstacle_cells | {_blocked_cell}
+                if _blocked_cell is not None
+                else obstacle_cells
+            )
             _ut0 = time.monotonic()
             action, detail = _plan_vanguard(
                 unit,
                 enemies,
-                obstacle_cells,
+                _unit_obstacles,
                 config,
                 core_pos=tuple(core_pos),
                 team=team,
@@ -8140,11 +8283,17 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
         elif unit.unit_type == UnitType.RANGER:
             team = _combat_team_for(name, config)
+            _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
+            _unit_obstacles = (
+                obstacle_cells | {_blocked_cell}
+                if _blocked_cell is not None
+                else obstacle_cells
+            )
             _ut0 = time.monotonic()
             action, detail = _plan_ranger(
                 unit,
                 enemies,
-                obstacle_cells,
+                _unit_obstacles,
                 config,
                 core_pos=tuple(core_pos),
                 team=team,

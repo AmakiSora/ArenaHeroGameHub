@@ -10405,5 +10405,422 @@ class CoreManualTargetAstDetourTests(unittest.TestCase):
         self.assertEqual(calls, [])  # straight heading needs no pathfinding
 
 
+class CargoHomeAstBudgetTests(unittest.TestCase):
+    """A loaded worker must get an A* budget that scales with its distance home.
+
+    The flat ``bfs_max_steps`` (2500) was exhausted long before the Core on real
+    return trips: 7 carriers 270..1083 cells out each burned exactly the cap
+    every Tick, fell to the greedy step, and lapped an 8-cell box for an hour
+    (6 deposits in 343 Ticks, storage 44 -> 2). Replaying those 7 positions
+    against the live obstacle memory, the scaled budget found every route with a
+    single search per worker and walked them all home.
+    """
+
+    GLOBALS = (
+        "_dead_obstacles", "_dead_open_count", "_dead_set", "_dead_view",
+        "_dead_structure_built", "_known_obstacles", "_obstacle_memory",
+        "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
+        "_path_blockers_union", "_worker_path_cache", "_cargo_route_miss_dist",
+        "_worker_last_pos", "_worker_recent", "_resource_assignments",
+        "_chute_in_demand", "_chute_vacating_this_tick",
+    )
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name)) for name in self.GLOBALS}
+        tactic._worker_path_cache.clear()
+        tactic._cargo_route_miss_dist.clear()
+        tactic._worker_last_pos.clear()
+        tactic._worker_recent.clear()
+        tactic._resource_assignments.clear()
+        tactic._chute_in_demand = False
+        tactic._chute_vacating_this_tick = False
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    class _Worker:
+        def __init__(self, uid: str, pos, cargo: int = 1) -> None:
+            self.id = uid
+            self.position = pos
+            self.cargo = cargo
+            self.direction = None
+            self.waited = False
+
+        def move(self, direction) -> None:
+            self.direction = direction
+
+        def wait(self) -> None:
+            self.waited = True
+
+    def _plan(self, worker, *, obstacle_cells=frozenset(), resource_cells=frozenset(),
+              config=None, bfs_result="real"):
+        """Plan one Tick for ``worker``; return (action, detail, budgets).
+
+        ``budgets`` records the ``max_steps`` of every map search the planner ran,
+        which is what these regression tests assert on.
+        """
+        budgets: list[int] = []
+        real_bfs = tactic._bfs_path
+
+        def spy(start, goal, obstacles, max_steps=2500, **kwargs):
+            budgets.append(max_steps)
+            if bfs_result == "real":
+                return real_bfs(start, goal, obstacles, max_steps=max_steps, **kwargs)
+            return None
+
+        with patch.object(tactic, "_bfs_path", side_effect=spy):
+            action, detail = tactic._plan_worker(
+                worker,
+                SimpleNamespace(id="core", position=(0, 0)),
+                resource_cells=resource_cells,
+                obstacle_cells=obstacle_cells,
+                depleted=set(),
+                config=config or default_config(),
+            )
+        return action, detail, budgets
+
+    def test_far_carrier_searches_with_scaled_budget(self) -> None:
+        worker = self._Worker("carrier-far", (400, 0))
+        action, detail, budgets = self._plan(worker)
+        self.assertEqual(budgets, [400 * tactic._CARGO_HOME_BUDGET_FACTOR])
+        self.assertEqual(action, "MOVE")
+        self.assertIn("-> (0, 0)", detail)
+        self.assertEqual(worker.direction, Direction.LEFT)
+        # A full cached route, not the two-cell greedy step.
+        cached = tactic._worker_path_cache["carrier-far"]
+        self.assertEqual(len(cached["path"]), 401)
+
+    def test_carrier_budget_stays_capped(self) -> None:
+        worker = self._Worker("carrier-huge", (6000, 0))
+        _, _, budgets = self._plan(worker)
+        self.assertEqual(budgets, [tactic._CARGO_HOME_BUDGET_MAX])
+
+    def test_empty_worker_keeps_flat_budget(self) -> None:
+        # The scaling is for the home march only: 25 carriers is bounded work,
+        # every worker re-planning to a far mine every Tick is not.
+        worker = self._Worker("miner-far", (200, 0), cargo=0)
+        tactic._resource_assignments["miner-far"] = (600, 0)
+        config = default_config()
+        _, _, budgets = self._plan(
+            worker,
+            resource_cells=frozenset({(600, 0)}),
+            config=config,
+        )
+        self.assertEqual(budgets, [config["bfs_max_steps"]])
+
+    def test_far_miss_is_recorded_at_the_missed_distance(self) -> None:
+        worker = self._Worker("carrier-blocked", (400, 0))
+        action, detail, budgets = self._plan(worker, bfs_result="none")
+        self.assertEqual(budgets, [400 * tactic._CARGO_HOME_BUDGET_FACTOR])
+        self.assertEqual(tactic._cargo_route_miss_dist["carrier-blocked"], 400)
+        # The greedy march still takes over rather than parking the carrier.
+        self.assertEqual(action, "MOVE")
+        self.assertIn("-> (0, 0)", detail)
+
+    def test_far_retry_is_suppressed_until_the_carrier_closes(self) -> None:
+        tactic._cargo_route_miss_dist["carrier-blocked"] = 400
+        worker = self._Worker("carrier-blocked", (395, 0))
+        _, _, budgets = self._plan(worker)
+        self.assertEqual(budgets, [])
+        self.assertEqual(tactic._cargo_route_miss_dist["carrier-blocked"], 400)
+
+    def test_far_retry_resumes_after_real_progress(self) -> None:
+        tactic._cargo_route_miss_dist["carrier-blocked"] = 400
+        worker = self._Worker("carrier-blocked", (400 - tactic._CARGO_HOME_RETRY_GAP, 0))
+        _, _, budgets = self._plan(worker)
+        self.assertEqual(len(budgets), 1)
+        self.assertNotIn("carrier-blocked", tactic._cargo_route_miss_dist)
+
+    def test_near_home_miss_never_suppresses_the_search(self) -> None:
+        # Close to the Core a missed route is usually transient congestion at
+        # the unloading chute, not a wall: freezing the route would strand cargo.
+        tactic._cargo_route_miss_dist["carrier-near"] = 20
+        worker = self._Worker("carrier-near", (tactic._CARGO_HOME_MISS_FAR - 18, 0))
+        _, _, budgets = self._plan(worker, bfs_result="none")
+        self.assertEqual(len(budgets), 1)
+
+    def test_near_home_success_clears_a_stale_miss(self) -> None:
+        tactic._cargo_route_miss_dist["carrier-near"] = 20
+        worker = self._Worker("carrier-near", (12, 0))
+        self._plan(worker)
+        self.assertNotIn("carrier-near", tactic._cargo_route_miss_dist)
+
+
+class HomeChuteHysteresisTests(unittest.TestCase):
+    """A defender pushed off the unloading ring must not walk straight back.
+
+    chute-clear (yield the chute to queued carriers) and home-patrol (return to
+    the assigned slot) used to take turns: ``RIGHT chute-clear`` one Tick,
+    ``LEFT home-patrol`` the next, on 100% of Ticks for V8/V3 — and V3's
+    re-entry alone logged 967 CELL_UNIT_LIMIT warns per 3000 Ticks.
+    """
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name)) for name in (
+            "_object_names", "_object_name_counters", "_home_patrol_slot_cache",
+            "_worker_last_pos", "_combat_path_cache",
+        )}
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        tactic._home_patrol_slot_cache.clear()
+        tactic._worker_last_pos.clear()
+        tactic._combat_path_cache.clear()
+        tactic._chute_in_demand = False
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    def _plan(self, *, pos, chute_demand: bool):
+        tactic._chute_in_demand = chute_demand
+        unit = SimpleNamespace(
+            id="vang-1", unit_type=UnitType.VANGUARD, position=pos, hp=5,
+        )
+        unit.move = lambda direction: None
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_team"] = "V1"
+        config["home_patrol_radius"] = 1
+        return tactic._plan_home_combat(
+            unit,
+            unit_kind="vanguard",
+            enemies=(),
+            obstacle_cells=frozenset(),
+            core_pos=(0, 0),
+            config=config,
+        )
+
+    def test_slot_on_the_chute_ring_is_held_from_outside(self) -> None:
+        # The single home defender gets slot (0,-1) — one cell from the Core.
+        action, detail = self._plan(pos=(2, 0), chute_demand=True)
+        self.assertEqual(action, "WAIT")
+        self.assertIn("home-chute-hold", detail)
+        self.assertIn("(0, -1)", detail)
+
+    def test_patrol_resumes_without_delivery_demand(self) -> None:
+        action, detail = self._plan(pos=(2, 0), chute_demand=False)
+        self.assertEqual(action, "MOVE")
+        self.assertIn("home-patrol", detail)
+
+    def test_demand_does_not_park_a_defender_whose_slot_is_off_the_ring(self) -> None:
+        # "vanguard-6" hashes onto slot (1,-1) — distance 2 from the Core, so
+        # yielding the chute is none of its business and it keeps patrolling.
+        tactic._chute_in_demand = True
+        unit = SimpleNamespace(
+            id="vanguard-6", unit_type=UnitType.VANGUARD, position=(2, 0), hp=5,
+        )
+        unit.move = lambda direction: None
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 1
+        action, detail = tactic._plan_home_combat(
+            unit, unit_kind="vanguard", enemies=(), obstacle_cells=frozenset(),
+            core_pos=(0, 0), config=config,
+        )
+        self.assertEqual(action, "MOVE", detail)
+        self.assertIn("home-patrol", detail)
+
+
+class CellLimitCooldownBreakerTests(unittest.TestCase):
+    """The CELL_UNIT_LIMIT breaker must stop re-issuing the rejected move.
+
+    One forced sidestep was not a break: normal planning resumed the next Tick
+    and walked straight back onto the same packed cell, so a single defender
+    (V3 onto (685,-302)) logged one warn every three Ticks for 27,000 Ticks.
+    """
+
+    GLOBALS = (
+        "_cell_limit_streak", "_cell_limit_blocked", "_worker_contest_streak",
+        "_object_names", "_object_name_counters", "_combat_path_cache",
+        "_worker_last_pos", "_known_obstacles", "_obstacle_memory",
+        "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
+        "_path_blockers_union",
+    )
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name)) for name in self.GLOBALS}
+        tactic._cell_limit_streak = {}
+        tactic._cell_limit_blocked = {}
+        tactic._worker_contest_streak = {}
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        tactic._combat_path_cache.clear()
+        tactic._worker_last_pos.clear()
+        tactic._obstacle_memory = set()
+        tactic._known_obstacles = frozenset()
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    @staticmethod
+    def _rejected_event() -> SimpleNamespace:
+        return SimpleNamespace(
+            event_type="UNIT_MOVE_FAILED",
+            reason_code="CELL_UNIT_LIMIT",
+            actor_id="vang-1", target_id=None, position=(4, 0), values={},
+        )
+
+    def _run(self, *, tick, events=()):
+        core = SimpleNamespace(
+            id="core", position=(0, 0), hp=5, shield=10,
+            view=SimpleNamespace(state=CoreState.NORMAL),
+            spawn=lambda unit_type: None, heal=lambda: None,
+            repair_shield=lambda: None, pickup_beacon=lambda: None,
+            start_move=lambda direction: None, wait=lambda: None,
+        )
+        unit = SimpleNamespace(
+            id="vang-1", unit_type=UnitType.VANGUARD, position=(3, 0),
+            direction=None,
+        )
+        unit.move = lambda direction: None
+        unit.wait = lambda: None
+        turn = SimpleNamespace(
+            tick=tick, units=(unit,), workers=(), vanguards=(unit,), rangers=(),
+            visible_enemies=(), core=core, resources=50,
+            resource_cells=frozenset(), resource_space=3,
+            beacon=SimpleNamespace(position=None, status=SimpleNamespace(name="GROUND")),
+            state=SimpleNamespace(population=3), events=tuple(events),
+            obstacle_cells=frozenset(),
+        )
+        config = default_config()
+        config["target_workers"] = 0
+        config["target_vanguards"] = 1
+        config["target_rangers"] = 0
+        seen: dict[str, object] = {}
+        real_plan = tactic._plan_vanguard
+
+        def spy(vanguard, enemies, obstacle_cells, *args, **kwargs):
+            seen["obstacles"] = frozenset(obstacle_cells)
+            return real_plan(vanguard, enemies, obstacle_cells, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            with patch.object(tactic, "load_config", return_value=config), \
+                 patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
+                 patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
+                 patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"), \
+                 patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"), \
+                 patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"), \
+                 patch.object(tactic, "_plan_vanguard", side_effect=spy):
+                tactic._map_dirty = False
+                _, details = tactic.choose_actions(turn)
+        return details, seen
+
+
+    def _reject(self, ticks):
+        """Consecutive Ticks in which this vanguard is rejected from (4, 0)."""
+        details = {}
+        for tick in ticks:
+            details, _ = self._run(tick=tick, events=[self._rejected_event()])
+        return details
+
+    def test_rejects_below_the_threshold_do_not_block_the_cell(self) -> None:
+        self._run(tick=1, events=[self._rejected_event()])
+        self._run(tick=2, events=[self._rejected_event()])
+        self.assertEqual(tactic._cell_limit_streak["vang-1"], 2)
+        self.assertEqual(tactic._cell_limit_blocked, {})
+
+    def test_third_reject_trips_the_breaker_and_blocks_the_cell(self) -> None:
+        self._run(tick=1, events=[self._rejected_event()])
+        self._run(tick=2, events=[self._rejected_event()])
+        details, _ = self._run(tick=3, events=[self._rejected_event()])
+        self.assertEqual(tactic._cell_limit_blocked["vang-1"], (
+            (4, 0), 1, 3 + tactic._CELL_LIMIT_BLOCK_TICKS,
+        ))
+        self.assertIn("cell-limit-detour", details["vang-1"])
+
+    def test_blocked_cell_is_a_wall_while_the_window_is_open(self) -> None:
+        self._reject([1, 2, 3])
+        _, seen = self._run(tick=4)
+        self.assertIn((4, 0), seen["obstacles"])
+        _, seen = self._run(tick=2 + tactic._CELL_LIMIT_BLOCK_TICKS)
+        self.assertIn((4, 0), seen["obstacles"])
+        # Window closed: the cell is walkable again, it was never a wall.
+        _, seen = self._run(tick=3 + tactic._CELL_LIMIT_BLOCK_TICKS)
+        self.assertNotIn((4, 0), seen["obstacles"])
+
+    def test_repeat_trips_double_the_window(self) -> None:
+        self._reject([1, 2, 3])
+        self.assertEqual(tactic._cell_limit_blocked["vang-1"][1], 1)
+        # The trip works: the unit stops re-issuing the move, so its streak
+        # clears, and only a later rejection on the same cell earns a longer
+        # window.
+        self._run(tick=4)
+        self._reject([5, 6, 7])
+        self.assertEqual(tactic._cell_limit_blocked["vang-1"], (
+            (4, 0), 2, 7 + 2 * tactic._CELL_LIMIT_BLOCK_TICKS,
+        ))
+        self._run(tick=8)
+        self._reject([9, 10, 11])
+        self.assertEqual(tactic._cell_limit_blocked["vang-1"][1], 3)
+        self.assertEqual(
+            tactic._cell_limit_blocked["vang-1"][2],
+            11 + 4 * tactic._CELL_LIMIT_BLOCK_TICKS,
+        )
+
+
+class KiteBacktrackTieBreakTests(unittest.TestCase):
+    """The kite single-step chooser must not undo its own last step.
+
+    V11/V6 shuttled between two cells on 98% of Ticks: the A* route layer
+    (``kite-route``) stepped north, then from the next cell the route search
+    missed and ``kite-position`` scored every safe cell as a tie and took the
+    first in scan order — the cell it had just come from.
+    """
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name)) for name in (
+            "_kite_prev_pos", "_kite_stall_pos", "_kite_stall_ticks",
+            "_dead_end_cache_key", "_dead_end_cache",
+        )}
+        tactic._kite_prev_pos.clear()
+        tactic._kite_stall_pos.clear()
+        tactic._kite_stall_ticks.clear()
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    def _choose(self, *, came_from, stall_ticks=0, goal=(50, 0),
+                walls=((1, 0),), unit_id="kite-1", pos=(0, 0)):
+        unit = SimpleNamespace(id=unit_id, position=pos)
+        if came_from is not None:
+            tactic._kite_prev_pos[unit_id] = came_from
+        direction, _, _ = tactic._kite_choose_move(
+            unit, pos, goal, (), frozenset(walls), 3, None,
+            must_move=True, stall_ticks=stall_ticks,
+        )
+        return direction
+
+    def test_equal_progress_step_beats_stepping_back(self) -> None:
+        # UP (0,-1), DOWN (0,1) and LEFT (-1,0) all cost one cell of progress.
+        # UP is the cell the unit came from and would otherwise win on scan
+        # order; DOWN is next in the scan, so that is the step it must take.
+        self.assertEqual(self._choose(came_from=(0, -1)), Direction.DOWN)
+
+    def test_without_the_memory_the_scan_order_shuttles(self) -> None:
+        # Documents the old failure: with no came-from memory the tie resolves
+        # to the first scanned cell, which is the one it just left.
+        self.assertEqual(self._choose(came_from=None), Direction.UP)
+
+    def test_stall_unlocked_still_refuses_the_backtrack(self) -> None:
+        self.assertEqual(
+            self._choose(
+                came_from=(0, -1), stall_ticks=tactic._KITE_STALL_UNLOCK_TICKS
+            ),
+            Direction.DOWN,
+        )
+
+    def test_backtrack_is_only_a_tie_break(self) -> None:
+        # When stepping back is also the only step that advances, take it.
+        direction = self._choose(
+            came_from=(0, -1), goal=(0, -50),
+            walls=((1, 0), (-1, 0), (0, 1)), unit_id="kite-2",
+        )
+        self.assertEqual(direction, Direction.UP)
+
+
 if __name__ == "__main__":
     unittest.main()
