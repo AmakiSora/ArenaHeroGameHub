@@ -4471,8 +4471,11 @@ def _kite_choose_move(
             -assessment["predicted_hits"],
             *tactical_ties,
             -dead_end,
-            -backtrack,
+            # Any step outranks sitting still: a unit in a genuine cul-de-sac
+            # must be allowed to retreat the way it came. Among steps, the one
+            # that undoes the last move ranks lowest.
             int(direction is not None),
+            -backtrack,
         )
         choices.append((score, direction, cell, {**assessment, "progress": progress}))
     if not choices:
@@ -5415,6 +5418,19 @@ def _plan_kite_combat(
         ):
             route_blocked_steps.add(cell)
     route_blocked_steps.update(friendly_memo_cells)
+    # The route layer has to obey the same no-U-turn rule as the single-step
+    # chooser below. With only the chooser disciplined, the two disagreed and
+    # the unit cycled a 3-cell pocket instead of a 2-cell one (observed after
+    # that first fix: ``kite-position RIGHT`` one Tick, cached ``kite-route
+    # LEFT`` straight back the next). Applies only while the unit is stalled —
+    # a healthy march may legitimately double back.
+    _came_from = _kite_prev_pos.get(uid)
+    if (
+        _came_from is not None
+        and _came_from != pos
+        and _kite_stall_ticks.get(uid, 0) >= _KITE_STALL_UNLOCK_TICKS
+    ):
+        route_blocked_steps.add(_came_from)
     bfs_step = _move_towards(
         unit, pos, move_goal, obstacle_cells,
         detail_prefix="kite-route",

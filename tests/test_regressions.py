@@ -10822,5 +10822,78 @@ class KiteBacktrackTieBreakTests(unittest.TestCase):
         self.assertEqual(direction, Direction.UP)
 
 
+class KiteRouteNoUTurnRegressionTests(KiteTeamPlannerTests):
+    """A stalled kite unit must not have its U-turn served by the route layer.
+
+    Disciplining only ``kite-position`` moved the shuttle from two cells to
+    three: the chooser stepped east to escape, then the cached ``kite-route``
+    stepped straight back west. Both layers now honour the same no-U-turn rule
+    (tactic.py:5421), while a genuinely boxed unit still retreats.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._prev = dict(tactic._kite_prev_pos)
+        self._stalls = dict(tactic._kite_stall_ticks)
+        self._anchors = dict(tactic._kite_stall_pos)
+        self._paths = dict(tactic._combat_path_cache)
+        tactic._kite_prev_pos.clear()
+        tactic._kite_stall_ticks.clear()
+        tactic._kite_stall_pos.clear()
+        tactic._combat_path_cache.clear()
+
+    def tearDown(self):
+        tactic._kite_prev_pos.clear()
+        tactic._kite_prev_pos.update(self._prev)
+        tactic._kite_stall_ticks.clear()
+        tactic._kite_stall_ticks.update(self._stalls)
+        tactic._kite_stall_pos.clear()
+        tactic._kite_stall_pos.update(self._anchors)
+        tactic._combat_path_cache.clear()
+        tactic._combat_path_cache.update(self._paths)
+        super().tearDown()
+
+    def _plan(self, uid, pos, came_from, stall_ticks, obstacles):
+        tactic._kite_prev_pos[uid] = came_from
+        tactic._kite_stall_pos[uid] = came_from
+        tactic._kite_stall_ticks[uid] = stall_ticks
+        unit = self.unit(uid, pos)
+        # Goal due west, so the westward cell is also the one it came from.
+        config = dict(self.config)
+        config.update({"kite_target_x": -10, "kite_target_y": 0})
+        action, detail = tactic._plan_vanguard(
+            unit, (), frozenset(obstacles), config,
+            core_pos=(0, 0), team="kite",
+        )
+        return action, detail, unit
+
+    def test_route_step_back_is_refused_while_stalled(self) -> None:
+        # Goal is due west, so (0, 0) — the cell the unit came from — is the
+        # natural route step. South (1, 1) is open and leads around.
+        walls = {(-1, 0), (0, -1), (1, -1)}
+        action, detail, unit = self._plan(
+            "kite-uturn", (1, 0), (0, 0), tactic._KITE_STALL_UNLOCK_TICKS, walls,
+        )
+        self.assertEqual(action, "MOVE", detail)
+        self.assertNotEqual(unit.arg, Direction.LEFT, detail)
+
+    def test_route_still_doubles_back_when_not_stalled(self) -> None:
+        walls = {(-1, 0), (0, -1), (1, -1)}
+        action, detail, unit = self._plan(
+            "kite-march", (1, 0), (0, 0), 0, walls,
+        )
+        self.assertEqual(action, "MOVE", detail)
+        self.assertEqual(unit.arg, Direction.LEFT, detail)
+
+    def test_boxed_stalled_unit_retreats_instead_of_sitting(self) -> None:
+        # Only the cell it came from is open: retreating must beat WAIT.
+        walls = {(2, 0), (1, -1), (1, 1)}
+        action, detail, unit = self._plan(
+            "kite-boxed", (1, 0), (0, 0), tactic._KITE_STALL_UNLOCK_TICKS, walls,
+        )
+        self.assertEqual(action, "MOVE", detail)
+        self.assertEqual(unit.arg, Direction.LEFT, detail)
+
+
 if __name__ == "__main__":
     unittest.main()
