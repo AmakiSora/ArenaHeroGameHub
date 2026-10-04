@@ -10895,5 +10895,127 @@ class KiteRouteNoUTurnRegressionTests(KiteTeamPlannerTests):
         self.assertEqual(unit.arg, Direction.LEFT, detail)
 
 
+class SquadMarchBudgetTests(unittest.TestCase):
+    """Squad marches need a distance-scaled A* budget, bounded per Tick.
+
+    Measured on the live obstacle memory: all 9 sampled kite/attack units had a
+    reachable objective (route length ~= straight line), yet the flat
+    bfs_max_steps=2500 missed every one, so each re-decided a single step per
+    Tick and shuttled instead of marching.
+    """
+
+    def setUp(self) -> None:
+        self._snap = {
+            "miss": dict(tactic._march_route_miss),
+            "spent": tactic._march_budget_spent,
+            "cache": dict(tactic._combat_path_cache),
+            "calls": tactic._pathfind_calls,
+            "exp": tactic._pathfind_expansions,
+            "ms": tactic._pathfind_ms,
+            "de_ms": tactic._dead_end_ms,
+            "de_runs": tactic._dead_end_runs,
+        }
+        tactic._march_route_miss.clear()
+        tactic._march_budget_spent = 0
+        tactic._combat_path_cache.clear()
+
+    def tearDown(self) -> None:
+        tactic._march_route_miss.clear()
+        tactic._march_route_miss.update(self._snap["miss"])
+        tactic._march_budget_spent = self._snap["spent"]
+        tactic._combat_path_cache.clear()
+        tactic._combat_path_cache.update(self._snap["cache"])
+        tactic._pathfind_calls = self._snap["calls"]
+        tactic._pathfind_expansions = self._snap["exp"]
+        tactic._pathfind_ms = self._snap["ms"]
+        tactic._dead_end_ms = self._snap["de_ms"]
+        tactic._dead_end_runs = self._snap["de_runs"]
+
+    def _budget(self, uid, pos, goal, min_budget=2500):
+        return tactic._march_budget(uid, pos, goal, min_budget)
+
+    def test_close_goal_keeps_the_callers_budget(self) -> None:
+        self.assertEqual(self._budget("u1", (0, 0), (30, 0)), 2500)
+
+    def test_far_goal_scales_with_distance(self) -> None:
+        self.assertEqual(self._budget("u2", (0, 0), (200, 0)),
+                         200 * tactic._MARCH_BUDGET_FACTOR)
+        self.assertEqual(self._budget("u3", (0, 0), (3000, 0)),
+                         tactic._MARCH_BUDGET_MAX)
+
+    def test_miss_cooldown_skips_the_same_goal_only(self) -> None:
+        goal = (500, 0)
+        budget = self._budget("u4", (0, 0), goal)
+        tactic._march_note_result("u4", goal, budget, found=False)
+        self.assertIsNone(self._budget("u4", (1, 0), goal))
+        # A new objective is worth a fresh search.
+        self.assertIsNotNone(self._budget("u4", (1, 0), (0, 600)))
+
+    def test_miss_cooldown_expires(self) -> None:
+        goal = (500, 0)
+        tactic._march_note_result("u5", goal, self._budget("u5", (0, 0), goal), found=False)
+        for _ in range(tactic._MARCH_MISS_COOLDOWN - 1):
+            self.assertIsNone(self._budget("u5", (0, 0), goal))
+        self.assertIsNotNone(self._budget("u5", (0, 0), goal))
+
+    def test_success_clears_the_miss(self) -> None:
+        goal = (500, 0)
+        tactic._march_note_result("u6", goal, self._budget("u6", (0, 0), goal), found=False)
+        tactic._march_note_result("u6", goal, 0, found=True)
+        self.assertEqual(tactic._march_route_miss, {})
+        self.assertIsNotNone(self._budget("u6", (0, 0), goal))
+
+    def test_per_tick_cap_stops_a_squad_stampede(self) -> None:
+        tactic._march_budget_spent = tactic._MARCH_BUDGET_PER_TICK - 10
+        self.assertIsNone(self._budget("u7", (0, 0), (500, 0)))
+        tactic._reset_pathfind_counters()
+        self.assertEqual(tactic._march_budget_spent, 0)
+        self.assertIsNotNone(self._budget("u7", (0, 0), (500, 0)))
+
+    def test_move_towards_searches_far_goals_with_the_scaled_budget(self) -> None:
+        seen: list[int] = []
+        real = tactic._bfs_path
+
+        def spy(start, goal, obstacles, max_steps=2500, **kwargs):
+            seen.append(max_steps)
+            return real(start, goal, obstacles, max_steps=max_steps, **kwargs)
+
+        unit = SimpleNamespace(id="march-1", position=(0, 0))
+        unit.move = lambda direction: None
+        unit.wait = lambda: None
+        with patch.object(tactic, "_bfs_path", side_effect=spy):
+            result = tactic._move_towards(
+                unit, (0, 0), (0, 300), frozenset(), detail_prefix="test",
+            )
+        self.assertEqual(seen, [300 * tactic._MARCH_BUDGET_FACTOR])
+        self.assertIsNotNone(result)
+        self.assertEqual(tactic._combat_path_cache["march-1"]["goal"], (0, 300))
+        self.assertEqual(tactic._march_route_miss, {})
+
+    def test_move_towards_records_a_far_miss_and_stops_retrying(self) -> None:
+        searches: list[int] = []
+        unit = SimpleNamespace(id="march-2", position=(0, 0))
+        unit.move = lambda direction: None
+        unit.wait = lambda: None
+
+        def miss(start, goal, obstacles, max_steps=2500, **kwargs):
+            searches.append(max_steps)
+            return None
+
+        with patch.object(tactic, "_bfs_path", side_effect=miss):
+            first = tactic._move_towards(
+                unit, (0, 0), (0, 300), frozenset(), detail_prefix="test",
+            )
+            second = tactic._move_towards(
+                unit, (0, 0), (0, 300), frozenset(), detail_prefix="test",
+            )
+        # Both Ticks still step (the budget-free greedy march remains), but the
+        # expensive search only runs once.
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(searches, [300 * tactic._MARCH_BUDGET_FACTOR])
+        self.assertEqual(tactic._march_route_miss["march-2"][0], (0, 300))
+
+
 if __name__ == "__main__":
     unittest.main()

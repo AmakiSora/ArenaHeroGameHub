@@ -325,15 +325,37 @@ _pathfind_ms: float = 0.0
 _dead_end_ms: float = 0.0
 _dead_end_runs: int = 0
 
+# Squad-march A* budget. Combat objectives sit hundreds to thousands of cells
+# away and the flat bfs_max_steps (2500) is exhausted long before them, so the
+# unit re-decides a single step every Tick and shuttles instead of marching
+# (observed: V11/V6 against a 1294-cell kite objective, V5/V10/R3 walking ~15
+# cells toward (-337,-800) and being pulled back by regroup). The budget scales
+# with distance like the carriers' home march, with three bounds on the blast
+# radius because a whole squad re-targets in one Tick:
+#   * goals closer than _MARCH_SCALE_FROM keep the caller's budget as-is;
+#   * a unit that missed with a scaled budget waits _MARCH_MISS_COOLDOWN plan
+#     calls before searching for that same goal again, so a genuinely sealed
+#     far goal cannot burn its full budget every Tick;
+#   * _MARCH_BUDGET_PER_TICK caps the scaled work all combat units may spend in
+#     one Tick, so a mass re-target cannot stall the loop.
+_MARCH_SCALE_FROM = 60
+_MARCH_BUDGET_FACTOR = 60
+_MARCH_BUDGET_MAX = 120_000
+_MARCH_MISS_COOLDOWN = 120
+_MARCH_BUDGET_PER_TICK = 300_000
+_march_route_miss: dict[str, tuple[tuple[int, int], int]] = {}
+_march_budget_spent: int = 0
+
 
 def _reset_pathfind_counters() -> None:
     global _pathfind_calls, _pathfind_expansions, _pathfind_ms
-    global _dead_end_ms, _dead_end_runs
+    global _dead_end_ms, _dead_end_runs, _march_budget_spent
     _pathfind_calls = 0
     _pathfind_expansions = 0
     _pathfind_ms = 0.0
     _dead_end_ms = 0.0
     _dead_end_runs = 0
+    _march_budget_spent = 0
 
 
 def _bfs_path_snapshot() -> tuple[int, int, float]:
@@ -344,6 +366,57 @@ def _bfs_path_snapshot() -> tuple[int, int, float]:
 def _dead_end_snapshot() -> tuple[int, float]:
     """Return (runs, ms) of _dead_end_cells since the last reset."""
     return _dead_end_runs, round(_dead_end_ms, 1)
+
+
+def _march_budget(
+    uid: str,
+    pos: tuple[int, int],
+    goal: tuple[int, int],
+    min_budget: int,
+) -> int | None:
+    """Expansion budget for a march toward ``goal``, or None to skip the search.
+
+    See the ``_MARCH_*`` block for why the flat cap fails far objectives. None
+    means the caller keeps its own budget-free fallback step, which is what the
+    squad did before this scaling existed — never a worse outcome than a Tick
+    without planning.
+    """
+    miss = _march_route_miss.get(uid)
+    if miss is not None:
+        missed_goal, remaining = miss
+        # Count the cooldown down on every plan call, including the calls this
+        # miss suppresses: a far goal can miss because a friendly body sits on a
+        # chokepoint, and freezing it forever would strand the march.
+        if remaining <= 1:
+            _march_route_miss.pop(uid, None)
+        else:
+            _march_route_miss[uid] = (missed_goal, remaining - 1)
+            if missed_goal == goal:
+                return None
+    dist = _manhattan(pos, goal)
+    if dist < _MARCH_SCALE_FROM:
+        return min_budget
+    budget = min(_MARCH_BUDGET_MAX, max(min_budget, dist * _MARCH_BUDGET_FACTOR))
+    global _march_budget_spent
+    if _march_budget_spent + budget > _MARCH_BUDGET_PER_TICK:
+        return None
+    _march_budget_spent += budget
+    return budget
+
+
+def _march_note_result(
+    uid: str,
+    goal: tuple[int, int],
+    budget: int | None,
+    found: bool,
+) -> None:
+    """Remember a scaled-budget miss so the next 120 plan calls skip the search."""
+    if budget is None:
+        return
+    if found:
+        _march_route_miss.pop(uid, None)
+    else:
+        _march_route_miss[uid] = (goal, _MARCH_MISS_COOLDOWN)
 
 
 def _reset_plan_profile_context() -> None:
@@ -3085,13 +3158,19 @@ def _move_towards(
                 cached["index"] = index
     if path is None:
         _combat_path_cache.pop(uid, None)
-        path = _bfs_path(
-            pos,
-            goal,
-            obstacle_cells,
-            max_steps=max_steps,
-            extras=transient_obstacles,
+        budget = _march_budget(uid, pos, goal, max_steps)
+        path = (
+            _bfs_path(
+                pos,
+                goal,
+                obstacle_cells,
+                max_steps=budget,
+                extras=transient_obstacles,
+            )
+            if budget is not None
+            else None
         )
+        _march_note_result(uid, goal, budget, bool(path and len(path) > 1))
         if path and len(path) > 1:
             _combat_path_cache[uid] = {"goal": goal, "path": path, "index": 0}
 
@@ -7120,6 +7199,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _worker_path_cache.pop(dead_id, None)
     for dead_id in set(_cargo_route_miss_dist) - alive_ids:
         _cargo_route_miss_dist.pop(dead_id, None)
+    for dead_id in set(_march_route_miss) - alive_ids:
+        _march_route_miss.pop(dead_id, None)
     for dead_id in set(_cell_limit_blocked) - alive_ids:
         _cell_limit_blocked.pop(dead_id, None)
     for dead_id in set(_combat_path_cache) - alive_ids:
