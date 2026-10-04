@@ -3941,14 +3941,52 @@ def _plan_home_combat(
                         return moved
 
     dist_home = _manhattan(pos, core_pos)
+    # The unloading ring belongs to the delivery pipeline while carriers are
+    # queued: chute-clear below evicts anyone standing on it, so the march must
+    # also route around it. Without the lock a defender whose slot lies on the
+    # far side re-enters the ring every Tick and the two rules trade turns
+    # forever (observed V4, 100% of Ticks: ``UP chute-clear`` / ``DOWN
+    # home-patrol`` between (682,-301) and (682,-302)).
+    # A defender standing on the Core is the one case the lock must not apply:
+    # its four exits are exactly the locked cells, so it would freeze there for
+    # the whole delivery window. Letting it out is self-limiting -- once it is
+    # on a cardinal, chute-clear evicts it outward and the lock holds it there.
+    _chute_ring = (
+        frozenset({
+            core_pos,
+            (core_pos[0] + 1, core_pos[1]), (core_pos[0] - 1, core_pos[1]),
+            (core_pos[0], core_pos[1] + 1), (core_pos[0], core_pos[1] - 1),
+        })
+        if _chute_in_demand and dist_home > 0
+        else frozenset()
+    )
+
+    unit_name = _object_name(
+        unit.id, _UNIT_NAME_PREFIX.get(getattr(unit, "unit_type", None), "U")
+    )
+    home_names = _parse_team_names(config.get("home_team", ""))
+    slot_assignments = _home_patrol_slot_assignments(home_names, radius)
+    goal = _home_patrol_goal(
+        str(unit.id),
+        core_pos,
+        radius,
+        preferred_slot=slot_assignments.get(unit_name),
+    )
+    # Home-return aims at the defender's own slot, not at the Core cell, so the
+    # two home rules share one destination. Two goals meant a patrol detour
+    # that closed in on the slot while gaining a cell of distance-to-Core
+    # crossed the return_radius band and was dragged straight back (observed on
+    # the live map: (684,-298) <-> (684,-299) on 100% of Ticks, with and without
+    # chute demand). The Core cell is also the chute the carriers need.
     if dist_home > return_radius:
         moved = _move_towards(
             unit,
             pos,
-            core_pos,
+            goal,
             obstacle_cells,
             detail_prefix="home-return",
             cell_counts=cell_counts,
+            extra_obstacles=_chute_ring,
         )
         if moved is not None:
             return moved
@@ -3977,17 +4015,6 @@ def _plan_home_combat(
         unit.wait()
         return ("WAIT", "packed-outward-wait")
 
-    unit_name = _object_name(
-        unit.id, _UNIT_NAME_PREFIX.get(getattr(unit, "unit_type", None), "U")
-    )
-    home_names = _parse_team_names(config.get("home_team", ""))
-    slot_assignments = _home_patrol_slot_assignments(home_names, radius)
-    goal = _home_patrol_goal(
-        str(unit.id),
-        core_pos,
-        radius,
-        preferred_slot=slot_assignments.get(unit_name),
-    )
     # Already on/near the assigned slot: hold instead of micro-stepping.
     if _manhattan(pos, goal) <= 1 and dist_home <= return_radius:
         unit.wait()
@@ -4011,12 +4038,13 @@ def _plan_home_combat(
             obstacle_cells,
             detail_prefix="home-patrol",
             cell_counts=cell_counts,
+            extra_obstacles=_chute_ring,
         )
         if moved is not None:
             return moved
 
     return _scout_cardinal(
-        unit, pos, obstacle_cells, config, label="home-patrol",
+        unit, pos, obstacle_cells | _chute_ring, config, label="home-patrol",
     )
 
 

@@ -10559,13 +10559,18 @@ class HomeChuteHysteresisTests(unittest.TestCase):
     def setUp(self) -> None:
         self._snap = {name: copy.copy(getattr(tactic, name)) for name in (
             "_object_names", "_object_name_counters", "_home_patrol_slot_cache",
-            "_worker_last_pos", "_combat_path_cache",
+            "_worker_last_pos", "_combat_path_cache", "_chute_in_demand",
+            "_march_route_miss", "_march_budget_spent",
         )}
         tactic._object_names.clear()
         tactic._object_name_counters.clear()
         tactic._home_patrol_slot_cache.clear()
         tactic._worker_last_pos.clear()
         tactic._combat_path_cache.clear()
+        # A refused march parks the goal in a cooldown, and that suppressed
+        # search hides the ring lock in later cases within the same class.
+        tactic._march_route_miss.clear()
+        tactic._march_budget_spent = 0
         tactic._chute_in_demand = False
 
     def tearDown(self) -> None:
@@ -10620,6 +10625,167 @@ class HomeChuteHysteresisTests(unittest.TestCase):
         )
         self.assertEqual(action, "MOVE", detail)
         self.assertIn("home-patrol", detail)
+
+
+    def test_march_routes_around_the_ring_not_through_it(self) -> None:
+        # V4's dither: standing one step outside the ring, its only open cell
+        # is a ring cell, and the chute evicts it the moment it enters — so the
+        # march must refuse the ring entirely instead of feeding chute-clear.
+        tactic._chute_in_demand = True
+        unit = SimpleNamespace(
+            id="vanguard-2", unit_type=UnitType.VANGUARD, position=(0, -2), hp=5,
+        )
+        moved: list = []
+        unit.move = lambda direction: moved.append(direction)
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 2
+        # "vanguard-2" hashes onto slot (0,2) — straight across the Core.
+        # All exits but the ring cell (0,-1) are walled.
+        walls = frozenset({(1, -2), (-1, -2), (0, -3)})
+        action, detail = tactic._plan_home_combat(
+            unit, unit_kind="vanguard", enemies=(), obstacle_cells=walls,
+            core_pos=(0, 0), config=config,
+        )
+        self.assertEqual(moved, [], f"defender entered the unloading ring: {action} {detail}")
+
+    def test_march_enters_the_ring_when_no_carriers_queue(self) -> None:
+        tactic._chute_in_demand = False
+        unit = SimpleNamespace(
+            id="vanguard-2", unit_type=UnitType.VANGUARD, position=(0, -2), hp=5,
+        )
+        moved: list = []
+        unit.move = lambda direction: moved.append(direction)
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 2
+        walls = frozenset({(1, -2), (-1, -2), (0, -3)})
+        tactic._plan_home_combat(
+            unit, unit_kind="vanguard", enemies=(), obstacle_cells=walls,
+            core_pos=(0, 0), config=config,
+        )
+        self.assertEqual(moved, [Direction.DOWN])
+
+    def _walk(self, start, *, demand: bool, ticks: int = 6, radius: int = 2):
+        """Re-plan one defender for ``ticks`` Ticks, returning its cells."""
+        tactic._chute_in_demand = demand
+        config = default_config()
+        config["home_patrol_radius"] = radius
+        pos = start
+        visit: list = []
+        for _ in range(ticks):
+            unit = SimpleNamespace(
+                id="vanguard-2", unit_type=UnitType.VANGUARD, position=pos, hp=5,
+            )
+            moved: list = []
+            unit.move = lambda direction: moved.append(direction)
+            unit.wait = lambda: None
+            tactic._plan_home_combat(
+                unit, unit_kind="vanguard", enemies=(), obstacle_cells=frozenset(),
+                core_pos=(0, 0), config=config,
+            )
+            if moved:
+                pos = (pos[0] + moved[0].delta[0], pos[1] + moved[0].delta[1])
+            visit.append(pos)
+        return visit
+
+    def test_defender_standing_on_the_core_is_not_walled_in(self) -> None:
+        # The lock covers the Core's four exits, so applying it to a defender
+        # that is already on the Core would strand it there for the whole
+        # delivery window instead of letting it join its patrol slot.
+        tactic._chute_in_demand = True
+        unit = SimpleNamespace(
+            id="vanguard-2", unit_type=UnitType.VANGUARD, position=(0, 0), hp=5,
+        )
+        moved: list = []
+        unit.move = lambda direction: moved.append(direction)
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 2
+        action, detail = tactic._plan_home_combat(
+            unit, unit_kind="vanguard", enemies=(), obstacle_cells=frozenset(),
+            core_pos=(0, 0), config=config,
+        )
+        self.assertEqual(action, "MOVE", detail)
+        self.assertEqual(len(moved), 1)
+
+    def test_core_escape_settles_instead_of_trading_turns_with_the_chute(self) -> None:
+        # Letting the Core-sitter out must not reopen the dither: chute-clear
+        # evicts it from the ring, and the lock then keeps it out.
+        ring = {(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)}
+        visit = self._walk((0, 0), demand=True)
+        self.assertNotIn(visit[-1], ring, f"defender settled back on the chute: {visit}")
+        self.assertEqual(
+            len(set(visit[-3:])), 1, f"defender never came to rest: {visit}",
+        )
+
+
+class HomeReturnSlotGoalTests(unittest.TestCase):
+    """home-return and home-patrol must share one destination.
+
+    home-return used to aim at the Core cell while home-patrol aimed at the
+    defender's patrol slot, so a slot approach that the terrain routed around
+    the Core gained distance-to-Core and was dragged straight back by the next
+    home-return Tick: a permanent two-cell bounce (observed on the live map at
+    (684,-298) <-> (684,-299), with and without chute demand).
+    """
+
+    # Slot for "vanguard-1" is (2,0); these four walls force the approach to
+    # loop below it, which is where the two-goal bounce used to start.
+    WALLS = frozenset({(-2, 0), (-1, 1), (1, -1), (1, 0)})
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name)) for name in (
+            "_object_names", "_object_name_counters", "_home_patrol_slot_cache",
+            "_worker_last_pos", "_combat_path_cache", "_chute_in_demand",
+            "_march_route_miss", "_march_budget_spent",
+        )}
+        for name, val in self._snap.items():
+            if hasattr(val, "clear"):
+                val.clear()
+        tactic._chute_in_demand = False
+        tactic._march_budget_spent = 0
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    def _plan(self, pos, *, demand=False):
+        tactic._chute_in_demand = demand
+        unit = SimpleNamespace(
+            id="vanguard-1", unit_type=UnitType.VANGUARD, position=pos, hp=5,
+        )
+        moved: list = []
+        unit.move = lambda direction: moved.append(direction)
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 2
+        action, detail = tactic._plan_home_combat(
+            unit, unit_kind="vanguard", enemies=(), obstacle_cells=self.WALLS,
+            core_pos=(0, 0), config=config,
+        )
+        return action, detail, moved, unit
+
+    def test_far_defender_returns_to_its_slot_not_the_core_cell(self) -> None:
+        action, detail, moved, _unit = self._plan((-3, -2))
+        self.assertEqual(action, "MOVE")
+        self.assertIn("home-return", detail)
+        self.assertIn("(2, 0)", detail, detail)
+        self.assertNotIn("(0, 0)", detail, detail)
+
+    def test_slot_approach_beyond_the_band_is_not_reversed(self) -> None:
+        pos, visit = (-3, -2), []
+        for _ in range(16):
+            _action, _detail, moved, _unit = self._plan(pos)
+            if moved:
+                pos = (pos[0] + moved[0].delta[0], pos[1] + moved[0].delta[1])
+            visit.append(pos)
+        reversals = sum(
+            1 for i in range(2, len(visit))
+            if visit[i] == visit[i - 2] and visit[i] != visit[i - 1]
+        )
+        self.assertEqual(reversals, 0, f"defender bounced between two cells: {visit}")
+        self.assertLessEqual(tactic._manhattan(visit[-1], (2, 0)), 1, visit)
 
 
 class CellLimitCooldownBreakerTests(unittest.TestCase):
