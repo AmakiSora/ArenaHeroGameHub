@@ -10666,6 +10666,48 @@ class HomeChuteHysteresisTests(unittest.TestCase):
         )
         self.assertEqual(moved, [Direction.DOWN])
 
+    def test_scout_keeps_the_wall_identity_and_avoids_the_ring(self) -> None:
+        # Performance regression guard: handing the scout a fresh
+        # ``obstacle_cells | ring`` set defeats the identity-cached dead-end
+        # structure and re-classifies the whole wall memory per call (measured
+        # on the live memory: 631ms vs 85ms), which is what pushed the vanguard
+        # planning phase from 166ms to 1012ms per Tick after the ring lock.
+        tactic._chute_in_demand = True
+        walls = frozenset()
+        unit = SimpleNamespace(
+            id="vanguard-2", unit_type=UnitType.VANGUARD, position=(0, -2), hp=5,
+        )
+        unit.move = lambda direction: None
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 2
+        # A route to the slot exists, so the march is only stopped by packed
+        # neighbours -- that keeps the "slot unreachable" hold out of the way
+        # and lands the plan on the scout, which is the call being guarded.
+        counts = {cell: tactic._CELL_UNIT_LIMIT for cell in (
+            (-1, -2), (1, -2), (0, -3), (0, -1),
+        )}
+        seen: dict = {}
+
+        def fake_scout(_unit, _pos, obstacles, _config, *, label, avoid_cells=()):
+            seen["obstacles"] = obstacles
+            seen["avoid"] = frozenset(avoid_cells)
+            seen["label"] = label
+            return ("WAIT", "no_way")
+
+        with patch.object(tactic, "_scout_cardinal", fake_scout):
+            action, detail = tactic._plan_home_combat(
+                unit, unit_kind="vanguard", enemies=(), obstacle_cells=walls,
+                core_pos=(0, 0), config=config, cell_counts=counts,
+            )
+        self.assertEqual((action, detail), ("WAIT", "no_way"))
+        self.assertIs(seen["obstacles"], walls, "home planner rebuilt the wall set")
+        self.assertEqual(
+            seen["avoid"],
+            {(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)},
+            seen["avoid"],
+        )
+
     def _walk(self, start, *, demand: bool, ticks: int = 6, radius: int = 2):
         """Re-plan one defender for ``ticks`` Ticks, returning its cells."""
         tactic._chute_in_demand = demand
@@ -10786,6 +10828,76 @@ class HomeReturnSlotGoalTests(unittest.TestCase):
         )
         self.assertEqual(reversals, 0, f"defender bounced between two cells: {visit}")
         self.assertLessEqual(tactic._manhattan(visit[-1], (2, 0)), 1, visit)
+
+
+class HomeSlotUnreachableHoldTests(unittest.TestCase):
+    """A walled-off patrol slot must not leave the defender shuffling.
+
+    V3's radius-3 slot (685,-300) has no path at all from the Core
+    neighbourhood, so each Tick it alternated a failed A* with the greedy step
+    one cell east/west: ``LEFT home-patrol`` / ``RIGHT home-patrol
+    (685, -300)`` on 100% of Ticks (live ticks 385531-385554, after the ring
+    lock stopped it re-entering the chute).
+    """
+
+    # "vanguard-1" parks on slot (2,0); these three walls plus the locked chute
+    # ring cell (0,-1) leave the defender at (0,-2) with no walkable step.
+    WALLS = frozenset({(1, -2), (-1, -2), (0, -3)})
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name)) for name in (
+            "_object_names", "_object_name_counters", "_home_patrol_slot_cache",
+            "_worker_last_pos", "_combat_path_cache", "_chute_in_demand",
+            "_march_route_miss", "_march_budget_spent",
+        )}
+        for name, val in self._snap.items():
+            if hasattr(val, "clear"):
+                val.clear()
+        tactic._chute_in_demand = False
+        tactic._march_budget_spent = 0
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    def _plan(self, pos, *, demand: bool):
+        tactic._chute_in_demand = demand
+        unit = SimpleNamespace(
+            id="vanguard-1", unit_type=UnitType.VANGUARD, position=pos, hp=5,
+        )
+        moved: list = []
+        unit.move = lambda direction: moved.append(direction)
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 2
+        action, detail = tactic._plan_home_combat(
+            unit, unit_kind="vanguard", enemies=(), obstacle_cells=self.WALLS,
+            core_pos=(0, 0), config=config,
+        )
+        return action, detail, moved
+
+    def test_defender_holds_when_its_slot_cannot_be_reached(self) -> None:
+        action, detail, moved = self._plan((0, -2), demand=True)
+        self.assertEqual(moved, [], f"{action} {detail}")
+        self.assertEqual(action, "WAIT")
+        self.assertIn("home-slot-unreachable", detail)
+        self.assertIn("(2, 0)", detail)
+
+    def test_holding_repeats_instead_of_resuming_the_shuffle(self) -> None:
+        pos, visit = (0, -2), []
+        for _ in range(6):
+            _action, _detail, moved = self._plan(pos, demand=True)
+            if moved:
+                pos = (pos[0] + moved[0].delta[0], pos[1] + moved[0].delta[1])
+            visit.append(pos)
+        self.assertEqual(set(visit), {(0, -2)}, visit)
+
+    def test_patrol_continues_while_the_slot_is_still_reachable(self) -> None:
+        # Control: without chute demand the ring cell (0,-1) is open, the route
+        # to (2,0) exists and no hold may swallow the defender there.
+        action, detail, moved = self._plan((0, -2), demand=False)
+        self.assertEqual(action, "MOVE", detail)
+        self.assertEqual(len(moved), 1)
 
 
 class CellLimitCooldownBreakerTests(unittest.TestCase):

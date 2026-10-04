@@ -4042,9 +4042,29 @@ def _plan_home_combat(
         )
         if moved is not None:
             return moved
+        if dist_home <= return_radius + 1:
+            # ``_move_towards`` searched this goal already and the miss it
+            # recorded is what keeps the next 120 plan calls from re-searching,
+            # so a None here means the slot is walled off from this side rather
+            # than merely crowded (observed V3: its radius-3 slot (685,-300) has
+            # no path at all from the Core neighbourhood, so it alternated a
+            # failed search with the greedy step one cell east/west forever --
+            # ``LEFT home-patrol`` / ``RIGHT home-patrol (685, -300)``). Holding
+            # the guard cell it is on beats shuffling beside it.
+            miss = _march_route_miss.get(str(unit.id))
+            if miss is not None and miss[0] == goal:
+                unit.wait()
+                _set_unit_route(unit, goal, [pos], complete=False)
+                return ("WAIT", f"home-slot-unreachable {goal}")
 
     return _scout_cardinal(
-        unit, pos, obstacle_cells | _chute_ring, config, label="home-patrol",
+        unit, pos, obstacle_cells, config, label="home-patrol",
+        # Not `obstacle_cells | _chute_ring`: a fresh set object defeats the
+        # identity-cached dead-end structure and re-runs the batch classification
+        # over the whole wall memory (measured live: unit:vanguard 166ms ->
+        # 1012ms per Tick). The scout only ever picks one adjacent cell, so
+        # excluding the ring as avoid_cells is the same rule for free.
+        avoid_cells=_chute_ring,
     )
 
 
