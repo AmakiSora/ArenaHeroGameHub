@@ -1966,6 +1966,57 @@ def _queue_sidestep(
     return ("WAIT", "core-queue-yield-boxed")
 
 
+def _worker_remember_explore(uid: str, pos: tuple[int, int]) -> None:
+    """Append one observation to the explore tail (repeats collapse)."""
+    history = _worker_explore_history.setdefault(uid, [])
+    if history and history[-1] == pos:
+        return
+    history.append(pos)
+    if len(history) > _WORKER_EXPLORE_MEMORY:
+        del history[:-_WORKER_EXPLORE_MEMORY]
+
+
+def _worker_explore_ages(uid: str) -> dict[tuple[int, int], int]:
+    """``cell -> steps since it was last stood on`` over the explore tail."""
+    history = _worker_explore_history.get(uid) or []
+    newest = len(history) - 1
+    ages: dict[tuple[int, int], int] = {}
+    for index, cell in enumerate(history):
+        ages[cell] = newest - index
+    return ages
+
+
+def _worker_rally_goal(
+    uid: str,
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    config: dict[str, Any],
+) -> tuple[int, int] | None:
+    """Rally target for a worker that no mine assignment can ever reach.
+
+    Mines are only assignable inside ``worker_mine_max_distance`` of the Core,
+    so an unassigned worker outside that ring mines nothing however far it
+    wanders — the fan-out just burns the unit. Two thresholds give hysteresis:
+    walking home starts only past ``2 x radius`` and stops only inside
+    ``radius / 2``, because one threshold flips rally/explore every tick at the
+    boundary and drops the worker back into the milling it just escaped. A
+    radius of 0 disables the filter itself, so there is no excluded zone.
+    """
+    mine_radius = int(config.get("worker_mine_max_distance", 0) or 0)
+    if mine_radius <= 0:
+        return None
+    dist = _manhattan(pos, core_pos)
+    if _worker_rally_home.get(uid):
+        if dist <= max(4, mine_radius // 2):
+            _worker_rally_home.pop(uid, None)
+            return None
+        return core_pos
+    if dist > mine_radius * 2:
+        _worker_rally_home[uid] = True
+        return core_pos
+    return None
+
+
 def _plan_worker(
     worker,
     core,
@@ -2468,6 +2519,40 @@ def _plan_worker(
     # than milling around the core).
     if goal is None and (not carrying or explore_mode):
         uid = str(worker.id)
+        # Far-from-home, unassignable, and milling: worth more walking back to
+        # the mining zone than scouting the pocket it is standing in. Mines are
+        # only assigned inside worker_mine_max_distance of the Core, so a mine
+        # found 800 cells out stays unassignable until the Core arrives.
+        # Full-vault explore_mode is the one case where fanning out IS the plan,
+        # so the rally stays out of it.
+        rally = (
+            None
+            if explore_mode
+            else _worker_rally_goal(uid, pos, tuple(core.position), config)
+        )
+        if rally is not None:
+            marched = _long_march_step(
+                worker,
+                pos,
+                rally,
+                obstacle_cells,
+                detail_prefix="rally-home",
+                cell_counts=cell_counts,
+                extra_obstacles=move_blocked,
+            )
+            if marched is not None:
+                _worker_remember_explore(uid, pos)
+                try:
+                    march_dir = Direction[marched[1].split()[0]]
+                except (KeyError, IndexError):
+                    march_dir = None
+                march_next = (
+                    (pos[0] + march_dir.delta[0], pos[1] + march_dir.delta[1])
+                    if march_dir is not None
+                    else pos
+                )
+                _set_worker_route(worker, rally, [tuple(pos), march_next], complete=False)
+                return marched
         prev = _worker_last_pos.get(uid)
         recent = _worker_recent.get(uid, [])
         idx = hash(uid) % 4
@@ -2475,11 +2560,30 @@ def _plan_worker(
         rotated = base[idx:] + base[:idx]
         # Sort: deprioritize dead ends, backtracking and recently visited cells
         recent_set = set(recent)
+        visited_age = _worker_explore_ages(uid)
+
         def _sort_key(d):
             nx, ny = pos[0] + d.delta[0], pos[1] + d.delta[1]
             score = 0
             if _is_dead_end_step((nx, ny), obstacle_cells):
                 score += 3  # obvious dead end = avoid first
+            # A 4-step memory cannot break an 8-cell ring: by the time the unit
+            # comes back around, every cell is "unrecent" again and the fixed
+            # ID direction rotation re-picks the same circuit forever (observed
+            # W7/W31/W13/W20 each visiting the same 8 cells 78 times in 625
+            # ticks). Age over the whole tail instead, so the never-walked exit
+            # of a pocket always outranks the ring successor.
+            age = visited_age.get((nx, ny))
+            if age is None:
+                score += 0  # fresh ground wins
+            elif age < 6:
+                score += 4
+            elif age < 12:
+                score += 3
+            elif age < 18:
+                score += 2
+            else:
+                score += 1
             if (nx, ny) in recent_set:
                 score += 2  # recently visited
             if config["avoid_backtracking"] and prev and (nx, ny) == prev:
@@ -2511,6 +2615,7 @@ def _plan_worker(
             if len(recent) > 4:
                 recent.pop(0)
             _worker_recent[uid] = recent
+            _worker_remember_explore(uid, pos)
             _set_worker_route(worker, (nx, ny), [tuple(pos), (nx, ny)], complete=True)
             return ("MOVE", f"{d.name} explore")
 
@@ -2689,11 +2794,36 @@ def _roam_update_stall(uid: str) -> bool:
             )
         )
         if stalled:
-            _roam_stall_cells[uid] = frozenset(history)
+            region = frozenset(history)
+            _roam_stall_cells[uid] = region
             _roam_stall_origin[uid] = window[-2] if len(window) >= 2 else window[-1]
+            expiry = int(getattr(turn_context, "tick", 0) or 0) + _ROAM_BAN_TICKS
+            banned = _roam_banned.setdefault(uid, {})
+            for cell in region:
+                if banned.get(cell, 0) < expiry:
+                    banned[cell] = expiry
             history.clear()
             return True
     return False
+
+
+def _roam_banned_cells(uid: str) -> frozenset[tuple[int, int]]:
+    """Cells this unit proved unable to roam out of and must still avoid.
+
+    Prunes the expired entries on the way out, so a unit that escaped long ago
+    gets the terrain back.
+    """
+    banned = _roam_banned.get(uid)
+    if not banned:
+        return frozenset()
+    now = int(getattr(turn_context, "tick", 0) or 0)
+    live = {cell: expiry for cell, expiry in banned.items() if expiry > now}
+    if live:
+        if len(live) != len(banned):
+            _roam_banned[uid] = live
+    else:
+        _roam_banned.pop(uid, None)
+    return frozenset(live)
 
 
 def _roam_bearing_choice(
@@ -2795,7 +2925,9 @@ def _guerrilla_roam(
     deterministic phases: while still inside the recent region the unit
     deflects to the bearings perpendicular to its own (reversed bearing as
     last resort); once outside, it keeps avoiding the region until the
-    _ROAM_ESCAPE_TICKS budget expires, then resumes normal roaming.
+    _ROAM_ESCAPE_TICKS budget expires, then resumes normal roaming. The
+    escaped pocket stays banned for _ROAM_BAN_TICKS and each confirmed escape
+    turns the heading further, so resuming roaming means a different route.
     """
     avoided = frozenset(avoid_cells)
     uid = str(unit.id)
@@ -2844,15 +2976,24 @@ def _guerrilla_roam(
         # A deflection step pointed out of the region last tick; this tick's
         # pos proves the server actually accepted the move (a cancelled step
         # would still be standing inside the region). Only now is the
-        # bearing flip confirmed — at most once per escape event, and at most
-        # once per unit's lifetime so repeated escapes in a long game cannot
-        # erode the eight-way bearing spread.
+        # bearing flip confirmed — at most once per escape event.
         _roam_flip_pending.pop(uid, None)
-        if _roam_flips_used.get(uid, 0) < 1:
-            _roam_bearing_offset[uid] = (
-                _roam_bearing_offset.get(uid, 0) + len(_EIGHT_WAY_DELTAS) // 2
-            ) % len(_EIGHT_WAY_DELTAS)
-            _roam_flips_used[uid] = _roam_flips_used.get(uid, 0) + 1
+        # The first escape reverses the heading; later ones turn it a quarter.
+        # Capping this at one per lifetime left repeat-trapped units with every
+        # future escape replaying the same bearing that walks them back in.
+        _roam_bearing_offset[uid] = (
+            _roam_bearing_offset.get(uid, 0)
+            + (
+                len(_EIGHT_WAY_DELTAS) // 2
+                if _roam_flips_used.get(uid, 0) < 1
+                else 2
+            )
+        ) % len(_EIGHT_WAY_DELTAS)
+        _roam_flips_used[uid] = _roam_flips_used.get(uid, 0) + 1
+    # Pockets escaped earlier stay off the route for _ROAM_BAN_TICKS: the active
+    # escape forgets its region as soon as the budget expires, and without this
+    # the base bearing pulls the unit straight back into the same bounce.
+    avoided = avoided | _roam_banned_cells(uid)
     if deflecting:
         label = "escape"
     else:
@@ -3720,10 +3861,14 @@ def _scout_cardinal(
             _set_unit_route(unit, npos, [pos, npos], complete=False)
             return ("MOVE", f"{direction.name} {label}")
     # If every open neighbor is a dead end, take the least-bad exit rather than wait.
+    # This pass ignores `avoided` on purpose: during a roam-oscillation escape the
+    # blacklist is the whole bounce region, so in a one-cell nub the only exit back
+    # through it IS the exit (observed: V7 wedged 5 straight WAIT:no_way at
+    # (1890,926) with (1890,925) blacklisted and nowhere else to go). A standing
+    # unit takes damage and advances nothing, which is strictly worse than
+    # re-entering the region — the escape state escalates the heading instead.
     for direction in rotated:
         npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
-        if npos in avoided:
-            continue
         if _try_move(unit, direction, pos, obstacle_cells):
             _set_unit_route(unit, npos, [pos, npos], complete=False)
             return ("MOVE", f"{direction.name} {label}")
@@ -5836,6 +5981,11 @@ _core_pending_move: tuple[tuple[int, int], "Direction", int] | None = None
 # CORE_ALREADY_MOVING rejection (usually a manual/auto command race): yield to
 # the other driver instead of re-issuing the same rejected start_move.
 _core_move_hold_until_tick: int = 0
+# How long a CELL_UNIT_LIMIT rejection suppresses core movement. The rejected
+# step is blocked by our own units, which move on their own, so a short hold
+# beats hammering: each attempt re-enters MOVING and a MOVING Core rejects every
+# worker DEPOSIT, which is how an 11-hour freeze looked in the field.
+_CORE_MOVE_HOLD_TICKS = 4
 # Worker MOVE_CONTESTED repeat tracker: {uid: (pos, contested_cell, count)}.
 # Two workers whose deterministic plans submit the same cell every Tick cancel
 # both moves every Tick (observed 30+ identical rejections); after two
@@ -5858,6 +6008,14 @@ _last_dashboard_map_sig: tuple | None = None
 # Track each worker's previous position to avoid backtracking
 _worker_last_pos: dict[str, tuple[int, int]] = {}
 _worker_recent: dict[str, list[tuple[int, int]]] = {}  # last 4 positions, anti-oscillation
+# Long-tail memory of the explore fan-out only: the 4-position `_worker_recent`
+# window is shorter than the rings it is meant to break, so a worker re-picks
+# the same circuit forever. Age over this tail makes the never-walked exit of a
+# pocket outrank the ring successor.
+_worker_explore_history: dict[str, list[tuple[int, int]]] = {}
+_WORKER_EXPLORE_MEMORY = 24
+# Sticky "walk back to the mining zone" flag, set by _worker_rally_goal.
+_worker_rally_home: dict[str, bool] = {}
 # Resource assignment: each resource assigned to closest worker only
 _resource_assignments: dict[str, tuple[int, int]] = {}
 # Worker A* path cache: reuse a computed path across ticks instead of recomputing
@@ -5950,10 +6108,20 @@ _roam_bearing_offset: dict[str, int] = {}
 # region only arms a pending flip; the flip itself executes once the NEXT
 # tick's pos confirms the server accepted the move (a cancelled first step
 # leaves the unit inside the region and the pending flag stays inert).
-# Lifetime flips are capped at one per unit so repeated escapes in a long
-# game cannot erode the eight-way bearing spread.
+# The first confirmed escape reverses the bearing; every later one turns it a
+# quarter instead, so a unit that keeps re-trapping keeps changing its route
+# instead of replaying the heading that walked it back into the pocket.
 _roam_flip_pending: dict[str, bool] = {}
 _roam_flips_used: dict[str, int] = {}
+# Durable memory of the pockets that proved to be oscillation traps, as
+# ``cell -> expiry tick``. The active escape drops its region the moment the
+# _ROAM_ESCAPE_TICKS budget runs out, and the ID-derived base bearing then
+# pulls the unit straight back into the same bounce (observed: R2 ping-ponging
+# (975,-1175)/(975,-1174) with the escape re-arming every 8 ticks — 9 distinct
+# cells in 625 ticks). Banned cells stay out of the roam choices for
+# _ROAM_BAN_TICKS, which is what turns one escape into an actual route change.
+_roam_banned: dict[str, dict[tuple[int, int], int]] = {}
+_ROAM_BAN_TICKS = 120
 # An 8-position-change window spanning <=2 cells proves an A-B-A bounce (the
 # window counts recorded position changes, not ticks; 8 also catches a
 # stationary unit, whose escape candidates just degrade into normal roaming,
@@ -7241,6 +7409,10 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _worker_last_pos.pop(dead_id, None)
     for dead_id in set(_worker_recent) - alive_ids:
         _worker_recent.pop(dead_id, None)
+    for dead_id in set(_worker_explore_history) - alive_ids:
+        _worker_explore_history.pop(dead_id, None)
+    for dead_id in set(_worker_rally_home) - alive_ids:
+        _worker_rally_home.pop(dead_id, None)
     for dead_id in set(_resource_assignments) - alive_ids:
         _resource_assignments.pop(dead_id, None)
     for dead_id in set(_worker_path_cache) - alive_ids:
@@ -7279,6 +7451,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _roam_stall_cells.pop(dead_id, None)
     for dead_id in set(_roam_stall_origin) - alive_ids:
         _roam_stall_origin.pop(dead_id, None)
+    for dead_id in set(_roam_banned) - alive_ids:
+        _roam_banned.pop(dead_id, None)
     for dead_id in set(_roam_bearing_offset) - alive_ids:
         _roam_bearing_offset.pop(dead_id, None)
     for dead_id in set(_roam_flip_pending) - alive_ids:
@@ -7765,6 +7939,18 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                     # Usually a manual/auto command race: yield the movement
                     # slot briefly instead of re-issuing the rejected move.
                     _core_move_hold_until_tick = turn_context.tick + 2
+                elif _reason == "CELL_UNIT_LIMIT":
+                    # The destination is packed with our OWN units, not walled,
+                    # so there is nothing to learn into the map — but hammering
+                    # it is far from free: every attempt puts the Core back into
+                    # MOVING, and a MOVING Core rejects every worker DEPOSIT.
+                    # Observed 11 hours of a frozen vault (26/185) while C1
+                    # re-issued one step into (666,-317) every few Ticks and the
+                    # economy logged "W16 卸货失败：核心迁移中" over and over.
+                    # Hold off and let the ring clear instead.
+                    _core_move_hold_until_tick = (
+                        turn_context.tick + _CORE_MOVE_HOLD_TICKS
+                    )
                 continue
             _dest: tuple[int, int] | None = None
             _pos_attr = getattr(_ev, "position", None)
@@ -7799,6 +7985,21 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             and _manhattan(w.position, core_pos) <= int(config["cargo_wait_distance"])
             for w in turn.workers
         )
+        # Friendly units per cell, for the destination pre-check below. The
+        # server stacks at most _CELL_UNIT_LIMIT units on a cell, and the Core
+        # used to pick headings from the obstacle/dead-end view only — so a
+        # destination packed with our own workers was re-issued every Tick,
+        # rejected as CELL_UNIT_LIMIT, and the resulting MOVING churn starved the
+        # unloading chute.
+        core_cell_counts: dict[tuple[int, int], int] = {}
+        for _core_count_list in (
+            turn.workers,
+            getattr(turn, "vanguards", ()) or (),
+            getattr(turn, "rangers", ()) or (),
+        ):
+            for _u in _core_count_list:
+                _p = tuple(_u.position)
+                core_cell_counts[_p] = core_cell_counts.get(_p, 0) + 1
         if (
             not close_cargo
             and not core_mid_move
@@ -7906,6 +8107,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                         if (
                             0 <= cidx < len(cpath) - 1
                             and cpath[cidx + 1] not in obstacle_cells
+                            and core_cell_counts.get(cpath[cidx + 1], 0)
+                            < _CELL_UNIT_LIMIT
                         ):
                             nxt = cpath[cidx + 1]
                 if nxt is None:
@@ -7921,6 +8124,13 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                             {"goal": tuple(target), "path": cpath}
                         )
                         nxt = cpath[1]
+                if nxt is not None and (
+                    core_cell_counts.get(nxt, 0) >= _CELL_UNIT_LIMIT
+                ):
+                    # Our own units are squatting on the route's next cell: hold
+                    # this Tick (the cached path stays valid, they will move)
+                    # rather than burning a rejected start_move.
+                    nxt = None
                 if nxt is not None:
                     _core_astep = (nxt[0] - core_pos[0], nxt[1] - core_pos[1])
             if _core_astep is not None:
@@ -7936,6 +8146,8 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             for d in (dirs if _core_astep is None else []):
                 nx, ny = core_pos[0] + d.delta[0], core_pos[1] + d.delta[1]
                 if (nx, ny) in obstacle_cells or (nx, ny) in core_blocked_now:
+                    continue
+                if core_cell_counts.get((nx, ny), 0) >= _CELL_UNIT_LIMIT:
                     continue
                 if (
                     max_drift > 0

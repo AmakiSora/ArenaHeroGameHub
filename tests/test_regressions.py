@@ -8853,6 +8853,9 @@ class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
         self._saved_offset = dict(tactic._roam_bearing_offset)
         self._saved_flip_pending = dict(tactic._roam_flip_pending)
         self._saved_flips_used = dict(tactic._roam_flips_used)
+        self._saved_banned = {
+            uid: dict(cells) for uid, cells in tactic._roam_banned.items()
+        }
         self._saved_dead_obstacles = tactic._dead_obstacles
         tactic._roam_pos_history.clear()
         tactic._roam_escape_left.clear()
@@ -8862,6 +8865,7 @@ class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
         tactic._roam_bearing_offset.clear()
         tactic._roam_flip_pending.clear()
         tactic._roam_flips_used.clear()
+        tactic._roam_banned.clear()
         tactic._dead_obstacles = None
 
     def tearDown(self):
@@ -8880,6 +8884,8 @@ class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
         tactic._roam_flip_pending.update(self._saved_flip_pending)
         tactic._roam_flips_used.clear()
         tactic._roam_flips_used.update(self._saved_flips_used)
+        tactic._roam_banned.clear()
+        tactic._roam_banned.update(self._saved_banned)
         tactic._dead_obstacles = self._saved_dead_obstacles
         super().tearDown()
 
@@ -9056,13 +9062,12 @@ class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
         self.assertEqual(action2, "MOVE")
         self.assertIn("escape", detail2)
 
-    def test_flip_deferred_until_exit_confirmed_and_capped_at_one(self):
+    def test_flip_deferred_until_exit_confirmed_then_escalates(self):
         # Review fix: the bearing flip used to fire on planning intent, so a
         # server-cancelled first escape step re-flipped on the next tick and
         # the offset jittered 0<->4 until the escape budget ran out with a
         # net-zero flip (silent no-op). The flip now waits for the confirmed
-        # exit, happens at most once per escape event, and at most once per
-        # unit lifetime so long games keep the eight-way bearing spread.
+        # exit and fires once per escape event, escalating with each repeat.
         unit = self.unit("roam-flip", (0, 1))
         bounce = [(0, 0), (0, 1)] * ((tactic._ROAM_STALL_WINDOW + 1) // 2)
         self._record_history("roam-flip", bounce)
@@ -9110,8 +9115,10 @@ class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
                 )
         self.assertEqual(tactic._roam_escape_left.get("roam-flip", 0), 0)
 
-        # A fresh oscillation triggers a second escape event; even after its
-        # exit is confirmed the lifetime cap keeps the offset where it is.
+        # A fresh oscillation triggers a second escape event. The lifetime cap
+        # used to leave the offset frozen here — every later escape then replayed
+        # the same heading straight back into the pocket (observed: R2 re-trapping
+        # every 8 ticks). Instead the heading turns a quarter further.
         self._record_history("roam-flip", bounce)
         action, detail = tactic._guerrilla_roam(
             unit, (0, 1), frozenset({(0, 0)}), self.config,
@@ -9125,8 +9132,72 @@ class RoamOscillationEscapeRegressionTests(KiteTeamPlannerTests):
         tactic._guerrilla_roam(
             unit, outside2, frozenset({(0, 0)}), self.config,
         )
-        self.assertEqual(tactic._roam_bearing_offset.get("roam-flip", 0), 4)
-        self.assertEqual(tactic._roam_flips_used.get("roam-flip", 0), 1)
+        self.assertEqual(tactic._roam_bearing_offset.get("roam-flip", 0), 6)
+        self.assertEqual(tactic._roam_flips_used.get("roam-flip", 0), 2)
+
+    def test_escaped_pocket_stays_banned_after_the_escape_budget_dies(self):
+        """A confirmed escape must not walk straight back into the same bounce.
+
+        The active escape forgets its region when the _ROAM_ESCAPE_TICKS budget
+        expires, so the ID-derived bearing re-picks the pocket heading on the
+        very next tick — that amnesia is what kept R2/V7 oscillating for hours.
+        The banned-region tail is what makes one escape change the route.
+        """
+        unit = self.unit("roam-ban", (0, 1))
+        bounce = [(0, 0), (0, 1)] * ((tactic._ROAM_STALL_WINDOW + 1) // 2)
+        self._record_history("roam-ban", bounce)
+
+        action, detail = tactic._guerrilla_roam(
+            unit, (0, 1), frozenset({(0, 0)}), self.config,
+        )
+        self.assertEqual(action, "MOVE")
+        self.assertIn("escape", detail)
+        self.assertTrue(tactic._roam_banned.get("roam-ban"))
+        self.assertIn((0, 1), tactic._roam_banned["roam-ban"])
+
+        # Drain the escape budget: the active region is gone, the ban is not.
+        pos = (0, 1)
+        for _ in range(tactic._ROAM_ESCAPE_TICKS + 2):
+            tactic._guerrilla_roam(unit, pos, frozenset({(0, 0)}), self.config)
+            if unit.arg is not None:
+                pos = (pos[0] + unit.arg.delta[0], pos[1] + unit.arg.delta[1])
+        self.assertEqual(tactic._roam_escape_left.get("roam-ban", 0), 0)
+        self.assertNotIn("roam-ban", tactic._roam_stall_cells)
+        self.assertTrue(tactic._roam_banned.get("roam-ban"))
+
+        # Once the ban expires the unit gets that terrain back.
+        tactic._roam_banned["roam-ban"] = {
+            cell: tactic.turn_context.tick - 1
+            for cell in tactic._roam_banned["roam-ban"]
+        }
+        tactic._guerrilla_roam(unit, pos, frozenset({(0, 0)}), self.config)
+        self.assertNotIn("roam-ban", tactic._roam_banned)
+
+    def test_scout_least_bad_exit_is_not_blocked_by_the_escape_blacklist(self):
+        """A nub whose only exit is blacklisted must move, not freeze.
+
+        Field: V7 spent 5 straight ticks on WAIT:no_way at (1890,926). Its one
+        free neighbour (1890,925) was the bounce region the roam escape told it
+        to avoid, and the least-bad-exit pass applied that blacklist too, so the
+        escape sealed the unit inside the pocket it was trying to leave. A
+        stationary unit takes damage and advances nothing, which is strictly
+        worse than re-entering the region — the stall memory is a preference,
+        not a wall.
+        """
+        uid = "scout-nub"
+        unit = self.unit(uid, (0, 0))
+        only_exit = next(iter(tactic._neighbor_cells((0, 0))))
+        walls = frozenset(tactic._neighbor_cells((0, 0))) - {only_exit}
+        action, detail = tactic._scout_cardinal(
+            unit, (0, 0), walls, self.config,
+            label="guerrilla-roam escape",
+            avoid_cells=(only_exit,),
+        )
+        self.assertEqual(action, "MOVE", detail)
+        self.assertEqual(
+            (only_exit[0], only_exit[1]),
+            (unit.arg.delta[0], unit.arg.delta[1]),
+        )
 
 
 class SquadTargetQueueTests(unittest.TestCase):
@@ -9654,7 +9725,7 @@ class CoreTerrainBlockedLearningTests(unittest.TestCase):
             setattr(tactic, name, copy.copy(val))
 
     def _run(self, *, core_pos, worker_pos, tick, events=(), config=None,
-             anchor=None):
+             anchor=None, extra_workers=()):
         """One Tick; returns (core_action, issued_start_moves, details)."""
         moves: list = []
         core = SimpleNamespace(
@@ -9673,13 +9744,22 @@ class CoreTerrainBlockedLearningTests(unittest.TestCase):
         )
         worker.move = lambda direction: None
         worker.wait = lambda: None
+        workers = [worker]
+        for index, position in enumerate(extra_workers, start=2):
+            extra = SimpleNamespace(
+                id=f"worker-{index}", unit_type=UnitType.WORKER,
+                position=position, cargo=0, direction=None,
+            )
+            extra.move = lambda direction: None
+            extra.wait = lambda: None
+            workers.append(extra)
         beacon = SimpleNamespace(
             position=None, status=SimpleNamespace(name="GROUND"),
         )
         turn = SimpleNamespace(
             tick=tick,
-            units=(worker,),
-            workers=(worker,),
+            units=tuple(workers),
+            workers=tuple(workers),
             vanguards=(),
             rangers=(),
             visible_enemies=(),
@@ -11293,6 +11373,196 @@ class SquadMarchBudgetTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertEqual(searches, [300 * tactic._MARCH_BUDGET_FACTOR])
         self.assertEqual(tactic._march_route_miss["march-2"][0], (0, 300))
+
+
+class CorePackedDestinationTests(CoreTerrainBlockedLearningTests):
+    """Regression from the remote log: the Core picks headings from the
+    obstacle/dead-end view only, so it re-issued a step into a cell packed with
+    its own workers. Every rejected attempt re-entered MOVING, and a MOVING Core
+    rejects every worker DEPOSIT — the vault sat at 26/185 for 11 hours while
+    "C1 移动/动作失败：CELL_UNIT_LIMIT (666,-317)" alternated with
+    "W16 卸货失败：核心迁移中"."""
+
+    def test_packed_heading_is_skipped_for_a_free_one(self) -> None:
+        config = default_config()
+        config["core_max_drift"] = 0
+        # Two workers fill (1,0) — the server caps a cell at _CELL_UNIT_LIMIT.
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(1, 0), extra_workers=((1, 0),),
+            tick=1, config=config,
+        )
+        self.assertNotEqual(moves, [Direction.RIGHT])
+        self.assertEqual(moves, [Direction.DOWN])
+        self.assertEqual(action, "MOVE_DOWN")
+
+    def test_cell_limit_rejection_suppresses_the_following_steps(self) -> None:
+        config = default_config()
+        config["core_max_drift"] = 0
+        event = SimpleNamespace(
+            event_type="CORE_MOVE_FAILED",
+            reason_code="CELL_UNIT_LIMIT",
+            actor_id="core", target_id=None, position=(1, 0), values={},
+        )
+        self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=5, events=[event],
+            config=config,
+        )
+        self.assertEqual(
+            tactic._core_move_hold_until_tick,
+            5 + tactic._CORE_MOVE_HOLD_TICKS,
+        )
+        # A packed cell is our own bodies, not terrain: nothing may be learned
+        # into the permanent obstacle map from this rejection.
+        self.assertNotIn((1, 0), tactic._obstacle_memory)
+
+        # Still holding: the Core waits instead of hammering the chute away.
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=6, config=config,
+        )
+        self.assertEqual(moves, [])
+        self.assertEqual(action, "WAIT")
+
+        # Past the hold the march resumes on its own.
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0),
+            tick=6 + tactic._CORE_MOVE_HOLD_TICKS, config=config,
+        )
+        self.assertEqual(moves, [Direction.RIGHT])
+
+
+class WorkerExploreLoopBreakTests(unittest.TestCase):
+    """The explore fan-out ranked candidates with a 4-position memory, shorter
+    than the rings it was meant to break, so an unassigned worker circled the
+    same pocket until it died (observed W7/W31/W13/W20 each standing on the same
+    8 cells 78 times in 625 Ticks while the store stayed at 26/185)."""
+
+    def setUp(self) -> None:
+        self._saved = {
+            "last": dict(tactic._worker_last_pos),
+            "recent": {k: list(v) for k, v in tactic._worker_recent.items()},
+            "history": {k: list(v) for k, v in tactic._worker_explore_history.items()},
+            "rally": dict(tactic._worker_rally_home),
+            "assign": dict(tactic._resource_assignments),
+            "space": tactic.turn_context.resource_space,
+        }
+        tactic._worker_last_pos.clear()
+        tactic._worker_recent.clear()
+        tactic._worker_explore_history.clear()
+        tactic._worker_rally_home.clear()
+        tactic._resource_assignments.clear()
+
+    def tearDown(self) -> None:
+        tactic._worker_last_pos.clear()
+        tactic._worker_last_pos.update(self._saved["last"])
+        tactic._worker_recent.clear()
+        tactic._worker_recent.update(self._saved["recent"])
+        tactic._worker_explore_history.clear()
+        tactic._worker_explore_history.update(self._saved["history"])
+        tactic._worker_rally_home.clear()
+        tactic._worker_rally_home.update(self._saved["rally"])
+        tactic._resource_assignments.clear()
+        tactic._resource_assignments.update(self._saved["assign"])
+        tactic.turn_context.resource_space = self._saved["space"]
+
+    def test_never_walked_exit_outranks_a_ring_cell_lapped_seven_steps_ago(self):
+        class Worker:
+            id = "w-ring"
+            position = (2, 1)
+            cargo = 0
+            direction = None
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+        lap = [(2, 0), (1, 0), (0, 0), (0, 1), (0, 2), (1, 2), (2, 2), (2, 1)]
+        tactic._worker_explore_history["w-ring"] = list(lap)
+        tactic._worker_recent["w-ring"] = list(lap[-4:])
+        tactic._worker_last_pos["w-ring"] = (2, 2)
+        # A 3x3 shell around a centre wall; (3,1) is the pocket's only exit and
+        # the ring successor (2,0) was last stood on 7 steps ago.
+        obstacles = frozenset({(1, 1), (-1, 0), (-1, 1), (-1, 2), (0, -1),
+                               (1, -1), (2, -1), (0, 3), (1, 3), (2, 3)})
+        worker = Worker()
+        config = default_config()
+        tactic.turn_context.resource_space = 100
+
+        tactic._plan_worker(
+            worker,
+            SimpleNamespace(position=(900, 900)),
+            resource_cells=frozenset(),
+            obstacle_cells=obstacles,
+            depleted=set(),
+            config=config,
+        )
+
+        self.assertIsNotNone(worker.direction)
+        self.assertEqual(
+            (worker.position[0] + worker.direction.delta[0],
+             worker.position[1] + worker.direction.delta[1]),
+            (3, 1),
+        )
+
+    def test_rally_engages_far_out_and_releases_inside_the_mining_ring(self):
+        config = default_config()
+        config["worker_mine_max_distance"] = 100
+        core = (0, 0)
+        # Past 2x the mine radius an unassignable worker walks home instead.
+        self.assertEqual(tactic._worker_rally_goal("u", (0, 201), core, config), core)
+        self.assertTrue(tactic._worker_rally_home.get("u"))
+        # Hysteresis: still inside the ring it keeps marching in, and only
+        # releases well inside the assignable zone — a single threshold would
+        # flip rally/explore every Tick at the boundary.
+        self.assertEqual(tactic._worker_rally_goal("u", (0, 120), core, config), core)
+        self.assertIsNone(tactic._worker_rally_goal("u", (0, 50), core, config))
+        self.assertNotIn("u", tactic._worker_rally_home)
+        # A fresh worker inside the enter threshold keeps exploring.
+        self.assertIsNone(tactic._worker_rally_goal("v", (0, 150), core, config))
+
+    def test_rally_is_inert_without_a_mine_radius(self):
+        config = default_config()
+        config["worker_mine_max_distance"] = 0
+        self.assertIsNone(
+            tactic._worker_rally_goal("u", (0, 900), (0, 0), config)
+        )
+
+    def test_far_unassigned_worker_marches_home_instead_of_exploring(self):
+        class Worker:
+            id = "w-rally"
+            position = (0, 400)
+            cargo = 0
+            direction = None
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.waited = True
+
+        config = default_config()
+        config["worker_mine_max_distance"] = 100
+        tactic.turn_context.resource_space = 100
+        worker = Worker()
+
+        action, detail = tactic._plan_worker(
+            worker,
+            SimpleNamespace(position=(0, 0)),
+            resource_cells=frozenset(),
+            obstacle_cells=frozenset(),
+            depleted=set(),
+            config=config,
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("rally-home", detail)
+        self.assertNotIn("explore", detail)
+        self.assertEqual(
+            (worker.position[0] + worker.direction.delta[0],
+             worker.position[1] + worker.direction.delta[1]),
+            (0, 399),
+        )
 
 
 if __name__ == "__main__":
