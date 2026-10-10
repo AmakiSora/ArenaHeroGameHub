@@ -4135,6 +4135,25 @@ def _plan_home_combat(
         )
         if moved is not None:
             return moved
+        # Pathing has a bounded expansion budget, so a defender stranded far
+        # outside the ring misses every Tick and used to fall through to the
+        # home-patrol scout step below. That scout step shuffled one cell out on
+        # the next Tick's march right back (observed after the 2026-10-10 deploy:
+        # V8 at (839,-1656), 1420 cells from home, 3 distinct cells and 98%
+        # revisits over 130 Ticks, alternating UP/RIGHT home-patrol with
+        # DOWN/LEFT home-return). Same answer the attack march uses: a
+        # budget-free greedy step toward the slot.
+        marched = _long_march_step(
+            unit,
+            pos,
+            goal,
+            obstacle_cells,
+            detail_prefix="home-return",
+            cell_counts=cell_counts,
+            extra_obstacles=_chute_ring,
+        )
+        if marched is not None:
+            return marched
 
     # Delivery pipeline: the cells adjacent to the chute are the next-in-line
     # pre-position slots. While carriers queue, a defender camped there blocks

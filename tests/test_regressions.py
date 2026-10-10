@@ -11565,5 +11565,68 @@ class WorkerExploreLoopBreakTests(unittest.TestCase):
         )
 
 
+class HomeReturnFarStrandedTests(unittest.TestCase):
+    """A home defender stranded far outside the patrol ring must march, not shuffle.
+
+    Post-2026-10-10 deploy: V8 sat 1420 cells from the Core alternating
+    ``UP/RIGHT home-patrol`` with ``DOWN/LEFT home-return`` across 3 cells
+    (98% revisits over 130 Ticks). The A* march has a bounded expansion budget,
+    so at that distance it returns None every Tick and the planner fell through
+    to the patrol scout step, whose one-cell shuffle the next Tick's march
+    undid. The attack march already solved exactly this with a budget-free
+    greedy step; the home march has to do the same instead of drifting down into
+    the scout.
+    """
+
+    def setUp(self) -> None:
+        self._saved = {
+            "last": dict(tactic._worker_last_pos),
+            "miss": dict(tactic._march_route_miss),
+            "names": dict(tactic._object_names),
+            "counters": dict(tactic._object_name_counters),
+        }
+        tactic._worker_last_pos.clear()
+        tactic._march_route_miss.clear()
+
+    def tearDown(self) -> None:
+        tactic._worker_last_pos.clear()
+        tactic._worker_last_pos.update(self._saved["last"])
+        tactic._march_route_miss.clear()
+        tactic._march_route_miss.update(self._saved["miss"])
+        tactic._object_names.clear()
+        tactic._object_names.update(self._saved["names"])
+        tactic._object_name_counters.clear()
+        tactic._object_name_counters.update(self._saved["counters"])
+
+    def test_far_defender_falls_back_to_the_budget_free_march(self) -> None:
+        core_pos = (668, -234)
+        pos = (839, -1656)
+        unit = SimpleNamespace(
+            id="v-far", unit_type=UnitType.VANGUARD, position=pos, hp=5,
+        )
+        steps: list = []
+        unit.move = lambda direction: steps.append(direction)
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 3
+
+        with patch.object(tactic, "_move_towards", return_value=None):
+            action, detail = tactic._plan_home_combat(
+                unit, unit_kind="vanguard", enemies=(),
+                obstacle_cells=frozenset(), core_pos=core_pos, config=config,
+            )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("home-return", detail)
+        self.assertNotIn("home-patrol", detail)
+        self.assertEqual(len(steps), 1)
+        # The step has to close the distance to the slot; a shuffle does not.
+        nxt = (pos[0] + steps[0].delta[0], pos[1] + steps[0].delta[1])
+        self.assertEqual(
+            tactic._manhattan(nxt, core_pos),
+            tactic._manhattan(pos, core_pos) - 1,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
