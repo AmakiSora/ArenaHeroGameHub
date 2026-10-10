@@ -2786,11 +2786,23 @@ def _roam_update_stall(uid: str) -> bool:
             abs(window[-1][0] - window[0][0]),
             abs(window[-1][1] - window[0][1]),
         )
+        # Bounding extent, not first-to-last drift: a unit circling a 2x2 box
+        # (V2 at (-336,-806), V5 at (237,-619) — UP/DOWN/LEFT/RIGHT over 4 cells,
+        # net 2 in 81 Ticks) returns to where it started so drift reads ~0 for a
+        # genuine advance too, while the box's extent pins it inside 3x3. Real
+        # roaming covers new ground and blows the box out well past it.
+        extent_x = max(c[0] for c in window) - min(c[0] for c in window)
+        extent_y = max(c[1] for c in window) - min(c[1] for c in window)
         stalled = (
             len(distinct) <= _ROAM_STALL_CELLS
             or (
                 len(distinct) <= _ROAM_STALL_CELLS + 1
                 and drift <= _ROAM_STALL_DRIFT
+            )
+            or (
+                len(distinct) <= _ROAM_STALL_BOX_CELLS
+                and extent_x <= _ROAM_STALL_BOX_EXTENT
+                and extent_y <= _ROAM_STALL_BOX_EXTENT
             )
         )
         if stalled:
@@ -3430,7 +3442,16 @@ def _long_march_step(
     best: Direction | None = None
     best_dist: int | None = None
     blocked = frozenset(extra_obstacles)
-    last = _worker_last_pos.get(str(unit.id))
+    uid = str(unit.id)
+    last = _worker_last_pos.get(uid)
+    # Same cycle-blindness the explore fan-out had: one step of back-track
+    # memory cannot break a 2x2 box. The march just walks the perimeter and the
+    # next Tick the "best distance" neighbour is the cell it came through two
+    # steps ago (observed after the rally-home deploy: W21 at (732,-681) and
+    # W14 at (1425,-237) each spent 81 Ticks on 4 cells with net displacement 0
+    # while supposedly marching 486 / 757 cells home). Nudge by visit age so a
+    # fresh cell wins the tie, and record the step into the same tail.
+    visited_age = _worker_explore_ages(uid)
     # Three escalating passes: (1) the normal step — no backtrack, no dead-end
     # cells; (2) escape pass — allow dead-end cells, because a unit that is
     # already INSIDE a pocket can only leave through its flagged mouth (this
@@ -3451,6 +3472,9 @@ def _long_march_step(
             if not allow_dead_end and _is_dead_end_step(npos, obstacle_cells):
                 continue
             dist = _manhattan(npos, goal)
+            age = visited_age.get(npos)
+            if age is not None:
+                dist += 3 if age < 6 else 1
             if best_dist is None or dist < best_dist:
                 best_dist = dist
                 best = direction
@@ -3459,7 +3483,8 @@ def _long_march_step(
     if best is None:
         return None
     unit.move(best)
-    _worker_last_pos[str(unit.id)] = pos
+    _worker_last_pos[uid] = pos
+    _worker_remember_explore(uid, pos)
     return ("MOVE", f"{best.name} {detail_prefix} {goal}")
 
 
@@ -6153,6 +6178,12 @@ _ROAM_BAN_TICKS = 120
 _ROAM_STALL_WINDOW = 8
 _ROAM_STALL_CELLS = 2
 _ROAM_STALL_DRIFT = 2
+# A window that never leaves a 3x3 box proves circling even when it visits more
+# cells than _ROAM_STALL_CELLS (the 2x2 perimeter the <=2-cell and drift tests
+# both miss). Extent rather than drift, because a box cycle keeps returning to
+# its start while a genuine advance also has small first-to-last drift.
+_ROAM_STALL_BOX_CELLS = 4
+_ROAM_STALL_BOX_EXTENT = 2
 # Keep a longer tail than the detection window so the remembered region also
 # covers the approach path into the bounce (the escape avoids re-entering it).
 _ROAM_STALL_REGION = 16
@@ -8103,12 +8134,26 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             # budget scaled to distance, path cached per goal and recomputed
             # when the Core leaves the cached path or a new wall blocks it.
             # Auto mode keeps the greedy heading (it is leash-constrained).
+            #
+            # Once a detour is committed it also drives every following Tick, not
+            # just the Tick its wall was found: the greedy heading is free to
+            # step straight back onto the cell the detour just left, and the two
+            # rules then erase each other (observed: C1 bouncing (668,-236)/
+            # (668,-237) with net 0 over 81 Ticks — (668,-235) is walled, so
+            # every Tick from -236 the A* said "back to -237 and around" while
+            # every Tick from -237 the greedy heading said "down to -236").
+            _core_on_cached_route = (
+                core_target_enabled
+                and _core_target_path_cache.get("goal") == tuple(target)
+                and tuple(core_pos) in (_core_target_path_cache.get("path") or ())
+            )
             _core_astep = None
             if (
                 core_target_enabled
                 and dirs
                 and (
-                    (core_pos[0] + dirs[0].delta[0], core_pos[1] + dirs[0].delta[1])
+                    _core_on_cached_route
+                    or (core_pos[0] + dirs[0].delta[0], core_pos[1] + dirs[0].delta[1])
                     in obstacle_cells
                     or _is_dead_end_step(
                         (core_pos[0] + dirs[0].delta[0], core_pos[1] + dirs[0].delta[1]),

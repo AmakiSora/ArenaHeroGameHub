@@ -11628,5 +11628,154 @@ class HomeReturnFarStrandedTests(unittest.TestCase):
         )
 
 
+class CoreCommittedRouteStickinessTests(CoreTerrainBlockedLearningTests):
+    """A committed Core detour must drive the following Ticks, not just its own.
+
+    Post-deploy field: C1 bounced (668,-236)/(668,-237) with net 0 over 81 Ticks.
+    (668,-235) is walled, so every Tick standing on -236 the A* detour said "step
+    back to -237 and go around", while every Tick standing on -237 the greedy
+    heading saw -236 free and stepped straight back onto it. The detour was
+    only consulted when the greedy primary cell was blocked, so the two rules
+    erased each other forever.
+    """
+
+    def setUp(self) -> None:
+        # Hermetic: an earlier test's obstacle memory makes the cached route's
+        # next cell look walled, and the block then silently re-runs A* instead
+        # of following the committed path. The base class snapshots these
+        # globals, so clearing here is restored automatically on teardown.
+        super().setUp()
+        tactic._obstacle_memory.clear()
+        tactic._known_obstacles = frozenset()
+        tactic._dead_obstacles = None
+        tactic._dead_structure_built = False
+        tactic._dead_set = set()
+        tactic._dead_view = frozenset()
+        tactic._dead_open_count = {}
+        tactic._path_blockers_union_key = None
+        tactic._path_blockers_union = frozenset()
+        tactic._core_target_path_cache.clear()
+
+    def test_cached_route_wins_even_when_the_greedy_heading_is_free(self) -> None:
+        config = default_config()
+        config["core_target_enabled"] = True
+        config["core_target_x"] = 0
+        config["core_target_y"] = 50
+        config["core_max_drift"] = 0
+        # Down is open and is exactly what the greedy heading wants, but the
+        # cached route says the way around starts by stepping up.
+        tactic._core_target_path_cache.clear()
+        tactic._core_target_path_cache.update({
+            "goal": (0, 50),
+            "path": [(0, 0), (0, -1), (1, -1), (1, 0), (1, 1), (1, 2)],
+        })
+
+        action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=1, config=config,
+        )
+
+        self.assertEqual(moves, [Direction.UP])
+        self.assertEqual(action, "MOVE_UP")
+
+    def test_greedy_heading_still_used_with_no_committed_route(self) -> None:
+        config = default_config()
+        config["core_target_enabled"] = True
+        config["core_target_x"] = 0
+        config["core_target_y"] = 50
+        config["core_max_drift"] = 0
+        tactic._core_target_path_cache.clear()
+
+        _action, moves, _ = self._run(
+            core_pos=(0, 0), worker_pos=(500, 0), tick=1, config=config,
+        )
+
+        self.assertEqual(moves, [Direction.DOWN])
+
+
+class LongMarchBoxEscapeTests(unittest.TestCase):
+    """`_long_march_step` must not re-walk a cell two steps back.
+
+    One step of back-track memory is shorter than the 2x2 box it traps units
+    in: the march ranks by distance to the goal, so the best-distance neighbour
+    is usually the cell stepped through two Ticks ago. Observed right after the
+    rally-home deploy — W21 at (732,-681) and W14 at (1425,-237) each spent 81
+    Ticks on 4 cells with net displacement 0 while supposedly marching hundreds
+    of cells home.
+    """
+
+    def setUp(self) -> None:
+        self._saved = {
+            "last": dict(tactic._worker_last_pos),
+            "history": {k: list(v) for k, v in tactic._worker_explore_history.items()},
+        }
+        tactic._worker_last_pos.clear()
+        tactic._worker_explore_history.clear()
+
+    def tearDown(self) -> None:
+        tactic._worker_last_pos.clear()
+        tactic._worker_last_pos.update(self._saved["last"])
+        tactic._worker_explore_history.clear()
+        tactic._worker_explore_history.update(self._saved["history"])
+
+    def _march(self):
+        unit = SimpleNamespace(id="m-box", position=(0, 0))
+        steps: list = []
+        unit.move = lambda direction: steps.append(direction)
+        # The unit circled A(0,1) -> B(1,1) -> C(1,0) and now stands on D(0,0);
+        # only C is inside the one-step memory, so A is still a legal "best".
+        tactic._worker_explore_history["m-box"] = [(0, 1), (1, 1), (1, 0), (0, 0)]
+        tactic._worker_last_pos["m-box"] = (1, 0)
+        action, detail = tactic._long_march_step(
+            unit, (0, 0), (0, 100), frozenset(), detail_prefix="rally-home",
+        )
+        return action, detail, steps
+
+    def test_visited_corner_loses_the_distance_tie(self) -> None:
+        action, _detail, steps = self._march()
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(len(steps), 1)
+        # A(0,1) is 99 from the goal but was walked 3 steps ago; the nudge must
+        # hand the step to fresh ground instead of closing the box cycle.
+        self.assertNotEqual(steps[0].delta, (0, 1))
+        self.assertEqual(
+            tactic._worker_explore_history["m-box"][-1], (0, 0),
+            "the march must record its step into the same visited tail",
+        )
+
+    def test_without_history_the_closest_cell_still_wins(self) -> None:
+        tactic._worker_explore_history.clear()
+        tactic._worker_last_pos.clear()
+        unit = SimpleNamespace(id="m-fresh", position=(0, 0))
+        steps: list = []
+        unit.move = lambda direction: steps.append(direction)
+        tactic._long_march_step(
+            unit, (0, 0), (0, 100), frozenset(), detail_prefix="rally-home",
+        )
+        self.assertEqual(steps[0].delta, (0, 1))
+
+
+class RoamBoxCycleDetectionTests(unittest.TestCase):
+    """A 2x2 roam box proves circling even though it visits 4 distinct cells."""
+
+    def setUp(self) -> None:
+        self._saved = {
+            k: list(v) for k, v in tactic._roam_pos_history.items()
+        }
+        tactic._roam_pos_history.clear()
+
+    def tearDown(self) -> None:
+        tactic._roam_pos_history.clear()
+        tactic._roam_pos_history.update(self._saved)
+
+    def test_two_by_two_box_triggers(self) -> None:
+        box = [(0, 0), (1, 0), (1, 1), (0, 1)]
+        tactic._roam_pos_history["u"] = list(box * 2)
+        self.assertTrue(tactic._roam_update_stall("u"))
+
+    def test_wide_sweep_never_triggers(self) -> None:
+        tactic._roam_pos_history["u"] = [(i, i % 2) for i in range(8)]
+        self.assertFalse(tactic._roam_update_stall("u"))
+
+
 if __name__ == "__main__":
     unittest.main()
