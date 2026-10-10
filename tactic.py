@@ -8392,6 +8392,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     # re-issuing the refused step forever. The rejection event names only the
     # worker's own cell, so the destination comes from what we planned last Tick.
     _blocked_now: dict[str, tuple[tuple[int, int], int]] = {}
+    _core_cell = tuple(core_pos)
     for _key, (_cell, _repeat) in _worker_contest_repeat.items():
         if _repeat < _WORKER_CONTEST_BLOCK_AFTER:
             continue
@@ -8409,6 +8410,11 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
         _planned = _worker_planned_step.get(_key)
         if _planned is None or _planned[0] != _cell:
             continue  # the worker moved since that plan: nothing to learn
+        if _planned[1] == _core_cell:
+            # Never park the chute: a carrier refused on the Core cell is the
+            # deposit path itself, and parking it starves the vault for the
+            # whole TTL instead of routing around a neighbour.
+            continue
         _blocked_now[_key] = (
             _planned[1],
             turn_context.tick + _WORKER_CONTEST_BLOCK_TICKS,

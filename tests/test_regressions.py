@@ -10092,6 +10092,27 @@ class WorkerContestedBackoffTests(unittest.TestCase):
             self.assertNotEqual(dest, (4, 0), seen)
             self.assertTrue(plan.startswith("MOVE"), seen)
 
+    def test_the_chute_cell_is_never_parked(self) -> None:
+        """Parking the Core cell would starve the vault, not dodge a peer.
+
+        A carrier refused on the Core cell is refused on the deposit path
+        itself — the only way in is in. Parking it for
+        _WORKER_CONTEST_BLOCK_TICKS would freeze that carrier's deliveries, the
+        very economy stall the whole breaker was written to prevent.
+        """
+        for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 3):
+            self._run(
+                tick=tick,
+                events=[self._contested_event(position=(1, 0))],
+                position=(1, 0),
+            )
+        self.assertNotIn("worker-1", tactic._worker_contest_blocked)
+        self.assertGreaterEqual(
+            tactic._worker_contest_repeat["worker-1"][1],
+            tactic._WORKER_CONTEST_BLOCK_AFTER,
+            "the tally has to cross the threshold for this to prove anything",
+        )
+
     def test_block_is_dropped_when_the_worker_leaves_that_origin(self) -> None:
         for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 2):
             self._run(tick=tick, events=[self._contested_event()])
