@@ -1,5 +1,14 @@
 # ArenaGame 巡检日志
 
+## 2026-10-10 19:40（W5 钉死的真因：一个从没生效过的安全机制）
+- W5 (49797bf4) 在 (279,-424) 连发 118 拍同一个 `MOVE:RIGHT`，每拍被服务端拒 `MOVE_CONTESTED`（最近 60 条 warn 里 57 条是它），周边没有任何我方单位。
+- **真因不是逻辑写错，是键形态不一致**：`choose_actions` 的单位循环用 `uid = str(unit.id)[:8]`（tactic.py:8497），而 `_worker_contest_streak` 在 8303 行按 `str(event.actor_id)`（完整 UUID）重建，8663 行却用 8 位 `uid` 去查 → **永远查不到 → MOVE_CONTESTED 退避一拍也不生效**。
+- 铁证：`grep -c 'contested-backoff' /app/runtime/tactic_play.log` = **0**（整个 44MB 历史一次都没触发过）。
+- 为什么测试没抓到：`tests/test_regressions.py` 的替身单位 id 就是 `"worker-1"`（≤8 字符），`[:8]` 截断等于没截，用例 `test_...contested...` 里 `WAIT:contested-backoff` 断言照常通过。与 `_prune_dead_unit_state` docstring 里"以前用 id[:8] 当键，每拍清空、防抖全灭"是同一类老坑，这次轮到另一处复发。
+- 修法（未动，待决策）：①最小——8663 改用 `str(unit.id)` 查表，把这条已设计已测试的退避重新武装；②补强——同一 `MOVE_CONTESTED` 目的地连续被拒 N 拍后，像先锋的 `_cell_limit_blocked` 那样把该格对该单位临时屏蔽，让满载贪心兜底换候选格。**只做①的话 W5 会变成 MOVE/MOVE/WAIT 循环，仍不走路**（对手机制没解除之前），所以②才是真正解困的那一半；而 8607 行那段注释明确把工人排除在强制绕行之外（"a forced detour would derail the chute pipeline"），要不要为工人破这个例需要你拍板。
+- V8 (f1194dcb) 仍是另一类：距家 1568 格，靠免预算贪心走但困在 3 格口袋。根因是 `_long_march_step` 三级降级的次序——pass1 排除死胡同格，而口袋**内部**永远有非死胡同格，于是 pass1 恒成功、pass2（允许死胡同格=口袋出口）永不触发。9-19 那次"口袋内出口即生路"只修到"候选全空"的情形。修法：pass1 候选若全部落在自己近期走过的格子里（证明在循环），直接升级到允许死胡同格。
+- 本轮只读日志与代码，未改动 tactic.py，未再部署。当前线上版本 = `47493fa`。
+
 ## 2026-10-10 19:15（第三次部署后复查）
 - 复查窗口 tick 415369→415481（113 拍）。核心确认修好：**(670,-237)→(693,-233)，distinct=28、net=27**，不再 2 格互扇（此前 113 拍 distinct=2/net=0）。
 - 打转单位从 6 个降到 2 个：W21/W14（我上一轮 rally-home 引入的 4 格盒）与 V2/V5（2x2 漫游盒）已消失；R3 恢复活动；V4 是 `kite-hold-safe` **故意驻守**（distinct=1 全 WAIT），已把巡检脚本判据改成"以 MOVE 为主且被限制在小格子集"才算抖动，避免把驻守误报成 bug。
