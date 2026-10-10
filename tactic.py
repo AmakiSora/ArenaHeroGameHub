@@ -2030,6 +2030,7 @@ def _plan_worker(
     lease_uid: str | None = None,
     next_uid: str | None = None,
     cell_counts: Mapping | None = None,
+    contest_blocked: frozenset[tuple[int, int]] = frozenset(),
 ) -> tuple[str, str]:
     """Return (action_name, detail).
 
@@ -2037,6 +2038,9 @@ def _plan_worker(
     this tick (see _assign_delivery_lease); ``next_uid`` the carrier that
     waits adjacent and chains in the tick the chute empties. None disables
     the queue — used by unit tests and any call outside choose_actions.
+    ``contest_blocked`` are cells this worker has been refused entry to
+    repeatedly (MOVE_CONTESTED); they ride the transient-blocker channel, not
+    the wall set, so the dead-end cache keeps its identity.
 
     ``cell_counts`` (friendly unit count per cell) enables capacity-aware
     retreats: a neighbour with one occupant is squeezable (server limit 2).
@@ -2075,6 +2079,12 @@ def _plan_worker(
         cell_counts,
         core_pos,
     )
+    if contest_blocked:
+        # Cells this worker has been refused again and again join the transient
+        # blockers (the same channel fellow units use), never the wall set: a
+        # fresh obstacle object would defeat the identity-cached dead-end
+        # structure for every later caller.
+        move_blocked = move_blocked | frozenset(contest_blocked)
 
     # Retreat view: with per-cell counts the friendly units are judged by
     # capacity (< _CELL_UNIT_LIMIT is squeezable) and only enemy cells stay
@@ -3457,9 +3467,16 @@ def _long_march_step(
     # already INSIDE a pocket can only leave through its flagged mouth (this
     # trapped the regroup march in a 2x2 box, cycling forever); (3) last
     # resort — also allow stepping back the way it came.
+    # Pass 1 also escalates when its best step is ground this unit already
+    # walked: a pocket's INTERIOR cells are ordinary cells, so pass 1 always
+    # finds something and the mouth in pass 2 was only ever reached when pass 1
+    # came back empty (observed: V8 at (839,-1656), 1568 cells from home, circling
+    # 3 cells with net 0 while marching toward its own patrol slot).
+    fallback: tuple[Direction, tuple[int, int]] | None = None
     for allow_dead_end, allow_backtrack in ((False, False), (True, False), (True, True)):
         best = None
         best_dist = None
+        best_cell: tuple[int, int] | None = None
         for direction in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
             npos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
             if npos in obstacle_cells or npos in blocked:
@@ -3478,8 +3495,22 @@ def _long_march_step(
             if best_dist is None or dist < best_dist:
                 best_dist = dist
                 best = direction
-        if best is not None:
-            break
+                best_cell = npos
+        if best is not None and fallback is None:
+            fallback = (best, best_cell)
+        if best is None:
+            continue
+        if not allow_dead_end and visited_age.get(best_cell) is not None:
+            # Best ordinary step is ground already walked: this unit is circling
+            # inside a pocket, so reach for the dead-end mouth instead of
+            # breaking out of the pass ladder here.
+            continue
+        break
+    else:
+        # Every escalation pass came back empty — keep the normal step rather
+        # than freezing a unit that did have somewhere to go.
+        if fallback is not None:
+            best, best_cell = fallback
     if best is None:
         return None
     unit.move(best)
@@ -6036,6 +6067,24 @@ _CORE_MOVE_HOLD_TICKS = 4
 # identical (pos, cell) rejections the worker backs off for one Tick so the
 # peer's move can finally land.
 _worker_contest_streak: dict[str, tuple[tuple[int, int], tuple[int, int], int]] = {}
+# Where a worker's last planned step was headed: ``full unit id -> (origin, dest)``.
+# The server reports MOVE_CONTESTED at the actor's OWN cell, so the rejection
+# event alone cannot say which neighbour was refused — the plan that produced it
+# can. Kept so a repeat offender can blacklist the destination instead of
+# re-issuing the same refused step forever.
+_worker_planned_step: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {}
+# Destination refused this many consecutive Ticks gets parked for the carrier,
+# and for how long. Observed: W5 (49797bf4) fired the same MOVE:RIGHT out of
+# (279,-424) for 118 straight Ticks, 57 of the last 60 warn rows in
+# battle_log — an invisible claimant holds that cell and the carrier has no way
+# to learn that from a rejection that names only its own cell.
+_WORKER_CONTEST_BLOCK_AFTER = 4
+_WORKER_CONTEST_BLOCK_TICKS = 60
+_worker_contest_blocked: dict[str, tuple[tuple[int, int], int]] = {}
+# Rejections counted per origin cell: ``full unit id -> (origin, count)``. Kept
+# across the waiting Tick (which emits no rejection) so a worker that keeps
+# losing the same fight actually reaches the block threshold.
+_worker_contest_repeat: dict[str, tuple[tuple[int, int], int]] = {}
 # Attack-team units currently in sticky home-recovery (regroup) mode: once a
 # march has failed, keep walking home until the Core cell is reached instead of
 # re-attempting the target march every Tick (that A-B-A'd against the regroup
@@ -7463,6 +7512,12 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _worker_explore_history.pop(dead_id, None)
     for dead_id in set(_worker_rally_home) - alive_ids:
         _worker_rally_home.pop(dead_id, None)
+    for dead_id in set(_worker_planned_step) - alive_ids:
+        _worker_planned_step.pop(dead_id, None)
+    for dead_id in set(_worker_contest_blocked) - alive_ids:
+        _worker_contest_blocked.pop(dead_id, None)
+    for dead_id in set(_worker_contest_repeat) - alive_ids:
+        _worker_contest_repeat.pop(dead_id, None)
     for dead_id in set(_resource_assignments) - alive_ids:
         _resource_assignments.pop(dead_id, None)
     for dead_id in set(_worker_path_cache) - alive_ids:
@@ -8267,6 +8322,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     # bounded by the unit count and never carries stale entries.
     global _cell_limit_streak, _healing_units_prev
     global _heal_return_inflight, _worker_contest_streak
+    global _worker_contest_blocked, _worker_contest_repeat
     _failed_again: set[str] = set()
     _failed_cell: dict[str, tuple[int, int]] = {}
     for _ev in getattr(turn, "events", ()) or ():
@@ -8309,6 +8365,60 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             else 1,
         )
         for _key, (_cell, _dest) in _contested_now.items()
+    }
+    # Backing off one Tick only helps when the claimant is a peer that also
+    # moves. Count rejections PER ORIGIN and keep the tally across the Tick the
+    # worker spends waiting (a waiting worker emits no rejection at all, so a
+    # from-scratch rebuild would bounce between 1 and 2 forever and never reach
+    # the block threshold). Drop it as soon as the worker stands somewhere else:
+    # the head-on is behind it.
+    _repeat_now: dict[str, tuple[tuple[int, int], int]] = {}
+    for _key, (_cell, _dest, _count) in _worker_contest_streak.items():
+        _prev = _worker_contest_repeat.get(_key)
+        _repeat_now[_key] = (
+            _cell,
+            _prev[1] + 1 if _prev is not None and _prev[0] == _cell else 1,
+        )
+    _worker_contest_repeat = {
+        **{
+            _k: _v for _k, _v in _worker_contest_repeat.items()
+            if _k not in _repeat_now
+            and _worker_pos_by_id.get(_k) == _v[0]
+        },
+        **_repeat_now,
+    }
+    # Once the same origin keeps losing the same fight, park the destination it
+    # keeps aiming at so the march routes around the claimant instead of
+    # re-issuing the refused step forever. The rejection event names only the
+    # worker's own cell, so the destination comes from what we planned last Tick.
+    _blocked_now: dict[str, tuple[tuple[int, int], int]] = {}
+    for _key, (_cell, _repeat) in _worker_contest_repeat.items():
+        if _repeat < _WORKER_CONTEST_BLOCK_AFTER:
+            continue
+        _live = _worker_contest_blocked.get(_key)
+        if _live is not None and _live[1] > turn_context.tick:
+            # Sticky while the carrier stands its ground: the tally keeps
+            # growing every Tick, and re-pointing the block at the newest plan
+            # destination would un-park the very cell that escape just stepped
+            # onto, flipping the ban LEFT/UP every Tick instead of routing
+            # around the claimant.
+            _blocked_now[_key] = (
+                _live[0], turn_context.tick + _WORKER_CONTEST_BLOCK_TICKS,
+            )
+            continue
+        _planned = _worker_planned_step.get(_key)
+        if _planned is None or _planned[0] != _cell:
+            continue  # the worker moved since that plan: nothing to learn
+        _blocked_now[_key] = (
+            _planned[1],
+            turn_context.tick + _WORKER_CONTEST_BLOCK_TICKS,
+        )
+    _worker_contest_blocked = {
+        **{
+            _k: _v for _k, _v in _worker_contest_blocked.items()
+            if _v[1] > turn_context.tick and _k not in _blocked_now
+        },
+        **_blocked_now,
     }
 
     # Serialize core deliveries: exactly one carrier may contest the chute
@@ -8660,8 +8770,20 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
             # with a peer worker. Sit this Tick out so the peer's move lands
             # instead of cancelling both again; normal planning resumes next
             # Tick (the streak resets once no contested rejection recurs).
-            _contest = _worker_contest_streak.get(uid)
-            if _contest is not None and _contest[2] >= 2:
+            # Keyed by the FULL unit id: the rejection events carry it, while
+            # this loop's ``uid`` is the 8-character display id. Looking the
+            # streak up by ``uid`` missed every single entry, which is why this
+            # breaker had never once fired in production (grep: zero
+            # contested-backoff lines in 44MB of tactic_play.log, while the test
+            # double's id "worker-1" was short enough to survive [:8]).
+            _full_uid = str(unit.id)
+            _contest = _worker_contest_streak.get(_full_uid)
+            _blocked = _worker_contest_blocked.get(_full_uid)
+            _blocking = _blocked is not None and _blocked[1] > turn_context.tick
+            # Once the destination is parked, plan around it instead of sitting
+            # out another Tick: waiting cannot resolve a head-on with something
+            # this worker cannot see or move.
+            if not _blocking and _contest is not None and _contest[2] >= 2:
                 unit.wait()
                 unit_actions_detail[uid] = (
                     f"WAIT:contested-backoff {_contest[1]}"
@@ -8679,9 +8801,29 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 lease_uid=delivery_lease,
                 next_uid=_delivery_next_uid,
                 cell_counts=friendly_cell_counts,
+                contest_blocked=(
+                    frozenset({_blocked[0]}) if _blocking else frozenset()
+                ),
             )
             unit_phase_ms["worker"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = f"{action}:{detail}"
+            if action == "MOVE":
+                # Remember where the step was going: the server reports
+                # MOVE_CONTESTED on the worker's own cell, so this is the only
+                # record of which neighbour was refused.
+                try:
+                    _step_dir = Direction[detail.split(" ", 1)[0]]
+                except (KeyError, IndexError, ValueError):
+                    _step_dir = None
+                if _step_dir is not None:
+                    _origin = tuple(unit.position)
+                    _worker_planned_step[_full_uid] = (
+                        _origin,
+                        (
+                            _origin[0] + _step_dir.delta[0],
+                            _origin[1] + _step_dir.delta[1],
+                        ),
+                    )
         elif unit.unit_type == UnitType.VANGUARD:
             team = _combat_team_for(name, config)
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)

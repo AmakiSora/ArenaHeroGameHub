@@ -9911,9 +9911,12 @@ class WorkerContestedBackoffTests(unittest.TestCase):
         "_dead_structure_built", "_known_obstacles", "_obstacle_memory",
         "_dead_end_cache_key", "_dead_end_cache", "_path_blockers_union_key",
         "_path_blockers_union", "_core_anchor", "_worker_contest_streak",
+        "_worker_contest_repeat", "_worker_contest_blocked",
+        "_worker_planned_step",
         "_cell_limit_streak", "_object_names", "_object_name_counters",
         "_worker_path_cache", "_combat_path_cache", "_worker_last_pos",
         "_worker_recent", "_resource_assignments",
+        "_worker_explore_history", "_worker_rally_home",
     )
 
     def setUp(self) -> None:
@@ -9927,7 +9930,7 @@ class WorkerContestedBackoffTests(unittest.TestCase):
             # under test, so restoring the original reference would be a no-op.
             setattr(tactic, name, copy.copy(val))
 
-    def _run(self, *, tick, events=()):
+    def _run(self, *, tick, events=(), worker_id="worker-1", position=(5, 0)):
         """One Tick with one cargo worker heading home; returns details."""
         core = SimpleNamespace(
             id="core", position=(0, 0), hp=5, shield=10,
@@ -9940,7 +9943,7 @@ class WorkerContestedBackoffTests(unittest.TestCase):
             wait=lambda: None,
         )
         worker = SimpleNamespace(
-            id="worker-1", unit_type=UnitType.WORKER, position=(5, 0),
+            id=worker_id, unit_type=UnitType.WORKER, position=position,
             cargo=1, direction=None,
         )
         worker.move = lambda direction: None
@@ -9983,11 +9986,11 @@ class WorkerContestedBackoffTests(unittest.TestCase):
         return details
 
     @staticmethod
-    def _contested_event() -> SimpleNamespace:
+    def _contested_event(actor_id="worker-1", position=(4, 0)):
         return SimpleNamespace(
             event_type="UNIT_MOVE_FAILED",
             reason_code="MOVE_CONTESTED",
-            actor_id="worker-1", target_id=None, position=(4, 0), values={},
+            actor_id=actor_id, target_id=None, position=position, values={},
         )
 
     def test_repeat_contested_rejection_backs_off_one_tick(self) -> None:
@@ -10021,6 +10024,82 @@ class WorkerContestedBackoffTests(unittest.TestCase):
         )
         self._run(tick=1, events=[event])
         self.assertEqual(tactic._worker_contest_streak, {})
+
+    def test_backoff_survives_uuid_sized_ids(self) -> None:
+        """The tracker is keyed by the FULL unit id the events carry.
+
+        Field: the plan loop looks units up by ``uid = str(unit.id)[:8]`` while
+        the rebuild wrote the streak under ``str(event.actor_id)`` (a full UUID),
+        so the lookup missed on every real unit and contested-backoff never fired
+        once in 44MB of production log. The test double's id ("worker-1") is
+        short enough that ``[:8]`` was a no-op, which is exactly why the suite
+        stayed green while the breaker was dead.
+        """
+        uid = "49797bf4-8ab1-4a51-9c0d-000000000005"
+        short = uid[:8]
+
+        details = self._run(
+            tick=1, events=[self._contested_event(uid)], worker_id=uid,
+        )
+        self.assertEqual(tactic._worker_contest_streak[uid][2], 1)
+        self.assertTrue(details[short].startswith("MOVE"), details)
+
+        details = self._run(
+            tick=2, events=[self._contested_event(uid)], worker_id=uid,
+        )
+        self.assertEqual(tactic._worker_contest_streak[uid][2], 2)
+        self.assertTrue(
+            details[short].startswith("WAIT:contested-backoff"), details,
+        )
+
+    def test_persistent_refusal_parks_the_rejected_destination(self) -> None:
+        """A worker that keeps losing the same cell has to route around it.
+
+        Observed: W5 (49797bf4) issued the same MOVE:RIGHT out of (279,-424) for
+        118 straight Ticks, 57 of the last 60 warn rows, because the claimant of
+        that neighbour is invisible to us and one-Tick backoffs cannot resolve a
+        fight with something that never moves. The waiting Tick emits no
+        rejection at all, so the tally is kept per origin instead of rebuilt.
+        """
+        seen: list = []
+        for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 3):
+            details = self._run(tick=tick, events=[self._contested_event()])
+            seen.append((
+                tick,
+                details["worker-1"],
+                tactic._worker_contest_blocked.get("worker-1", (None, None))[0],
+                tactic._worker_planned_step.get("worker-1", (None, None))[1],
+            ))
+
+        blocked_cell, until = tactic._worker_contest_blocked["worker-1"]
+        self.assertEqual(blocked_cell, (4, 0))
+        self.assertGreater(until, tactic.turn_context.tick)
+        # (4,0) is the straight line to the Core at (0,0): with it parked the
+        # plan must step somewhere else rather than re-issuing the refused move.
+        self.assertTrue(details["worker-1"].startswith("MOVE"), details)
+        self.assertNotEqual(
+            tactic._worker_planned_step["worker-1"][1], (4, 0),
+        )
+        # The park must be sticky. Re-pointing it at each Tick's fresh plan
+        # destination un-parks the cell the escape just walked into, so the
+        # carrier flips between the two refused steps forever instead of
+        # routing around the claimant.
+        parked = [(tick, plan, blocked, dest) for tick, plan, blocked, dest in seen
+                  if blocked is not None]
+        self.assertTrue(parked, seen)
+        self.assertEqual({blocked for _t, _p, blocked, _d in parked}, {(4, 0)}, seen)
+        for _tick, plan, _blocked, dest in parked:
+            self.assertNotEqual(dest, (4, 0), seen)
+            self.assertTrue(plan.startswith("MOVE"), seen)
+
+    def test_block_is_dropped_when_the_worker_leaves_that_origin(self) -> None:
+        for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 2):
+            self._run(tick=tick, events=[self._contested_event()])
+        self.assertIn("worker-1", tactic._worker_contest_repeat)
+        # No further refusals and the worker standing elsewhere: tally is gone.
+        self._run(tick=tactic._WORKER_CONTEST_BLOCK_AFTER + 3, worker_id="worker-1",
+                  position=(9, 9))
+        self.assertEqual(tactic._worker_contest_repeat, {})
 
 
 class CapacityAwareCombatMoveTests(unittest.TestCase):
@@ -11752,6 +11831,58 @@ class LongMarchBoxEscapeTests(unittest.TestCase):
             unit, (0, 0), (0, 100), frozenset(), detail_prefix="rally-home",
         )
         self.assertEqual(steps[0].delta, (0, 1))
+
+
+class LongMarchDeadEndMouthEscalationTests(unittest.TestCase):
+    """Recycled interior ground must push the march to the pocket mouth.
+
+    A dead-end pocket's INTERIOR cells are ordinary cells, so the first greedy
+    pass always finds one and never falls through to the pass that is allowed to
+    step onto the flagged mouth. Observed: V8 at (839,-1656), 1568 cells from
+    home, circling 3 cells with net displacement 0 while the home-return march
+    ranked its own cul-de-sac.
+    """
+
+    # (1,0) is the mouth: walled on three sides, only (0,0) open behind it.
+    # (0,-1) is the way out into open map, but 2 cells further from (10,0).
+    WALLS = frozenset({(-1, 0), (0, 1), (2, 0), (1, 1), (1, -1)})
+
+    def setUp(self) -> None:
+        self._saved = {
+            "last": dict(tactic._worker_last_pos),
+            "history": {k: list(v) for k, v in tactic._worker_explore_history.items()},
+        }
+        tactic._worker_last_pos.clear()
+        tactic._worker_explore_history.clear()
+
+    def tearDown(self) -> None:
+        tactic._worker_last_pos.clear()
+        tactic._worker_last_pos.update(self._saved["last"])
+        tactic._worker_explore_history.clear()
+        tactic._worker_explore_history.update(self._saved["history"])
+
+    def _step(self, uid: str, tail: list[tuple[int, int]]):
+        unit = SimpleNamespace(id=uid, position=(0, 0))
+        steps: list = []
+        unit.move = lambda direction: steps.append(direction)
+        if tail:
+            tactic._worker_explore_history[uid] = tail
+        result = tactic._long_march_step(
+            unit, (0, 0), (10, 0), self.WALLS, detail_prefix="home-return",
+        )
+        self.assertIsNotNone(result)
+        return steps[0].delta
+
+    def test_fresh_unit_prefers_the_open_exit_over_the_mouth(self) -> None:
+        self.assertEqual(self._step("m-mouth-fresh", []), (0, -1))
+
+    def test_recycled_interior_reaches_for_the_mouth(self) -> None:
+        # Standing on the mouth itself is legal for the escape pass: leaving a
+        # pocket is only possible through it.
+        self.assertEqual(
+            self._step("m-mouth-stale", [(0, -1), (0, 0)]), (1, 0),
+            "best ordinary step is already-walked ground -> take the dead-end mouth",
+        )
 
 
 class RoamBoxCycleDetectionTests(unittest.TestCase):
