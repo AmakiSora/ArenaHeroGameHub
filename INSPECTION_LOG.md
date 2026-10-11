@@ -1,5 +1,17 @@
 # ArenaGame 巡检日志
 
+## 2026-10-11 15:10（第六/七次部署：kite 家族缺的那道防抖闸，以及一次不能算数的"清零"）
+- 复查窗口 tick **419628→419699（69 拍，第五次部署后）**：W5/V8 确认在正常干活，**`MOVE_CONTESTED` 全网归零**（W5 那 302 条全部落在 tick ≤415603，是部署前的历史），核心 distinct=12/net=11 不再互扇，卸货 137／挖矿 131。`contested-backoff` 与目的地拉黑**仍未被实战触发过**（没有任何工人连续两拍在同格被拒）。
+- 但抓到**两类新的"每拍 MOVE 却 net=0"**：V1（游击先锋）在 (327,-174)↔(327,-173)、R7（游骑兵，hp=1）在 (934,-45)↔(934,-44)，各 36+36 拍。
+- 根因（候选打分直接从 `kite_decisions` 里读出来的，不是猜的）：R7 在 (934,-44) 时四个格子 `current_hits` 全 =1（没有一个安全格），于是排序落到 `(nearest, progress)` 这一档——回头格 (934,-45) 的 `nearest=2` 与外撤格 (934,-43) 打平，而它的 `progress=+1` 压过对方的 `-1`，**U 形回头恒赢**；同时 `must_move=True`（对面是敌方游骑兵）把 WAIT 整个禁掉。于是"走出火力圈→下一拍所有格都危险→按进度走回圈内→挨一发→再走出"。V1 同构。已有的 `_KITE_STALL_UNLOCK_TICKS` 救不了它们：那道闸**明确要求全军零可见敌人**（cover 契约），而打转的前提就是敌人一直在视野里；`-backtrack` 也只是元组最低一档，永远轮不到。
+- 修法（`6b07ec9`）：stall 累计 ≥ `_KITE_SHUTTLE_UNLOCK_TICKS=6` 时把"踩回 came_from"这一步从候选里删掉——安全排序一个字没动，删的是选项不是契约。
+- **写第一版时自己踩进一个坑，被现有用例当场抓住**：判据写成"还有别的候选"，而 WAIT 恒在候选里，于是等于把死胡同里唯一的外撤步也删掉、把单位原地钉死——`test_planner_stops_waiting_after_twelve_stall_ticks`（12 拍解锁后该 MOVE 却永久 WAIT）与 `test_boxed_stalled_unit_retreats_instead_of_sitting` 双双转红。改成"必须有别的**步子**、但 WAIT 保留"后 696→698 全绿。A/B 两处：关闸门 → R7 几何用例 DOWN≠UP；把 WAIT 算作替代品 → nub 两条用例同时转红。
+- 第 6 次部署（tick 419749）后取 126 拍全新代码窗口：**打转单位 0，V1 distinct=131/net=116，R7 名字位 distinct=121/net=100**。
+- **但这个 0 不能记在新闸门头上**（逐拍回溯过部署边界）：V1 的脱离发生在 **tick 419747，比部署还早两拍**，是它那一拍被打中触发 `kite-evade` 才走的，之后 `kite-route`→`guerrilla-roam` 一路 NW 走出去；R7 那个名字已被回收给一匹新单位（旧 R7 hp=1 已阵亡，坐标从 (934,-45) 跳到 (1292,-59) 不可能是同一匹）。也就是说 `_KITE_SHUTTLE_UNLOCK_TICKS` 这道闸**至今零次实战触发证据**。
+- 所以 `020c415` 给闸门加了自报：prune 真的删掉候选时置 `assessment["shuttle_break"]`，由 `_plan_kite_combat` 渲染成 `… kite-position goal=(…) risk=1/0 shuttle-break`。端到端用例走的就是 R7 原几何（ranger／hp=1／同墙形）：stall=0 → `MOVE:DOWN`（回头），stall=6 → `MOVE:UP … shuttle-break`。**下次巡检的判据就是 grep 这个串**：为 0 说明真实对战里根本用不上这道闸（该考虑降级或换触发条件），>0 则要看触发后单位是否真的走开。第 7 次部署 tick 419914，md5 `558733ec…` 与 HEAD 归一化逐字节一致。
+- 延迟（本轮认真量了一次，不再是"看着还行"）：n=703 拍 mean **6101ms**、p95 10581、max **14870ms**（四层修复前基线 4877/14323）。最慢几拍的 phase 构成：`map_memory` 最高 6987ms、`unit:worker` 最高 9409ms、`deadend(runs=15..21)` 3123–3887ms、pathfind 5200–6733ms；**60/60 拍都在重写 map_memory 并重算 extras 死胡同**，墙记忆已 33.15 万格。回合周期约 17s，整窗 1114 拍只出现 7 次 `TICK_MISMATCH`（最大 streak 2，且多在重启边界），预算还没被吃穿。**建议下一轮做 map_memory 写盘节流**（变化量低于阈值或每 N 拍落盘一次），这是目前唯一还在单调上涨的指标。
+- 备份：`tactic.py.bak-20261011-141718`（md5 `9c61bb84…`，第 6 次部署前的线上版）。`core_target (1362,1239)` 与全部配置仍未动过一个字。
+
 ## 2026-10-11 02:20（第四次+第五次部署：W5/V8 双双解困，打转单位清零）
 - 复查窗口 tick **416903→417055（146 拍，全部是部署后数据）**，容器 healthy，远端 tactic.py 归一化 md5 = `ce8aeff…` 与 HEAD 逐字节一致（deploy_source_only 传的是工作树文件，带 CRLF，比对需先归一化——这是本轮新增的部署校验点）。
 - **两处遗留单位确认修复**：
