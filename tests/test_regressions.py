@@ -4699,18 +4699,6 @@ class ConfigClobberProtectionTests(unittest.TestCase):
         self.assertIn("V9", result["home_team"])
         self.assertEqual(mutate_mock.call_count, 1)
 
-    def test_lead_fire_defaults_on_for_existing_config_and_renders_switch(self) -> None:
-        legacy = tactic_config.default_config()
-        legacy.pop("ranger_lead_fire_enabled")
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "tactic_config.json"
-            path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
-            loaded = tactic_config.load_config(path)
-
-        self.assertTrue(loaded["ranger_lead_fire_enabled"])
-        html = dashboard.render_teams_panel()
-        self.assertIn('name="ranger_lead_fire_enabled"', html)
-        self.assertIn("移动预判实射", html)
 
 
 class GameStatsTests(unittest.TestCase):
@@ -7152,24 +7140,7 @@ class BattleLogTests(unittest.TestCase):
         )
         self.assertIn(expected_time, html)
 
-    def test_log_panel_is_present_below_config(self) -> None:
-        page = dashboard.generate_html()
-        self.assertIn('id="logPanel"', page)
-        self.assertIn('id="logSection"', page)
-        self.assertIn('id="logCount"', page)
-        for cat in ("discover", "kill", "defeat", "combat", "economy", "config", "warn"):
-            self.assertIn(f'data-log-cat="{cat}"', page)
-        self.assertGreater(page.index('id="logPanel"'), page.index('id="tacticConfigForm"'))
 
-    def test_log_panel_has_time_window_buttons(self) -> None:
-        """The battle-log panel offers time-window filters (presets + custom)
-        that replace the fixed newest-200 view."""
-        page = dashboard.generate_html()
-        for seconds in ("600", "1800", "3600", "21600"):
-            self.assertIn(f'data-log-window="{seconds}"', page)
-        self.assertIn('data-log-window="all"', page)
-        self.assertIn('id="logWindowMinutes"', page)
-        self.assertIn('id="logWindowCustomApply"', page)
 
     def test_battle_log_rows_carry_ts_for_time_filtering(self) -> None:
         """Each rendered row carries its wall-clock ts so the client can hide
@@ -7237,49 +7208,11 @@ class BattleLogTests(unittest.TestCase):
         self.assertEqual(dashboard._clamp_log_limit(req4), 200)
 
 
-class DashboardVisualSystemTests(unittest.TestCase):
-    def test_major_panels_share_visual_system_tokens(self) -> None:
-        for token in ("--surface-soft", "--control-bg", "--radius-panel", "--radius-control"):
-            self.assertIn(token, dashboard.CSS)
-        for selector in (
-            ".map-panel",
-            ".teams-panel",
-            ".config-panel",
-            ".trends-panel",
-            ".log-panel",
-            ".units-panel",
-            ".waypoint-panel",
-            ".res-panel",
-        ):
-            self.assertIn(selector, dashboard.CSS)
-
-    def test_long_resource_list_has_bounded_desktop_region(self) -> None:
-        self.assertIn(".res-panel #resSection{max-height:430px;overflow:auto", dashboard.CSS)
 
 
-class LeftSidebarTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.page = dashboard.generate_html()
-
-    def test_left_sidebar_uses_layered_summary_panels(self) -> None:
-        for panel in (
-            "core-summary",
-            "resource-summary",
-            "battle-summary",
-            "issue-summary",
-            "report-panel",
-            "enemy-panel",
-        ):
-            self.assertIn(panel, self.page)
-        self.assertIn('class="rail-focus"', self.page)
-        self.assertIn('class="rail-metric-grid"', self.page)
-        self.assertIn('class="rail-activity"', self.page)
-
-    def test_core_card_has_segmented_hp_and_shield_bars(self) -> None:
-        """The left core card shows HP and shield as one cell per point."""
-        self.assertIn('class="rail-vitals"', self.page)
-        self.assertIn('class="vital-label hp">HP', self.page)
-        self.assertIn('class="vital-label sh">盾', self.page)
+class CoreRailBarTests(unittest.TestCase):
+    """Core vitals bars come from the live helpers (_seg_cells /
+    _core_rail_html) that /api/state still emits for the arena console."""
 
     def test_seg_cells_one_cell_per_point_with_filled_prefix(self) -> None:
         self.assertEqual(
@@ -7307,17 +7240,6 @@ class LeftSidebarTests(unittest.TestCase):
         self.assertIn("3/5", dashboard._core_rail_html(away))
 
 
-class TrendPanelTests(unittest.TestCase):
-    def test_chart_series_names_match_trend_point_keys(self) -> None:
-        for key in ("r", "c", "w", "v", "g", "e"):
-            self.assertIn(f"{key}:     {{ key: '{key}'", dashboard.JS)
-
-    def test_window_buttons_use_time_seconds_not_ticks(self) -> None:
-        page = dashboard.generate_html()
-        for seconds, label in (("600", "10分钟"), ("1800", "30分钟"), ("3600", "1小时")):
-            self.assertIn(f'data-trend-window="{seconds}">{label}', page)
-        self.assertIn("最近", page)
-        self.assertNotIn('data-trend-window="400"', page)
 
 
 class TrendTimeWindowTests(unittest.TestCase):
@@ -7377,43 +7299,6 @@ class TrendTimeWindowTests(unittest.TestCase):
         self.assertTrue(all(r["_ts"] is not None for r in records))
 
 
-class UnitTabsTests(unittest.TestCase):
-    """Right sidebar unit cards are one panel with three tabs."""
-
-    def setUp(self) -> None:
-        self.page = dashboard.generate_html()
-
-    def test_three_unit_tabs_in_one_panel(self) -> None:
-        for tab in ("workers", "vanguards", "rangers"):
-            self.assertIn(f'data-unit-tab="{tab}"', self.page)
-        for pane in ("workers", "vanguards", "rangers"):
-            self.assertIn(f'data-unit-pane="{pane}"', self.page)
-        # One tab container, exactly three tab buttons + three panes.
-        self.assertEqual(self.page.count("class=\"units-tabs\""), 1)
-        self.assertEqual(self.page.count("data-unit-tab="), 3)
-        self.assertEqual(self.page.count("data-unit-pane="), 3)
-        # The three grids are the tab panes' contents.
-        self.assertEqual(self.page.count("data-unit-pane="), 3)
-
-    def test_unit_grids_and_counts_still_present(self) -> None:
-        for grid in ("workersGrid", "vgGrid", "rgGrid"):
-            self.assertIn(f'id="{grid}"', self.page)
-        for count in ("workersCount", "vgCount", "rgCount"):
-            self.assertIn(f'id="{count}"', self.page)
-
-    def test_separate_unit_panels_removed(self) -> None:
-        # The old per-type <section class="panel"> cards are gone; the tabs are
-        # inside a single units-panel section.
-        self.assertNotIn('<section class="panel">\n        <div class="panel-title"><span>工人</span>', self.page)
-        self.assertIn('class="panel units-panel"', self.page)
-
-    def test_unit_cards_use_compact_two_row_layout(self) -> None:
-        self.assertIn('class="unit-facts"', self.page)
-        self.assertIn('class="unit-locator"', self.page)
-        self.assertIn('class="unit-fact"', self.page)
-        self.assertNotIn('class="unit-coords"', self.page)
-        self.assertNotIn('class="unit-meta"', self.page)
-        self.assertNotIn('class="unit-action"', self.page)
 
 
 class TickMismatchSelfHealTests(unittest.TestCase):
@@ -7690,9 +7575,10 @@ class CombatHotspotTests(unittest.TestCase):
 class ArenaConsoleRoutingTests(unittest.TestCase):
     """HTTP-level coverage for the /arena console integration.
 
-    The old dashboard page moved to /dashboard, / redirects there, and the
-    React build is served from web/dist with the game API proxied behind the
-    dashboard token (the proxy injects the server-side API key).
+    The React build is served from web/dist with the game API proxied behind the
+    dashboard token (the proxy injects the server-side API key). The legacy
+    server-rendered page was retired: "/" now lands on /arena and /dashboard is
+    gone.
     """
 
     @classmethod
@@ -7723,16 +7609,14 @@ class ArenaConsoleRoutingTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_root_redirects_to_dashboard(self) -> None:
+    def test_root_redirects_to_arena(self) -> None:
         status, headers, _ = self._request("GET", "/")
         self.assertEqual(status, 302)
-        self.assertEqual(headers.get("Location"), "/dashboard")
+        self.assertEqual(headers.get("Location"), "/arena")
 
-    def test_dashboard_path_serves_legacy_page(self) -> None:
-        status, headers, body = self._request("GET", "/dashboard")
-        self.assertEqual(status, 200)
-        self.assertIn("text/html", headers.get("Content-Type", ""))
-        self.assertIn("<title>Arena Hero 战术仪表盘</title>", body.decode("utf-8"))
+    def test_legacy_dashboard_path_is_gone(self) -> None:
+        status, _headers, body = self._request("GET", "/dashboard")
+        self.assertEqual(status, 404, body[:120])
 
     def test_arena_spa_serves_dist_with_route_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

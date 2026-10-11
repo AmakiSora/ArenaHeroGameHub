@@ -84,7 +84,7 @@ ArenaGame/
 ├── tactic.py              # 主战术脚本（核心决策逻辑，事件驱动）
 ├── tactic_config.py       # 策略配置字段定义、校验、热加载与原子写
 ├── tactic_config.json     # 运行时配置（仪表盘生成，git 忽略）
-├── dashboard.py           # Web 仪表盘 HTTP 服务 + 单文件前端
+├── dashboard.py           # HTTP 服务：/api/* 状态与配置接口、/arena 静态托管、游戏 API 代理
 ├── game_stats.py          # 累计战报统计聚合与持久化
 ├── state_io.py            # 跨进程文件锁、原子写、JSONL 追加与裁剪
 ├── status.py              # 命令行实时状态查看器
@@ -140,9 +140,9 @@ cp .env.example .env
 # 3. 启动战术进程（前台，Ctrl+C 会保存地图记忆并退出）
 python tactic.py
 
-# 4. 另开一个终端，启动仪表盘
+# 4. 另开一个终端，启动 Web 服务（托管 /arena 控制台与 /api/*）
 python dashboard.py
-#  打开 http://localhost:4399，填入 DASHBOARD_TOKEN 登录
+#  打开 http://localhost:4399/arena，填入 DASHBOARD_TOKEN 登录
 ```
 
 Windows PowerShell 等价写法：
@@ -245,11 +245,13 @@ curl -X POST http://localhost:4399/api/config/reset \
 
 ---
 
-## Web 仪表盘
+## Web 控制台（/arena）
 
-`dashboard.py` 是一个零依赖前端框架的单文件 Web 应用（HTTP 服务 + 内嵌 HTML/CSS/JS），默认端口 **4399**。
+`dashboard.py` 是零第三方依赖的 HTTP 服务（默认端口 **4399**）：提供 `/api/*` 状态与配置接口、把 `/api/v1/*` 用服务端密钥代理到游戏 API、并托管 `web/`（React + Vite，构建产物 `web/dist`）的 `/arena` 控制台。
 
-### 主要面板
+原先服务端渲染的那套单文件面板（`generate_html()` + 内嵌 CSS/JS）已于 2026-10-11 下线：`/` 现在直接跳转 `/arena`，`/dashboard` 返回 404。下列视图由 arena 控制台承担。
+
+### 主要视图
 
 - **地图舞台**：平移缩放 SVG，显示核心、工人、先锋、游侠、敌人（按兵种细分）、敌人踪迹、墙、可见/记忆矿、单位路径、目标、信标等。图例标签均为可点击开关，显示/隐藏对应类别，选择持久化在 localStorage
 - **战斗分队卡片**：五个拖拽列（待命池 / 守家 / 进攻 / 风筝 / 游击）和守家、进攻、风筝、游击、通用参数组；拖拽与参数修改先形成草稿，点击“保存修改”后统一生效。进攻队与风筝队只显示各自当前模式需要的字段
