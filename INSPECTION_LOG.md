@@ -1,5 +1,12 @@
 # ArenaGame 巡检日志
 
+## 2026-10-11 22:58（第 9 次部署：旧面板 UI 下线，巡检工具的入口随之变化）
+- 用户决定今后只在 `/arena` 操作，要求删掉旧面板。`dashboard.py` **不是独立面板而是容器里唯一的 HTTP 服务本体**（托管 `web/dist` 的 arena 控制台、`/api/*`、`/api/v1/*` 带密钥代理与 WS），所以按"只下线旧 UI"执行，服务与全部 API 保留：删 `generate_html()` + `render_config/teams/trends_panel` + 失去唯一调用方的内嵌 `CSS`(677 行)/`JS`(1911 行)，共 -3357 行；`/` 改为 302 到 `/arena`，`/dashboard` 落 404。可达性用 AST 迭代算过，`render_svg`/`_seg_cells`/`_core_rail_html`/`render_waypoints_panel` 仍被 `build_parts`(→/api/state) 调用故保留；`CSS`/`JS` 仅剩两处命中是注释不是引用。
+- 测试 685 通过（原 698）：删掉 13 条只断言旧面板 DOM/CSS 的用例，同批类里直接调用活函数的 `_seg_cells`、核心血条两条留下（类改名 `CoreRailBarTests`），路由用例改成断言新契约；`deploy/smoke_production_bar.py`（只为旧面板进度条存在）删除。README 里"dashboard.py 是内嵌 HTML/CSS/JS 的单文件前端"等已变假话的描述一并更正。
+- **对后续巡检的直接影响**：`curl /dashboard` 不再是检查点，改成 `curl -o /dev/null -w '%{http_code}' /arena/`（应为 200）与 `/`（应为 302 → /arena）；`deploy_source_only.py` 的冒烟仍打 `/`（401）与 `/api/state`（200），两者行为未变，无需改脚本。
+- 部署验证（第 9 次）：远端 `dashboard.py` md5 与 HEAD 归一化一致 `80658510…`；容器 healthy；VPS 实测 `/`→302 /arena、`/dashboard`→404、`/arena/`→200（返回 React `<!doctype html>`）、`/api/state`→200；容器日志出现 `[arena-proxy] WS open`，说明 arena 页面实时通道正常；战术进程照常出拍（tick 421674，latency 3824ms）。备份：`dashboard.py.bak-20261011-225409`（`2d7662ad…`）。
+- 遗留可选项（本次按用户选择没做）：`/api/log`、`/api/battle-log`、`/api/stream` 返回的仍是旧面板风格的 HTML 片段，arena 前端并不消费它们（只用 `/api/config|teams|holds|unit-routes|enemy-memory|waypoints|squad-targets|unit-names` + `/api/v1/*`），healthcheck 用的 `/api/state` 也只被当作 200 探针。真要清这批孤儿接口属于当时选项 2，需要同时改 compose healthcheck 与部署冒烟检查的探针目标。
+
 ## 2026-10-11 16:35（第 8 次部署后复查：误报归零，但正向效果仍只有测试证据）
 - 窗口 tick **420072→420190（119 拍，全部是第 8 次部署后）**。
 - **`shuttle-break` 触发次数：8 → 0**；V4 回到纯驻守（obs=112、WAIT=92、net=3，稳定在 (502,-217)，不再被顶出去）。严格折返判据把误伤彻底消掉了。
