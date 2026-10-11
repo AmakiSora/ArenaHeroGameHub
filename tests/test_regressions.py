@@ -8604,26 +8604,34 @@ class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
     def setUp(self):
         super().setUp()
         self._saved_prev = dict(tactic._kite_prev_pos)
+        self._saved_prev_prev = dict(tactic._kite_prev_prev_pos)
+        self._saved_shuttle = dict(tactic._kite_shuttle_ticks)
         self._saved_stall_ticks = dict(tactic._kite_stall_ticks)
         self._saved_stall_pos = dict(tactic._kite_stall_pos)
         tactic._kite_prev_pos.clear()
+        tactic._kite_prev_prev_pos.clear()
+        tactic._kite_shuttle_ticks.clear()
 
     def tearDown(self):
-        tactic._kite_prev_pos.clear()
-        tactic._kite_prev_pos.update(self._saved_prev)
-        tactic._kite_stall_ticks.clear()
-        tactic._kite_stall_ticks.update(self._saved_stall_ticks)
-        tactic._kite_stall_pos.clear()
-        tactic._kite_stall_pos.update(self._saved_stall_pos)
+        for name, saved in (
+            ("_kite_prev_pos", self._saved_prev),
+            ("_kite_prev_prev_pos", self._saved_prev_prev),
+            ("_kite_shuttle_ticks", self._saved_shuttle),
+            ("_kite_stall_ticks", self._saved_stall_ticks),
+            ("_kite_stall_pos", self._saved_stall_pos),
+        ):
+            getattr(tactic, name).clear()
+            getattr(tactic, name).update(saved)
         super().tearDown()
 
-    def _choose(self, uid, stall_ticks):
+    def _choose(self, uid, reversals):
         unit = self.unit(uid, self.POS)
         ranger = self.enemy("shooter", self.ENEMY_AT, UnitType.RANGER)
         tactic._kite_prev_pos[uid] = self.CAME_FROM
+        tactic._kite_shuttle_ticks[uid] = reversals
         direction, assessment, candidates = tactic._kite_choose_move(
             unit, self.POS, self.ENEMY_AT, (ranger,), self.WALLS, self.RANGE, {},
-            must_move=True, stall_ticks=stall_ticks, global_enemies=(ranger,),
+            must_move=True, stall_ticks=0, global_enemies=(ranger,),
         )
         return unit, direction, assessment, candidates
 
@@ -8632,7 +8640,7 @@ class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
         # the cell it came from, ties UP (2,-2) on threat distance (Chebyshev 2)
         # and beats it on progress toward the goal.
         _unit, direction, _a, candidates = self._choose(
-            "kite-shuttle-gate", stall_ticks=0,
+            "kite-shuttle-gate", reversals=0,
         )
         self.assertEqual(direction, Direction.DOWN, candidates)
 
@@ -8645,18 +8653,18 @@ class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
         """
         _unit, _direction, assessment, _c = self._choose(
             "kite-shuttle-marked",
-            stall_ticks=tactic._KITE_SHUTTLE_UNLOCK_TICKS,
+            reversals=tactic._KITE_SHUTTLE_BREAK_REVERSALS,
         )
         self.assertTrue(assessment.get("shuttle_break"), assessment)
         _unit, _direction, quiet, _c = self._choose(
-            "kite-shuttle-unmarked", stall_ticks=0,
+            "kite-shuttle-unmarked", reversals=0,
         )
         self.assertFalse(quiet.get("shuttle_break"), quiet)
 
     def test_shuttle_gate_drops_the_u_turn_and_steps_deeper_away(self) -> None:
         _unit, direction, _a, candidates = self._choose(
             "kite-shuttle-break",
-            stall_ticks=tactic._KITE_SHUTTLE_UNLOCK_TICKS,
+            reversals=tactic._KITE_SHUTTLE_BREAK_REVERSALS,
         )
         self.assertEqual(
             direction, Direction.UP,
@@ -8668,24 +8676,47 @@ class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
             "the pruned option must not survive into the ranked list",
         )
 
+    def test_a_deliberate_hold_never_counts_as_a_shuttle(self) -> None:
+        """Field correction after the 7th deploy.
+
+        The first version gated on the stall counter ("ticks without progress"),
+        which fired 8 times on V4 — a unit sitting on ``kite-hold-safe`` by
+        design — and poked it out of its chosen safe cell every ~16 Ticks. A
+        hold matches pos == prev == prev_prev trivially; only a unit that keeps
+        *undoing an actual move* is shuttling.
+        """
+        uid = "v4-holder"
+        for _ in range(tactic._KITE_SHUTTLE_BREAK_REVERSALS + 5):
+            tactic._record_kite_stall(uid, (503, -216))
+        self.assertEqual(tactic._kite_shuttle_ticks[uid], 0)
+        # And the same counter does climb for a genuine A-B-A.
+        other = "r7-shuttle"
+        for pos in ((934, -45), (934, -44)) * 4:
+            tactic._record_kite_stall(other, pos)
+        self.assertGreaterEqual(
+            tactic._kite_shuttle_ticks[other],
+            tactic._KITE_SHUTTLE_BREAK_REVERSALS,
+        )
+
     def test_the_marker_reaches_the_action_detail(self) -> None:
         """End-to-end on R7's own path (ranger at hp=1, same geometry).
 
         The chooser-level flag is worthless if the planner does not surface it:
-        the grep for "shuttle-break" in tactic_play.log is what will tell the
-        next inspection whether this gate ever actually fires in the field.
+        the grep for "shuttle-break" in the live log is what tells the next
+        inspection whether this gate ever actually fires in the field.
         """
         config = dict(self.config)
         config["bfs_max_steps"] = 1
         shooter = self.enemy("mark-shooter-e2e", self.ENEMY_AT, UnitType.RANGER)
-        for stall, expect in (
+        for reversals, expect in (
             (0, Direction.DOWN),
-            (tactic._KITE_SHUTTLE_UNLOCK_TICKS, Direction.UP),
+            (tactic._KITE_SHUTTLE_BREAK_REVERSALS, Direction.UP),
         ):
             unit = self.unit(
-                f"mark-e2e-{stall}", self.POS, unit_type=UnitType.RANGER, hp=1,
+                f"mark-e2e-{reversals}", self.POS,
+                unit_type=UnitType.RANGER, hp=1,
             )
-            tactic._kite_stall_ticks[unit.id] = stall
+            tactic._kite_shuttle_ticks[unit.id] = reversals
             tactic._kite_prev_pos[unit.id] = self.CAME_FROM
             action, detail = tactic._plan_kite_combat(
                 unit, unit_kind="ranger", enemies=(shooter,),
@@ -8706,7 +8737,7 @@ class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
             # (a) a ranger threat makes WAIT illegal, the U-turn is the only step.
             _unit, direction, _a, candidates = self._choose(
                 "kite-only-exit-move",
-                stall_ticks=tactic._KITE_SHUTTLE_UNLOCK_TICKS + 5,
+                reversals=tactic._KITE_SHUTTLE_BREAK_REVERSALS + 5,
             )
             self.assertEqual(direction, Direction.DOWN, candidates)
 
@@ -8716,13 +8747,12 @@ class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
             # sitting in the nub forever.
             unit = self.unit("kite-only-exit-wait", self.POS)
             tactic._kite_prev_pos[unit.id] = self.CAME_FROM
+            tactic._kite_shuttle_ticks[unit.id] = (
+                tactic._KITE_SHUTTLE_BREAK_REVERSALS + 5
+            )
             direction, _assessment, candidates = tactic._kite_choose_move(
                 unit, self.POS, self.ENEMY_AT, (), self.WALLS, self.RANGE, {},
-                must_move=False,
-                stall_ticks=max(
-                    tactic._KITE_SHUTTLE_UNLOCK_TICKS,
-                    tactic._KITE_STALL_UNLOCK_TICKS,
-                ),
+                must_move=False, stall_ticks=tactic._KITE_STALL_UNLOCK_TICKS,
             )
             self.assertEqual(
                 direction, Direction.DOWN,

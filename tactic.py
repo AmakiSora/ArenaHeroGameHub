@@ -4761,13 +4761,13 @@ def _kite_choose_move(
     the unlock fire there would jitter the unit one cell every threshold
     ticks.
 
-    Past ``_KITE_SHUTTLE_UNLOCK_TICKS`` the step back onto ``came_from`` is
-    dropped from the candidate list, whenever at least one *other step* remains
-    (holding still is never an alternative to a cul-de-sac retreat). That gate
-    carries no threat condition on purpose: a unit ping-ponging across an
-    enemy's threat ring sees a threat every Tick, so the unlock above can never
-    fire for it, and `-backtrack` alone cannot win because the two cells already
-    differ higher up in the score tuple.
+    Past ``_KITE_SHUTTLE_BREAK_REVERSALS`` strict reversals the step back onto
+    ``came_from`` is dropped from the candidate list, whenever at least one
+    *other step* remains (holding still is never an alternative to a
+    cul-de-sac retreat). That gate carries no threat condition on purpose: a
+    unit ping-ponging across an enemy's threat ring sees a threat every Tick, so
+    the unlock above can never fire for it, and `-backtrack` alone cannot win
+    because the two cells already differ higher up in the score tuple.
     """
     counts = cell_counts or {}
     enemy_cells = {tuple(enemy.position) for enemy in enemies}
@@ -4840,7 +4840,9 @@ def _kite_choose_move(
     if not choices:
         return None, _kite_cell_assessment(pos, enemies, obstacle_cells, ranger_range), []
     pruned = False
-    if stall_ticks >= _KITE_SHUTTLE_UNLOCK_TICKS and came_from is not None:
+    if came_from is not None and (
+        _kite_shuttle_ticks.get(str(unit.id), 0) >= _KITE_SHUTTLE_BREAK_REVERSALS
+    ):
         # Past the gate the `-backtrack` tie-break is not enough: the two cells
         # differ higher up in the tuple (one of them is inside the enemy's ring,
         # the other advances the goal), so the U-turn still wins on safety and
@@ -6198,10 +6200,19 @@ _kite_prev_pos: dict[str, tuple[int, int]] = {}
 # across an enemy's threat ring sees a threat, never trips the unlock and shuttles
 # forever (observed after the 5th deploy: R7 between (934,-45) and (934,-44) and
 # V1 between (327,-174) and (327,-173), 36 Ticks each way, net displacement 0,
-# MOVE every single Tick). Past this many accumulated stall ticks the single-step
-# chooser drops the "undo my last step" candidate outright. Safety ranking is
-# untouched — what goes is the option, not the contract.
-_KITE_SHUTTLE_UNLOCK_TICKS = 6
+# MOVE every single Tick). Past this many *strict reversals* in a row — pos equal
+# to where the unit stood two Ticks ago while having actually moved last Tick —
+# the single-step chooser drops the "undo my last step" candidate. Safety
+# ranking is untouched; what goes is the option, not the contract.
+# Counting reversals and not "ticks without progress" is the field correction
+# after the 7th deploy: the stall-tick version fired 8 times on V4, a unit
+# deliberately holding on `kite-hold-safe`, poking it out of its chosen safe cell
+# every ~16 Ticks. A hold is not a shuttle, and only a hold-free unit that keeps
+# undoing itself deserves the break.
+_KITE_SHUTTLE_BREAK_REVERSALS = 3
+_kite_shuttle_ticks: dict[str, int] = {}
+# The planned position from two Ticks ago, kept only to detect the reversal.
+_kite_prev_prev_pos: dict[str, tuple[int, int]] = {}
 
 
 def _record_kite_stall(uid: str, pos: tuple[int, int]) -> None:
@@ -6214,6 +6225,13 @@ def _record_kite_stall(uid: str, pos: tuple[int, int]) -> None:
     micro-jitter (e.g. the occasional ±1 MOVE_CONTESTED escape step) and keep
     accumulating; only a net displacement of at least _KITE_STALL_DRIFT + 1
     counts as a real move, resetting the counter and re-anchoring.
+
+    Also the single place that sees the per-unit planned-position trail, so it
+    keeps the strict-reversal counter the shuttle breaker reads: ``pos`` equal to
+    the position from two Ticks ago *while last Tick's position differed*. A
+    unit holding still matches that test trivially (pos == prev == prev_prev),
+    and a deliberate hold is not a shuttle — that distinction is what the
+    stall-tick version of the gate got wrong for V4.
     """
     anchor = _kite_stall_pos.get(uid)
     if (
@@ -6225,6 +6243,13 @@ def _record_kite_stall(uid: str, pos: tuple[int, int]) -> None:
     else:
         _kite_stall_pos[uid] = pos
         _kite_stall_ticks[uid] = 0
+    prev = _kite_prev_pos.get(uid)
+    prev_prev = _kite_prev_prev_pos.get(uid)
+    if prev is not None and prev_prev is not None and prev != pos and prev_prev == pos:
+        _kite_shuttle_ticks[uid] = _kite_shuttle_ticks.get(uid, 0) + 1
+    else:
+        _kite_shuttle_ticks[uid] = 0
+    _kite_prev_prev_pos[uid] = prev
     _kite_prev_pos[uid] = pos
 
 
@@ -7592,6 +7617,10 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _kite_stall_ticks.pop(dead_id, None)
     for dead_id in set(_kite_prev_pos) - alive_ids:
         _kite_prev_pos.pop(dead_id, None)
+    for dead_id in set(_kite_shuttle_ticks) - alive_ids:
+        _kite_shuttle_ticks.pop(dead_id, None)
+    for dead_id in set(_kite_prev_prev_pos) - alive_ids:
+        _kite_prev_prev_pos.pop(dead_id, None)
     for dead_id in set(_kite_friendly_split) - alive_ids:
         _kite_friendly_split.pop(dead_id, None)
     for dead_id in set(_roam_pos_history) - alive_ids:
