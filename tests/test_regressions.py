@@ -8604,11 +8604,17 @@ class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
     def setUp(self):
         super().setUp()
         self._saved_prev = dict(tactic._kite_prev_pos)
+        self._saved_stall_ticks = dict(tactic._kite_stall_ticks)
+        self._saved_stall_pos = dict(tactic._kite_stall_pos)
         tactic._kite_prev_pos.clear()
 
     def tearDown(self):
         tactic._kite_prev_pos.clear()
         tactic._kite_prev_pos.update(self._saved_prev)
+        tactic._kite_stall_ticks.clear()
+        tactic._kite_stall_ticks.update(self._saved_stall_ticks)
+        tactic._kite_stall_pos.clear()
+        tactic._kite_stall_pos.update(self._saved_stall_pos)
         super().tearDown()
 
     def _choose(self, uid, stall_ticks):
@@ -8630,6 +8636,23 @@ class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
         )
         self.assertEqual(direction, Direction.DOWN, candidates)
 
+    def test_the_gate_marks_itself_in_the_assessment(self) -> None:
+        """A breaker nobody can see fire stays invisible for days.
+
+        The contested-backoff id[:8] bug sat undetected in 44MB of production
+        log; this gate therefore announces itself in the action detail (the
+        caller renders ``assessment["shuttle_break"]`` as " shuttle-break").
+        """
+        _unit, _direction, assessment, _c = self._choose(
+            "kite-shuttle-marked",
+            stall_ticks=tactic._KITE_SHUTTLE_UNLOCK_TICKS,
+        )
+        self.assertTrue(assessment.get("shuttle_break"), assessment)
+        _unit, _direction, quiet, _c = self._choose(
+            "kite-shuttle-unmarked", stall_ticks=0,
+        )
+        self.assertFalse(quiet.get("shuttle_break"), quiet)
+
     def test_shuttle_gate_drops_the_u_turn_and_steps_deeper_away(self) -> None:
         _unit, direction, _a, candidates = self._choose(
             "kite-shuttle-break",
@@ -8644,6 +8667,36 @@ class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
             self.CAME_FROM, [tuple(c["cell"]) for c in candidates],
             "the pruned option must not survive into the ranked list",
         )
+
+    def test_the_marker_reaches_the_action_detail(self) -> None:
+        """End-to-end on R7's own path (ranger at hp=1, same geometry).
+
+        The chooser-level flag is worthless if the planner does not surface it:
+        the grep for "shuttle-break" in tactic_play.log is what will tell the
+        next inspection whether this gate ever actually fires in the field.
+        """
+        config = dict(self.config)
+        config["bfs_max_steps"] = 1
+        shooter = self.enemy("mark-shooter-e2e", self.ENEMY_AT, UnitType.RANGER)
+        for stall, expect in (
+            (0, Direction.DOWN),
+            (tactic._KITE_SHUTTLE_UNLOCK_TICKS, Direction.UP),
+        ):
+            unit = self.unit(
+                f"mark-e2e-{stall}", self.POS, unit_type=UnitType.RANGER, hp=1,
+            )
+            tactic._kite_stall_ticks[unit.id] = stall
+            tactic._kite_prev_pos[unit.id] = self.CAME_FROM
+            action, detail = tactic._plan_kite_combat(
+                unit, unit_kind="ranger", enemies=(shooter,),
+                obstacle_cells=self.WALLS, config=config, cell_counts={},
+            )
+            self.assertEqual(action, "MOVE", detail)
+            self.assertEqual(unit.arg, expect, detail)
+            if expect is Direction.UP:
+                self.assertIn("shuttle-break", detail)
+            else:
+                self.assertNotIn("shuttle-break", detail)
 
     def test_u_turn_still_allowed_when_it_is_the_only_exit(self) -> None:
         # A unit in a one-cell nub must be allowed to retreat the way it came.

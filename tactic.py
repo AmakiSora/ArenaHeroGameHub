@@ -4839,6 +4839,7 @@ def _kite_choose_move(
         }))
     if not choices:
         return None, _kite_cell_assessment(pos, enemies, obstacle_cells, ranger_range), []
+    pruned = False
     if stall_ticks >= _KITE_SHUTTLE_UNLOCK_TICKS and came_from is not None:
         # Past the gate the `-backtrack` tie-break is not enough: the two cells
         # differ higher up in the tuple (one of them is inside the enemy's ring,
@@ -4851,12 +4852,19 @@ def _kite_choose_move(
         # _of_sitting). WAIT itself stays in the list — only the U-turn goes.
         steps = [item for item in choices if item[1] is not None]
         if [item for item in steps if not item[3]["backtrack"]]:
-            choices = [
+            filtered = [
                 item for item in choices
                 if item[1] is None or not item[3]["backtrack"]
             ]
+            if len(filtered) != len(choices):
+                pruned = True
+            choices = filtered
     choices.sort(key=lambda item: item[0], reverse=True)
     _, direction, _, assessment = choices[0]
+    if pruned:
+        # Surfaced in the action detail by the caller: a breaker nobody can see
+        # fire is how the contested-backoff id[:8] bug stayed invisible for days.
+        assessment = {**assessment, "shuttle_break": True}
     public = [
         {
             "direction": item[1].name if item[1] is not None else "WAIT",
@@ -5853,6 +5861,7 @@ def _plan_kite_combat(
         detail = (
             f"{direction.name} kite-position goal={move_goal} "
             f"risk={assessment['current_hits']}/{assessment['predicted_hits']}"
+            + (" shuttle-break" if assessment.get("shuttle_break") else "")
         )
         _kite_log_decision(
             unit, unit_kind, mode, objective, threats, "MOVE", detail,
