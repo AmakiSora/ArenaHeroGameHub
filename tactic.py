@@ -4760,6 +4760,14 @@ def _kite_choose_move(
     arriving at a coordinate/beacon target is a deliberate hold, and letting
     the unlock fire there would jitter the unit one cell every threshold
     ticks.
+
+    Past ``_KITE_SHUTTLE_UNLOCK_TICKS`` the step back onto ``came_from`` is
+    dropped from the candidate list, whenever at least one *other step* remains
+    (holding still is never an alternative to a cul-de-sac retreat). That gate
+    carries no threat condition on purpose: a unit ping-ponging across an
+    enemy's threat ring sees a threat every Tick, so the unlock above can never
+    fire for it, and `-backtrack` alone cannot win because the two cells already
+    differ higher up in the score tuple.
     """
     counts = cell_counts or {}
     enemy_cells = {tuple(enemy.position) for enemy in enemies}
@@ -4824,9 +4832,29 @@ def _kite_choose_move(
             int(direction is not None),
             -backtrack,
         )
-        choices.append((score, direction, cell, {**assessment, "progress": progress}))
+        choices.append((score, direction, cell, {
+            **assessment,
+            "progress": progress,
+            "backtrack": backtrack,
+        }))
     if not choices:
         return None, _kite_cell_assessment(pos, enemies, obstacle_cells, ranger_range), []
+    if stall_ticks >= _KITE_SHUTTLE_UNLOCK_TICKS and came_from is not None:
+        # Past the gate the `-backtrack` tie-break is not enough: the two cells
+        # differ higher up in the tuple (one of them is inside the enemy's ring,
+        # the other advances the goal), so the U-turn still wins on safety and
+        # the unit alternates forever. Drop the option instead.
+        # The trigger asks for another STEP, not just another candidate: WAIT is
+        # always available, so counting it would strip the retreat out of a
+        # one-cell nub and freeze the unit there (protected by
+        # KiteRouteNoUTurnRegressionTests.test_boxed_stalled_unit_retreats_instead
+        # _of_sitting). WAIT itself stays in the list — only the U-turn goes.
+        steps = [item for item in choices if item[1] is not None]
+        if [item for item in steps if not item[3]["backtrack"]]:
+            choices = [
+                item for item in choices
+                if item[1] is None or not item[3]["backtrack"]
+            ]
     choices.sort(key=lambda item: item[0], reverse=True)
     _, direction, _, assessment = choices[0]
     public = [
@@ -6156,6 +6184,15 @@ _KITE_STALL_DRIFT = 1
 # Where each kite unit stood when it last planned, so the single-step chooser
 # can rank a step back onto that cell below every other equally safe step.
 _kite_prev_pos: dict[str, tuple[int, int]] = {}
+# Confirmed A-B-A shuttle breaker. The stall unlock above is deliberately
+# threat-free only, so exactly the worst case slips through: a unit ping-ponging
+# across an enemy's threat ring sees a threat, never trips the unlock and shuttles
+# forever (observed after the 5th deploy: R7 between (934,-45) and (934,-44) and
+# V1 between (327,-174) and (327,-173), 36 Ticks each way, net displacement 0,
+# MOVE every single Tick). Past this many accumulated stall ticks the single-step
+# chooser drops the "undo my last step" candidate outright. Safety ranking is
+# untouched — what goes is the option, not the contract.
+_KITE_SHUTTLE_UNLOCK_TICKS = 6
 
 
 def _record_kite_stall(uid: str, pos: tuple[int, int]) -> None:

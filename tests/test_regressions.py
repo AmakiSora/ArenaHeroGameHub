@@ -8583,6 +8583,103 @@ class KiteStallUnlockRegressionTests(KiteTeamPlannerTests):
         self.assertEqual(tactic._kite_stall_ticks[str(unit.id)], 2)
 
 
+class KiteThreatShuttleBreakerTests(KiteTeamPlannerTests):
+    """A threat-visible A-B-A shuttle needs its own breaker.
+
+    Field (after the 5th deploy): R7 (ranger, hp=1) alternated (934,-45) and
+    (934,-44) 36 Ticks each way, net displacement 0, MOVE every Tick; V1 did the
+    same between (327,-174) and (327,-173). The existing stall unlock cannot
+    help them — it is deliberately suppressed while any enemy is visible, and
+    these units see one every Tick. And `-backtrack` cannot win either: the
+    U-turn cell ties the alternative on threat distance and beats it on goal
+    progress, so the two cells already differ higher up in the score tuple.
+    """
+
+    ENEMY_AT = (0, 0)
+    POS = (2, -1)
+    CAME_FROM = (2, 0)
+    WALLS = frozenset({(3, -1)})
+    RANGE = 2
+
+    def setUp(self):
+        super().setUp()
+        self._saved_prev = dict(tactic._kite_prev_pos)
+        tactic._kite_prev_pos.clear()
+
+    def tearDown(self):
+        tactic._kite_prev_pos.clear()
+        tactic._kite_prev_pos.update(self._saved_prev)
+        super().tearDown()
+
+    def _choose(self, uid, stall_ticks):
+        unit = self.unit(uid, self.POS)
+        ranger = self.enemy("shooter", self.ENEMY_AT, UnitType.RANGER)
+        tactic._kite_prev_pos[uid] = self.CAME_FROM
+        direction, assessment, candidates = tactic._kite_choose_move(
+            unit, self.POS, self.ENEMY_AT, (ranger,), self.WALLS, self.RANGE, {},
+            must_move=True, stall_ticks=stall_ticks, global_enemies=(ranger,),
+        )
+        return unit, direction, assessment, candidates
+
+    def test_below_the_gate_the_undo_my_last_step_still_wins(self) -> None:
+        # Proves the geometry really does rank the U-turn first: DOWN (2,0) is
+        # the cell it came from, ties UP (2,-2) on threat distance (Chebyshev 2)
+        # and beats it on progress toward the goal.
+        _unit, direction, _a, candidates = self._choose(
+            "kite-shuttle-gate", stall_ticks=0,
+        )
+        self.assertEqual(direction, Direction.DOWN, candidates)
+
+    def test_shuttle_gate_drops_the_u_turn_and_steps_deeper_away(self) -> None:
+        _unit, direction, _a, candidates = self._choose(
+            "kite-shuttle-break",
+            stall_ticks=tactic._KITE_SHUTTLE_UNLOCK_TICKS,
+        )
+        self.assertEqual(
+            direction, Direction.UP,
+            "past the gate the unit must keep backing off instead of re-entering "
+            "the ring it just left",
+        )
+        self.assertNotIn(
+            self.CAME_FROM, [tuple(c["cell"]) for c in candidates],
+            "the pruned option must not survive into the ranked list",
+        )
+
+    def test_u_turn_still_allowed_when_it_is_the_only_exit(self) -> None:
+        # A unit in a one-cell nub must be allowed to retreat the way it came.
+        # Two shapes of that, because the chooser ranks safety first:
+        self.WALLS = frozenset({(3, -1), (2, -2), (1, -1)})
+        try:
+            # (a) a ranger threat makes WAIT illegal, the U-turn is the only step.
+            _unit, direction, _a, candidates = self._choose(
+                "kite-only-exit-move",
+                stall_ticks=tactic._KITE_SHUTTLE_UNLOCK_TICKS + 5,
+            )
+            self.assertEqual(direction, Direction.DOWN, candidates)
+
+            # (b) no threat at all: WAIT is a legal candidate and is
+            # equal-safe with the retreat step. If WAIT counted as "another
+            # option", the prune would strip the U-turn and leave the unit
+            # sitting in the nub forever.
+            unit = self.unit("kite-only-exit-wait", self.POS)
+            tactic._kite_prev_pos[unit.id] = self.CAME_FROM
+            direction, _assessment, candidates = tactic._kite_choose_move(
+                unit, self.POS, self.ENEMY_AT, (), self.WALLS, self.RANGE, {},
+                must_move=False,
+                stall_ticks=max(
+                    tactic._KITE_SHUTTLE_UNLOCK_TICKS,
+                    tactic._KITE_STALL_UNLOCK_TICKS,
+                ),
+            )
+            self.assertEqual(
+                direction, Direction.DOWN,
+                f"retreat must beat WAIT in a nub: {candidates}",
+            )
+        finally:
+            self.WALLS = frozenset({(3, -1)})
+
+
+
 class FriendlySameCellSplitRegressionTests(KiteTeamPlannerTests):
     """Two stacked allies whose same-exit moves keep cancelling server-side
     must deterministically pick different exits, and the split decision is
