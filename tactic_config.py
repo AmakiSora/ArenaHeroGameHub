@@ -59,6 +59,16 @@ CONFIG_FIELDS = (
     # break the loop. Detection window/thresholds stay module constants in
     # tactic.py; this switch only enables/disables the policy.
     ConfigField("roam_oscillation_escape", "漫游振荡逃逸", "worker", "boolean", True),
+    # Long-horizon roam detector: a guerrilla that covers no new ground for
+    # _ROAM_ORBIT_STALL_STEPS recorded steps is orbiting a pocket, not exploring
+    # (production V2 re-walked 426 cells for a whole day). Arms the escape above
+    # with the whole loop and a longer budget. Thresholds stay in tactic.py.
+    ConfigField("roam_orbit_break", "漫游宏观绕圈拆解", "worker", "boolean", True),
+    # Sweep miss fuse: a unit whose last three sweeps hit nothing stops being
+    # aimed at the cell an enemy currently occupies (movement resolves before
+    # combat, so that aim is what missed 407 times in a row for V15). The
+    # refusal is a cooldown, not a disarmament — any sweep that lands resets it.
+    ConfigField("sweep_miss_fuse", "横扫空枪熔断", "combat", "boolean", True),
     ConfigField("backtrack_penalty", "载矿回头惩罚", "worker", "integer", 10, 0, 100, 1),
     ConfigField("enemy_threat_radius", "工人遇敌回避半径", "worker", "integer", 3, 0, 10, 1),
     ConfigField("worker_mine_max_distance", "工人采矿最大距离", "worker", "integer", 0, 0, 200, 1),

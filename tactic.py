@@ -2938,6 +2938,84 @@ def _roam_update_stall(uid: str) -> bool:
     return False
 
 
+def _roam_record_discovery(uid: str, pos: tuple[int, int]) -> bool:
+    """Fold this step into the unit's discovery ledger; True once it orbits.
+
+    The proof is a stall in *new ground*, not a repeated cell: production V2
+    circled a 150x48 pocket with a ~468-Tick period, so every short window of
+    its trail looked like fresh exploration while the whole day re-walked the
+    same 426 cells (V13 471 cells, V15 25 cells). Nothing in the 8-position
+    A-B-A window can see that.
+
+    Over three days of recorded routes (145,972 guerrilla steps) the split is
+    unambiguous: the units that ended a day orbiting went 2,120 / 4,559 / 4,703
+    recorded steps between their last two new cells, while every unit that kept
+    exploring stayed under 361. Consecutive duplicates are folded, so a unit
+    deliberately holding station records nothing — the misfire that the
+    stall-tick gate produced on V4's intentional 驻守 cannot repeat here.
+
+    The ledger is not reset here: the caller arms the escape and resets it, so
+    an orbit proven while another escape is still running is not thrown away.
+    """
+    discovered = _roam_discovered.setdefault(uid, {})
+    recent = _roam_recent.setdefault(uid, deque(maxlen=_ROAM_ORBIT_REGION))
+    if recent and recent[-1] == pos:
+        return False
+    recent.append(pos)
+    if pos not in discovered:
+        discovered[pos] = None
+        _roam_new_stall[uid] = 0
+        # Bound the ledger so a weeks-long process cannot grow without limit.
+        # Forgetting the oldest discoveries only makes the detector more
+        # forgiving, never more trigger-happy.
+        while len(discovered) > _ROAM_ORBIT_MEMORY:
+            discovered.pop(next(iter(discovered)))
+        return False
+    _roam_new_stall[uid] = _roam_new_stall.get(uid, 0) + 1
+    return _roam_new_stall[uid] >= _ROAM_ORBIT_STALL_STEPS
+
+
+def _roam_reset_discovery(uid: str) -> None:
+    """Start this unit's exploration ledger over after an orbit was broken."""
+    _roam_discovered.pop(uid, None)
+    _roam_new_stall[uid] = 0
+
+
+def _arm_roam_orbit_escape(uid: str) -> None:
+    """Hand a confirmed orbit to the existing two-phase escape.
+
+    The remembered region is the unit's recent loop rather than a two-cell
+    bounce, and the budget is long enough to walk a pocket's width out of it
+    (the 6-Tick bounce budget cannot cross a 150x48 region). Only the tail of
+    the loop gets banned: banning every cell the unit still stands inside would
+    leave it no legal step and trade an orbit for a freeze.
+    """
+    recent = _roam_recent.get(uid)
+    if not recent:
+        return
+    cells = list(recent)
+    region = frozenset(cells)
+    _roam_stall_cells[uid] = region
+    _roam_stall_origin[uid] = cells[-2] if len(cells) >= 2 else cells[-1]
+    _roam_escape_left[uid] = _ROAM_ORBIT_ESCAPE_TICKS
+    expiry = int(getattr(turn_context, "tick", 0) or 0) + _ROAM_BAN_TICKS
+    banned = _roam_banned.setdefault(uid, {})
+    for cell in cells[-_ROAM_STALL_REGION:]:
+        if banned.get(cell, 0) < expiry:
+            banned[cell] = expiry
+
+
+def _roam_break_note(uid: str) -> str:
+    """Self-report the orbit break in the action detail so it is greppable.
+
+    A safety mechanism nobody can see is a mechanism that does not exist: the
+    last two of these were only found because a marker made them countable.
+    """
+    if _roam_break_tick.get(uid) == int(getattr(turn_context, "tick", 0) or 0):
+        return " orbit-break"
+    return ""
+
+
 def _roam_banned_cells(uid: str) -> frozenset[tuple[int, int]]:
     """Cells this unit proved unable to roam out of and must still avoid.
 
@@ -3074,6 +3152,13 @@ def _guerrilla_roam(
     if not history or history[-1] != pos:
         history.append(pos)
         del history[:-_ROAM_STALL_REGION]
+    # The discovery ledger records every step regardless of escape state: an
+    # orbit proven while another escape is still running must not be thrown
+    # away, it arms on the first Tick that is no longer escaping.
+    orbit_proven = (
+        bool(config.get("roam_orbit_break", True))
+        and _roam_record_discovery(uid, pos)
+    )
     escaping = _roam_escape_left.get(uid, 0) > 0
     # roam_oscillation_escape gates the whole detection/trigger entry point:
     # with the switch off the unit keeps its original bearing-based roaming
@@ -3096,6 +3181,21 @@ def _guerrilla_roam(
             _roam_stall_cells.pop(uid, None)
             _roam_stall_origin.pop(uid, None)
             _roam_flip_pending.pop(uid, None)
+    # The 8-position window above can only prove a two-cell bounce. A unit
+    # walking a long loop inside one pocket looks like fresh ground in every
+    # short window (production: 468-Tick period over 426 cells, for a whole
+    # day), so the discovery ledger judges the long trail instead — and it never
+    # interrupts an escape that is already running.
+    if orbit_proven and not escaping:
+        _arm_roam_orbit_escape(uid)
+        _roam_reset_discovery(uid)
+        escaping = True
+        _roam_break_tick[uid] = int(getattr(turn_context, "tick", 0) or 0)
+        print(
+            f"[orbit-break] uid={uid} 连续 {_ROAM_ORBIT_STALL_STEPS} 步没踏上任何新格，"
+            f"判定为绕圈而非探索，转入 {_ROAM_ORBIT_ESCAPE_TICKS} 拍脱困",
+            flush=True,
+        )
     stall_cells = _roam_stall_cells.get(uid, frozenset())
     stall_origin = _roam_stall_origin.get(uid)
     deflecting = escaping and pos in stall_cells
@@ -3154,13 +3254,13 @@ def _guerrilla_roam(
             # the _roam_flip_pending confirmation above).
             _roam_flip_pending[uid] = True
         _kite_record_move_attempt(unit, pos, next_cell)
-        return ("MOVE", f"{direction.name} guerrilla-roam {label}")
+        return ("MOVE", f"{direction.name} guerrilla-roam {label}{_roam_break_note(uid)}")
     action, detail = _scout_cardinal(
         unit,
         pos,
         obstacle_cells,
         config,
-        label=f"guerrilla-roam {label}",
+        label=f"guerrilla-roam {label}{_roam_break_note(uid)}",
         avoid_cells=avoided,
     )
     if action == "MOVE":
@@ -3696,11 +3796,103 @@ def _attack_regroup_step(
     )
 
 
+# ── sweep miss fuse ──────────────────────────────────────────────────────────
+# A sweep resolves AFTER movement, so aiming at the cell an enemy occupies
+# this Tick misses whenever that enemy steps aside. Production proved the cost:
+# V15 stood at (889,-920) for ~2000 Ticks and issued 407 sweeps that hit 0
+# targets — every Tick the planner re-aimed at the enemy's current cell and
+# every resolution came back empty, while the enemy traded blows with it.
+# The fuse counts one unit's consecutive zero-hit sweeps; once they prove the
+# aim is wasted, current-cell sweeps are refused for _SWEEP_FUSE_TICKS so the
+# predictive and movement branches take over instead. Any sweep that lands a
+# target wipes the debt: this is about wasted aim, not about fighting.
+_SWEEP_MISS_FUSE_LIMIT = 3
+_SWEEP_FUSE_TICKS = 40
+_sweep_miss_streak: dict[str, int] = {}
+_sweep_fuse_until: dict[str, int] = {}
+
+
+def _record_sweep_resolutions(turn: Any, enabled: bool = True) -> None:
+    """Feed last Tick's SWEEP_RESOLVED outcomes into the miss fuse.
+
+    Keys are full unit ids, never ``id[:8]``: display names get recycled when a
+    unit dies and truncated ids have already killed one safety mechanism here.
+    ``enabled`` comes from the dashboard switch; off wipes the ledger, because a
+    fuse already armed would otherwise keep refusing swings the operator has
+    decided to allow.
+    """
+    if not enabled:
+        _sweep_miss_streak.clear()
+        _sweep_fuse_until.clear()
+        return
+    tick = int(getattr(turn_context, "tick", 0) or 0)
+    allies = {
+        str(unit.id)
+        for group in (
+            getattr(turn, "workers", ()) or (),
+            getattr(turn, "vanguards", ()) or (),
+            getattr(turn, "rangers", ()) or (),
+        )
+        for unit in group
+    }
+    for event in getattr(turn, "events", ()) or ():
+        if getattr(event, "event_type", "") != "SWEEP_RESOLVED":
+            continue
+        actor_id = getattr(event, "actor_id", None)
+        if actor_id is None:
+            continue
+        uid = str(actor_id)
+        if uid not in allies:
+            # An enemy's wasted swings are none of our business — and recording
+            # them would grow the ledger without bound on dead enemy ids.
+            continue
+        values = getattr(event, "values", None) or {}
+        try:
+            hit = int(values.get("targets_hit", 0) or 0)
+        except (TypeError, ValueError):
+            hit = 0
+        if hit > 0:
+            _sweep_miss_streak.pop(uid, None)
+            _sweep_fuse_until.pop(uid, None)
+            continue
+        streak = _sweep_miss_streak.get(uid, 0) + 1
+        if streak >= _SWEEP_MISS_FUSE_LIMIT:
+            _sweep_miss_streak[uid] = 0
+            _sweep_fuse_until[uid] = tick + _SWEEP_FUSE_TICKS
+            print(
+                f"[sweep-fuse] uid={uid} 连续 {streak} 次横扫空枪，"
+                f"{_SWEEP_FUSE_TICKS} 拍内不再朝当前格横扫",
+                flush=True,
+            )
+        else:
+            _sweep_miss_streak[uid] = streak
+
+
+def _sweep_fused(unit: Any) -> bool:
+    """True while this unit's aim at an occupied cell is proven wasted."""
+    expiry = _sweep_fuse_until.get(str(unit.id))
+    if expiry is None:
+        return False
+    if int(getattr(turn_context, "tick", 0) or 0) >= expiry:
+        _sweep_fuse_until.pop(str(unit.id), None)
+        return False
+    return True
+
+
+def _sweep_fuse_note(unit: Any) -> str:
+    """Self-report marker so the fuse is greppable in the Tick log."""
+    return " sweep-fuse" if _sweep_fused(unit) else ""
+
+
 def _vanguard_adjacent_sweep(
     vanguard: Any,
     pos: tuple[int, int],
     enemies: tuple,
 ) -> tuple[str, str] | None:
+    if _sweep_fused(vanguard):
+        # Refuse the current-cell aim; the caller falls through to predictive
+        # aiming or closes the distance, which is the point of the fuse.
+        return None
     for direction in (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT):
         tx = pos[0] + direction.delta[0]
         ty = pos[1] + direction.delta[1]
@@ -5661,7 +5853,7 @@ def _plan_kite_combat(
     if full_v_vs_r:
         dx = target.position[0] - pos[0]
         dy = target.position[1] - pos[1]
-        if abs(dx) + abs(dy) == 1:
+        if abs(dx) + abs(dy) == 1 and not _sweep_fused(unit):
             direction = _cardinal_toward_delta(dx, dy)
             _kite_clear_move_attempt(unit)
             unit.sweep(direction)
@@ -5830,7 +6022,7 @@ def _plan_kite_combat(
         if abs(dx) + abs(dy) == 1:
             # Workers cannot retaliate; combat targets would have triggered
             # current-range evasion above (except the full-health Ranger case).
-            if etype in {"WORKER", "CORE"}:
+            if etype in {"WORKER", "CORE"} and not _sweep_fused(unit):
                 direction = _cardinal_toward_delta(dx, dy)
                 _kite_clear_move_attempt(unit)
                 unit.sweep(direction)
@@ -6417,6 +6609,25 @@ _ROAM_STALL_BOX_EXTENT = 2
 # covers the approach path into the bounce (the escape avoids re-entering it).
 _ROAM_STALL_REGION = 16
 _ROAM_ESCAPE_TICKS = 6
+# Long-horizon orbit detector. ``_ROAM_STALL_WINDOW`` proves a two-cell bounce;
+# it cannot see a unit circling a whole pocket, which is what the route recorder
+# caught in production: V2 re-walked 426 cells for 5170 Ticks (150x48, ~468-Tick
+# period), V13 471 cells in 102x102, V15 25 cells in an 18x5 box. The proof is a
+# stall in NEW ground: those three went 2,120 / 4,559 / 4,703 recorded steps
+# between their last two new cells, while every unit that kept exploring stayed
+# under 361. ``_ROAM_ORBIT_STALL_STEPS`` sits inside that gap.
+_ROAM_ORBIT_STALL_STEPS = 500
+# The loop handed to the escape, and the bound on the discovery ledger (a unit
+# covers ~4,700 new cells a day, so this is a few days of ground per unit).
+_ROAM_ORBIT_REGION = 200
+_ROAM_ORBIT_MEMORY = 8000
+# Walking out of a 150x48 pocket takes more steps than the 6-Tick bounce budget
+# allows, so an orbit escape gets its own longer budget.
+_ROAM_ORBIT_ESCAPE_TICKS = 120
+_roam_discovered: dict[str, dict[tuple[int, int], None]] = {}
+_roam_new_stall: dict[str, int] = {}
+_roam_recent: dict[str, deque] = {}
+_roam_break_tick: dict[str, int] = {}
 # Consecutive ticks a worker has not moved — triggers un-stick recovery.
 # _worker_stuck_ticks counts consecutive same-position ticks; _worker_stuck_pos
 # remembers the position those ticks were counted at (independent of last-pos,
@@ -7746,6 +7957,18 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _roam_bearing_offset.pop(dead_id, None)
     for dead_id in set(_roam_flip_pending) - alive_ids:
         _roam_flip_pending.pop(dead_id, None)
+    for dead_id in set(_roam_discovered) - alive_ids:
+        _roam_discovered.pop(dead_id, None)
+    for dead_id in set(_roam_new_stall) - alive_ids:
+        _roam_new_stall.pop(dead_id, None)
+    for dead_id in set(_roam_recent) - alive_ids:
+        _roam_recent.pop(dead_id, None)
+    for dead_id in set(_roam_break_tick) - alive_ids:
+        _roam_break_tick.pop(dead_id, None)
+    for dead_id in set(_sweep_miss_streak) - alive_ids:
+        _sweep_miss_streak.pop(dead_id, None)
+    for dead_id in set(_sweep_fuse_until) - alive_ids:
+        _sweep_fuse_until.pop(dead_id, None)
     for dead_id in set(_roam_flips_used) - alive_ids:
         _roam_flips_used.pop(dead_id, None)
     for (prefix, obj_id), name in list(_object_names.items()):
@@ -7862,6 +8085,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
     _discard_noncollision_move_failures(turn)
+    _record_sweep_resolutions(turn, bool(config.get("sweep_miss_fuse", True)))
     turn_context.shot_predictions = []
     turn_context.kite_decisions = []
     turn_context.guerrilla_decisions = []
@@ -9033,7 +9257,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 cell_counts=friendly_cell_counts,
             )
             unit_phase_ms["vanguard"] += time.monotonic() - _ut0
-            unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
+            unit_actions_detail[uid] = f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
         elif unit.unit_type == UnitType.RANGER:
             team = _combat_team_for(name, config)
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
@@ -9053,7 +9277,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 cell_counts=friendly_cell_counts,
             )
             unit_phase_ms["ranger"] += time.monotonic() - _ut0
-            unit_actions_detail[uid] = f"{action}:{detail}[{team}]"
+            unit_actions_detail[uid] = f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
 
     # Ack the dashboard's 自裁 commands we just issued; concurrent new commands
     # added while planning stay pending for the next Tick.

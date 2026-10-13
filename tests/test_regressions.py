@@ -12211,5 +12211,412 @@ class GuerrillaTrackEndpointTests(unittest.TestCase):
         self.assertEqual(len(body["units"]), 2)
 
 
+class SweepMissFuseTests(KiteTeamPlannerTests):
+    """横扫空枪熔断 (sweep miss fuse).
+
+    Production proof from the route recorder plus battle_log: V15 stood at
+    (889,-920) for ~2000 Ticks and issued 407 sweeps that hit 0 targets — every
+    ~5 Ticks, forever, while it was shot down to HP 1. A sweep resolves AFTER
+    movement, so aiming at the cell the enemy occupies this Tick misses every
+    time that enemy steps aside, and the planner re-aimed at the same cell with
+    no memory of having wasted 406 swings already.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved_streak = dict(tactic._sweep_miss_streak)
+        self._saved_until = dict(tactic._sweep_fuse_until)
+        tactic._sweep_miss_streak.clear()
+        tactic._sweep_fuse_until.clear()
+        tactic.turn_context.tick = 0
+
+    def tearDown(self):
+        tactic._sweep_miss_streak.clear()
+        tactic._sweep_miss_streak.update(self._saved_streak)
+        tactic._sweep_fuse_until.clear()
+        tactic._sweep_fuse_until.update(self._saved_until)
+        super().tearDown()
+
+    def _turn(self, unit, outcomes):
+        """A turn carrying one SWEEP_RESOLVED event per outcome value."""
+        group = "rangers" if unit.unit_type == UnitType.RANGER else "vanguards"
+        kwargs = {"workers": (), "vanguards": (), "rangers": ()}
+        kwargs[group] = (unit,)
+        return SimpleNamespace(
+            **kwargs,
+            events=tuple(
+                SimpleNamespace(
+                    event_type="SWEEP_RESOLVED",
+                    actor_id=unit.id,
+                    values={"targets_hit": hits},
+                )
+                for hits in outcomes
+            ),
+        )
+
+    def test_three_zero_hit_sweeps_refuse_the_current_cell_sweep(self):
+        unit = self.unit("fuse-vanguard", (889, -920))
+        enemy = self.enemy("fuse-enemy", (888, -920))
+
+        # Baseline: an enemy standing on the adjacent cell gets swept.
+        tactic.turn_context.tick = 0
+        action, detail = tactic._vanguard_adjacent_sweep(unit, (889, -920), (enemy,))
+        self.assertEqual(action, "SWEEP")
+        self.assertEqual(unit.action, "SWEEP")
+
+        # Two misses is not yet proof — real fights miss sometimes.
+        tactic._record_sweep_resolutions(self._turn(unit, [0, 0]))
+        self.assertFalse(tactic._sweep_fused(unit))
+        self.assertIsNotNone(
+            tactic._vanguard_adjacent_sweep(unit, (889, -920), (enemy,))[0]
+        )
+
+        # The third consecutive miss arms the fuse: the same aim is refused, and
+        # no sweep is issued at all (the caller falls through to prediction or
+        # to closing the distance).
+        tactic._record_sweep_resolutions(self._turn(unit, [0]))
+        self.assertTrue(tactic._sweep_fused(unit))
+        unit.action = None
+        self.assertIsNone(
+            tactic._vanguard_adjacent_sweep(unit, (889, -920), (enemy,))
+        )
+        self.assertIsNone(unit.action)
+
+    def test_one_landing_sweep_clears_the_debt(self):
+        unit = self.unit("fuse-reset", (0, 0))
+        tactic._record_sweep_resolutions(self._turn(unit, [0, 0, 1]))
+        self.assertFalse(tactic._sweep_fused(unit))
+        self.assertNotIn(str(unit.id), tactic._sweep_miss_streak)
+        self.assertNotIn(str(unit.id), tactic._sweep_fuse_until)
+
+    def test_fuse_is_a_cooldown_not_a_disarmament(self):
+        unit = self.unit("fuse-expiry", (0, 0))
+        enemy = self.enemy("fuse-expiry-e", (1, 0))
+        tactic._record_sweep_resolutions(self._turn(unit, [0, 0, 0]))
+        self.assertTrue(tactic._sweep_fused(unit))
+        tactic.turn_context.tick = tactic._SWEEP_FUSE_TICKS
+        self.assertFalse(tactic._sweep_fused(unit))
+        self.assertEqual(
+            tactic._vanguard_adjacent_sweep(unit, (0, 0), (enemy,))[0], "SWEEP"
+        )
+
+    def test_enemy_misses_never_enter_the_ledger(self):
+        # The ledger is keyed by unit id and pruned with the unit; recording an
+        # enemy's wasted swings would grow it without bound on dead enemy ids.
+        unit = self.unit("fuse-ally", (0, 0))
+        turn = SimpleNamespace(
+            workers=(), vanguards=(unit,), rangers=(),
+            events=(SimpleNamespace(
+                event_type="SWEEP_RESOLVED", actor_id="some-enemy-id",
+                values={"targets_hit": 0},
+            ),),
+        )
+        tactic._record_sweep_resolutions(turn)
+        self.assertEqual(tactic._sweep_miss_streak, {})
+
+    def test_marker_is_greppable_while_the_fuse_is_armed(self):
+        # A silent safety mechanism is a mechanism that does not exist: the
+        # detail must say so, because that string is what an inspection greps.
+        unit = self.unit("fuse-marker", (0, 0))
+        self.assertEqual(tactic._sweep_fuse_note(unit), "")
+        tactic._record_sweep_resolutions(self._turn(unit, [0, 0, 0]))
+        self.assertEqual(tactic._sweep_fuse_note(unit), " sweep-fuse")
+
+    def test_full_vanguard_trade_is_gated_by_the_same_fuse(self):
+        # The other current-cell sweep a guerrilla vanguard issues: a full
+        # health vanguard adjacent to a ranger trades blows at the ranger's
+        # present cell, which is exactly the aim that missed 407 times.
+        unit = self.unit("fuse-trade", (0, 0))
+        ranger = self.enemy("fuse-trade-r", (1, 0), UnitType.RANGER)
+        config = dict(self.config)
+        config["guerrilla_engage_radius"] = 10
+        kwargs = {
+            "unit_kind": "vanguard",
+            "enemies": (ranger,),
+            "obstacle_cells": frozenset(),
+            "config": config,
+            "solo": True,
+        }
+        # A/B: the same geometry without the fuse trades blows as before.
+        self.assertEqual(
+            tactic._plan_kite_combat(unit, **kwargs)[0], "SWEEP",
+        )
+        tactic._record_sweep_resolutions(self._turn(unit, [0, 0, 0]))
+        action, detail = tactic._plan_kite_combat(unit, **kwargs)
+        self.assertNotEqual(action, "SWEEP")
+        self.assertIn("full-vanguard-close", detail)
+
+    def test_switch_off_loses_the_ledger_and_the_armed_fuse(self):
+        unit = self.unit("fuse-switch", (0, 0))
+        tactic._record_sweep_resolutions(self._turn(unit, [0, 0, 0]))
+        self.assertTrue(tactic._sweep_fused(unit))
+        # The dashboard switch has to be able to un-arm an existing fuse, not
+        # merely stop new ones: otherwise turning it off changes nothing for
+        # 40 Ticks.
+        tactic._record_sweep_resolutions(self._turn(unit, []), enabled=False)
+        self.assertFalse(tactic._sweep_fused(unit))
+        self.assertEqual(tactic._sweep_miss_streak, {})
+        self.assertEqual(tactic._sweep_fuse_until, {})
+
+    def test_dead_unit_fuse_state_is_pruned(self):
+        unit = self.unit("fuse-prune", (0, 0))
+        tactic._record_sweep_resolutions(self._turn(unit, [0, 0, 0]))
+        self.assertIn(str(unit.id), tactic._sweep_fuse_until)
+        tactic._prune_dead_unit_bookkeeping(set())
+        self.assertNotIn(str(unit.id), tactic._sweep_fuse_until)
+        self.assertNotIn(str(unit.id), tactic._sweep_miss_streak)
+
+
+class RoamOrbitBreakTests(KiteTeamPlannerTests):
+    """宏观绕圈拆解 (orbit break) — the failure the 8-Tick stall window cannot see.
+
+    Three days of runtime/guerrilla_routes-*.jsonl (145,972 guerrilla steps):
+    V2 spent all of 10-13 re-walking 426 cells inside a 150x48 pocket with a
+    ~468-Tick period, V13 471 cells in 102x102, V15 3889 steps over 25 cells in
+    an 18x5 box. Every short window of those trails looks like fresh ground, so
+    ``_roam_update_stall`` never fired once. The separating statistic is a stall
+    in NEW ground: those units went 2,120 / 4,559 / 4,703 recorded steps between
+    their last two new cells, while every unit that kept exploring stayed under
+    361.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved_discovered = {
+            uid: dict(cells) for uid, cells in tactic._roam_discovered.items()
+        }
+        self._saved_stall = dict(tactic._roam_new_stall)
+        self._saved_recent = {
+            uid: list(cells) for uid, cells in tactic._roam_recent.items()
+        }
+        self._saved_break = dict(tactic._roam_break_tick)
+        self._saved_history = {
+            uid: list(cells) for uid, cells in tactic._roam_pos_history.items()
+        }
+        self._saved_cells = dict(tactic._roam_stall_cells)
+        self._saved_origin = dict(tactic._roam_stall_origin)
+        self._saved_escape = dict(tactic._roam_escape_left)
+        self._saved_banned = {
+            uid: dict(cells) for uid, cells in tactic._roam_banned.items()
+        }
+        self._saved_offset = dict(tactic._roam_bearing_offset)
+        self._saved_flip = dict(tactic._roam_flip_pending)
+        self._saved_flips_used = dict(tactic._roam_flips_used)
+        self._saved_dead = tactic._dead_obstacles
+        for store in (
+            tactic._roam_discovered, tactic._roam_new_stall, tactic._roam_recent,
+            tactic._roam_break_tick, tactic._roam_pos_history,
+            tactic._roam_stall_cells, tactic._roam_stall_origin,
+            tactic._roam_escape_left, tactic._roam_banned,
+            tactic._roam_bearing_offset, tactic._roam_flip_pending,
+            tactic._roam_flips_used,
+        ):
+            store.clear()
+        tactic._dead_obstacles = None
+        tactic.turn_context.tick = 0
+
+    def tearDown(self):
+        tactic._roam_discovered.clear()
+        tactic._roam_discovered.update(self._saved_discovered)
+        tactic._roam_new_stall.clear()
+        tactic._roam_new_stall.update(self._saved_stall)
+        tactic._roam_recent.clear()
+        tactic._roam_recent.update(self._saved_recent)
+        tactic._roam_break_tick.clear()
+        tactic._roam_break_tick.update(self._saved_break)
+        tactic._roam_pos_history.clear()
+        tactic._roam_pos_history.update(self._saved_history)
+        tactic._roam_stall_cells.clear()
+        tactic._roam_stall_cells.update(self._saved_cells)
+        tactic._roam_stall_origin.clear()
+        tactic._roam_stall_origin.update(self._saved_origin)
+        tactic._roam_escape_left.clear()
+        tactic._roam_escape_left.update(self._saved_escape)
+        tactic._roam_banned.clear()
+        tactic._roam_banned.update(self._saved_banned)
+        tactic._roam_bearing_offset.clear()
+        tactic._roam_bearing_offset.update(self._saved_offset)
+        tactic._roam_flip_pending.clear()
+        tactic._roam_flip_pending.update(self._saved_flip)
+        tactic._roam_flips_used.clear()
+        tactic._roam_flips_used.update(self._saved_flips_used)
+        tactic._dead_obstacles = self._saved_dead
+        super().tearDown()
+
+    @staticmethod
+    def _pocket_circuit(width=150, height=48):
+        """V2's shape: the perimeter circuit of a 150x48 pocket, 392 cells."""
+        return (
+            [(x, 0) for x in range(width)]
+            + [(width - 1, y) for y in range(1, height)]
+            + [(x, height - 1) for x in range(width - 2, -1, -1)]
+            + [(0, y) for y in range(height - 2, 0, -1)]
+        )
+
+    def test_threshold_sits_inside_the_measured_gap(self):
+        # The constant is data, not taste: the fleet that kept exploring never
+        # went longer than 361 recorded steps without a new cell, and the three
+        # units that ended a day orbiting never shorter than 2,120.
+        self.assertGreater(tactic._ROAM_ORBIT_STALL_STEPS, 361)
+        self.assertLess(tactic._ROAM_ORBIT_STALL_STEPS, 2120)
+
+    def test_production_scale_loop_is_proven(self):
+        circuit = self._pocket_circuit()
+        self.assertEqual(len(circuit), 392)
+        proven = [
+            tactic._roam_record_discovery("v2", circuit[index % len(circuit)])
+            for index in range(5170)
+        ]
+        self.assertIn(True, proven)
+        # Earliest possible proof: the first lap is all new ground, then a full
+        # stall of revisits.
+        self.assertEqual(
+            proven.index(True), 392 + tactic._ROAM_ORBIT_STALL_STEPS - 1
+        )
+
+    def test_genuine_exploration_is_never_proven(self):
+        # False-positive guard, learned the hard way from the V4 驻守 misfire.
+        stall = tactic._ROAM_ORBIT_STALL_STEPS
+        for index in range(stall * 20):
+            self.assertFalse(
+                tactic._roam_record_discovery("explorer", (index, index // 2))
+            )
+
+    def test_extending_patrol_is_not_an_orbit(self):
+        # Repetition alone is not the trigger — a stall in NEW ground is. A unit
+        # shuttling over a patrol line whose far end grows one cell a lap walks
+        # onto fresh ground before the stall bound can be reached.
+        proven = []
+        for lap in range(60):
+            far = 100 + lap
+            path = (
+                [(index, 0) for index in range(far)]
+                + [(index, 0) for index in range(far - 1, -1, -1)]
+            )
+            for cell in path:
+                proven.append(tactic._roam_record_discovery("patrol", cell))
+        self.assertNotIn(True, proven)
+
+    def test_stationary_hold_records_nothing(self):
+        # Consecutive duplicates are folded, so a deliberate hold can never fill
+        # the ledger — the exact misfire the stall-tick gate produced on V4.
+        for _ in range(tactic._ROAM_ORBIT_STALL_STEPS * 3):
+            self.assertFalse(tactic._roam_record_discovery("holder", (889, -920)))
+        self.assertEqual(len(tactic._roam_recent["holder"]), 1)
+        self.assertEqual(tactic._roam_new_stall.get("holder", 0), 0)
+
+    def test_ledger_sees_the_loop_that_the_short_window_is_blind_to(self):
+        # The A/B proving this is not a re-test of the old gate: replaying V2's
+        # circuit leaves _roam_update_stall silent while the ledger confirms an
+        # orbit. The walk length is a fixed three laps, NOT derived from the
+        # bound — otherwise disabling the bound would silently shorten the walk
+        # and this test would stay green with the detector switched off.
+        circuit = self._pocket_circuit()
+        history = tactic._roam_pos_history.setdefault("v2", [])
+        stall_seen = False
+        proven = False
+        for index in range(3 * len(circuit)):
+            pos = circuit[index % len(circuit)]
+            if not history or history[-1] != pos:
+                history.append(pos)
+                del history[:-tactic._ROAM_STALL_REGION]
+            stall_seen = stall_seen or tactic._roam_update_stall("v2")
+            if tactic._roam_record_discovery("v2", pos):
+                proven = True
+                break
+        self.assertTrue(proven, "the ledger never confirmed the production orbit")
+        self.assertFalse(stall_seen)
+
+    def test_confirmed_orbit_arms_the_escape_and_rebaselines(self):
+        with (
+            patch.object(tactic, "_ROAM_ORBIT_STALL_STEPS", 24),
+            patch.object(tactic, "_ROAM_ORBIT_REGION", 12),
+            patch.object(tactic, "_ROAM_ORBIT_ESCAPE_TICKS", 33),
+        ):
+            unit = self.unit("orbit-e2e", (0, 0))
+            circuit = [(index % 4, (index // 4) % 4) for index in range(16)]
+            detail = ""
+            for step in range(45):
+                action, detail = tactic._guerrilla_roam(
+                    unit, circuit[step % len(circuit)], frozenset(), self.config,
+                )
+                if "orbit-break" in detail:
+                    break
+            self.assertIn("orbit-break", detail)
+            self.assertEqual(tactic._roam_escape_left["orbit-e2e"], 33)
+            self.assertGreaterEqual(len(tactic._roam_stall_cells["orbit-e2e"]), 4)
+            # Banning the whole loop while the unit still stands inside it would
+            # leave no legal step and trade an orbit for a freeze, so only the
+            # approach tail is forbidden.
+            self.assertLessEqual(
+                len(tactic._roam_banned.get("orbit-e2e", {})),
+                tactic._ROAM_STALL_REGION,
+            )
+            # Re-baselined: another full stall is needed before it fires again.
+            self.assertEqual(tactic._roam_new_stall["orbit-e2e"], 0)
+
+    def test_orbit_switch_off_disables_the_ledger_too(self):
+        with patch.object(tactic, "_ROAM_ORBIT_STALL_STEPS", 8):
+            config = dict(self.config)
+            config["roam_orbit_break"] = False
+            unit = self.unit("orbit-off", (0, 0))
+            circuit = [(index % 4, (index // 4) % 4) for index in range(16)]
+            details = []
+            for step in range(30):
+                _, detail = tactic._guerrilla_roam(
+                    unit, circuit[step % len(circuit)], frozenset(), config,
+                )
+                details.append(detail)
+            self.assertNotIn(True, ["orbit-break" in d for d in details])
+            self.assertNotIn("orbit-off", tactic._roam_discovered)
+
+    def test_the_a_b_a_escape_switch_does_not_own_the_orbit_detector(self):
+        # Two independent levers: the dashboard must be able to disable the
+        # long-horizon detector without switching off the two-cell bounce escape
+        # it shares, and the other way round.
+        with patch.object(tactic, "_ROAM_ORBIT_STALL_STEPS", 8):
+            config = dict(self.config)
+            config["roam_oscillation_escape"] = False
+            config["roam_orbit_break"] = True
+            unit = self.unit("orbit-only", (0, 0))
+            circuit = [(index % 4, (index // 4) % 4) for index in range(16)]
+            for step in range(30):
+                _, detail = tactic._guerrilla_roam(
+                    unit, circuit[step % len(circuit)], frozenset(), config,
+                )
+                if "orbit-break" in detail:
+                    break
+            self.assertIn("orbit-break", detail)
+
+    def test_dead_unit_orbit_state_is_pruned(self):
+        tactic._roam_record_discovery("orbit-die", (0, 0))
+        tactic._roam_break_tick["orbit-die"] = 1
+        tactic._prune_dead_unit_bookkeeping(set())
+        self.assertNotIn("orbit-die", tactic._roam_discovered)
+        self.assertNotIn("orbit-die", tactic._roam_recent)
+        self.assertNotIn("orbit-die", tactic._roam_new_stall)
+        self.assertNotIn("orbit-die", tactic._roam_break_tick)
+
+
+
+class OrbitBreakAndSweepFuseConfigTests(unittest.TestCase):
+    """Both new gates ship as registered booleans so production can turn either
+    one off without a redeploy (the same reason roam_oscillation_escape exists)."""
+
+    def test_fields_registered_and_default_on(self) -> None:
+        keys = {field.key for field in tactic_config.CONFIG_FIELDS}
+        self.assertIn("roam_orbit_break", keys)
+        self.assertIn("sweep_miss_fuse", keys)
+        config = default_config()
+        self.assertTrue(config["roam_orbit_break"])
+        self.assertTrue(config["sweep_miss_fuse"])
+
+    def test_validation_rejects_non_boolean(self) -> None:
+        for key in ("roam_orbit_break", "sweep_miss_fuse"):
+            self.assertFalse(tactic_config.validate_config({key: False})[key])
+            with self.assertRaises(tactic_config.ConfigValidationError):
+                tactic_config.validate_config({key: "yes"})
+
+
 if __name__ == "__main__":
     unittest.main()
