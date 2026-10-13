@@ -70,6 +70,16 @@ _UNIT_NAME_PREFIX = {
 # Rotate tactic_log.jsonl when it exceeds this size and keep at most N backups.
 LOG_MAX_BYTES = int(os.environ.get("ARENA_LOG_MAX_MB", "20")) * 1024 * 1024
 LOG_BACKUP_COUNT = 3
+# Guerrilla route recorder: one date-stamped append-only file per local day
+# (guerrilla_routes-YYYYMMDD.jsonl), one tiny row per guerrilla unit per Tick.
+# tactic_log.jsonl is ~22KB/Tick and rotates every ~890 Ticks (~4h at the live
+# ~16s Tick cycle), so it can never hold a whole day of routes; these rows are
+# ~60B and the 3-day window costs about 10MB on the runtime volume.
+GUERRILLA_ROUTE_PREFIX = "guerrilla_routes-"
+GUERRILLA_ROUTE_KEEP_DAYS = 3
+# A day file this big means something is writing far more than the expected
+# ~8 units x 5400 Ticks, so recording pauses rather than filling the volume.
+GUERRILLA_ROUTE_MAX_DAY_BYTES = 64 * 1024 * 1024
 # Shutdown summary only reads this many of the newest tick records.
 _SUMMARY_TAIL_RECORDS = 10000
 # Print a per-Tick phase breakdown here when planning+submit crossed this many
@@ -1191,6 +1201,105 @@ class TacticLogger:
         self._tick_count += 1
         self._last_tick_time = now
         return rec
+
+
+# ── guerrilla route recorder ─────────────────────────────────────────────────
+
+_guerrilla_route_state = {"date": "", "paused": False}
+
+
+def _guerrilla_route_path(date: str) -> Path:
+    return _data_dir() / f"{GUERRILLA_ROUTE_PREFIX}{date}.jsonl"
+
+
+def _prune_guerrilla_route_logs(today: str) -> None:
+    """Delete route files older than GUERRILLA_ROUTE_KEEP_DAYS local days."""
+    try:
+        today_date = datetime.strptime(today, "%Y%m%d").date()
+    except ValueError:
+        return
+    for path in _data_dir().glob(f"{GUERRILLA_ROUTE_PREFIX}*.jsonl"):
+        stamp = path.name[len(GUERRILLA_ROUTE_PREFIX):-len(".jsonl")]
+        try:
+            logged_date = datetime.strptime(stamp, "%Y%m%d").date()
+        except ValueError:
+            continue
+        if (today_date - logged_date).days >= GUERRILLA_ROUTE_KEEP_DAYS:
+            try:
+                path.unlink()
+                print(f"[route-log] pruned {path.name}", flush=True)
+            except OSError:
+                pass
+
+
+def _guerrilla_route_rows(
+    turn: Any,
+    unit_actions: dict[str, str],
+) -> list[dict[str, Any]]:
+    """One row per unit the planner tagged [guerrilla] this Tick.
+
+    The tag comes from ``unit_actions_detail`` (the same string the Tick log
+    keeps), so the roster itself is never re-resolved here. The short id rides
+    along with the display name because names get recycled when a unit dies —
+    without it two successive units share one polyline.
+    """
+    by_uid: dict[str, tuple[Any, str]] = {}
+    for prefix, group in (("V", turn.vanguards), ("R", turn.rangers)):
+        for unit in group:
+            by_uid[str(unit.id)[:8]] = (unit, prefix)
+    now_epoch = int(time.time())
+    rows: list[dict[str, Any]] = []
+    for uid, detail in unit_actions.items():
+        if "[guerrilla]" not in str(detail):
+            continue
+        found = by_uid.get(uid)
+        if found is None:
+            continue
+        unit, prefix = found
+        rows.append({
+            "t": turn.tick,
+            "e": now_epoch,
+            "u": _object_name(unit.id, prefix),
+            "i": uid,
+            "p": [int(unit.position[0]), int(unit.position[1])],
+        })
+    return rows
+
+
+def _record_guerrilla_routes(turn: Any, unit_actions: dict[str, str]) -> None:
+    """Append this Tick's guerrilla positions to the current day's route file.
+
+    Never allowed to cost a Tick: every failure is swallowed the way the Tick
+    logger's rotation is. The file is append-only and never trimmed — the whole
+    point is that a day of routes survives intact for later review, unlike the
+    size-rotated tactic_log.jsonl.
+    """
+    try:
+        if not load_config().get("guerrilla_route_log", True):
+            return
+        today = time.strftime("%Y%m%d")
+        if today != _guerrilla_route_state["date"]:
+            _guerrilla_route_state["date"] = today
+            _guerrilla_route_state["paused"] = False
+            _prune_guerrilla_route_logs(today)
+        if _guerrilla_route_state["paused"]:
+            return
+        rows = _guerrilla_route_rows(turn, unit_actions)
+        if not rows:
+            return
+        path = _guerrilla_route_path(today)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="") as f:
+            f.write("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+        if path.stat().st_size > GUERRILLA_ROUTE_MAX_DAY_BYTES:
+            _guerrilla_route_state["paused"] = True
+            print(
+                f"[route-log] {path.name} over "
+                f"{GUERRILLA_ROUTE_MAX_DAY_BYTES} bytes, recording paused",
+                flush=True,
+            )
+    except Exception as exc:
+        print(f"[route-log] write failed: {exc}", flush=True)
 
 
 # ── unit planners ────────────────────────────────────────────────────────────
@@ -9082,6 +9191,7 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             dead_end_runs=de_runs,
                             dead_end_ms=de_ms,
                         )
+                        _record_guerrilla_routes(turn, plan_actions)
                         print(
                             f"tick={accepted.tick} "
                             f"core={core_action} "

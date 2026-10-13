@@ -1,10 +1,11 @@
-import { Crosshair, Move, Settings, Sword } from 'lucide-react'
+import { Crosshair, Footprints, Move, Settings, Sword } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { AssetList } from '../components/game/AssetList'
 import { BattleLogPanel } from '../components/game/BattleLogPanel'
 import { EnemySightings } from '../components/game/EnemySightings'
 import { GameHUD } from '../components/game/GameHUD'
+import { GuerrillaTracksDialog } from '../components/game/GuerrillaTracksDialog'
 import { ENEMY_FILTER_TYPES, MapControls } from '../components/game/MapControls'
 import { PendingCommands } from '../components/game/PendingCommands'
 import { ResourceActivity } from '../components/game/ResourceActivity'
@@ -13,6 +14,7 @@ import { StrategyConfigDialog } from '../components/game/StrategyConfigDialog'
 import { WorldCanvas } from '../components/game/WorldCanvas'
 import { UnitActionDialog, type MapAnchor } from '../components/game/UnitActionDialog'
 import { useGameStream } from '../hooks/useGameStream'
+import { useGuerrillaTracks } from '../hooks/useGuerrillaTracks'
 import { useEnemyMemory } from '../hooks/useEnemyMemory'
 import { useUnitNames } from '../hooks/useUnitNames'
 import { useUnitRoutes } from '../hooks/useUnitRoutes'
@@ -79,6 +81,13 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   // production fields the sidebar panels don't already cover.
   const [strategyConfigOpen, setStrategyConfigOpen] = useState(false)
   const strategyConfigButtonRef = useRef<HTMLButtonElement>(null)
+  // Guerrilla route overview (路线记录 button, next to the gear): a whole day of
+  // exploration lines from the tactic bot's route recorder. Fetched only while
+  // the dialog is open — a day file is thousands of cells per unit.
+  const [guerrillaTracksOpen, setGuerrillaTracksOpen] = useState(false)
+  const guerrillaTracksButtonRef = useRef<HTMLButtonElement>(null)
+  const [guerrillaTracksDate, setGuerrillaTracksDate] = useState<string | null>(null)
+  const guerrillaTracks = useGuerrillaTracks(guerrillaTracksOpen, guerrillaTracksDate)
   // Core-target map picking started from the strategy dialog: the modal
   // closes while picking (the map must be clickable) and reopens after the
   // chosen point is saved.
@@ -383,8 +392,10 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
       {waypointPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.waypointPickHint', { name: waypointPick.name })}</span><button onClick={() => setWaypointPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {squadTargetPick && <div className="panel absolute left-1/2 top-28 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full pl-4 pr-1.5 text-xs text-cyan-signal"><Crosshair size={15} /><span>{t('game.squadTargetPickHint', { squad: t(`game.teamSettings.${squadTargetPick === 'attack' ? 'attackQueueName' : 'kiteQueueName'}`) })}</span><button onClick={() => setSquadTargetPick(null)} className="focus-ring ml-1 min-h-11 rounded-full px-3 text-zinc-400 hover:bg-white/5 hover:text-white">{t('common.cancel')}</button></div>}
       {!respawning && <MapControls onCenter={() => { setCenterPosition(null); setCenterRequest((value) => value + 1) }} onZoom={(direction) => setZoomRequest((value) => direction * (Math.abs(value) + 1))} beaconIndicatorVisible={beaconIndicatorVisible} onToggleBeaconIndicator={toggleBeaconIndicator} coreIndicatorVisible={coreIndicatorVisible} onToggleCoreIndicator={toggleCoreIndicator} memoryVisible={enemyMemoryVisible} onToggleMemory={toggleEnemyMemory} routesVisible={unitRoutesVisible} onToggleRoutes={demo ? undefined : toggleUnitRoutes} obstaclesVisible={obstaclesVisible} onToggleObstacles={toggleObstacles} memoryFilters={new Set(enemyMemoryFilters)} onToggleMemoryFilter={toggleEnemyMemoryFilter} />}
+      {!demo && !respawning && <button ref={guerrillaTracksButtonRef} type="button" onClick={() => { setGuerrillaTracksDate(null); setGuerrillaTracksOpen(true) }} aria-label={t('game.openGuerrillaTracks')} title={t('game.openGuerrillaTracks')} className="focus-ring panel absolute bottom-4 right-16 z-20 grid size-11 place-items-center rounded-gold text-zinc-400 transition-colors hover:bg-white/[.06] hover:text-zinc-100"><Footprints size={18} /></button>}
       {!demo && !respawning && <button ref={strategyConfigButtonRef} type="button" onClick={() => setStrategyConfigOpen(true)} aria-label={t('game.openStrategyConfig')} title={t('game.openStrategyConfig')} className="focus-ring panel absolute bottom-4 right-4 z-20 grid size-11 place-items-center rounded-gold text-zinc-400 transition-colors hover:bg-white/[.06] hover:text-zinc-100"><Settings size={18} /></button>}
       {!demo && strategyConfigOpen && <StrategyConfigDialog returnFocusRef={strategyConfigButtonRef} onClose={() => setStrategyConfigOpen(false)} onPickCoords={startStrategyCoordPick} />}
+      {!demo && guerrillaTracksOpen && <GuerrillaTracksDialog returnFocusRef={guerrillaTracksButtonRef} onClose={() => setGuerrillaTracksOpen(false)} date={guerrillaTracks.date} dates={guerrillaTracks.dates} units={guerrillaTracks.units} onSelectDate={setGuerrillaTracksDate} />}
       {game.error && <div role="alert" className="panel absolute bottom-4 right-4 z-30 max-w-[min(24rem,calc(100%-2rem))] px-4 py-3 text-xs leading-5 text-coral-hostile">{describeError(game.error)}</div>}
     </section>
   </div>

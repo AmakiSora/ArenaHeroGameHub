@@ -186,6 +186,161 @@ def read_history(ticks: int = 40):
     return out
 
 
+# ---------- guerrilla route tracks ---------------------------------------
+# The tactic bot appends one tiny row per guerrilla unit per Tick to
+# runtime/guerrilla_routes-YYYYMMDD.jsonl (see GUERRILLA_ROUTE_PREFIX in
+# tactic.py). tactic_log.jsonl holds ~890 Ticks before rotating (~4h at the
+# live Tick cycle), so a whole day of exploration lines only exists in these
+# files. One row: {"t": tick, "e": epoch, "u": "V1", "i": id8, "p": [x, y]}.
+
+GUERRILLA_ROUTE_PREFIX = "guerrilla_routes-"
+GUERRILLA_TRACK_MAX_POINTS = 800
+
+
+def _guerrilla_route_files() -> list[tuple[str, str]]:
+    """(date, path) for every route file, newest date first."""
+    directory = Path(_data_path(".")).resolve()
+    out: list[tuple[str, str]] = []
+    try:
+        names = sorted(directory.glob(f"{GUERRILLA_ROUTE_PREFIX}*.jsonl"), reverse=True)
+    except OSError:
+        return []
+    for path in names:
+        stamp = path.name[len(GUERRILLA_ROUTE_PREFIX):-len(".jsonl")]
+        if len(stamp) == 8 and stamp.isdigit():
+            out.append((stamp, str(path)))
+    return out
+
+
+def _guerrilla_route_signature(path: str) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+# Keyed by (path, max_points, since_epoch) -> (signature, built_at, payload).
+# The route file gains rows every Tick, so a signature-only cache would
+# re-parse several MB on every poll; the tracks layer is a review tool, so one
+# refresh per minute is plenty and keeps this process off the tactic bot's CPU.
+_guerrilla_track_cache: dict[tuple, tuple[tuple[int, int] | None, float, dict]] = {}
+GUERRILLA_TRACK_REFRESH_SECONDS = 60.0
+
+
+def read_guerrilla_tracks(
+    date: str | None = None,
+    max_points: int = GUERRILLA_TRACK_MAX_POINTS,
+    hours: int | None = None,
+) -> dict:
+    """Aggregate one day's route rows into a polyline per guerrilla unit.
+
+    Consecutive duplicate cells are folded first (a unit that WAITs or is
+    refused its MOVE still writes a row every Tick), then the remaining walk is
+    strided down to ``max_points`` with the newest cell always kept.
+    """
+    files = _guerrilla_route_files()
+    dates = [stamp for stamp, _ in files]
+    if not files:
+        return {"ok": True, "date": None, "dates": [], "units": []}
+    if date is None or date not in dates:
+        date, path = files[0]
+    else:
+        path = next(p for stamp, p in files if stamp == date)
+    since_epoch = None
+    if hours and hours > 0:
+        since_epoch = int(time.time()) - hours * 3600
+    signature = _guerrilla_route_signature(path)
+    key = (path, int(max_points), since_epoch)
+    cached = _guerrilla_track_cache.get(key)
+    if cached is not None:
+        cached_sig, built_at, payload = cached
+        throttled = time.monotonic() - built_at < GUERRILLA_TRACK_REFRESH_SECONDS
+        if throttled or cached_sig == signature:
+            return {**payload, "dates": dates}
+
+    tracks: dict[str, dict] = {}
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        pos = row.get("p")
+        uid = str(row.get("i") or row.get("u") or "")
+        if not uid or not isinstance(pos, list) or len(pos) != 2:
+            continue
+        if since_epoch is not None and int(row.get("e") or 0) < since_epoch:
+            continue
+        track = tracks.setdefault(uid, {
+            "id": uid,
+            "name": str(row.get("u") or uid),
+            "type": "RANGER" if str(row.get("u") or "").upper().startswith("R") else "VANGUARD",
+            "cells": [],
+            "distinct": set(),
+            "ticks": 0,
+            "first_tick": row.get("t"),
+            "last_tick": row.get("t"),
+            "first_epoch": row.get("e"),
+            "last_epoch": row.get("e"),
+        })
+        cell = (int(pos[0]), int(pos[1]))
+        track["ticks"] += 1
+        track["last_tick"] = row.get("t")
+        track["last_epoch"] = row.get("e")
+        track["distinct"].add(cell)
+        if not track["cells"] or track["cells"][-1] != cell:
+            track["cells"].append(cell)
+
+    units = []
+    for track in tracks.values():
+        cells = track["cells"]
+        stride = max(1, -(-len(cells) // max(1, int(max_points))))
+        kept = cells[::stride]
+        if not kept or kept[-1] != cells[-1]:
+            kept.append(cells[-1])
+        # Distinct cells / net drift are measured over EVERY row, not over the
+        # decimated polyline: "400 Ticks inside 6 cells" is the whole point of
+        # the recorder, and striding would undercount it.
+        distinct = track["distinct"]
+        xs = [cell[0] for cell in distinct]
+        ys = [cell[1] for cell in distinct]
+        start, end = cells[0], cells[-1]
+        units.append({
+            "id": track["id"],
+            "name": track["name"],
+            "type": track["type"],
+            "points": [[x, y] for x, y in kept],
+            "ticks": track["ticks"],
+            "distinct": len(distinct),
+            "net": max(abs(end[0] - start[0]), abs(end[1] - start[1])),
+            "bounds": [min(xs), min(ys), max(xs), max(ys)],
+            "first_tick": track["first_tick"],
+            "last_tick": track["last_tick"],
+            "first_epoch": track["first_epoch"],
+            "last_epoch": track["last_epoch"],
+        })
+    units.sort(key=lambda item: (-item["ticks"], item["name"]))
+    payload = {
+        "ok": True,
+        "date": date,
+        "max_points": int(max_points),
+        "hours": hours,
+        "units": units,
+    }
+    _guerrilla_track_cache.clear()
+    _guerrilla_track_cache[key] = (signature, time.monotonic(), payload)
+    return {**payload, "dates": dates}
+
+
 def _parse_iso_ts(value) -> float | None:
     """Parse a tactic-log ``timestamp`` (ISO string) to wall-clock epoch seconds.
 
@@ -3261,6 +3416,23 @@ class Handler(BaseHTTPRequestHandler):
                 "tick": rec.get("tick"),
                 "units": units,
             })
+            return
+        if path == "/api/guerrilla-tracks":
+            # A whole day of guerrilla exploration lines for the arena SPA's
+            # 游击轨迹 layer: ?date=YYYYMMDD (default newest), ?hours=N to cut to
+            # the newest N hours, ?max_points= to decimate each polyline.
+            query = parse_qs(urlsplit(self.path).query)
+            wanted_date = (query.get("date") or [""])[0].strip() or None
+            try:
+                max_points = int((query.get("max_points") or [GUERRILLA_TRACK_MAX_POINTS])[0])
+            except (TypeError, ValueError):
+                max_points = GUERRILLA_TRACK_MAX_POINTS
+            max_points = max(50, min(2000, max_points))
+            try:
+                hours = int((query.get("hours") or [0])[0]) or None
+            except (TypeError, ValueError):
+                hours = None
+            self._send_json(200, read_guerrilla_tracks(wanted_date, max_points, hours))
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 

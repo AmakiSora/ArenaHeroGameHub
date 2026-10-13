@@ -42,6 +42,7 @@ export const STRATEGY_GROUPS: StrategyGroupSpec[] = [
     titleKey: 'runtimeGroup',
     fields: [
       { kind: 'number', field: 'map_save_interval_ticks', labelKey: 'mapSaveInterval', min: 1, max: 200 },
+      { kind: 'switch', field: 'guerrilla_route_log', labelKey: 'guerrillaRouteLog' },
     ],
   },
   {

@@ -11993,5 +11993,223 @@ class RoamBoxCycleDetectionTests(unittest.TestCase):
         self.assertFalse(tactic._roam_update_stall("u"))
 
 
+class GuerrillaRouteRecorderTests(unittest.TestCase):
+    """The day-long route recorder (runtime/guerrilla_routes-YYYYMMDD.jsonl).
+
+    tactic_log.jsonl rotates after ~890 Ticks, so this recorder is the only
+    thing that can answer "where did the guerrillas walk yesterday".
+    """
+
+    def setUp(self) -> None:
+        self._names = dict(tactic._object_names)
+        self._counters = dict(tactic._object_name_counters)
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+        tactic._guerrilla_route_state["date"] = ""
+        tactic._guerrilla_route_state["paused"] = False
+
+    def tearDown(self) -> None:
+        tactic._object_names.clear()
+        tactic._object_names.update(self._names)
+        tactic._object_name_counters.clear()
+        tactic._object_name_counters.update(self._counters)
+
+    @staticmethod
+    def _turn():
+        return SimpleNamespace(
+            tick=420190,
+            vanguards=[SimpleNamespace(id="vanguard-aaaa", position=(821, -421))],
+            rangers=[
+                SimpleNamespace(id="ranger-bbbb", position=(976, -1175)),
+                SimpleNamespace(id="ranger-cccc", position=(10, 10)),
+            ],
+        )
+
+    @staticmethod
+    def _rows(path: Path) -> list[dict]:
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in
+                path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def test_records_only_guerrilla_tagged_units(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ARENA_DATA_DIR": tmp}), \
+                    patch.object(tactic, "load_config", return_value={"guerrilla_route_log": True}), \
+                    patch.object(tactic.time, "strftime", return_value="20261011"):
+                tactic._record_guerrilla_routes(self._turn(), {
+                    "vanguard": "MOVE:LEFT guerrilla-roam N[guerrilla]",
+                    "ranger-b": "MOVE:UP guerrilla-roam S[guerrilla]",
+                    "ranger-c": "WAIT:kite-hold-safe[kite]",
+                })
+            rows = self._rows(Path(tmp) / "guerrilla_routes-20261011.jsonl")
+        self.assertEqual([row["u"] for row in rows], ["V1", "R1"])
+        self.assertEqual(rows[0]["i"], "vanguard")
+        self.assertEqual(rows[0]["p"], [821, -421])
+        self.assertEqual(rows[0]["t"], 420190)
+        self.assertIsInstance(rows[0]["e"], int)
+
+    def test_switch_off_writes_no_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ARENA_DATA_DIR": tmp}), \
+                    patch.object(tactic, "load_config", return_value={"guerrilla_route_log": False}), \
+                    patch.object(tactic.time, "strftime", return_value="20261011"):
+                tactic._record_guerrilla_routes(self._turn(), {
+                    "vanguard": "MOVE:LEFT guerrilla-roam N[guerrilla]",
+                })
+            self.assertEqual(list(Path(tmp).glob("guerrilla_routes-*")), [])
+
+    def test_new_day_rolls_over_and_prunes_beyond_the_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for stamp in ("20261008", "20261009", "20261010", "20261011", "junkfile"):
+                (root / f"guerrilla_routes-{stamp}.jsonl").write_text("{}\n", encoding="utf-8")
+            with patch.dict(os.environ, {"ARENA_DATA_DIR": tmp}), \
+                    patch.object(tactic, "load_config", return_value={"guerrilla_route_log": True}), \
+                    patch.object(tactic.time, "strftime", return_value="20261011"):
+                tactic._record_guerrilla_routes(self._turn(), {
+                    "vanguard": "MOVE:LEFT guerrilla-roam N[guerrilla]",
+                })
+            kept = sorted(path.name for path in root.glob("guerrilla_routes-*"))
+            # Keep-days window counts from today: 11, 10, 09 stay; 08 is dropped.
+            self.assertEqual(kept, [
+                "guerrilla_routes-20261009.jsonl",
+                "guerrilla_routes-20261010.jsonl",
+                "guerrilla_routes-20261011.jsonl",
+                "guerrilla_routes-junkfile.jsonl",
+            ])
+            self.assertEqual(len(self._rows(root / "guerrilla_routes-20261011.jsonl")), 2)
+
+    def test_recorder_never_costs_a_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ARENA_DATA_DIR": tmp}), \
+                    patch.object(tactic, "load_config", side_effect=OSError("config unreadable")):
+                tactic._record_guerrilla_routes(self._turn(), {
+                    "vanguard": "MOVE:LEFT guerrilla-roam N[guerrilla]",
+                })
+            self.assertEqual(list(Path(tmp).glob("guerrilla_routes-*")), [])
+
+    def test_day_size_cap_pauses_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"ARENA_DATA_DIR": tmp}), \
+                    patch.object(tactic, "load_config", return_value={"guerrilla_route_log": True}), \
+                    patch.object(tactic.time, "strftime", return_value="20261011"), \
+                    patch.object(tactic, "GUERRILLA_ROUTE_MAX_DAY_BYTES", 1):
+                tactic._record_guerrilla_routes(self._turn(), {
+                    "vanguard": "MOVE:LEFT guerrilla-roam N[guerrilla]",
+                })
+                before = (Path(tmp) / "guerrilla_routes-20261011.jsonl").stat().st_size
+                tactic._record_guerrilla_routes(self._turn(), {
+                    "vanguard": "MOVE:LEFT guerrilla-roam N[guerrilla]",
+                })
+                after = (Path(tmp) / "guerrilla_routes-20261011.jsonl").stat().st_size
+        self.assertGreater(before, 0)
+        self.assertEqual(before, after, "paused recorder must stop appending")
+
+
+class GuerrillaTrackEndpointTests(unittest.TestCase):
+    """Dashboard aggregation of the route files for /api/guerrilla-tracks."""
+
+    def _write_day(self, root: Path, stamp: str, rows: list[dict]) -> None:
+        (root / f"guerrilla_routes-{stamp}.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    def _rows(self) -> list[dict]:
+        # V1: a deterministic 3-cell loop (many Ticks, almost no ground covered).
+        # R2: a real march, including a repeated cell to fold.
+        loop = [(821, -421), (820, -421), (819, -421)]
+        rows = [{"t": 100 + index, "e": 1000 + index, "u": "V1", "i": "vanguard-a",
+                 "p": list(loop[index % 3])} for index in range(30)]
+        rows.append({"t": 100, "e": 1000, "u": "V1", "i": "vanguard-a", "p": [821, -421]})
+        for index in range(10):
+            rows.append({"t": 200 + index, "e": 2000 + index, "u": "R2", "i": "ranger-b",
+                         "p": [0, index]})
+            rows.append({"t": 200 + index, "e": 2000 + index, "u": "R2", "i": "ranger-b",
+                         "p": [0, index]})
+        return rows
+
+    def test_aggregates_loops_marches_and_ignores_junk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_day(root, time.strftime("%Y%m%d"), self._rows())
+            self._write_day(root, "20260101", [{"t": 1, "e": 1, "u": "V1", "i": "x", "p": [5, 5]}])
+            (root / "guerrilla_routes-notes.jsonl").write_text("{}\n", encoding="utf-8")
+            with patch.dict(os.environ, {"ARENA_DATA_DIR": tmp}):
+                data = dashboard.read_guerrilla_tracks()
+            self.assertEqual(data["date"], time.strftime("%Y%m%d"))
+            self.assertEqual(data["dates"], [time.strftime("%Y%m%d"), "20260101"])
+            by_id = {unit["id"]: unit for unit in data["units"]}
+            self.assertEqual(len(by_id), 2, "non-dated files must not be read")
+            loop = by_id["vanguard-a"]
+            march = by_id["ranger-b"]
+            self.assertEqual(loop["type"], "VANGUARD")
+            self.assertEqual(march["type"], "RANGER")
+            # 31 rows, 3 distinct cells, back where it started.
+            self.assertEqual((loop["ticks"], loop["distinct"], loop["net"]), (31, 3, 0))
+            self.assertEqual(loop["bounds"], [819, -421, 821, -421])
+            # Consecutive duplicate cells fold: 20 rows but 10 walked cells.
+            self.assertEqual((march["ticks"], march["distinct"], march["net"]), (20, 10, 9))
+            self.assertEqual(march["points"], [[0, index] for index in range(10)])
+
+    def test_decimation_keeps_the_newest_cell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = [{"t": index, "e": 1000 + index, "u": "R2", "i": "ranger-b",
+                     "p": [index, 0]} for index in range(100)]
+            self._write_day(root, time.strftime("%Y%m%d"), rows)
+            with patch.dict(os.environ, {"ARENA_DATA_DIR": tmp}):
+                data = dashboard.read_guerrilla_tracks(max_points=7)
+        points = data["units"][0]["points"]
+        # stride = ceil(100 / 7) = 15 → cells 0,15,…,90 plus the always-kept last.
+        self.assertEqual(len(points), 8)
+        self.assertEqual(points[0], [0, 0])
+        self.assertEqual(points[-1], [99, 0])
+
+    def test_cache_throttles_reparsing_a_growing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stamp = time.strftime("%Y%m%d")
+            path = root / f"guerrilla_routes-{stamp}.jsonl"
+            self._write_day(root, stamp, [{"t": 1, "e": 1000, "u": "V1", "i": "a", "p": [0, 0]}])
+            with patch.dict(os.environ, {"ARENA_DATA_DIR": tmp}):
+                first = dashboard.read_guerrilla_tracks()
+                self._write_day(root, stamp, [
+                    {"t": 1, "e": 1000, "u": "V1", "i": "a", "p": [0, 0]},
+                    {"t": 2, "e": 1001, "u": "V1", "i": "a", "p": [1, 0]},
+                ])
+                throttled = dashboard.read_guerrilla_tracks()
+                with patch.object(dashboard, "GUERRILLA_TRACK_REFRESH_SECONDS", 0.0):
+                    refreshed = dashboard.read_guerrilla_tracks()
+        self.assertEqual(throttled["units"][0]["ticks"], first["units"][0]["ticks"])
+        self.assertEqual(refreshed["units"][0]["ticks"], 2)
+
+    def test_http_endpoint_serves_the_tracks(self) -> None:
+        from http.server import ThreadingHTTPServer
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_day(Path(tmp), time.strftime("%Y%m%d"), self._rows())
+            server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+            server.daemon_threads = True
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                import http.client
+
+                with patch.dict(os.environ, {"ARENA_DATA_DIR": tmp}):
+                    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+                    conn.request("GET", "/api/guerrilla-tracks?max_points=200")
+                    response = conn.getresponse()
+                    status_code = response.status
+                    body = json.loads(response.read())
+                    conn.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+        self.assertEqual(status_code, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(len(body["units"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

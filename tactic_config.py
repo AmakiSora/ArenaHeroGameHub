@@ -224,6 +224,10 @@ CONFIG_FIELDS = (
         1,
     ),
     ConfigField("map_save_interval_ticks", "地图保存间隔 Tick", "runtime", "integer", 10, 1, 200, 1),
+    # Guerrilla route recorder: appends one tiny row per guerrilla unit per Tick
+    # to runtime/guerrilla_routes-YYYYMMDD.jsonl (3 days kept) so a whole day of
+    # exploration lines survives for review — tactic_log.jsonl rotates every ~4h.
+    ConfigField("guerrilla_route_log", "游击队路线记录", "runtime", "boolean", True),
     ConfigField("target_workers", "工人目标", "production", "integer", 10, 0, 100, 1),
     ConfigField("target_vanguards", "先锋目标", "production", "integer", 2, 0, 100, 1),
     ConfigField("target_rangers", "游侠目标", "production", "integer", 2, 0, 100, 1),
