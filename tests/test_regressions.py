@@ -12677,6 +12677,190 @@ class RoamOrbitBreakTests(KiteTeamPlannerTests):
 
 
 
+class GuerrillaFrontierRoamTests(unittest.TestCase):
+    """游击前沿探索 (guerrilla_frontier_roam) — 不再抱着一个 ID 派生方位不放。
+
+    Production 15h window after the orbit-break gate shipped: V1 re-walked 25.7%
+    of its steps, V2 21.9%, R14 20.1%, V5 20.0% — ground the unit had already
+    stood on 3+ times. The gate catches a pocket only after 500 recorded steps
+    with no new cell; the fixed bearing is what keeps walking them back in.
+    Replaying the five real break events on today's 509,299-cell wall memory:
+    the old arm rewalked 22.1% on average and re-triggered the orbit gate 2 of 5
+    times, the new arm 0.6% and zero, with no WAIT freeze in either.
+    """
+
+    class SimUnit:
+        def __init__(self, uid, position):
+            self.id = uid
+            self.position = position
+            self.arg = None
+
+        def move(self, direction):
+            self.arg = direction
+
+        def wait(self):
+            self.arg = None
+
+    _STORES = (
+        "_roam_pos_history", "_roam_escape_left", "_roam_stall_cells",
+        "_roam_stall_origin", "_roam_bearing_offset", "_roam_flip_pending",
+        "_roam_flips_used", "_roam_banned", "_roam_discovered",
+        "_roam_new_stall", "_roam_recent", "_roam_break_tick", "_roam_seen",
+    )
+
+    def setUp(self):
+        self.config = default_config()
+        self._saved = {
+            name: {uid: copy.deepcopy(value)
+                   for uid, value in getattr(tactic, name).items()}
+            for name in self._STORES
+        }
+        for name in self._STORES:
+            getattr(tactic, name).clear()
+        tactic.turn_context.tick = 0
+
+    def tearDown(self):
+        for name, saved in self._saved.items():
+            store = getattr(tactic, name)
+            store.clear()
+            store.update(saved)
+
+    def _seed_line(self, uid, origin, length=12):
+        """Mark the ground along this unit's fixed bearing (both ways) as seen."""
+        base = tactic._stable_slot_index(uid, len(tactic._EIGHT_WAY_DELTAS))
+        dx, dy = tactic._EIGHT_WAY_DELTAS[base]
+        cells = {}
+        for step in range(-length, length + 1):
+            cells[(origin[0] + dx * step, origin[1] + dy * step)] = None
+        tactic._roam_seen[uid] = cells
+        return base, cells
+
+    def test_virgin_terrain_is_byte_for_byte_the_old_policy(self) -> None:
+        # Nothing visited yet => every bearing ties => the rotation starts at the
+        # base bearing => the fleet keeps the spread of headings it has today.
+        unit = self.SimUnit("frontier-virgin", (500, 500))
+        config_off = dict(self.config)
+        config_off["guerrilla_frontier_roam"] = False
+        tactic.turn_context.tick = 1
+        _a1, d1 = tactic._guerrilla_roam(unit, (500, 500), frozenset(), config_off)
+        tactic._roam_seen.clear(); tactic._roam_pos_history.clear()
+        _a2, d2 = tactic._guerrilla_roam(
+            self.SimUnit("frontier-virgin", (500, 500)), (500, 500), frozenset(), self.config,
+        )
+        self.assertEqual(d1, d2)
+
+    def test_aimed_at_fresh_ground_instead_of_its_own_trail(self) -> None:
+        uid = "frontier-turn"
+        origin = (40, 40)
+        base, seen = self._seed_line(uid, origin)
+        unit = self.SimUnit(uid, origin)
+        tactic.turn_context.tick = 3
+        _a, detail_off = tactic._guerrilla_roam(
+            unit, origin, frozenset(), {**self.config, "guerrilla_frontier_roam": False},
+        )
+        cell_off = (origin[0] + tactic._EIGHT_WAY_DELTAS[base][0],
+                    origin[1] + tactic._EIGHT_WAY_DELTAS[base][1])
+        self.assertIn(cell_off, seen)
+        self.assertIn(tactic._EIGHT_WAY_LABELS[base], detail_off)
+
+        tactic._roam_pos_history.clear()
+        unit = self.SimUnit(uid, origin)
+        tactic.turn_context.tick = 3
+        action, detail_on = tactic._guerrilla_roam(
+            unit, origin, frozenset(), self.config,
+        )
+        self.assertEqual(action, "MOVE")
+        dx, dy = unit.arg.delta
+        # The old heading lands on ground it has stood on; the frontier one does
+        # not, and it is a different heading — that is the whole change.
+        self.assertNotEqual(detail_off.split()[0], detail_on.split()[0])
+        self.assertNotIn((origin[0] + dx, origin[1] + dy), seen)
+
+    def test_a_dead_end_still_backs_out_instead_of_freezing(self) -> None:
+        # Everything legal is behind the unit. Skipping blocked headings must not
+        # turn "no fresh ground ahead" into a WAIT: a frozen unit explores less
+        # than one that orbits, and the gate cannot help a unit that never moves.
+        uid = "frontier-deadend"
+        origin = (0, 0)
+        walls = frozenset(
+            {(x, y) for x in range(-2, 3) for y in range(-2, 3)}
+            - {(0, 0), (0, 1)}
+        )
+        tactic._roam_seen[uid] = {(0, 0): None}
+        unit = self.SimUnit(uid, origin)
+        tactic.turn_context.tick = 1
+        action, detail = tactic._guerrilla_roam(unit, origin, walls, self.config)
+        self.assertEqual(action, "MOVE")
+        self.assertIn(unit.arg.delta, [(0, 1), (1, 1), (1, 0)])
+
+    def test_the_escape_phase_is_not_resteered(self) -> None:
+        # Blast radius: the two-phase escape is measured-good in production (all
+        # three orbit breaks in the 15h window worked). Frontier scoring must not
+        # touch a unit that is escaping.
+        uid = "frontier-escape"
+        pos = (5, 5)
+        tactic._roam_escape_left[uid] = 4
+        tactic._roam_stall_cells[uid] = frozenset(
+            [(x, y) for x in range(3, 8) for y in range(3, 8)]
+        )
+        tactic._roam_stall_origin[uid] = (4, 5)
+        tactic._roam_seen[uid] = {pos: None}
+        unit = self.SimUnit(uid, pos)
+        with patch.object(
+            tactic, "_roam_frontier_bearing",
+            side_effect=AssertionError("frontier steering ran during an escape"),
+        ):
+            _action, detail = tactic._guerrilla_roam(
+                unit, pos, frozenset(), self.config,
+            )
+        self.assertIn("escape", detail)
+
+    def test_frontier_memory_outlives_the_orbit_ledger(self) -> None:
+        # The detector wants a fresh baseline after a break; the heading chooser
+        # must keep remembering where it has already been, or the first hundred
+        # steps after every break would look like virgin ground again.
+        uid = "frontier-memory"
+        tactic._roam_record_seen(uid, (1, 1))
+        tactic._roam_discovered[uid] = {(1, 1): None}
+        tactic._roam_reset_discovery(uid)
+        self.assertNotIn(uid, tactic._roam_discovered)
+        self.assertIn((1, 1), tactic._roam_seen[uid])
+
+    def test_frontier_memory_is_bounded(self) -> None:
+        uid = "frontier-bound"
+        with patch.object(tactic, "_ROAM_FRONTIER_MEMORY", 50):
+            for index in range(400):
+                tactic._roam_record_seen(uid, (index, 0))
+            self.assertEqual(len(tactic._roam_seen[uid]), 50)
+            self.assertIn((399, 0), tactic._roam_seen[uid])
+            self.assertNotIn((0, 0), tactic._roam_seen[uid])
+
+    def test_dead_unit_frontier_memory_is_pruned(self) -> None:
+        tactic._roam_record_seen("frontier-die", (0, 0))
+        tactic._prune_dead_unit_bookkeeping(set())
+        self.assertNotIn("frontier-die", tactic._roam_seen)
+
+
+class GuerrillaFrontierRoamConfigTests(unittest.TestCase):
+    """The new policy ships behind its own switch so production can turn the
+    roaming behaviour back without a redeploy — the same lever that made the two
+    gates in the last deployment safe to try."""
+
+    def test_field_registered_and_default_on(self) -> None:
+        keys = {field.key for field in tactic_config.CONFIG_FIELDS}
+        self.assertIn("guerrilla_frontier_roam", keys)
+        self.assertTrue(default_config()["guerrilla_frontier_roam"])
+
+    def test_validation_rejects_non_boolean(self) -> None:
+        self.assertFalse(
+            tactic_config.validate_config({"guerrilla_frontier_roam": False})[
+                "guerrilla_frontier_roam"
+            ]
+        )
+        with self.assertRaises(tactic_config.ConfigValidationError):
+            tactic_config.validate_config({"guerrilla_frontier_roam": "yes"})
+
+
 class OrbitBreakAndSweepFuseConfigTests(unittest.TestCase):
     """Both new gates ship as registered booleans so production can turn either
     one off without a redeploy (the same reason roam_oscillation_escape exists)."""

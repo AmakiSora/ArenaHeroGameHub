@@ -3005,6 +3005,58 @@ def _arm_roam_orbit_escape(uid: str) -> None:
             banned[cell] = expiry
 
 
+def _roam_record_seen(uid: str, pos: tuple[int, int]) -> None:
+    """Remember every cell this unit has stood on, oldest-first bounded.
+
+    Bounding it to a few days of ground only makes the frontier policy more
+    forgiving about ancient history, never less.
+    """
+    seen = _roam_seen.setdefault(uid, {})
+    seen[pos] = None
+    while len(seen) > _ROAM_FRONTIER_MEMORY:
+        seen.pop(next(iter(seen)))
+
+
+def _roam_frontier_bearing(
+    uid: str,
+    pos: tuple[int, int],
+    base_bearing: int,
+    obstacle_cells: frozenset[tuple[int, int]],
+) -> int:
+    """Pick the heading with the most never-visited ground straight ahead.
+
+    The lookahead is a straight line per bearing — 8 x 3 dict lookups, and it is
+    the question the ID-derived fixed bearing never asked. A heading blocked by
+    a wall is skipped while any legal one exists, so a dead end still falls back
+    to the base bearing and the existing cardinal scout. Ties go to whichever
+    comes first in the rotation starting at the base bearing, so in virgin
+    terrain every unit keeps exactly the heading it keeps today and the fleet
+    keeps its spread of directions.
+    """
+    seen = _roam_seen.get(uid)
+    if not seen:
+        return base_bearing
+    count = len(_EIGHT_WAY_DELTAS)
+    best_bearing = base_bearing
+    best_score = -1
+    for offset in range(count):
+        bearing = (base_bearing + offset) % count
+        dx, dy = _EIGHT_WAY_DELTAS[bearing]
+        if (pos[0] + dx, pos[1] + dy) in obstacle_cells:
+            continue
+        fresh = 0
+        for step in range(1, _ROAM_FRONTIER_LOOKAHEAD + 1):
+            cell = (pos[0] + dx * step, pos[1] + dy * step)
+            if cell in obstacle_cells:
+                break
+            if cell not in seen:
+                fresh += 1
+        if fresh > best_score:
+            best_score = fresh
+            best_bearing = bearing
+    return best_bearing
+
+
 def _roam_break_note(uid: str) -> str:
     """Self-report the orbit break in the action detail so it is greppable.
 
@@ -3152,6 +3204,8 @@ def _guerrilla_roam(
     if not history or history[-1] != pos:
         history.append(pos)
         del history[:-_ROAM_STALL_REGION]
+    if bool(config.get("guerrilla_frontier_roam", True)):
+        _roam_record_seen(uid, pos)
     # The discovery ledger records every step regardless of escape state: an
     # orbit proven while another escape is still running must not be thrown
     # away, it arms on the first Tick that is no longer escaping.
@@ -3221,6 +3275,13 @@ def _guerrilla_roam(
             )
         ) % len(_EIGHT_WAY_DELTAS)
         _roam_flips_used[uid] = _roam_flips_used.get(uid, 0) + 1
+    # guerrilla_frontier_roam: hold the fixed bearing only while escaping. The
+    # bearing itself is what drags a unit back along its own trail every Tick —
+    # production measured a fifth of every guerrilla step landing on ground that
+    # unit had already stood on three times or more. Out of an escape, aim at the
+    # direction that still has unvisited ground in front of it.
+    if not escaping and bool(config.get("guerrilla_frontier_roam", True)):
+        bearing = _roam_frontier_bearing(uid, pos, bearing, obstacle_cells)
     # Pockets escaped earlier stay off the route for _ROAM_BAN_TICKS: the active
     # escape forgets its region as soon as the budget expires, and without this
     # the base bearing pulls the unit straight back into the same bounce.
@@ -6628,6 +6689,13 @@ _roam_discovered: dict[str, dict[tuple[int, int], None]] = {}
 _roam_new_stall: dict[str, int] = {}
 _roam_recent: dict[str, deque] = {}
 _roam_break_tick: dict[str, int] = {}
+# Frontier roaming memory: every cell this unit has stood on since the process
+# started, bounded FIFO. Unlike _roam_discovered it is NOT reset when an orbit is
+# broken — the detector wants a fresh baseline after an escape, but a unit that
+# is choosing where to walk next must keep remembering the ground it came from.
+_ROAM_FRONTIER_LOOKAHEAD = 3
+_ROAM_FRONTIER_MEMORY = 8000
+_roam_seen: dict[str, dict[tuple[int, int], None]] = {}
 # Consecutive ticks a worker has not moved — triggers un-stick recovery.
 # _worker_stuck_ticks counts consecutive same-position ticks; _worker_stuck_pos
 # remembers the position those ticks were counted at (independent of last-pos,
@@ -7959,6 +8027,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _roam_flip_pending.pop(dead_id, None)
     for dead_id in set(_roam_discovered) - alive_ids:
         _roam_discovered.pop(dead_id, None)
+    for dead_id in set(_roam_seen) - alive_ids:
+        _roam_seen.pop(dead_id, None)
     for dead_id in set(_roam_new_stall) - alive_ids:
         _roam_new_stall.pop(dead_id, None)
     for dead_id in set(_roam_recent) - alive_ids:

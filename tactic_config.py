@@ -64,6 +64,15 @@ CONFIG_FIELDS = (
     # (production V2 re-walked 426 cells for a whole day). Arms the escape above
     # with the whole loop and a longer budget. Thresholds stay in tactic.py.
     ConfigField("roam_orbit_break", "漫游宏观绕圈拆解", "worker", "boolean", True),
+    # Frontier roaming: a guerrilla picks its bearing by looking forward up to
+    # _ROAM_FRONTIER_LOOKAHEAD cells and taking the direction with the most
+    # never-visited ground, instead of holding the one ID-derived bearing it
+    # was born with. The fixed bearing is what pulls a unit back along its own
+    # trail every Tick (production 15h window: V1 25.7% / V2 21.9% / R14 20.1%
+    # of all steps landed on a cell that unit had already stood on 3+ times).
+    # Ties fall back to the ID bearing, so in virgin terrain this is exactly the
+    # old policy and the fleet keeps its spread of headings.
+    ConfigField("guerrilla_frontier_roam", "游击前沿探索", "worker", "boolean", True),
     # Sweep miss fuse: a unit whose last three sweeps hit nothing stops being
     # aimed at the cell an enemy currently occupies (movement resolves before
     # combat, so that aim is what missed 407 times in a row for V15). The
