@@ -270,7 +270,11 @@ def main() -> int:
         alarms.append(f"重走率 {fleet:.2f}% 未优于上线前的 9.20%")
 
     client.close()
-    print("\n" + ("⚠ 告警:\n  - " + "\n  - ".join(alarms) if alarms else "[OK] 无告警"))
+    if notes:
+        print("\n观察项（不影响退出码）:")
+        for note in notes:
+            print(f"  - {note}")
+    print("\n" + ("[ALARM] 告警:\n  - " + "\n  - ".join(alarms) if alarms else "[OK] 无告警"))
     return 1 if alarms else 0
 
 
