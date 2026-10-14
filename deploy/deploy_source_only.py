@@ -9,6 +9,14 @@ import paramiko
 
 ENV_FILE = Path(__file__).resolve().parent / ".env.deploy"
 
+# A deploy script that dies while streaming the build leaves the old container
+# half-updated: docker's build output carries glyphs a legacy Windows console
+# cannot encode (a check mark in the vite log killed one mid-build), so never let
+# printing be the thing that breaks a deployment.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
 
 def load_env() -> dict[str, str]:
     env: dict[str, str] = {}
