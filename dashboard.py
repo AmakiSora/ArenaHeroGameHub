@@ -3283,6 +3283,19 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/stream":
             self._stream_events()
             return
+        if path == "/api/health":
+            # Liveness probe that costs milliseconds, for the compose healthcheck
+            # and the deploy smoke test — the only two callers that ever asked
+            # for /api/state on a schedule. /api/state renders every remembered
+            # wall cell into one SVG: measured on production, 20.8 MB of a
+            # 22.9 MB body (90.7%) taking 1.7-26.8 s per call against a 3 s
+            # healthcheck timeout, while nothing consumes the body at all.
+            history = read_history(1)
+            self._send_json(200, {
+                "ok": True,
+                "tick": history[0].get("tick") if history else None,
+            })
+            return
         if path == "/api/state":
             parts = build_parts(log_limit=_clamp_log_limit(self))
             if not parts:

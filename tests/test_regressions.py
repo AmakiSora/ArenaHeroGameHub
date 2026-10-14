@@ -7210,6 +7210,84 @@ class BattleLogTests(unittest.TestCase):
 
 
 
+class ApiHealthProbeTests(unittest.TestCase):
+    """``/api/health`` is what the container healthcheck and the deploy smoke
+    test call.
+
+    Production measured ``/api/state`` at a 22.9 MB body whose ``mapSvg`` field
+    alone is 20.8 MB (90.7%) — every remembered wall cell drawn into one SVG —
+    answering in 1.7-26.8 s against a healthcheck that gives up at 3 s. Nothing
+    consumes that body (the arena SPA never requests ``/api/state``), so the
+    30-second probe was the only caller paying for the render, and it was the
+    thing the render kept making it fail.
+    """
+
+    def _get(self, path: str, log_file: str):
+        recorded = {"build_parts": 0}
+
+        class _Wire:
+            def __init__(self) -> None:
+                self.body = b""
+
+            def write(self, data: bytes) -> None:
+                self.body += data
+
+        def boom(*_args, **_kwargs):
+            recorded["build_parts"] += 1
+            return None
+
+        with (
+            patch.object(dashboard, "build_parts", boom),
+            patch.object(dashboard, "LOG_FILE", log_file),
+            patch.object(dashboard.Handler, "_is_loopback", lambda self: True),
+        ):
+            handler = dashboard.Handler.__new__(dashboard.Handler)
+            handler.path = path
+            handler.headers = {}
+            wire = _Wire()
+            statuses: list[int] = []
+            handler.send_response = statuses.append
+            handler.send_header = lambda *_pair: None
+            handler.end_headers = lambda: None
+            handler.wfile = wire
+            handler.do_GET()
+        return statuses, wire.body, recorded
+
+    def test_probe_answers_small_without_building_the_state_payload(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "tactic_log.jsonl"
+            log.write_text(
+                json.dumps({"tick": 435397, "plan_unit_actions": {}}) + "\n",
+                encoding="utf-8",
+            )
+            statuses, body, recorded = self._get("/api/health", str(log))
+        self.assertEqual(statuses, [200])
+        self.assertLess(len(body), 256)
+        # The whole point: the probe must not pay for the map render.
+        self.assertEqual(recorded["build_parts"], 0)
+        self.assertEqual(json.loads(body)["tick"], 435397)
+
+    def test_probe_reports_no_tick_without_a_log_but_still_answers(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses, body, _recorded = self._get(
+                "/api/health", str(Path(tmp) / "absent.jsonl"),
+            )
+        self.assertEqual(statuses, [200])
+        self.assertIsNone(json.loads(body)["tick"])
+
+    def test_state_endpoint_still_builds_the_full_payload(self) -> None:
+        # The two endpoints differ on purpose: /api/state keeps rendering the
+        # panel payload it always did (the deploy smoke test still proves it
+        # once), /api/health never does.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses, _body, recorded = self._get("/api/state", Path(tmp) / "x.jsonl")
+        self.assertEqual(statuses, [200])
+        self.assertEqual(recorded["build_parts"], 1)
+
+
 class CoreRailBarTests(unittest.TestCase):
     """Core vitals bars come from the live helpers (_seg_cells /
     _core_rail_html) that /api/state still emits for the arena console."""

@@ -63,7 +63,7 @@ The script will:
 1. SFTP project files to `DEPLOY_REMOTE_BASE`
 2. Write remote `.env` with `ARENA_HERO_API_KEY` + `DASHBOARD_TOKEN`
 3. Run `docker compose up --build --detach`
-4. Smoke-check `http://127.0.0.1:4399/` and `/api/state`
+4. Smoke-check `http://127.0.0.1:4399/`, `/api/health` and `/api/state`
 
 ## Manual First Launch On The VPS
 
@@ -144,7 +144,10 @@ After every deployment:
 
 1. `http://SERVER_IP:4399/` shows the login page when no token is given, and
    the dashboard after entering the token
-2. `/api/state` returns JSON (with a valid token)
+2. `/api/health` answers in milliseconds — the container healthcheck probes it
+   every 30 s, and `/api/state` (which renders the whole remembered map into one
+   SVG) is deliberately not the probe target. `/api/state` still returns JSON
+   with a valid token
 3. `/api/config` responds (production targets live in the config form)
 4. `docker compose logs app` shows tactic connecting when API key is set
 5. New ticks appear in the dashboard after the tactic joins a game

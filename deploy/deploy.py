@@ -333,6 +333,10 @@ def main() -> None:
         f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{APP_PORT}/",
         # Host-side curls hit the container via docker-proxy (source = bridge
         # gateway, not loopback), so pass the token through Bearer.
+        f"curl -s -o /dev/null -w '%{{http_code}}' -H 'Authorization: Bearer {DASHBOARD_TOKEN}' http://127.0.0.1:{APP_PORT}/api/health",
+        # Kept alongside the probe: /api/state costs seconds to build, so the
+        # healthcheck no longer pays for it, but a deploy is the one place worth
+        # proving the full panel payload still renders.
         f"curl -s -o /dev/null -w '%{{http_code}}' -H 'Authorization: Bearer {DASHBOARD_TOKEN}' http://127.0.0.1:{APP_PORT}/api/state",
         "docker exec arena-game-app-1 ls -la /app/runtime",
     ]
