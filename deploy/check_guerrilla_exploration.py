@@ -36,6 +36,7 @@ REWALK_REGRESS_PCT = 19.3      # pre-gate fleet baseline
 REWALK_WATCH_PCT = 9.2         # pre-frontier fleet baseline
 COLLAPSE_DISTINCT = 600        # distinct cells under this with 800+ steps = collapsed
 COLLAPSE_MIN_STEPS = 800
+MIN_TICKS_FOR_VERDICT = 600    # below this the window cannot say anything about exploration
 FLAP_PER_UNIT_DAY = 8.0
 SLOW_SHARE_WATCH = 45.0        # % of ticks over the 3000ms logging threshold
 MAPWRITE_5S_WATCH = 200        # ticks whose map_memory phase cost >=5s
@@ -252,22 +253,27 @@ def main() -> int:
             alarms.append(f"orbit-break 触发密度 {per_unit_day:.1f}/单位-日 超线，可能在反复顶同一个口袋")
     rows_out.sort(key=lambda item: -item[2]["rewalk"])
     fleet = 100.0 * re_total / steps if steps else 0.0
+    enough = span >= MIN_TICKS_FOR_VERDICT and bool(rows_out)
     print(f"\n轨迹: {len(rows_out)} 匹游击单位 / {steps:,} 步（跳过截断行 {skipped}）")
-    print(f"  {'名':<5}{'id':<11}{'步数':>7}{'distinct':>9}{'重走%':>8}{'最长无新格':>11}  bbox")
-    for uid, name, data in rows_out:
-        flag = ""
-        if data["steps"] >= COLLAPSE_MIN_STEPS and data["distinct"] < COLLAPSE_DISTINCT:
-            flag = "  <-- 塌缩"
-            alarms.append(f"{name}({uid}) 塌缩：{data['steps']} 步只有 {data['distinct']} 格")
-        if data["max_gap"] >= 500 and not any(full.startswith(uid) for full in fired):
-            flag += "  <-- 越过 500 判据却没有触发记录"
-            alarms.append(f"{name}({uid}) 最长无新格 {data['max_gap']} 拍 >=500，但窗口内没有它的触发记录")
-        print(f"  {name:<5}{uid:<11}{data['steps']:>7}{data['distinct']:>9}"
-              f"{data['rewalk']:>7.1f}%{data['max_gap']:>11}  "
-              f"{data['bbox'][0]}x{data['bbox'][1]}{flag}")
-    print(f"\n全网重走率 {fleet:.2f}%  （前沿探索上线前 9.20%，各道闸上线前 {REWALK_REGRESS_PCT}%）")
-    if fleet > REWALK_WATCH_PCT:
-        alarms.append(f"重走率 {fleet:.2f}% 未优于上线前的 9.20%")
+    if not enough:
+        print(f"  窗口只有 {span} 拍（判定至少需要 {MIN_TICKS_FOR_VERDICT} 拍），"
+              "样本不足以判定探索效果 —— 不报重走率、不给有效或无效的结论")
+    else:
+        print(f"  {'名':<5}{'id':<11}{'步数':>7}{'distinct':>9}{'重走%':>8}{'最长无新格':>11}  bbox")
+        for uid, name, data in rows_out:
+            flag = ""
+            if data["steps"] >= COLLAPSE_MIN_STEPS and data["distinct"] < COLLAPSE_DISTINCT:
+                flag = "  <-- 塌缩"
+                alarms.append(f"{name}({uid}) 塌缩：{data['steps']} 步只有 {data['distinct']} 格")
+            if data["max_gap"] >= 500 and not any(full.startswith(uid) for full in fired):
+                flag += "  <-- 越过 500 判据却没有触发记录"
+                alarms.append(f"{name}({uid}) 最长无新格 {data['max_gap']} 拍 >=500，但窗口内没有它的触发记录")
+            print(f"  {name:<5}{uid:<11}{data['steps']:>7}{data['distinct']:>9}"
+                  f"{data['rewalk']:>7.1f}%{data['max_gap']:>11}  "
+                  f"{data['bbox'][0]}x{data['bbox'][1]}{flag}")
+        print(f"\n全网重走率 {fleet:.2f}%  （前沿探索上线前 9.20%，各道闸上线前 {REWALK_REGRESS_PCT}%）")
+        if fleet > REWALK_WATCH_PCT:
+            alarms.append(f"重走率 {fleet:.2f}% 未优于上线前的 9.20%")
 
     client.close()
     if notes:
