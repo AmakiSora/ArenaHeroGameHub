@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from functools import wraps
 from getpass import getpass
-from heapq import heappop, heappush
+from heapq import heappop, heappush, merge
 from pathlib import Path
 from typing import Any
 
@@ -6798,6 +6798,16 @@ _waypoint_stuck: dict[str, tuple[int, tuple[int, int]]] = {}
 _WAYPOINT_STUCK_THRESHOLD = 15
 _map_dirty: bool = False
 _last_map_save_tick: int = -1
+# Disk-owned map fields, refreshed only when map_memory.json's signature changes
+# (see _apply_dashboard_map_edits). They used to be recovered by json.loads-ing
+# the whole file on every save — ~0.4s at 560k walls, for three small fields.
+_map_disk_manual: set[tuple[int, int]] = set()
+_map_disk_forgotten: set[tuple[int, int]] = set()
+_map_disk_clear_seq: int = 0
+# Sorted obstacle payload reused across saves, and the adds not merged into it
+# yet. See _obstacles_sorted_payload().
+_obstacle_sorted_cache: list[tuple[int, int]] | None = None
+_obstacle_pending_adds: set[tuple[int, int]] = set()
 
 # Cumulative battle-report statistics (economy / combat / production + per-unit
 # details), persisted to game_stats.json so they survive process restarts.
@@ -6842,7 +6852,8 @@ def _load_map_memory() -> None:
     """Load permanent obstacle/resource/enemy memory from disk."""
     global _resource_memory, _obstacle_memory, _enemy_memory, _enemy_memory_types, \
         _enemy_memory_ticks, _enemy_clear_seq, _last_dashboard_map_sig, _known_obstacles, \
-        _core_anchor
+        _core_anchor, _map_disk_manual, _map_disk_forgotten, _map_disk_clear_seq, \
+        _obstacle_sorted_cache
     if not MAP_MEMORY_PATH.exists():
         return
     try:
@@ -6865,6 +6876,13 @@ def _load_map_memory() -> None:
             else None
         )
         _last_dashboard_map_sig = _dashboard_map_sig(data)
+        _map_disk_manual = manual
+        _map_disk_forgotten = forgotten
+        _map_disk_clear_seq = _enemy_clear_seq
+        # Wholesale reload: the file this process just read is no longer what any
+        # earlier save saw, so drop the incremental obstacle payload cache.
+        _obstacle_sorted_cache = None
+        _obstacle_pending_adds.clear()
         # Wholesale reload: rebase the stable obstacle view and defer the batch
         # dead-end build to the first _ensure_dead_structure() of the next tick.
         _known_obstacles = frozenset(_obstacle_memory)
@@ -6924,7 +6942,8 @@ def _apply_dashboard_map_edits() -> None:
     stale on-disk forget list.
     """
     global _resource_memory, _enemy_memory, _enemy_memory_types, _enemy_memory_ticks, \
-        _enemy_clear_seq, _map_dirty, _last_dashboard_map_sig
+        _enemy_clear_seq, _map_dirty, _last_dashboard_map_sig, _map_disk_manual, \
+        _map_disk_forgotten, _map_disk_clear_seq
     if not MAP_MEMORY_PATH.exists():
         return
     file_sig = _file_signature(MAP_MEMORY_PATH)
@@ -6938,14 +6957,20 @@ def _apply_dashboard_map_edits() -> None:
     if file_sig is not None:
         _map_file_sig_cache[cache_key] = file_sig
 
+    # Stash the disk-owned fields: _save_map_memory needs them and must not
+    # re-parse the file to get them. While this signature still matches the
+    # file, they are exactly what is on disk.
+    _map_disk_forgotten = _coords_from_payload(data.get("forgotten_resources"))
+    _map_disk_manual = _coords_from_payload(data.get("manual_resources"))
+    _map_disk_clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
+
     sig = _dashboard_map_sig(data)
     if sig == _last_dashboard_map_sig:
         return
     _last_dashboard_map_sig = sig
 
-    forgotten = _coords_from_payload(data.get("forgotten_resources"))
-    manual = _coords_from_payload(data.get("manual_resources"))
-    disk_resources = _coords_from_payload(data.get("resources"))
+    forgotten = _map_disk_forgotten
+    manual = _map_disk_manual
 
     if forgotten:
         before = set(_resource_memory)
@@ -6969,10 +6994,10 @@ def _apply_dashboard_map_edits() -> None:
             _resource_memory.add(pos)
             _map_dirty = True
         _resource_tombstones.discard(pos)
-    # disk_resources is intentionally unused for rehydration.
-    _ = disk_resources
+    # On-disk auto resources are intentionally unused for rehydration: they are
+    # owned by this process, and a stale copy would resurrect a local forget.
 
-    clear_seq = int(data.get("enemy_clear_seq", 0) or 0)
+    clear_seq = _map_disk_clear_seq
     if clear_seq > _enemy_clear_seq:
         _enemy_clear_seq = clear_seq
         disk_positions, disk_types, disk_ticks = _enemy_sightings_from_payload(
@@ -6995,6 +7020,36 @@ def _map_transaction(func):
             return func(*args, **kwargs)
 
     return locked
+
+
+def _obstacles_sorted_payload() -> list[tuple[int, int]]:
+    """Obstacle coordinates as a sorted list, reused across saves.
+
+    Walls only ever grow (every mutation is a `.add()`), so a save that added a
+    handful of cells merges them into the cached sorted list instead of
+    re-sorting ~560k coordinates — which measured 1.9s per save and was the
+    single biggest term in the `map_memory` phase of a slow tick.
+
+    Any disagreement between (cache + recorded adds) and the live set rebuilds
+    the cache from scratch, so a mutation site that forgets to register its add
+    costs time but can never write a wrong file.
+    """
+    global _obstacle_sorted_cache
+    cache = _obstacle_sorted_cache
+    if cache is not None:
+        pending = _obstacle_pending_adds
+        # Same-cardinality swaps would slip past the length check, but obstacles
+        # never shrink and a wholesale reload resets the cache in _load_map_memory.
+        if len(_obstacle_memory) == len(cache) + len(pending) and pending <= _obstacle_memory:
+            if pending:
+                cache = list(merge(cache, sorted(pending)))
+                _obstacle_sorted_cache = cache
+            _obstacle_pending_adds.clear()
+            return cache
+    rebuilt = sorted(_obstacle_memory)
+    _obstacle_sorted_cache = rebuilt
+    _obstacle_pending_adds.clear()
+    return rebuilt
 
 
 @_map_transaction
@@ -7021,18 +7076,15 @@ def _save_map_memory(
     ):
         return
 
-    manual: set[tuple[int, int]] = set()
-    disk_forgotten: set[tuple[int, int]] = set()
-    disk_enemy_clear_seq = _enemy_clear_seq
-    if MAP_MEMORY_PATH.exists():
-        try:
-            prev = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
-            manual = _coords_from_payload(prev.get("manual_resources"))
-            disk_forgotten = _coords_from_payload(prev.get("forgotten_resources"))
-            disk_enemy_clear_seq = int(prev.get("enemy_clear_seq", _enemy_clear_seq) or 0)
-        except Exception:
-            manual = set()
-            disk_forgotten = set()
+    # Taken from the edit-sync's parse of this same file (under this lock), not a
+    # second full re-parse. Copied because the sets below are mutated.
+    manual: set[tuple[int, int]] = set(_map_disk_manual)
+    disk_forgotten: set[tuple[int, int]] = set(_map_disk_forgotten)
+    disk_enemy_clear_seq = _map_disk_clear_seq
+    if not MAP_MEMORY_PATH.exists():
+        manual.clear()
+        disk_forgotten.clear()
+        disk_enemy_clear_seq = _enemy_clear_seq
 
     # Sticky forget list: dashboard clears + runtime depletion confirmations.
     # Anything currently known again (re-seen live, or revived in RAM) leaves
@@ -7049,7 +7101,7 @@ def _save_map_memory(
     payload = {
         "updated_tick": tick,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "obstacles": sorted([list(p) for p in _obstacle_memory]),
+        "obstacles": _obstacles_sorted_payload(),
         "resources": sorted([list(p) for p in resources]),
         "manual_resources": sorted([list(p) for p in manual]),
         "forgotten_resources": sorted([list(p) for p in forgotten]),
@@ -7513,7 +7565,7 @@ def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
     wall-only dead-end fast-path in _get_dead_ends is an O(1) identity hit on
     no-growth ticks and a tiny incremental update on growth ticks.
     """
-    global _obstacle_memory, _map_dirty, _known_obstacles
+    global _obstacle_memory, _map_dirty, _known_obstacles, _obstacle_sorted_cache
     before = len(_obstacle_memory)
     if len(_known_obstacles) != before or _known_obstacles != _obstacle_memory:
         # _obstacle_memory changed outside this function (tests clear/restore it
@@ -7523,6 +7575,10 @@ def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
         _known_obstacles = frozenset(_obstacle_memory)
         _reset_dead_structure(_known_obstacles)
         _ensure_dead_structure()
+        # Same reason: a replacement this function did not perform cannot be
+        # merged into the sorted payload cache, so drop it and rebuild on save.
+        _obstacle_sorted_cache = None
+        _obstacle_pending_adds.clear()
     added: list[tuple[int, int]] = []
     for p in turn.obstacle_cells:
         q = tuple(p) if not isinstance(p, tuple) else p
@@ -7531,6 +7587,7 @@ def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
             added.append(q)
     if added:
         _map_dirty = True
+        _obstacle_pending_adds.update(added)
         _dead_add_walls(added)
         _known_obstacles = _dead_obstacles
     return _known_obstacles
@@ -8559,6 +8616,7 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
                 and _dest not in _resource_memory
             ):
                 _obstacle_memory.add(_dest)
+                _obstacle_pending_adds.add(_dest)
                 _map_dirty = True
                 core_blocked_now.add(_dest)
         # Stop if a cargo worker is close (any carrying worker heads home to

@@ -202,6 +202,182 @@ class DashboardMapMemoryTests(unittest.TestCase):
         self.assertEqual(saved["forgotten_resources"], [])
 
 
+class MapSaveCacheTests(unittest.TestCase):
+    """The two save-path caches may change how long a save takes, never what
+    lands on disk.
+
+    They replace work that ran on every save: re-sorting the whole obstacle set
+    (~2.0s at 509k walls) and json.loads-ing the entire file to recover the
+    three dashboard-owned fields (~0.4s). Both are now incremental.
+    """
+
+    MEMORY_GLOBALS = (
+        "_obstacle_memory", "_resource_memory", "_resource_tombstones",
+        "_known_obstacles", "_enemy_memory", "_enemy_memory_types",
+        "_enemy_memory_ticks", "_enemy_clear_seq", "_core_anchor",
+        "_last_dashboard_map_sig", "_map_dirty", "_last_map_save_tick",
+    )
+    CACHE_GLOBALS = (
+        "_obstacle_sorted_cache", "_obstacle_pending_adds", "_map_disk_manual",
+        "_map_disk_forgotten", "_map_disk_clear_seq", "_map_file_sig_cache",
+    )
+
+    def setUp(self) -> None:
+        self._snap = {
+            name: copy.deepcopy(getattr(tactic, name))
+            for name in self.MEMORY_GLOBALS
+        }
+        self._reset_caches()
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, val)
+        self._reset_caches()
+
+    def _reset_caches(self) -> None:
+        tactic._obstacle_sorted_cache = None
+        tactic._obstacle_pending_adds = set()
+        tactic._map_disk_manual = set()
+        tactic._map_disk_forgotten = set()
+        tactic._map_disk_clear_seq = 0
+        tactic._map_file_sig_cache = {}
+
+    @staticmethod
+    def _seed(path: Path, obstacles: list, manual: list | None = None) -> None:
+        path.write_text(json.dumps({
+            "obstacles": obstacles,
+            "resources": manual or [],
+            "manual_resources": manual or [],
+            "forgotten_resources": [],
+            "enemy_sightings": [],
+            "enemy_clear_seq": 0,
+            "core_anchor": None,
+        }), encoding="utf-8")
+
+    def test_incremental_wall_adds_write_the_same_file_as_a_cold_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            self._seed(path, [[5, 5], [1, 1]])
+            with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._load_map_memory()
+                tactic._update_obstacle_memory(
+                    SimpleNamespace(obstacle_cells=frozenset({(3, 9), (0, -2)}))
+                )
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                first = json.loads(path.read_text(encoding="utf-8"))["obstacles"]
+                # A later wall must be merged into the sorted order, not appended.
+                tactic._update_obstacle_memory(
+                    SimpleNamespace(obstacle_cells=frozenset({(-7, 4)}))
+                )
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                second = json.loads(path.read_text(encoding="utf-8"))["obstacles"]
+
+        self.assertEqual(first, sorted([[5, 5], [1, 1], [3, 9], [0, -2]]))
+        self.assertEqual(second, sorted(first + [[-7, 4]]))
+
+    def test_clean_save_neither_reparses_the_file_nor_resorts_the_walls(self) -> None:
+        # The two costs this change removes, asserted as absences: a save whose
+        # file signature is unchanged parses nothing, and a save with no new
+        # walls reuses the sorted payload object instead of rebuilding it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            self._seed(path, [[5, 5], [1, 1], [3, 3]])
+            real_loads = tactic.json.loads
+            parsed: list[int] = []
+            with patch.object(
+                tactic.json,
+                "loads",
+                lambda text, *a, **k: (parsed.append(len(text)), real_loads(text))[1],
+            ), patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._load_map_memory()
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)  # one parse: the edit-sync
+                parsed.clear()
+                cached = tactic._obstacle_sorted_cache
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+
+            self.assertEqual(parsed, [], "a clean save re-read no file")
+            self.assertIsNotNone(cached, "the save must publish a sorted cache")
+            self.assertIs(tactic._obstacle_sorted_cache, cached)
+
+    def test_obstacle_added_without_the_pending_bit_still_persists(self) -> None:
+        # A future mutation site that forgets to register its add must cost a
+        # rebuild, never silently drop a wall from the file.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            self._seed(path, [[1, 1]])
+            with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._load_map_memory()
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)  # fills the cache
+                tactic._obstacle_memory.add((42, 42))  # deliberately unregistered
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertIn([42, 42], saved["obstacles"])
+        self.assertEqual(saved["obstacle_count"], len(saved["obstacles"]))
+
+    def test_reload_of_a_smaller_map_wins_over_the_stale_cache(self) -> None:
+        # A wholesale reload replaces the obstacle set, so the cached payload may
+        # not survive it — otherwise walls the reloaded file never had would be
+        # written straight back.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            self._seed(path, [[1, 1], [2, 2], [3, 3], [4, 4]])
+            with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._load_map_memory()
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                self._seed(path, [[2, 2]])
+                tactic._load_map_memory()
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["obstacles"], [[2, 2]])
+
+    def test_manual_resource_survives_a_save_that_re_parses_nothing(self) -> None:
+        # The second save early-returns from the edit-sync (unchanged file
+        # signature), so the dashboard-owned field it used to re-read must come
+        # from the cache instead.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            self._seed(path, [[1, 1]], manual=[[3, 3]])
+            with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._load_map_memory()
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["manual_resources"], [[3, 3]])
+        self.assertIn([3, 3], saved["resources"])
+
+    def test_manual_resource_written_on_disk_between_saves_is_preserved(self) -> None:
+        # Cross-process case the old full re-parse covered by construction: the
+        # dashboard adds a manual resource after tactic's previous save, and the
+        # next tactic save must absorb it rather than clobber it.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            self._seed(path, [[1, 1]])
+            with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._load_map_memory()
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                self._seed(path, [[1, 1]], manual=[[6, 6]])
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["manual_resources"], [[6, 6]])
+        self.assertIn((6, 6), tactic._resource_memory)
+
+
 class ConfiguredPlannerTests(unittest.TestCase):
     def test_worker_forgets_empty_remembered_target_and_explores(self) -> None:
         class Worker:
