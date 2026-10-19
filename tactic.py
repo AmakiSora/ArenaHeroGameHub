@@ -9478,6 +9478,20 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
     global _skip_exit_map_save
     _skip_exit_map_save = False
     _load_map_memory()
+    # Build the dead-end structure before connecting. Lazy-building it on the
+    # first turn costs ~10s at 760k walls; the command window for that turn is
+    # already gone by the time the plan finishes, which shows up as a
+    # TICK_MISMATCH right after every container restart.
+    _warm_t0 = time.monotonic()
+    try:
+        _ensure_dead_structure()
+        print(
+            f"[map] dead-end structure ready in "
+            f"{(time.monotonic() - _warm_t0) * 1000:.0f}ms",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[map] dead-end warmup failed: {e}", flush=True)
     logger = TacticLogger(log_path)
     logger.open()
     print(f"[tactic] logging to {log_path}", flush=True)
