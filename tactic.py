@@ -7125,10 +7125,19 @@ def _save_map_memory(
     _resource_tombstones.update(forgotten)
     _enemy_clear_seq = max(_enemy_clear_seq, disk_enemy_clear_seq)
 
+    obstacle_fields = (
+        # Large maps are encoded straight from the live set: the sorted list
+        # only exists to make the legacy plain payload cheap, and keeping it
+        # would hold another 760k coordinate tuples in RAM on a 2 GB VPS.
+        map_codec.encode_obstacle_fields(_obstacle_memory)
+        if len(_obstacle_memory) > map_codec.PLAIN_OBSTACLE_LIMIT
+        else map_codec.encode_obstacle_fields(_obstacles_sorted_payload())
+    )
+
     payload = {
         "updated_tick": tick,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        **map_codec.encode_obstacle_fields(_obstacles_sorted_payload()),
+        **obstacle_fields,
         "resources": sorted([list(p) for p in resources]),
         "manual_resources": sorted([list(p) for p in manual]),
         "forgotten_resources": sorted([list(p) for p in forgotten]),
