@@ -18,6 +18,7 @@ from arena_hero import CoreState, Direction, UnitType
 
 import dashboard
 import game_stats
+import map_codec
 import status
 import tactic
 import tactic_config
@@ -376,6 +377,62 @@ class MapSaveCacheTests(unittest.TestCase):
 
         self.assertEqual(saved["manual_resources"], [[6, 6]])
         self.assertIn((6, 6), tactic._resource_memory)
+
+    def test_large_map_saves_packed_and_survives_dashboard_edits(self) -> None:
+        obstacles = [[x, 0] for x in range(12)] + [[3, 1], [4, 1], [-2, -3]]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            self._seed(path, obstacles)
+            with patch.object(tactic, "MAP_MEMORY_PATH", path), \
+                    patch.object(map_codec, "PLAIN_OBSTACLE_LIMIT", 5):
+                tactic._load_map_memory()
+                tactic._map_dirty = True
+                tactic._save_map_memory(force=True)
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                self.assertNotIn("obstacles", raw)
+                self.assertIn(map_codec.OBSTACLE_RLE_KEY, raw)
+                decoded = map_codec.decode_obstacles(raw)
+                self.assertEqual(decoded, {tuple(p) for p in obstacles})
+                with patch.object(dashboard, "MAP_FILE", str(path)):
+                    dashboard._map_memory_cache.clear()
+                    loaded = dashboard.load_map_memory()
+                    self.assertEqual(loaded["obstacles"], sorted(decoded))
+                    # A dashboard edit must carry the packed blob along instead
+                    # of dropping it (which would erase every wall).
+                    dashboard.save_manual_resource(6, 6)
+                    raw2 = json.loads(path.read_text(encoding="utf-8"))
+                    self.assertNotIn("obstacles", raw2)
+                    self.assertIn(map_codec.OBSTACLE_RLE_KEY, raw2)
+                    self.assertEqual(map_codec.decode_obstacles(raw2), decoded)
+
+
+class PlanPathfindingDeadlineTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        tactic._plan_pathfind_deadline = None
+
+    def test_bfs_path_aborts_once_the_deadline_passed(self) -> None:
+        obstacles = frozenset()
+        tactic._plan_pathfind_deadline = time.monotonic() - 1
+        self.assertIsNone(
+            tactic._bfs_path((0, 0), (200, 0), obstacles, max_steps=120_000)
+        )
+
+    def test_normal_plan_still_finds_short_paths(self) -> None:
+        self.assertIsNone(tactic._plan_pathfind_deadline)
+        path = tactic._bfs_path((0, 0), (5, 0), frozenset(), max_steps=120_000)
+        self.assertEqual(path, [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)])
+
+    def test_choose_actions_sets_and_clears_the_deadline(self) -> None:
+        seen = {}
+
+        def fake(turn):
+            seen["deadline"] = tactic._plan_pathfind_deadline
+            return ("WAIT", {})
+
+        with patch.object(tactic, "_choose_actions", fake):
+            tactic.choose_actions(SimpleNamespace())
+        self.assertIsNotNone(seen["deadline"])
+        self.assertIsNone(tactic._plan_pathfind_deadline)
 
 
 class ConfiguredPlannerTests(unittest.TestCase):
@@ -7623,12 +7680,16 @@ class TickMismatchSelfHealTests(unittest.TestCase):
             self._fake_turn(100 + i, r) for i, r in enumerate(results)
         ]
         client = self._FakeClient(turns)
+        self.save_calls = []
         with contextlib.redirect_stdout(io.StringIO()):
             with (
                 patch.object(tactic, "ArenaHeroClient", return_value=client),
                 patch.object(tactic, "TacticLogger", self._FakeLogger),
                 patch.object(tactic, "_load_map_memory", lambda: None),
-                patch.object(tactic, "_save_map_memory", lambda force=False: None),
+                patch.object(
+                    tactic, "_save_map_memory",
+                    lambda *a, **k: self.save_calls.append(k.get("force", False)),
+                ),
                 patch.object(tactic, "_commit_shadow_predictions", lambda *a, **k: None),
                 patch.object(tactic, "_print_summary", lambda *a, **k: None),
                 patch.object(tactic, "choose_actions", lambda turn: ("WAIT", {})),
@@ -7665,6 +7726,20 @@ class TickMismatchSelfHealTests(unittest.TestCase):
         # container (the only proven recovery).
         code = self._run_play([self._mismatch() for _ in range(6)])
         self.assertEqual(code, 3)
+
+    def test_stale_session_exit_skips_the_forced_map_save(self) -> None:
+        # The forced save serializes the whole wall map; on the small VPS that
+        # blocked the exiting process in swap and the container restart waited
+        # minutes. The map is already saved every few ticks, so skip it here.
+        code = self._run_play([self._mismatch() for _ in range(6)])
+        self.assertEqual(code, 3)
+        self.assertEqual(self.save_calls, [])
+
+    def test_normal_stream_end_still_saves_the_map(self) -> None:
+        code = self._run_play([None, None])
+        self.assertEqual(code, 9)
+        self.assertTrue(self.save_calls, "shutdown save must still run")
+        self.assertTrue(all(self.save_calls))
 
     def test_success_resets_the_streak(self) -> None:
         # 4 mismatches, then a success, then more mismatches: the success resets

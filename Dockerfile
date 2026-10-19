@@ -31,6 +31,7 @@ COPY dashboard.py \
      game_stats.py \
      state_io.py \
      tactic_config.py \
+     map_codec.py \
      status.py \
      watchdog.py \
      docker-entrypoint.py \

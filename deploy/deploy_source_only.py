@@ -47,6 +47,7 @@ FILES = (
     "tactic.py",
     "tactic_config.py",
     "dashboard.py",
+    "map_codec.py",
     "game_stats.py",
     "state_io.py",
     "watchdog.py",

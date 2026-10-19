@@ -33,6 +33,7 @@ from arena_hero import (
 )
 from arena_hero.errors import APIError, ProtocolError, TransportError
 import game_stats
+import map_codec
 from state_io import append_jsonl, atomic_write_text, file_lock
 from tactic_config import CONFIG_PATH, load_config, mutate_config, parse_team_ratio
 
@@ -356,6 +357,13 @@ _MARCH_BUDGET_PER_TICK = 300_000
 _march_route_miss: dict[str, tuple[tuple[int, int], int]] = {}
 _march_budget_spent: int = 0
 
+# Wall-clock cap for all A* work in one plan. A far regroup search can burn its
+# whole 120k-expansion budget (6-13 s on the VPS) while the server's command
+# window moves on, producing 409 TICK_MISMATCH and eventually a desync restart.
+# Expiry is treated exactly like the expansion cap: no path, greedy fallback.
+PLAN_PATHFIND_BUDGET_S = 2.0
+_plan_pathfind_deadline: float | None = None
+
 
 def _reset_pathfind_counters() -> None:
     global _pathfind_calls, _pathfind_expansions, _pathfind_ms
@@ -617,8 +625,12 @@ def _dead_ends_with_extras(obstacles, extras) -> frozenset[tuple[int, int]]:
     `extras` are transient occupied cells (fellow units + visible enemies) that
     the caller unions into its search's obstacle set. Treating them as walls can
     collapse corridors only *this* tick, so the result must be recomputed per
-    tick — but from the cached wall base, never from scratch. Works on a copy of
-    the structure so the persistent wall cache is untouched.
+    tick — but from the cached wall base, never from scratch.
+
+    The cascade touches only the neighbourhood of `extras`, so it runs over a
+    copy-on-write overlay instead of duplicating the whole open-count map. That
+    map reached 2.1M candidate cells on production; copying it per A* call was
+    a multi-hundred-millisecond term in slow ticks.
 
     If `obstacles` is not the persistent wall set (a caller built a different
     obstacle set, e.g. the rare core-cell-as-obstacle case), fall back to the
@@ -633,55 +645,66 @@ def _dead_ends_with_extras(obstacles, extras) -> frozenset[tuple[int, int]]:
     _ensure_dead_structure()
     _dt0 = time.monotonic()
     _dead_end_runs += 1
-    oc = dict(_dead_open_count)
-    dead = set(_dead_set)
-    union = _dead_obstacles | extras
-    touched: set[tuple[int, int]] = set()
+
+    walls = _dead_obstacles
+    base_dead = _dead_set
+    base_oc = _dead_open_count
+    extra_set = frozenset(extras)
+    removed = {x for x in extra_set if x in base_dead}
+    new_dead: set[tuple[int, int]] = set()
+    overrides: dict[tuple[int, int], int] = {}
+    fresh: set[tuple[int, int]] = set()
     work: deque = deque()
-    was_dead: set[tuple[int, int]] = set()
-    for x in extras:
-        if x in _dead_obstacles:
+
+    def effective_dead(cell: tuple[int, int]) -> bool:
+        return cell in new_dead or (cell in base_dead and cell not in removed)
+
+    for x in extra_set:
+        if x in walls:
             continue  # already a permanent wall — blocked in every count already
-        if x in dead:
-            was_dead.add(x)
-        oc.pop(x, None)
-        dead.discard(x)
-    for x in extras:
-        if x in _dead_obstacles:
-            continue
+        was_dead = x in base_dead
         for n in _neighbor_cells(x):
-            if n in union or n in dead or n in touched:
+            if n in walls or n in extra_set or effective_dead(n) or n in fresh:
                 continue
-            if n in oc:
-                if x not in was_dead:
-                    cnt = oc[n] - 1
-                    oc[n] = cnt
-                    if cnt <= 1:
-                        work.append(n)
-            else:
+            cnt = overrides[n] if n in overrides else base_oc.get(n)
+            if cnt is None:
                 cnt = sum(
                     1 for m in _neighbor_cells(n)
-                    if m not in union and m not in dead
+                    if m not in walls and m not in extra_set and not effective_dead(m)
                 )
-                oc[n] = cnt
-                touched.add(n)
-                if cnt <= 1:
-                    work.append(n)
+                overrides[n] = cnt
+                fresh.add(n)
+            elif not was_dead:
+                cnt -= 1
+                overrides[n] = cnt
+            if n in overrides and overrides[n] <= 1:
+                work.append(n)
+
     while work:
         cell = work.popleft()
-        if cell in union or cell in dead or oc.get(cell, 0) > 1:
+        if cell in walls or cell in extra_set or effective_dead(cell):
             continue
-        dead.add(cell)
+        if overrides.get(cell, base_oc.get(cell, 0)) > 1:
+            continue
+        new_dead.add(cell)
         for n in _neighbor_cells(cell):
-            if n in union or n in dead:
+            if n in walls or n in extra_set or effective_dead(n):
                 continue
-            if n not in oc:
-                continue
-            oc[n] -= 1
-            if oc[n] <= 1:
+            if n in overrides:
+                overrides[n] -= 1
+                cnt = overrides[n]
+            elif n in base_oc:
+                cnt = base_oc[n] - 1
+                overrides[n] = cnt
+            else:
+                continue  # batch parity: cascade only propagates through candidates
+            if cnt <= 1:
                 work.append(n)
+
     _dead_end_ms += (time.monotonic() - _dt0) * 1000.0
-    return frozenset(dead)
+    if not new_dead and not removed:
+        return _dead_view
+    return frozenset((base_dead - removed) | new_dead)
 
 
 def _get_dead_ends(
@@ -846,7 +869,11 @@ def _bfs_path(
     heappush(open_heap, (_manhattan(start, goal), _manhattan(start, goal), 0, 0, start))
     expansions = 0
     counter = 0
+    deadline = _plan_pathfind_deadline
     while open_heap and expansions < max_steps:
+        if deadline is not None and (expansions & 2047) == 0 \
+                and time.monotonic() > deadline:
+            break
         _f, _h, _c, g_current, current = heappop(open_heap)
         if g_current > g_score.get(current, 1 << 30):
             continue  # stale heap entry
@@ -6859,7 +6886,7 @@ def _load_map_memory() -> None:
     try:
         data = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
         forgotten = _coords_from_payload(data.get("forgotten_resources"))
-        _obstacle_memory = _coords_from_payload(data.get("obstacles"))
+        _obstacle_memory = map_codec.decode_obstacles(data)
         resources = _coords_from_payload(data.get("resources"))
         manual = _coords_from_payload(data.get("manual_resources"))
         _resource_memory = (resources | manual) - forgotten
@@ -7101,7 +7128,7 @@ def _save_map_memory(
     payload = {
         "updated_tick": tick,
         "updated_at": datetime.now(timezone.utc).isoformat(),
-        "obstacles": _obstacles_sorted_payload(),
+        **map_codec.encode_obstacle_fields(_obstacles_sorted_payload()),
         "resources": sorted([list(p) for p in resources]),
         "manual_resources": sorted([list(p) for p in manual]),
         "forgotten_resources": sorted([list(p) for p in forgotten]),
@@ -8201,6 +8228,16 @@ def _unit_should_return_to_heal(
 
 
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
+    """Plan one Tick, holding every A* search to a shared wall-clock budget."""
+    global _plan_pathfind_deadline
+    _plan_pathfind_deadline = time.monotonic() + PLAN_PATHFIND_BUDGET_S
+    try:
+        return _choose_actions(turn)
+    finally:
+        _plan_pathfind_deadline = None
+
+
+def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     """Queue actions, return (core_action_name, {unit_id: action_detail})."""
     _phase = _PhaseTimer()
     _reset_pathfind_counters()
@@ -9430,8 +9467,16 @@ def choose_actions(turn) -> tuple[str, dict[str, str]]:
 
 # ── live loop ────────────────────────────────────────────────────────────────
 
+# Set on the desynced-session exit path: the forced full map save there can
+# stall the process on a memory-tight VPS, delaying the container restart that
+# is the only recovery.
+_skip_exit_map_save = False
+
+
 def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
     """Run forever with automatic reconnect on protocol/transport failures."""
+    global _skip_exit_map_save
+    _skip_exit_map_save = False
     _load_map_memory()
     logger = TacticLogger(log_path)
     logger.open()
@@ -9497,6 +9542,13 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                                         "session desynced, exiting for container restart",
                                         flush=True,
                                     )
+                                    # The map is already saved every few ticks; a
+                                    # forced full save here serializes 760k walls
+                                    # and on a small VPS blocks the process in
+                                    # swap, so the entrypoint's restart waits
+                                    # minutes. Losing the last few ticks of walls
+                                    # is cheaper than a stuck container.
+                                    _skip_exit_map_save = True
                                     raise SystemExit(3) from e
                                 continue
                             stale_streak = 0
@@ -9600,7 +9652,14 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
     except KeyboardInterrupt:
         print("\n[tactic] stopped by user", flush=True)
     finally:
-        _save_map_memory(force=True)
+        if _skip_exit_map_save:
+            print(
+                "[tactic] stale session exit: skipping full map save so the "
+                "container can restart",
+                flush=True,
+            )
+        else:
+            _save_map_memory(force=True)
         logger.close()
         _print_summary(log_path)
 

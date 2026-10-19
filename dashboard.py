@@ -25,6 +25,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlsplit
 
 import game_stats
+import map_codec
 from tactic_config import (
     CONFIG_PATH,
     ConfigValidationError,
@@ -778,6 +779,24 @@ def _coord_set(raw) -> set[tuple[int, int]]:
     return out
 
 
+def _obstacle_fields(data: dict) -> dict:
+    """Carry the on-disk obstacle representation through a dashboard edit.
+
+    Tactic may have written the packed form; decoding and re-encoding it just
+    to add a resource would rewrite a multi-MB blob on every click, so copy
+    the fields verbatim. The plain list remains for legacy/small maps.
+    """
+    blob = data.get(map_codec.OBSTACLE_RLE_KEY)
+    if isinstance(blob, str) and blob:
+        return {
+            map_codec.OBSTACLE_RLE_KEY: blob,
+            map_codec.OBSTACLE_ENCODING_KEY: data.get(
+                map_codec.OBSTACLE_ENCODING_KEY, map_codec.OBSTACLE_ENCODING
+            ),
+        }
+    return {"obstacles": data.get("obstacles", [])}
+
+
 # ── remembered enemy sightings (last-known positions + unit type) ───────────
 
 # Color + short label per enemy unit type, matching the live-enemy map colors.
@@ -883,8 +902,9 @@ def load_map_memory():
         if s is not None
     ]
     enemy_sightings.sort(key=lambda s: s[0])
+    obstacles = sorted(map_codec.decode_obstacles(d))
     result = {
-        "obstacles": sorted(_coord_set(d.get("obstacles"))),
+        "obstacles": obstacles,
         "resources": all_res,
         "manual_resources": sorted(manual),
         "forgotten_resources": sorted(forgotten),
@@ -892,7 +912,7 @@ def load_map_memory():
             {"pos": pos, "type": etype, "tick": tick}
             for pos, etype, tick in enemy_sightings
         ],
-        "obstacle_count": d.get("obstacle_count", len(d.get("obstacles", []) or [])),
+        "obstacle_count": d.get("obstacle_count", len(obstacles)),
         "resource_count": len(all_res),
         "manual_count": len(manual),
         "enemy_clear_seq": int(d.get("enemy_clear_seq", 0) or 0),
@@ -921,7 +941,7 @@ def save_manual_resource(x: int, y: int) -> dict:
     payload = {
         "updated_tick": data.get("updated_tick"),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "obstacles": data.get("obstacles", []),
+        **_obstacle_fields(data),
         "resources": [list(p) for p in sorted(resources)],
         "manual_resources": [list(p) for p in sorted(manual)],
         "forgotten_resources": [list(p) for p in sorted(forgotten)],
@@ -958,7 +978,7 @@ def remove_manual_resource(x: int, y: int) -> dict:
     payload = {
         "updated_tick": data.get("updated_tick"),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "obstacles": data.get("obstacles", []),
+        **_obstacle_fields(data),
         "resources": [list(p) for p in sorted(resources)],
         "manual_resources": [list(p) for p in sorted(manual)],
         "forgotten_resources": [list(p) for p in sorted(forgotten)],
@@ -993,7 +1013,7 @@ def clear_remembered_resources() -> dict:
     payload = {
         "updated_tick": data.get("updated_tick"),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "obstacles": data.get("obstacles", []),
+        **_obstacle_fields(data),
         "resources": [],
         "manual_resources": [],
         "forgotten_resources": [list(p) for p in sorted(forgotten)],
@@ -1024,7 +1044,7 @@ def clear_enemy_sightings() -> dict:
     payload = {
         "updated_tick": data.get("updated_tick"),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "obstacles": data.get("obstacles", []),
+        **_obstacle_fields(data),
         "resources": data.get("resources", []),
         "manual_resources": data.get("manual_resources", []),
         "forgotten_resources": data.get("forgotten_resources", []),
