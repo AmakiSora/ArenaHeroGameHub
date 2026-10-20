@@ -2827,6 +2827,11 @@ _GUERRILLA_SIGHT: dict[str, int] = {"vanguard": 4, "ranger": 5}
 # deliberately local: a Vanguard/Ranger elsewhere on the map is not a guard
 # for this target, while a combat unit in one of the surrounding cells is.
 _GUERRILLA_CORE_GUARD_RADIUS = 1
+# Remember a solo guerrilla's last-seen exposed core for a few ticks: at a
+# wall corner the core can flicker out of sight for a tick or two, and
+# immediately reverting to the roam bearing makes the unit A-B-A. The lock
+# lets the normal A* route commit around the corner instead.
+_GUERRILLA_CORE_MEMORY_TICKS = 6
 # Auto-attack core hunting only trusts recent sightings: cores move, and an
 # old marker would send the squad to a cell that has been empty for hours.
 _CORE_HUNT_MEMORY_MAX_AGE_TICKS = 2000
@@ -5841,6 +5846,16 @@ def _plan_kite_combat(
         key=lambda enemy: _manhattan(pos, tuple(enemy.position)),
         default=None,
     )
+    if solo:
+        locked_core = _guerrilla_core_target.get(uid)
+        if locked_core is not None and not _core_position_unguarded(
+            locked_core[0], enemies,
+        ):
+            # A combat escort showed up next to the remembered core: forget it.
+            _guerrilla_core_target.pop(uid, None)
+    if solo and target is not None and _enemy_unit_type_name(target) == "CORE":
+        # Refresh the lock every tick the exposed core is actually visible.
+        _guerrilla_core_target[uid] = (tuple(target.position), tick)
     current_assessment = _kite_cell_assessment(
         pos, threats, obstacle_cells, attack_range,
     )
@@ -6196,15 +6211,31 @@ def _plan_kite_combat(
     # a solo guerrilla resumes its own bearing instead of converging on a
     # shared coordinate. Tactical evasion is per-unit in both modes.
     if solo and target is None:
-        roam_action, roam_detail = _guerrilla_roam(
-            unit,
-            pos,
-            obstacle_cells,
-            config,
-            avoid_cells=(collision_avoid,) if collision_avoid is not None else (),
-        )
-        _record_kite_stall(uid, pos)
-        return roam_action, roam_detail
+        locked_core = _guerrilla_core_target.get(uid)
+        if locked_core is not None:
+            core_cell, last_seen = locked_core
+            if (
+                not threats
+                and tick - last_seen <= _GUERRILLA_CORE_MEMORY_TICKS
+                and pos != core_cell
+                and _core_position_unguarded(core_cell, enemies)
+            ):
+                # The core is only briefly out of sight (typically a wall
+                # corner). Keep the normal A* route pointed at its last-seen
+                # cell instead of flipping back to the roam bearing.
+                objective = core_cell
+            else:
+                _guerrilla_core_target.pop(uid, None)
+        if uid not in _guerrilla_core_target:
+            roam_action, roam_detail = _guerrilla_roam(
+                unit,
+                pos,
+                obstacle_cells,
+                config,
+                avoid_cells=(collision_avoid,) if collision_avoid is not None else (),
+            )
+            _record_kite_stall(uid, pos)
+            return roam_action, roam_detail
     must_move = any(_enemy_unit_type_name(enemy) == "RANGER" for enemy in threats)
     move_goal = tuple(target.position) if target is not None else objective
     # Follow a real A* route toward the objective first. The single-step
@@ -6520,6 +6551,10 @@ _enemy_motion_tracks: dict[str, list[tuple[int, tuple[int, int]]]] = {}
 # Keeps a defender chasing a foe that slipped out of vision for a few ticks
 # instead of flipping back into patrol the instant it disappears.
 _home_engage_target: dict[str, tuple[str, int]] = {}
+# Solo guerrilla exposed-core lock: unit id -> (last-seen core cell, tick).
+# Keeps the A* route committed when a wall corner makes the core flicker out
+# of sight instead of flipping back to the roam bearing.
+_guerrilla_core_target: dict[str, tuple[tuple[int, int], int]] = {}
 _pending_shot_predictions: list[dict[str, Any]] = []
 # Last applied dashboard enemy-clear sequence from map_memory.json.
 _enemy_clear_seq: int = 0
@@ -8136,6 +8171,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _combat_path_cache.pop(dead_id, None)
     for dead_id in set(_home_engage_target) - alive_ids:
         _home_engage_target.pop(dead_id, None)
+    for dead_id in set(_guerrilla_core_target) - alive_ids:
+        _guerrilla_core_target.pop(dead_id, None)
     for dead_id in set(_worker_stuck_ticks) - alive_ids:
         _worker_stuck_ticks.pop(dead_id, None)
     for dead_id in set(_worker_stuck_pos) - alive_ids:

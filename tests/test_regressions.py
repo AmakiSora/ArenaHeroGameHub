@@ -2791,6 +2791,84 @@ class CombatTeamPlannerTests(unittest.TestCase):
 
         self.assertEqual(action, "MOVE")
         self.assertIn("kite-route", detail)
+
+    def test_guerrilla_core_lock_survives_vision_flicker(self) -> None:
+        # 核心在墙角会短暂离开视野；目标锁必须让 A* 继续绕行，而不是回漫游。
+        unit = self.CombatUnit("r-g-core-lock", (0, 0))
+        core = SimpleNamespace(position=(4, 0), unit_type="CORE", id="core-lock")
+        tactic.turn_context.tick = 100
+        try:
+            action, detail = tactic._plan_ranger(
+                unit,
+                enemies=(core,),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="guerrilla",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("kite-route (4, 0)", detail)
+            self.assertIn("r-g-core-lock", tactic._guerrilla_core_target)
+
+            tactic.turn_context.tick = 101
+            unit.position = (1, 0)
+            action, detail = tactic._plan_ranger(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="guerrilla",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("kite-route (4, 0)", detail)
+            self.assertNotIn("guerrilla-roam", detail)
+
+            tactic.turn_context.tick = 107
+            unit.position = (2, 0)
+            action, detail = tactic._plan_ranger(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="guerrilla",
+            )
+            self.assertIn("guerrilla-roam", detail)
+        finally:
+            tactic._guerrilla_core_target.pop("r-g-core-lock", None)
+            tactic.turn_context.tick = 0
+
+    def test_guerrilla_core_lock_drops_when_guard_appears(self) -> None:
+        unit = self.CombatUnit("r-g-core-lock-guard", (0, 0))
+        core = SimpleNamespace(position=(4, 0), unit_type="CORE", id="core-lock-guard")
+        guard = SimpleNamespace(position=(5, 0), unit_type="VANGUARD", id="guard-1")
+        tactic.turn_context.tick = 200
+        try:
+            tactic._plan_ranger(
+                unit,
+                enemies=(core,),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="guerrilla",
+            )
+            self.assertIn("r-g-core-lock-guard", tactic._guerrilla_core_target)
+
+            tactic.turn_context.tick = 201
+            tactic._plan_ranger(
+                unit,
+                enemies=(core, guard),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="guerrilla",
+            )
+            self.assertNotIn("r-g-core-lock-guard", tactic._guerrilla_core_target)
+        finally:
+            tactic._guerrilla_core_target.pop("r-g-core-lock-guard", None)
+            tactic.turn_context.tick = 0
+
     def test_summary_reads_jsonl_tick_records(self) -> None:
         records = [
             {"_meta": "test"},
