@@ -3620,7 +3620,13 @@ def _try_move(
     if avoid_dead_ends and _is_dead_end_step((nx, ny), obstacle_cells, allow=allow):
         return False
     unit.move(direction)
-    _worker_last_pos[str(unit.id)] = pos
+    uid = str(unit.id)
+    _worker_last_pos[uid] = pos
+    # The distance-free march's 2x2 orbit break compares visit ages, so every
+    # step this unit takes must enter the same tail — recording only the march's
+    # own steps let a mixed march/_move_towards loop stay invisible (R16 cycled
+    # A-B-C-D around a wall corner for 100+ ticks).
+    _worker_remember_explore(uid, pos)
     return True
 
 
@@ -3643,6 +3649,16 @@ def _move_towards(
     uid = str(unit.id)
     counts = cell_counts or {}
     transient_obstacles = frozenset(extra_obstacles)
+    last_pos = _worker_last_pos.get(uid)
+
+    def _reverses_last_step(cell: tuple[int, int]) -> bool:
+        # The greedy fallback below ranks neighbours by distance alone, so when
+        # the distance-best cell is the one this unit just left it walks straight
+        # back. Callers only get their distance-free march (with the
+        # anti-backtrack ladder) when this returns None; without the guard a
+        # wall pocket becomes an endless A-B-A (V8/V11/R11/R14/R16 home-return
+        # and attack-regroup, 100+ ticks on 2-3 cells).
+        return last_pos is not None and cell == last_pos and cell != goal
 
     def _step_allowed(cell: tuple[int, int]) -> bool:
         if cell in obstacle_cells or cell in transient_obstacles:
@@ -3710,13 +3726,17 @@ def _move_towards(
     # Skip 凸-shaped cul-de-sacs unless the goal itself is inside one.
     allow = (goal,)
     next_cell = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
-    if _step_allowed(next_cell) and _try_move(
-        unit,
-        direction,
-        pos,
-        obstacle_cells,
-        avoid_dead_ends=True,
-        allow=allow,
+    if (
+        _step_allowed(next_cell)
+        and not _reverses_last_step(next_cell)
+        and _try_move(
+            unit,
+            direction,
+            pos,
+            obstacle_cells,
+            avoid_dead_ends=True,
+            allow=allow,
+        )
     ):
         _set_unit_route(unit, goal, [pos, goal], complete=False)
         return ("MOVE", f"{direction.name} {detail_prefix} {goal}")
@@ -3746,19 +3766,27 @@ def _move_towards(
         if alt == direction:
             continue
         alt_cell = (pos[0] + alt.delta[0], pos[1] + alt.delta[1])
-        if _step_allowed(alt_cell) and _try_move(
-            unit,
-            alt,
-            pos,
-            obstacle_cells,
-            avoid_dead_ends=True,
-            allow=allow,
+        if (
+            _step_allowed(alt_cell)
+            and not _reverses_last_step(alt_cell)
+            and _try_move(
+                unit,
+                alt,
+                pos,
+                obstacle_cells,
+                avoid_dead_ends=True,
+                allow=allow,
+            )
         ):
             return ("MOVE", f"{alt.name} {detail_prefix} {goal}")
     # Last resort: ignore dead-end filter if goal requires it.
     next_cell = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
-    if _step_allowed(next_cell) and _try_move(
-        unit, direction, pos, obstacle_cells,
+    if (
+        _step_allowed(next_cell)
+        and not _reverses_last_step(next_cell)
+        and _try_move(
+            unit, direction, pos, obstacle_cells,
+        )
     ):
         _set_unit_route(unit, goal, [pos, goal], complete=False)
         return ("MOVE", f"{direction.name} {detail_prefix} {goal}")
@@ -3766,7 +3794,11 @@ def _move_towards(
         if alt == direction:
             continue
         alt_cell = (pos[0] + alt.delta[0], pos[1] + alt.delta[1])
-        if _step_allowed(alt_cell) and _try_move(unit, alt, pos, obstacle_cells):
+        if (
+            _step_allowed(alt_cell)
+            and not _reverses_last_step(alt_cell)
+            and _try_move(unit, alt, pos, obstacle_cells)
+        ):
             return ("MOVE", f"{alt.name} {detail_prefix} {goal}")
     return None
 

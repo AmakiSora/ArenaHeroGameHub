@@ -10727,6 +10727,126 @@ class CapacityAwareCombatMoveTests(unittest.TestCase):
         self.assertEqual(moves, [Direction.RIGHT])
 
 
+class MoveTowardsBacktrackGuardTests(unittest.TestCase):
+    """The greedy fallback must not undo the unit's own last step.
+
+    ``_move_towards`` only yields to the caller's distance-free march (the one
+    with the anti-backtrack ladder) when it returns None. Ranking neighbours by
+    distance alone made it step straight back onto the cell the unit just left,
+    so home-return and attack-regroup units cycled 2-3 cells for hours
+    (observed: V8/V11/R11/R14/R16)."""
+
+    GLOBALS = (
+        "_combat_path_cache", "_worker_last_pos", "_march_route_miss",
+        "_march_budget_spent", "_dead_end_cache_key", "_dead_end_cache",
+        "_path_blockers_union_key", "_path_blockers_union",
+        "_worker_explore_history",
+    )
+
+    def setUp(self) -> None:
+        self._snap = {name: copy.copy(getattr(tactic, name))
+                      for name in self.GLOBALS}
+        tactic._combat_path_cache.clear()
+        tactic._worker_last_pos.clear()
+        tactic._worker_explore_history.clear()
+        tactic._march_route_miss.clear()
+        tactic._march_budget_spent = 0
+        tactic._dead_end_cache_key = None
+        tactic._dead_end_cache = frozenset()
+        tactic._path_blockers_union_key = None
+        tactic._path_blockers_union = frozenset()
+
+    def tearDown(self) -> None:
+        for name, val in self._snap.items():
+            setattr(tactic, name, copy.copy(val))
+
+    def _unit(self):
+        moves: list = []
+        unit = SimpleNamespace(id="u-back", position=(0, 0))
+        unit.move = lambda direction: moves.append(direction)
+        return unit, moves
+
+    def test_greedy_fallback_avoids_stepping_back_onto_last_cell(self) -> None:
+        # A* is capped at one expansion, so the greedy fallback decides. The
+        # primary goal-ward cell (1,0) is exactly where the unit came from;
+        # the open northern cell must win instead of bouncing back east.
+        unit, moves = self._unit()
+        tactic._worker_last_pos["u-back"] = (1, 0)
+        result = tactic._move_towards(
+            unit,
+            (0, 0),
+            (5, -5),
+            frozenset({(-1, 0), (0, 1)}),
+            detail_prefix="test",
+            max_steps=1,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(moves, [Direction.UP])
+
+    def test_backtrack_to_goal_is_still_allowed(self) -> None:
+        # The previous cell is also the goal: refusing it would strand the
+        # unit one step away from where it is trying to go.
+        unit, moves = self._unit()
+        tactic._worker_last_pos["u-back"] = (1, 0)
+        result = tactic._move_towards(
+            unit,
+            (0, 0),
+            (1, 0),
+            frozenset(),
+            detail_prefix="test",
+            max_steps=1,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(moves, [Direction.RIGHT])
+
+    def test_boxed_pocket_returns_none_for_the_long_march(self) -> None:
+        # Every non-backtracking neighbour is walled. Returning None lets the
+        # caller run its anti-backtrack march instead of walking back forever.
+        unit, moves = self._unit()
+        tactic._worker_last_pos["u-back"] = (1, 0)
+        result = tactic._move_towards(
+            unit,
+            (0, 0),
+            (5, -5),
+            frozenset({(-1, 0), (0, 1), (0, -1)}),
+            detail_prefix="test",
+            max_steps=1,
+        )
+        self.assertIsNone(result)
+        self.assertEqual(moves, [])
+
+    def test_mixed_march_and_move_towards_escapes_wall_corner_orbit(self) -> None:
+        # 2x2 free box whose only productive exit is west. The loop mixes
+        # _move_towards steps with long-march steps; both must enter the visit
+        # tail or the age tie-break cannot see B/C and the unit cycles
+        # A-B-C-D forever (production R16).
+        unit, moves = self._unit()
+        pos = (0, 0)
+        goal = (5, 5)
+        walls = frozenset({(0, 1), (1, 1), (2, 0)})
+        tactic._worker_last_pos["u-back"] = (1, 0)
+        seen: list = []
+        for _ in range(8):
+            result = tactic._move_towards(
+                unit, pos, goal, walls, detail_prefix="test", max_steps=1,
+            )
+            if result is None:
+                result = tactic._long_march_step(
+                    unit, pos, goal, walls, detail_prefix="test",
+                )
+            self.assertIsNotNone(result)
+            action, detail = result
+            self.assertEqual(action, "MOVE")
+            direction = Direction[detail.split()[0]]
+            pos = (pos[0] + direction.delta[0], pos[1] + direction.delta[1])
+            unit.position = pos
+            seen.append(pos)
+        self.assertNotIn(
+            pos, {(0, 0), (0, -1), (1, -1), (1, 0)},
+            f"unit still orbiting the 2x2 box: {seen}",
+        )
+
+
 class AttackRegroupTests(unittest.TestCase):
     """Regression: attack-team units scattered beyond the A* expansion budget
     (observed 11k cells) sat at WAIT:attack-blocked forever with no warn row
