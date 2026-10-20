@@ -2345,6 +2345,74 @@ class CombatTeamPlannerTests(unittest.TestCase):
             tactic._enemy_memory.discard((10, 0))
             tactic.turn_context.core_pos = None
 
+    def test_attack_auto_prefers_unguarded_core_memory(self) -> None:
+        # (2,0) 更近，但 (6,0) 是新鲜的落单核心记忆点 -> 优先清核。
+        tactic._enemy_memory.update({(2, 0), (6, 0)})
+        tactic._enemy_memory_types[(6, 0)] = "CORE"
+        tactic.turn_context.core_pos = (0, 0)
+        try:
+            unit = self.CombatUnit("v-attack-core", (0, 0))
+            self.config["attack_mode"] = "auto"
+            self.config["attack_auto_radius"] = 20
+            self.config["attack_target_x"] = 90
+            self.config["attack_target_y"] = 90
+
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-march-auto (6, 0)", detail)
+        finally:
+            tactic._enemy_memory.discard((2, 0))
+            tactic._enemy_memory.discard((6, 0))
+            tactic._enemy_memory_types.pop((6, 0), None)
+            tactic.turn_context.core_pos = None
+
+    def test_auto_core_targets_drop_guarded_and_stale_memories(self) -> None:
+        tactic._enemy_memory_types.update(
+            {(4, 0): "CORE", (8, 0): "CORE", (12, 0): "CORE"}
+        )
+        tactic._enemy_memory_ticks.update({(12, 0): 1000})
+        tactic.turn_context.tick = 5000
+        try:
+            targets, drop = tactic._auto_core_targets(
+                {(4, 0), (8, 0), (12, 0)},
+                (SimpleNamespace(position=(9, 0), unit_type="VANGUARD"),),
+            )
+
+            self.assertEqual(targets, {(4, 0)})
+            self.assertEqual(drop, {(8, 0)})
+        finally:
+            for pos in ((4, 0), (8, 0), (12, 0)):
+                tactic._enemy_memory_types.pop(pos, None)
+                tactic._enemy_memory_ticks.pop(pos, None)
+            tactic.turn_context.tick = 0
+
+    def test_kite_auto_prefers_unguarded_core_memory(self) -> None:
+        tactic._enemy_memory.update({(2, 0), (6, 0)})
+        tactic._enemy_memory_types[(6, 0)] = "CORE"
+        tactic.turn_context.core_pos = (0, 0)
+        tactic.turn_context.kite_squad_pos = (0, 0)
+        try:
+            self.config["kite_mode"] = "auto"
+            self.config["kite_auto_radius"] = 20
+
+            mode, target = tactic._kite_mode_target((0, 0), self.config, ())
+
+            self.assertEqual((mode, target), ("auto", (6, 0)))
+        finally:
+            tactic._enemy_memory.discard((2, 0))
+            tactic._enemy_memory.discard((6, 0))
+            tactic._enemy_memory_types.pop((6, 0), None)
+            tactic.turn_context.core_pos = None
+            tactic.turn_context.kite_squad_pos = None
+
     def test_guerrilla_uses_kite_evasion_for_three_enemies(self) -> None:
         unit = self.CombatUnit("v-g", (5, 5))
         enemies = (

@@ -172,7 +172,7 @@ CONFIG_FIELDS = (
         "coords",
         options=("coords", "auto", "beacon"),
     ),
-    ConfigField("attack_auto_radius", "自动进攻半径(0=不限)", "combat", "integer", 100, 0, 1000, 1),
+    ConfigField("attack_auto_radius", "自动进攻半径(0=不限)", "combat", "integer", 300, 0, 1000, 1),
     ConfigField("kite_target_x", "风筝队目标 X", "combat", "integer", 0, -10000, 10000, 1),
     ConfigField("kite_target_y", "风筝队目标 Y", "combat", "integer", 0, -10000, 10000, 1),
     ConfigField(
@@ -183,7 +183,7 @@ CONFIG_FIELDS = (
         "coords",
         options=("coords", "auto", "beacon"),
     ),
-    ConfigField("kite_auto_radius", "风筝队自动进攻半径(0=不限)", "combat", "integer", 100, 0, 1000, 1),
+    ConfigField("kite_auto_radius", "风筝队自动进攻半径(0=不限)", "combat", "integer", 300, 0, 1000, 1),
     ConfigField(
         "kite_march_engage_radius",
         "风筝队行军接敌半径(0=仅顺路)",

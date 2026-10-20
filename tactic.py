@@ -2827,29 +2827,27 @@ _GUERRILLA_SIGHT: dict[str, int] = {"vanguard": 4, "ranger": 5}
 # deliberately local: a Vanguard/Ranger elsewhere on the map is not a guard
 # for this target, while a combat unit in one of the surrounding cells is.
 _GUERRILLA_CORE_GUARD_RADIUS = 1
+# Auto-attack core hunting only trusts recent sightings: cores move, and an
+# old marker would send the squad to a cell that has been empty for hours.
+_CORE_HUNT_MEMORY_MAX_AGE_TICKS = 2000
 
 
-def _guerrilla_core_isolated(
-    core: Any,
+def _core_position_unguarded(
+    core_pos: tuple[int, int],
     enemies: Iterable[Any],
     *,
     guard_radius: int = _GUERRILLA_CORE_GUARD_RADIUS,
+    ignore: Any = None,
 ) -> bool:
-    """Return whether *core* has no nearby enemy combat-unit escort.
+    """Return whether *core_pos* has no adjacent enemy combat-unit escort.
 
     Enemy workers and cores do not count as guards.  Unknown enemy types are
     treated as threats by :func:`_is_combat_threat`, so incomplete sightings
     fail safely instead of making a defended core look exposed.
     """
-    raw_core_pos = getattr(core, "position", None)
-    if raw_core_pos is None:
-        return False
-    core_pos = tuple(raw_core_pos)
-    if len(core_pos) != 2:
-        return False
     radius = max(0, int(guard_radius))
     for enemy in enemies:
-        if enemy is core:
+        if enemy is ignore:
             continue
         raw_enemy_pos = getattr(enemy, "position", None)
         if raw_enemy_pos is None:
@@ -2860,6 +2858,50 @@ def _guerrilla_core_isolated(
         if _chebyshev(core_pos, enemy_pos) <= radius:
             return False
     return True
+
+
+def _guerrilla_core_isolated(
+    core: Any,
+    enemies: Iterable[Any],
+    *,
+    guard_radius: int = _GUERRILLA_CORE_GUARD_RADIUS,
+) -> bool:
+    """Return whether *core* has no nearby enemy combat-unit escort."""
+    raw_core_pos = getattr(core, "position", None)
+    if raw_core_pos is None:
+        return False
+    core_pos = tuple(raw_core_pos)
+    if len(core_pos) != 2:
+        return False
+    return _core_position_unguarded(
+        core_pos, enemies, guard_radius=guard_radius, ignore=core,
+    )
+
+
+def _auto_core_targets(
+    candidates: set[tuple[int, int]],
+    enemies: Iterable[Any],
+) -> tuple[set[tuple[int, int]], set[tuple[int, int]]]:
+    """Split remembered CORE sightings into fresh unguarded targets and drops.
+
+    Fresh, unguarded cores are returned as priority targets.  Guarded core
+    memories are returned separately so the caller can remove them from the
+    normal candidate pool instead of marching into an escorted target.
+    """
+    tick = int(getattr(turn_context, "tick", 0) or 0)
+    targets: set[tuple[int, int]] = set()
+    drop: set[tuple[int, int]] = set()
+    for pos in candidates:
+        if _enemy_memory_types.get(pos) != "CORE":
+            continue
+        if not _core_position_unguarded(pos, enemies):
+            drop.add(pos)
+            continue
+        seen = int(_enemy_memory_ticks.get(pos, 0) or 0)
+        if tick > 0 and seen > 0 and tick - seen > _CORE_HUNT_MEMORY_MAX_AGE_TICKS:
+            continue
+        targets.add(pos)
+    return targets, drop
 
 
 def _guerrilla_roam_goal(unit: Any, pos: tuple[int, int]) -> tuple[int, int]:
@@ -4770,6 +4812,11 @@ def _plan_attack_combat(
             candidates = {
                 p for p in candidates if _manhattan(p, core_pos) <= attack_radius
             }
+        core_targets, guarded_cores = _auto_core_targets(candidates, enemies)
+        candidates -= guarded_cores
+        if core_targets:
+            # 落单核心优先：半径内有新鲜的无护卫核心目击点时，整队先清核。
+            candidates = core_targets
         if not candidates:
             # Everything in memory is part of the outnumbering cluster (or
             # memory only holds the cluster): regroup toward the home coords
@@ -5270,6 +5317,7 @@ def _kite_choose_move(
 def _kite_mode_target(
     pos: tuple[int, int],
     config: dict[str, Any],
+    enemies: tuple = (),
 ) -> tuple[str, tuple[int, int]]:
     mode = str(config.get("kite_mode", "coords"))
     fallback = (
@@ -5290,6 +5338,10 @@ def _kite_mode_target(
         candidates = set(_enemy_memory)
         if radius > 0 and core_pos is not None:
             candidates = {p for p in candidates if _manhattan(p, core_pos) <= radius}
+        core_targets, guarded_cores = _auto_core_targets(candidates, enemies)
+        candidates -= guarded_cores
+        if core_targets:
+            candidates = core_targets
         if candidates:
             if core_pos is None:
                 return mode, min(candidates, key=lambda p: _manhattan(p, squad_pos))
@@ -5684,7 +5736,7 @@ def _plan_kite_combat(
         mode = "guerrilla"
         objective = _guerrilla_roam_goal(unit, pos)
     else:
-        mode, objective = _kite_mode_target(pos, config)
+        mode, objective = _kite_mode_target(pos, config, enemies)
     attack_range = int(config.get("ranger_attack_range", 3))
     # turn.visible_enemies is the union of the whole army's sight. "Nearby"
     # must remain per-kite-unit or one scout would make every kite unit dodge a
