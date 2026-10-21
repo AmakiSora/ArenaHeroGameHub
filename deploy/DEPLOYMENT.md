@@ -145,9 +145,9 @@ After every deployment:
 1. `http://SERVER_IP:4399/` shows the login page when no token is given, and
    the dashboard after entering the token
 2. `/api/health` answers in milliseconds — the container healthcheck probes it
-   every 30 s, and `/api/state` (which renders the whole remembered map into one
-   SVG) is deliberately not the probe target. `/api/state` still returns JSON
-   with a valid token
+   every 30 s. `/api/state` is a compact tick probe; `?full=1` renders the full
+   panel payload (the whole remembered map) and is deliberately not the probe
+   target.
 3. `/api/config` responds (production targets live in the config form)
 4. `docker compose logs app` shows tactic connecting when API key is set
 5. New ticks appear in the dashboard after the tactic joins a game

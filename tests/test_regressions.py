@@ -74,6 +74,70 @@ class ResourceMergeTests(unittest.TestCase):
         self.assertEqual(saved["forgotten_resources"], [list(stale_resource)])
 
 
+class DeferredMapSaveTests(unittest.TestCase):
+    """The planner must not serialize the wall map before turn.submit()."""
+
+    GLOBALS = (
+        "_obstacle_memory", "_resource_memory", "_resource_tombstones",
+        "_map_disk_manual", "_map_disk_forgotten", "_map_disk_clear_seq",
+        "_enemy_memory", "_enemy_memory_types", "_enemy_memory_ticks",
+        "_map_dirty", "_last_map_save_tick", "_pending_map_save_tick",
+        "_last_dashboard_map_sig", "_obstacle_sorted_cache",
+        "_obstacle_pending_adds", "_core_anchor", "_map_file_sig_cache",
+    )
+
+    def setUp(self) -> None:
+        self._saved = {
+            name: copy.copy(getattr(tactic, name)) for name in self.GLOBALS
+        }
+        tactic._obstacle_memory = set()
+        tactic._resource_memory = set()
+        tactic._resource_tombstones = set()
+        tactic._map_disk_manual = set()
+        tactic._map_disk_forgotten = set()
+        tactic._map_disk_clear_seq = 0
+        tactic._enemy_memory = set()
+        tactic._enemy_memory_types = {}
+        tactic._enemy_memory_ticks = {}
+        tactic._map_dirty = True
+        tactic._last_map_save_tick = -1
+        tactic._pending_map_save_tick = None
+        tactic._last_dashboard_map_sig = None
+        tactic._obstacle_sorted_cache = None
+        tactic._obstacle_pending_adds = set()
+        tactic._core_anchor = None
+        tactic._map_file_sig_cache.clear()
+
+    def tearDown(self) -> None:
+        for name, value in self._saved.items():
+            setattr(tactic, name, copy.copy(value))
+
+    def test_defer_marks_pending_without_touching_disk(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._save_map_memory(
+                    tick=10, save_interval_ticks=8, defer=True,
+                )
+                self.assertFalse(path.exists())
+                self.assertEqual(tactic._pending_map_save_tick, 10)
+                tactic._flush_pending_map_memory()
+                self.assertTrue(path.exists())
+                self.assertIsNone(tactic._pending_map_save_tick)
+                self.assertEqual(tactic._last_map_save_tick, 10)
+
+    def test_clean_map_does_not_schedule_a_save(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            tactic._map_dirty = False
+            with patch.object(tactic, "MAP_MEMORY_PATH", path):
+                tactic._save_map_memory(
+                    tick=10, save_interval_ticks=8, defer=True,
+                )
+                self.assertFalse(path.exists())
+                self.assertIsNone(tactic._pending_map_save_tick)
+
+
 class DashboardMapMemoryTests(unittest.TestCase):
     def test_remove_resource_writes_sticky_forgotten_list(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7626,15 +7690,14 @@ class BattleLogTests(unittest.TestCase):
 
 
 class ApiHealthProbeTests(unittest.TestCase):
-    """``/api/health`` is what the container healthcheck and the deploy smoke
-    test call.
+    """``/api/health`` is what the container healthcheck calls; ``/api/state``
+    is now a compact probe by default and only renders the full panel payload
+    behind ``?full=1``.
 
     Production measured ``/api/state`` at a 22.9 MB body whose ``mapSvg`` field
     alone is 20.8 MB (90.7%) — every remembered wall cell drawn into one SVG —
-    answering in 1.7-26.8 s against a healthcheck that gives up at 3 s. Nothing
-    consumes that body (the arena SPA never requests ``/api/state``), so the
-    30-second probe was the only caller paying for the render, and it was the
-    thing the render kept making it fail.
+    answering in 1.7-26.8 s. Nothing consumes that body (the arena SPA never
+    requests ``/api/state``), so routine probes must not pay for it.
     """
 
     def _get(self, path: str, log_file: str):
@@ -7692,13 +7755,28 @@ class ApiHealthProbeTests(unittest.TestCase):
         self.assertEqual(statuses, [200])
         self.assertIsNone(json.loads(body)["tick"])
 
-    def test_state_endpoint_still_builds_the_full_payload(self) -> None:
-        # The two endpoints differ on purpose: /api/state keeps rendering the
-        # panel payload it always did (the deploy smoke test still proves it
-        # once), /api/health never does.
+    def test_state_endpoint_is_compact_by_default(self) -> None:
+        # Routine /api/state probes stay tiny; the full panel payload moved
+        # behind ?full=1 so a probe can never pay the map-render cost.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
-            statuses, _body, recorded = self._get("/api/state", Path(tmp) / "x.jsonl")
+            log = Path(tmp) / "tactic_log.jsonl"
+            log.write_text(
+                json.dumps({"tick": 435397, "plan_unit_actions": {}}) + "\n",
+                encoding="utf-8",
+            )
+            statuses, body, recorded = self._get("/api/state", str(log))
+        self.assertEqual(statuses, [200])
+        self.assertEqual(recorded["build_parts"], 0)
+        self.assertLess(len(body), 256)
+        self.assertEqual(json.loads(body)["tick"], 435397)
+
+    def test_full_state_is_still_available_on_request(self) -> None:
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses, _body, recorded = self._get(
+                "/api/state?full=1", str(Path(tmp) / "x.jsonl"),
+            )
         self.assertEqual(statuses, [200])
         self.assertEqual(recorded["build_parts"], 1)
 

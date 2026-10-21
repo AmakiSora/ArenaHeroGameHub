@@ -265,7 +265,7 @@ curl -X POST http://localhost:4399/api/config/reset \
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | POST | `/api/login` | 用 token 换 cookie（无须鉴权） |
-| GET  | `/api/state` | 最新 Tick 完整状态 JSON |
+| GET  | `/api/state` | 轻量状态探针（ok/tick）；完整状态加 `?full=1` |
 | GET  | `/api/config` | 当前策略配置 |
 | POST | `/api/config` | 合并更新配置（原子写 + 校验） |
 | POST | `/api/config/reset` | 恢复全部默认 |
@@ -324,7 +324,7 @@ curl -i http://localhost:4399/ -H "Authorization: Bearer $DASHBOARD_TOKEN"
 
 - 非 root 用户 `arena`（uid 10001）运行
 - `docker-entrypoint.py` 守护 tactic 进程（崩溃自动重启）与 dashboard 进程
-- healthcheck 命中环回 `/api/state`
+- healthcheck 命中环回 `/api/health`（`/api/state` 为轻量 tick 探针）
 - `stop_grace_period: 20s` 给 tactic 留时间保存地图记忆
 - runtime volume 备份与恢复见 [单 VPS 部署](#单-vps-部署)
 

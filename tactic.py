@@ -7044,6 +7044,9 @@ _waypoint_stuck: dict[str, tuple[int, tuple[int, int]]] = {}
 _WAYPOINT_STUCK_THRESHOLD = 15
 _map_dirty: bool = False
 _last_map_save_tick: int = -1
+# Deferred disk write: planning only marks the save, the live loop flushes it
+# after turn.submit() so a 10s wall serialization cannot eat the command window.
+_pending_map_save_tick: int | None = None
 # Disk-owned map fields, refreshed only when map_memory.json's signature changes
 # (see _apply_dashboard_map_edits). They used to be recovered by json.loads-ing
 # the whole file on every save — ~0.4s at 560k walls, for three small fields.
@@ -7303,13 +7306,18 @@ def _save_map_memory(
     tick: int | None = None,
     force: bool = False,
     save_interval_ticks: int = 10,
+    defer: bool = False,
 ) -> None:
     """Persist permanent map memory. Obstacles never shrink.
 
     Manual resources entered from the dashboard are preserved across saves,
     except coordinates listed in forgotten_resources / local tombstones.
+
+    ``defer`` performs the dashboard-memory reconciliation and due checks but
+    leaves the expensive encode/write to the live loop after submit.
     """
     global _map_dirty, _last_map_save_tick, _enemy_clear_seq, _last_dashboard_map_sig
+    global _pending_map_save_tick
     # Always honor dashboard deletions, even on a non-dirty no-op path.
     _apply_dashboard_map_edits()
     if not force and not _map_dirty:
@@ -7320,6 +7328,10 @@ def _save_map_memory(
         and _last_map_save_tick >= 0
         and tick - _last_map_save_tick < save_interval_ticks
     ):
+        return
+    if defer and not force and tick is not None:
+        if _pending_map_save_tick is None:
+            _pending_map_save_tick = tick
         return
 
     # Taken from the edit-sync's parse of this same file (under this lock), not a
@@ -7377,6 +7389,7 @@ def _save_map_memory(
     }
     atomic_write_text(MAP_MEMORY_PATH, json.dumps(payload, ensure_ascii=False))
     _map_dirty = False
+    _pending_map_save_tick = None
     _last_dashboard_map_sig = _dashboard_map_sig(payload)
     # The file we just wrote is in sync — seed its signature so the next
     # Tick's edit-sync skips the full re-read entirely.
@@ -7385,6 +7398,25 @@ def _save_map_memory(
         _map_file_sig_cache[str(MAP_MEMORY_PATH)] = written_sig
     if tick is not None:
         _last_map_save_tick = tick
+
+
+def _flush_pending_map_memory() -> None:
+    """Write a save deferred out of the planning phase, after submit."""
+    global _pending_map_save_tick, _map_dirty
+    tick = _pending_map_save_tick
+    if tick is None:
+        return
+    _pending_map_save_tick = None
+    started = time.monotonic()
+    try:
+        _save_map_memory(tick=tick, force=True)
+    except Exception as exc:
+        _map_dirty = True
+        print(f"[map] deferred save failed tick={tick}: {exc}", flush=True)
+        return
+    elapsed_ms = (time.monotonic() - started) * 1000
+    if elapsed_ms >= 1000:
+        print(f"[map] deferred save tick={tick} {elapsed_ms:.0f}ms", flush=True)
 
 
 # ── manual per-unit waypoints (dashboard ⌖) ─────────────────────────────────
@@ -8552,6 +8584,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     _save_map_memory(
         tick=getattr(turn, "tick", None),
         save_interval_ticks=int(config["map_save_interval_ticks"]),
+        defer=True,
     )
     _phase.stop()
 
@@ -9705,8 +9738,9 @@ _skip_exit_map_save = False
 
 def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
     """Run forever with automatic reconnect on protocol/transport failures."""
-    global _skip_exit_map_save
+    global _skip_exit_map_save, _pending_map_save_tick
     _skip_exit_map_save = False
+    _pending_map_save_tick = None
     _load_map_memory()
     # Build the dead-end structure before connecting. Lazy-building it on the
     # first turn costs ~10s at 760k walls; the command window for that turn is
@@ -9811,11 +9845,16 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                                 flush=True,
                             )
                             continue
+                        finally:
+                            # Measure the command path before the deferred disk
+                            # write, then persist outside the submit window.
+                            latency = (time.monotonic() - tick_start) * 1000
+                            if not _skip_exit_map_save:
+                                _flush_pending_map_memory()
                         stale_streak = 0
                         _finalize_kite_collision_state(accepted.accepted)
                         _commit_shadow_predictions(accepted.accepted)
                         _append_accepted_kite_battle_log(accepted.accepted)
-                        latency = (time.monotonic() - tick_start) * 1000
                         plan_actions: dict[str, str] = {}
                         for uid, detail in unit_actions.items():
                             plan_actions[uid] = detail

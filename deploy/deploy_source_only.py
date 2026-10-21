@@ -127,8 +127,7 @@ cmds = [
     "docker compose ps",
     f"curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{APP_PORT}/",
     f"curl -s -o /dev/null -w '%{{http_code}}' {AUTH} http://127.0.0.1:{APP_PORT}/api/health",
-    # /api/state builds the whole panel payload (seconds) and the healthcheck no
-    # longer pays for it, so a deploy is where it still gets proven once.
+    # /api/state is compact by default; ?full=1 still renders the full panel.
     f"curl -s -o /dev/null -w '%{{http_code}}' {AUTH} http://127.0.0.1:{APP_PORT}/api/state",
     f"curl -s {AUTH} http://127.0.0.1:{APP_PORT}/api/config | head -c 400",
     "docker compose logs --tail=5 app",

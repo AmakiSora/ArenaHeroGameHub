@@ -50,6 +50,6 @@ USER arena
 EXPOSE 4399
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4399/api/state', timeout=3)"
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4399/api/health', timeout=3)"
 
 ENTRYPOINT ["python", "/app/docker-entrypoint.py"]
