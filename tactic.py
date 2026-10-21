@@ -2122,6 +2122,23 @@ def _worker_explore_ages(uid: str) -> dict[tuple[int, int], int]:
     return ages
 
 
+def _is_tight_loop(
+    uid: str,
+    *,
+    window: int = 12,
+    span: int = 3,
+    min_steps: int = 8,
+) -> bool:
+    """True when the unit's recent trail is trapped in a small area."""
+    history = _worker_explore_history.get(uid) or []
+    recent = history[-window:]
+    if len(recent) < min_steps:
+        return False
+    xs = [cell[0] for cell in recent]
+    ys = [cell[1] for cell in recent]
+    return max(max(xs) - min(xs), max(ys) - min(ys)) <= span
+
+
 def _worker_rally_goal(
     uid: str,
     pos: tuple[int, int],
@@ -4687,6 +4704,24 @@ def _plan_home_combat(
     # the live map: (684,-298) <-> (684,-299) on 100% of Ticks, with and without
     # chute demand). The Core cell is also the chute the carriers need.
     if dist_home > return_radius:
+        # _move_towards' greedy fallback and _long_march_step can undo each
+        # other in a 2x2 pocket: the former steps toward the goal, the latter
+        # steps out, and the pair loops forever. Production R19 spent 300+
+        # Ticks in a 2x2 pocket 398 cells from home. Once the recent trail
+        # proves a tight loop, let the loop-aware march pick first; it already
+        # leans on visit age to leave the pocket.
+        if _is_tight_loop(str(unit.id)):
+            marched = _long_march_step(
+                unit,
+                pos,
+                goal,
+                obstacle_cells,
+                detail_prefix="home-return",
+                cell_counts=cell_counts,
+                extra_obstacles=_chute_ring,
+            )
+            if marched is not None:
+                return marched
         moved = _move_towards(
             unit,
             pos,

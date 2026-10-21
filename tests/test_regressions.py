@@ -12436,9 +12436,11 @@ class HomeReturnFarStrandedTests(unittest.TestCase):
             "miss": dict(tactic._march_route_miss),
             "names": dict(tactic._object_names),
             "counters": dict(tactic._object_name_counters),
+            "history": {k: list(v) for k, v in tactic._worker_explore_history.items()},
         }
         tactic._worker_last_pos.clear()
         tactic._march_route_miss.clear()
+        tactic._worker_explore_history.clear()
 
     def tearDown(self) -> None:
         tactic._worker_last_pos.clear()
@@ -12449,6 +12451,8 @@ class HomeReturnFarStrandedTests(unittest.TestCase):
         tactic._object_names.update(self._saved["names"])
         tactic._object_name_counters.clear()
         tactic._object_name_counters.update(self._saved["counters"])
+        tactic._worker_explore_history.clear()
+        tactic._worker_explore_history.update(self._saved["history"])
 
     def test_far_defender_falls_back_to_the_budget_free_march(self) -> None:
         core_pos = (668, -234)
@@ -12478,6 +12482,84 @@ class HomeReturnFarStrandedTests(unittest.TestCase):
             tactic._manhattan(nxt, core_pos),
             tactic._manhattan(pos, core_pos) - 1,
         )
+
+    def test_tight_loop_prefers_loop_aware_long_march(self) -> None:
+        # R19 spent 300+ Ticks on a 2x2 cycle: _move_towards stepped toward the
+        # goal, _long_march_step stepped out of the pocket, and the next Tick
+        # the first planner undid it. A recent tight trail must hand the move to
+        # the loop-aware march before _move_towards can re-enter the cycle.
+        core_pos = (0, 100)
+        pos = (0, 0)
+        unit = SimpleNamespace(
+            id="v-loop", unit_type=UnitType.VANGUARD, position=pos, hp=5,
+        )
+        moves: list = []
+        unit.move = lambda direction: moves.append(direction)
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 3
+        tactic._worker_explore_history["v-loop"] = [
+            (0, 0), (1, 0), (1, 1), (0, 1),
+        ] * 4
+        long_calls: list = []
+        move_calls: list = []
+
+        def fake_long(unit_arg, pos_arg, goal, *args, **kwargs):
+            long_calls.append(goal)
+            unit_arg.move(Direction.LEFT)
+            return ("MOVE", "LEFT home-return test")
+
+        def fake_move(unit_arg, pos_arg, goal, *args, **kwargs):
+            move_calls.append(goal)
+            unit_arg.move(Direction.DOWN)
+            return ("MOVE", "DOWN home-return test")
+
+        with patch.object(tactic, "_long_march_step", side_effect=fake_long), \
+             patch.object(tactic, "_move_towards", side_effect=fake_move):
+            action, detail = tactic._plan_home_combat(
+                unit, unit_kind="vanguard", enemies=(),
+                obstacle_cells=frozenset(), core_pos=core_pos, config=config,
+            )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(moves, [Direction.LEFT])
+        self.assertEqual(len(long_calls), 1)
+        self.assertEqual(move_calls, [])
+        self.assertIn("home-return", detail)
+
+    def test_open_trail_keeps_normal_move_towards_priority(self) -> None:
+        # A trail spanning more than a few cells is ordinary travel, not a
+        # loop; the pre-check must not hijack it.
+        core_pos = (0, 100)
+        pos = (0, 0)
+        unit = SimpleNamespace(
+            id="v-open", unit_type=UnitType.VANGUARD, position=pos, hp=5,
+        )
+        moves: list = []
+        unit.move = lambda direction: moves.append(direction)
+        unit.wait = lambda: None
+        config = default_config()
+        config["home_patrol_radius"] = 3
+        tactic._worker_explore_history["v-open"] = [
+            (i, 0) for i in range(12)
+        ]
+
+        def fake_move(unit_arg, pos_arg, goal, *args, **kwargs):
+            unit_arg.move(Direction.DOWN)
+            return ("MOVE", "DOWN home-return test")
+
+        with patch.object(
+            tactic, "_long_march_step",
+            side_effect=AssertionError("open trail must not preempt A*"),
+        ), patch.object(tactic, "_move_towards", side_effect=fake_move):
+            action, detail = tactic._plan_home_combat(
+                unit, unit_kind="vanguard", enemies=(),
+                obstacle_cells=frozenset(), core_pos=core_pos, config=config,
+            )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(moves, [Direction.DOWN])
+        self.assertIn("home-return", detail)
 
 
 class CoreCommittedRouteStickinessTests(CoreTerrainBlockedLearningTests):
