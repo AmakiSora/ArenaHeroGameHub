@@ -11120,6 +11120,63 @@ class AttackRegroupTests(unittest.TestCase):
         self.assertEqual(waits, [])
         self.assertIn("attack-regroup", detail)
 
+    def test_regroup_avoids_adjacent_enemy_when_path_exists(self) -> None:
+        # The server rejects moving onto an enemy-occupied cell. Regroup A*
+        # does not know enemy positions, so it must receive adjacent enemies as
+        # temporary obstacles instead of routing through them.
+        moves: list = []
+        waits: list = []
+        unit = self._unit((0, 0), moves, waits)
+        enemy = SimpleNamespace(id="e1", position=(-1, 0), unit_type="WORKER", hp=2)
+        tactic._chute_in_demand = False
+        seen: dict = {}
+
+        def fake_move(unit_arg, pos, goal, *args, **kwargs):
+            seen["extra"] = set(kwargs.get("extra_obstacles") or ())
+            unit_arg.move(Direction.DOWN)
+            return ("MOVE", f"DOWN attack-regroup {goal}")
+
+        with patch.object(tactic, "_move_towards", side_effect=fake_move), \
+             patch.object(tactic, "_long_march_step",
+                          side_effect=AssertionError("A* failure not reached")), \
+             patch.object(tactic, "_ranger_best_shot",
+                          side_effect=AssertionError("must not shoot")):
+            action, detail = tactic._attack_regroup_step(
+                unit, (0, 0), (-5, 0), frozenset(),
+                config=self._config((-337, -800)),
+                enemies=(enemy,), unit_kind="ranger",
+            )
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(moves, [Direction.DOWN])
+        self.assertIn((-1, 0), seen["extra"])
+
+    def test_regroup_shoots_adjacent_enemy_when_boxed(self) -> None:
+        # R11 spent 130 Ticks at (-1056,980) next to a stationary enemy worker:
+        # every regroup step was rejected as MOVE_DESTINATION_OCCUPIED and the
+        # unit never engaged. With no route around, it must shoot the blocker.
+        moves: list = []
+        waits: list = []
+        unit = self._unit((0, 0), moves, waits)
+        enemy = SimpleNamespace(id="e1", position=(-1, 0), unit_type="WORKER", hp=2)
+        tactic._attack_regroup_ids.add("u1")
+        tactic._chute_in_demand = False
+        with patch.object(tactic, "_move_towards", return_value=None), \
+             patch.object(tactic, "_long_march_step", return_value=None), \
+             patch.object(
+                 tactic, "_ranger_best_shot",
+                 return_value=("SHOOT", "current enemy at (-1, 0) dist=1"),
+             ) as shot:
+            action, detail = tactic._plan_attack_combat(
+                unit, unit_kind="ranger", enemies=(enemy,),
+                obstacle_cells=frozenset(), config=self._config((-337, -800)),
+                core_pos=(-5, 0),
+            )
+        self.assertEqual(action, "SHOOT")
+        self.assertIn("attack-regroup-blocker", detail)
+        self.assertEqual(moves, [])
+        self.assertTrue(shot.called)
+        self.assertIn(enemy, shot.call_args[0][2])
+
 
 class CoreManualTargetAstDetourTests(unittest.TestCase):
     """Regression: with a manual core target sharing the core's row, a wall

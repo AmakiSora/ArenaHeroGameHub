@@ -3911,6 +3911,8 @@ def _attack_regroup_step(
     *,
     cell_counts: Mapping | None = None,
     config: Mapping | None = None,
+    enemies: tuple = (),
+    unit_kind: str = "ranger",
 ) -> tuple[str, str] | None:
     """One step of the attack-team home-recovery march toward the Core.
 
@@ -3941,6 +3943,20 @@ def _attack_regroup_step(
         unit.wait()
         _set_unit_route(unit, core_pos, [tuple(pos)], complete=True)
         return ("WAIT", f"attack-regroup-ring {core_pos}")
+    # A visible enemy next to the unit is not in obstacle_cells, so A* happily
+    # routes through its cell and the server rejects every step with
+    # MOVE_DESTINATION_OCCUPIED. Production R11 sat at (-1056,980) for 130
+    # Ticks next to a stationary enemy worker, re-issuing the same westward
+    # move 122 times. Treat adjacent enemies as temporary obstacles; if the
+    # unit is boxed with no way around, shoot/sweep the blocker instead of
+    # walking into it forever.
+    adjacent_enemies = tuple(
+        enemy for enemy in enemies
+        if _manhattan(pos, tuple(enemy.position)) == 1
+    )
+    blocked_cells = frozenset(
+        tuple(enemy.position) for enemy in adjacent_enemies
+    )
     budget = min(1_500_000, max(50_000, _manhattan(pos, core_pos) * 60))
     moved = _move_towards(
         unit,
@@ -3949,18 +3965,41 @@ def _attack_regroup_step(
         obstacle_cells,
         detail_prefix="attack-regroup",
         cell_counts=cell_counts,
+        extra_obstacles=blocked_cells,
         max_steps=budget,
     )
     if moved is not None:
         return moved
-    return _long_march_step(
+    marched = _long_march_step(
         unit,
         pos,
         core_pos,
         obstacle_cells,
         detail_prefix="attack-regroup",
         cell_counts=cell_counts,
+        extra_obstacles=blocked_cells,
     )
+    if marched is not None:
+        return marched
+    if adjacent_enemies:
+        if unit_kind == "vanguard":
+            sweep = _vanguard_adjacent_sweep(unit, pos, adjacent_enemies)
+            if sweep is not None:
+                return ("SWEEP", f"attack-regroup-blocker {sweep[1]}")
+        else:
+            shot = _ranger_best_shot(
+                unit,
+                pos,
+                adjacent_enemies,
+                obstacle_cells,
+                int((config or {}).get("ranger_attack_range", 3)),
+                lead_fire_enabled=bool(
+                    (config or {}).get("ranger_lead_fire_enabled", True)
+                ),
+            )
+            if shot is not None:
+                return ("SHOOT", f"attack-regroup-blocker {shot[1]}")
+    return None
 
 
 # ── sweep miss fuse ──────────────────────────────────────────────────────────
@@ -4818,6 +4857,8 @@ def _plan_attack_combat(
                 obstacle_cells,
                 cell_counts=cell_counts,
                 config=config,
+                enemies=enemies,
+                unit_kind=unit_kind,
             )
             if step is not None:
                 return step
@@ -4988,6 +5029,8 @@ def _plan_attack_combat(
             obstacle_cells,
             cell_counts=cell_counts,
             config=config,
+            enemies=enemies,
+            unit_kind=unit_kind,
         )
         if regroup is not None:
             return regroup
