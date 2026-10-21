@@ -2994,6 +2994,42 @@ class KiteTeamPlannerTests(unittest.TestCase):
         tactic._enemy_motion_tracks[enemy.id] = [(3, (2, 0)), (4, (3, 0))]
         self.assertEqual(tactic._kite_motion_info(enemy, (0, 0))["state"], "retreat")
 
+    def test_motion_predicts_bounce_back_to_previous_cell(self):
+        # Production R15/R12 faced a worker alternating (-1352,1301) and
+        # (-1352,1302). Continuing the latest velocity aimed one cell past it
+        # every Tick: 140 shots, 2 hits. A two-cell bounce must predict the
+        # cell the target just left.
+        enemy = self.enemy("enemy-bounce", (2, 0))
+        tactic._enemy_motion_tracks[enemy.id] = [
+            (1, (3, 0)), (2, (2, 0)), (3, (3, 0)), (4, (2, 0)),
+        ]
+        info = tactic._kite_motion_info(enemy, (0, 0))
+        self.assertTrue(info["oscillating"])
+        self.assertEqual(info["state"], "advance")
+        self.assertEqual(info["predicted"], (3, 0))
+
+        enemy.position = (3, 0)
+        tactic._enemy_motion_tracks[enemy.id] = [
+            (2, (2, 0)), (3, (3, 0)), (4, (2, 0)), (5, (3, 0)),
+        ]
+        info = tactic._kite_motion_info(enemy, (0, 0))
+        self.assertTrue(info["oscillating"])
+        self.assertEqual(info["predicted"], (2, 0))
+
+    def test_guerrilla_lead_fires_bounce_cell(self):
+        ranger = self.unit("kite-r", (0, 0), UnitType.RANGER)
+        enemy = self.enemy("enemy-bounce", (2, 0), UnitType.WORKER)
+        tactic._enemy_motion_tracks[enemy.id] = [
+            (1, (3, 0)), (2, (2, 0)), (3, (3, 0)), (4, (2, 0)),
+        ]
+        action, detail = tactic._plan_guerrilla_combat(
+            ranger, unit_kind="ranger", enemies=(enemy,),
+            obstacle_cells=frozenset(), config=self.config,
+        )
+        self.assertEqual(action, "SHOOT")
+        self.assertIn("bounce", detail)
+        self.assertEqual(ranger.expected_cell, (3, 0))
+
     def test_vanguard_prefires_straight_gap_against_advancing_vanguard(self):
         unit = self.unit("kite-v", (0, 0))
         enemy = self.enemy("enemy-v", (2, 0))

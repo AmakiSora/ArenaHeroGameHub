@@ -5058,6 +5058,13 @@ def _kite_motion_info(
     state = "unknown"
     previous = history[-2][1] if len(history) >= 2 else None
     current = tuple(enemy.position)
+    positions = [entry[1] for entry in history]
+    oscillating = (
+        len(positions) >= 3
+        and positions[-1] == current
+        and positions[-2] != current
+        and positions[-3] == current
+    )
     if previous is not None:
         step = current[0] - previous[0], current[1] - previous[1]
         toward = friendly_pos[0] - previous[0], friendly_pos[1] - previous[1]
@@ -5071,7 +5078,13 @@ def _kite_motion_info(
         else:
             state = "lateral"
     predicted = None
-    if velocity is not None and abs(velocity[0]) + abs(velocity[1]) == 1:
+    if oscillating:
+        # A two-cell bounce reverses every Tick, so continuing the latest
+        # velocity aims one cell past the target every time. Production R15/R12
+        # fired 140 shots at an enemy alternating (-1352,1301)/(-1352,1302) and
+        # hit twice; the next cell is the one it just left.
+        predicted = positions[-2]
+    elif velocity is not None and abs(velocity[0]) + abs(velocity[1]) == 1:
         predicted = (current[0] + velocity[0], current[1] + velocity[1])
     return {
         "state": state,
@@ -5080,6 +5093,7 @@ def _kite_motion_info(
         "velocity": velocity,
         "streak": streak,
         "predicted": predicted,
+        "oscillating": oscillating,
     }
 
 
@@ -5647,6 +5661,7 @@ def _kite_ranger_fire(
             "velocity": list(motion["velocity"]) if motion["velocity"] else None,
             "move_streak": motion["streak"],
             "motion_state": f"kite_{motion['state']}",
+            "oscillating": bool(motion.get("oscillating")),
             "prediction_legal": True,
             "eligible": True,
             "reason": "kite_motion_prediction",
@@ -5656,7 +5671,8 @@ def _kite_ranger_fire(
             "fired_cell": list(expected),
         })
         turn_context.shot_predictions.append(prediction)
-        return "SHOOT", f"kite-lead {expected} motion={motion['state']}"
+        suffix = " bounce" if motion.get("oscillating") else ""
+        return "SHOOT", f"kite-lead {expected} motion={motion['state']}{suffix}"
     ranger.shoot(target)
     return "SHOOT", f"kite-current {tuple(target.position)}"
 
@@ -6265,11 +6281,17 @@ def _plan_kite_combat(
 
     if target is not None and unit_kind == "ranger":
         motion = _kite_motion_info(target, pos)
-        expected = motion.get("predicted") if motion["state"] in {"advance", "retreat"} else None
+        expected = (
+            motion.get("predicted")
+            if motion["state"] in {"advance", "retreat"} or motion.get("oscillating")
+            else None
+        )
         shot = _kite_ranger_fire(
             unit, pos, target, expected, obstacle_cells, attack_range,
         )
-        if shot is None and motion["state"] in {"stationary", "unknown"}:
+        if shot is None and (
+            motion["state"] in {"stationary", "unknown"} or motion.get("oscillating")
+        ):
             shot = _kite_ranger_fire(
                 unit, pos, target, None, obstacle_cells, attack_range,
             )
