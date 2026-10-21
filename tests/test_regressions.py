@@ -138,6 +138,139 @@ class DeferredMapSaveTests(unittest.TestCase):
                 self.assertIsNone(tactic._pending_map_save_tick)
 
 
+class ColdMapPruneTests(unittest.TestCase):
+    """Startup cold-wall prune must be reversible and marker-gated."""
+
+    GLOBALS = DeferredMapSaveTests.GLOBALS + (
+        "_known_obstacles", "_resource_tombstones", "_enemy_clear_seq",
+        "_enemy_memory_ticks", "_dead_obstacles", "_dead_open_count",
+        "_dead_set", "_dead_view", "_dead_structure_built",
+        "_dead_end_cache_key", "_dead_end_cache",
+        "_path_blockers_union_key", "_path_blockers_union",
+    )
+
+    def setUp(self) -> None:
+        self._saved = {
+            name: copy.copy(getattr(tactic, name)) for name in self.GLOBALS
+        }
+        tactic._obstacle_memory = set()
+        tactic._known_obstacles = frozenset()
+        tactic._resource_memory = set()
+        tactic._resource_tombstones = set()
+        tactic._enemy_memory = set()
+        tactic._enemy_memory_types = {}
+        tactic._enemy_memory_ticks = {}
+        tactic._enemy_clear_seq = 0
+        tactic._map_disk_manual = set()
+        tactic._map_disk_forgotten = set()
+        tactic._map_disk_clear_seq = 0
+        tactic._map_dirty = False
+        tactic._last_map_save_tick = -1
+        tactic._pending_map_save_tick = None
+        tactic._last_dashboard_map_sig = None
+        tactic._obstacle_sorted_cache = None
+        tactic._obstacle_pending_adds = set()
+        tactic._core_anchor = (0, 0)
+        tactic._map_file_sig_cache.clear()
+        tactic._dead_obstacles = None
+        tactic._dead_open_count = {}
+        tactic._dead_set = set()
+        tactic._dead_view = frozenset()
+        tactic._dead_structure_built = False
+        tactic._dead_end_cache_key = None
+        tactic._dead_end_cache = frozenset()
+        tactic._path_blockers_union_key = None
+        tactic._path_blockers_union = frozenset()
+
+    def tearDown(self) -> None:
+        for name, value in self._saved.items():
+            setattr(tactic, name, copy.copy(value))
+
+    def _setup(self, temp_dir: str):
+        root = Path(temp_dir)
+        map_path = root / "map_memory.json"
+        marker = root / "map_cold_prune.done"
+        log_path = root / "tactic_log.jsonl"
+        near = {(5, 0), (10, 1)}
+        far = {(500, 0), (500, 1)}
+        payload = {
+            "updated_tick": 1,
+            **map_codec.encode_obstacle_fields(near | far),
+            "resources": [[30, 0]],
+            "manual_resources": [],
+            "forgotten_resources": [],
+            "enemy_sightings": [[40, 0, "CORE", 1]],
+            "enemy_clear_seq": 0,
+            "core_anchor": [0, 0],
+        }
+        map_path.write_text(json.dumps(payload), encoding="utf-8")
+        tactic._obstacle_memory = set(near | far)
+        tactic._known_obstacles = frozenset(tactic._obstacle_memory)
+        tactic._resource_memory = {(30, 0)}
+        tactic._enemy_memory = {(40, 0)}
+        tactic._enemy_memory_types = {(40, 0): "CORE"}
+        tactic._enemy_memory_ticks = {(40, 0): 1}
+        log_path.write_text(json.dumps({
+            "tick": 123,
+            "core_pos": [0, 0],
+            "workers": [{
+                "id": "w1", "name": "W1", "pos": [10, 0],
+                "target": [20, 0], "path": [[10, 0], [20, 0]],
+            }],
+            "plan_unit_actions": {},
+        }) + "\n", encoding="utf-8")
+        config = default_config()
+        config.update({
+            "map_cold_prune_enabled": True,
+            "map_cold_prune_once": True,
+            "map_cold_prune_core_radius": 100,
+            "map_cold_prune_unit_radius": 100,
+            "map_cold_prune_path_radius": 1,
+        })
+        return root, map_path, marker, log_path, config, near, far
+
+    def test_prune_archives_backs_up_and_keeps_non_wall_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, map_path, marker, log_path, config, near, far = self._setup(temp_dir)
+            with patch.object(tactic, "MAP_MEMORY_PATH", map_path), \
+                 patch.object(tactic, "MAP_COLD_PRUNE_MARKER", marker), \
+                 patch.object(tactic, "DEFAULT_LOG_PATH", str(log_path)), \
+                 patch.object(tactic, "load_config", return_value=config):
+                tactic._prune_cold_map_memory()
+                self.assertEqual(tactic._obstacle_memory, near)
+                self.assertTrue(marker.exists())
+                self.assertEqual(
+                    len(list(root.glob("map_memory.pre-prune-*.json"))), 1,
+                )
+                self.assertEqual(
+                    len(list(root.glob("map_memory.cold-prune-*.json.gz"))), 1,
+                )
+                saved = json.loads(map_path.read_text(encoding="utf-8"))
+                self.assertEqual(map_codec.decode_obstacles(saved), near)
+                self.assertEqual(saved["resources"], [[30, 0]])
+                self.assertEqual(saved["enemy_sightings"][0][:2], [40, 0])
+                # once=True + marker: a second startup must not prune again.
+                tactic._prune_cold_map_memory()
+                self.assertEqual(
+                    len(list(root.glob("map_memory.pre-prune-*.json"))), 1,
+                )
+
+    def test_save_failure_restores_all_walls_and_no_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root, map_path, marker, log_path, config, near, far = self._setup(temp_dir)
+            with patch.object(tactic, "MAP_MEMORY_PATH", map_path), \
+                 patch.object(tactic, "MAP_COLD_PRUNE_MARKER", marker), \
+                 patch.object(tactic, "DEFAULT_LOG_PATH", str(log_path)), \
+                 patch.object(tactic, "load_config", return_value=config), \
+                 patch.object(
+                     tactic, "_save_map_memory",
+                     side_effect=RuntimeError("disk full"),
+                 ):
+                tactic._prune_cold_map_memory()
+            self.assertEqual(tactic._obstacle_memory, near | far)
+            self.assertFalse(marker.exists())
+
+
 class DashboardMapMemoryTests(unittest.TestCase):
     def test_remove_resource_writes_sticky_forgotten_list(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

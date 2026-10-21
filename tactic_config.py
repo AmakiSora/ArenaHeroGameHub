@@ -243,6 +243,14 @@ CONFIG_FIELDS = (
         1,
     ),
     ConfigField("map_save_interval_ticks", "地图保存间隔 Tick", "runtime", "integer", 10, 1, 200, 1),
+    # One-shot cold-wall prune at startup. The full pre-prune map and the cold
+    # wall list are archived next to map_memory.json; the marker prevents a
+    # restart loop from pruning/archiving again.
+    ConfigField("map_cold_prune_enabled", "启动时裁剪冷墙", "runtime", "boolean", True),
+    ConfigField("map_cold_prune_once", "冷墙裁剪仅执行一次", "runtime", "boolean", True),
+    ConfigField("map_cold_prune_core_radius", "冷墙保留-核心半径", "runtime", "integer", 1000, 100, 5000, 50),
+    ConfigField("map_cold_prune_unit_radius", "冷墙保留-单位半径", "runtime", "integer", 1000, 100, 5000, 50),
+    ConfigField("map_cold_prune_path_radius", "冷墙保留-路径半径", "runtime", "integer", 5, 0, 50, 1),
     # Guerrilla route recorder: appends one tiny row per guerrilla unit per Tick
     # to runtime/guerrilla_routes-YYYYMMDD.jsonl (3 days kept) so a whole day of
     # exploration lines survives for review — tactic_log.jsonl rotates every ~4h.

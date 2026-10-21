@@ -11,6 +11,8 @@ import json
 import os
 import time
 import traceback
+import gzip
+import shutil
 
 import watchdog
 
@@ -44,6 +46,7 @@ def _data_dir() -> Path:
 
 MAP_MEMORY_PATH = _data_dir() / "map_memory.json"
 DEFAULT_LOG_PATH = str(_data_dir() / "tactic_log.jsonl")
+MAP_COLD_PRUNE_MARKER = MAP_MEMORY_PATH.parent / "map_cold_prune.done"
 # Categorized battle log (discoveries / kills / defeats / config changes) that
 # both the tactic process and the dashboard process append to.
 BATTLE_LOG_PATH = _data_dir() / "battle_log.jsonl"
@@ -7146,6 +7149,206 @@ def _load_map_memory() -> None:
         print(f"[map] load failed: {e}", flush=True)
 
 
+def _latest_tactic_record_for_prune() -> dict | None:
+    """Return the newest complete tick record for cold-wall retention."""
+    path = Path(DEFAULT_LOG_PATH)
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            return None
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - 2_000_000))
+            chunk = handle.read()
+    except OSError:
+        return None
+    for raw in reversed(chunk.splitlines()):
+        try:
+            record = json.loads(raw.decode("utf-8", "replace"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(record, dict)
+            and isinstance(record.get("tick"), int)
+            and record.get("core_pos")
+        ):
+            return record
+    return None
+
+
+def _prune_cold_map_memory() -> None:
+    """One-shot startup prune of walls far from all current activity.
+
+    Safety rails: config-gated, marker-gated, full pre-prune backup, a gzipped
+    archive of every removed wall, and an in-memory rollback if the pruned map
+    cannot be saved. The running unit/path set comes from the newest complete
+    tick record, so a restart prunes against where the army actually is.
+    """
+    global _obstacle_memory, _known_obstacles, _map_dirty
+    config = load_config()
+    if not bool(config.get("map_cold_prune_enabled", False)):
+        return
+    if (
+        bool(config.get("map_cold_prune_once", True))
+        and MAP_COLD_PRUNE_MARKER.exists()
+    ):
+        print("[map] cold prune skipped: marker present", flush=True)
+        return
+    if not MAP_MEMORY_PATH.exists() or not _obstacle_memory:
+        return
+    record = _latest_tactic_record_for_prune()
+    if record is None:
+        print("[map] cold prune skipped: no recent tick record", flush=True)
+        return
+    try:
+        core_raw = record.get("core_pos") or ()
+        core = (int(core_raw[0]), int(core_raw[1]))
+    except (TypeError, ValueError, IndexError):
+        print("[map] cold prune skipped: invalid core position", flush=True)
+        return
+    units: list[dict[str, Any]] = []
+    for group in ("workers", "vanguards", "rangers"):
+        for unit in record.get(group) or []:
+            if not isinstance(unit, dict):
+                continue
+            pos = unit.get("pos")
+            if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                continue
+            target = unit.get("target")
+            units.append({
+                "pos": (int(pos[0]), int(pos[1])),
+                "target": (
+                    (int(target[0]), int(target[1]))
+                    if isinstance(target, (list, tuple)) and len(target) >= 2
+                    else None
+                ),
+                "path": unit.get("path") or [],
+            })
+    if not units:
+        print("[map] cold prune skipped: no unit snapshot", flush=True)
+        return
+
+    core_radius = max(0, int(config.get("map_cold_prune_core_radius", 1000) or 0))
+    unit_radius = max(0, int(config.get("map_cold_prune_unit_radius", 1000) or 0))
+    path_radius = max(0, int(config.get("map_cold_prune_path_radius", 5) or 0))
+
+    corridor: set[tuple[int, int]] = set()
+    for unit in units:
+        for cell in unit["path"]:
+            if not isinstance(cell, (list, tuple)) or len(cell) < 2:
+                continue
+            x, y = int(cell[0]), int(cell[1])
+            for dx in range(-path_radius, path_radius + 1):
+                for dy in range(-path_radius, path_radius + 1):
+                    corridor.add((x + dx, y + dy))
+                    if len(corridor) > 500_000:
+                        print(
+                            "[map] cold prune skipped: path corridor too large",
+                            flush=True,
+                        )
+                        return
+
+    points: set[tuple[int, int]] = set()
+    for unit in units:
+        points.add(unit["pos"])
+        if unit["target"] is not None:
+            points.add(unit["target"])
+    cell_size = max(unit_radius, 1)
+    grid: dict[tuple[int, int], list[tuple[int, int]]] = defaultdict(list)
+    for point in points:
+        grid[(point[0] // cell_size, point[1] // cell_size)].append(point)
+
+    cold: set[tuple[int, int]] = set()
+    for wall in _obstacle_memory:
+        x, y = int(wall[0]), int(wall[1])
+        if abs(x - core[0]) + abs(y - core[1]) <= core_radius:
+            continue
+        near_unit = False
+        if unit_radius > 0:
+            gx, gy = x // cell_size, y // cell_size
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for point in grid.get((gx + dx, gy + dy), ()):
+                        if abs(x - point[0]) + abs(y - point[1]) <= unit_radius:
+                            near_unit = True
+                            break
+                    if near_unit:
+                        break
+                if near_unit:
+                    break
+        if near_unit:
+            continue
+        if wall in corridor:
+            continue
+        cold.add((x, y))
+
+    if not cold:
+        print("[map] cold prune skipped: no cold walls", flush=True)
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_path = MAP_MEMORY_PATH.with_name(f"map_memory.pre-prune-{stamp}.json")
+    archive_path = MAP_MEMORY_PATH.with_name(f"map_memory.cold-prune-{stamp}.json.gz")
+    try:
+        shutil.copy2(MAP_MEMORY_PATH, backup_path)
+        tmp_archive = archive_path.with_name(archive_path.name + ".tmp")
+        with gzip.open(tmp_archive, "wt", encoding="utf-8") as handle:
+            json.dump({
+                "version": 1,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "tick": record.get("tick"),
+                "core": list(core),
+                "policy": {
+                    "core_radius": core_radius,
+                    "unit_radius": unit_radius,
+                    "path_radius": path_radius,
+                },
+                "cold_count": len(cold),
+                "walls": [list(wall) for wall in cold],
+            }, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp_archive, archive_path)
+    except Exception as exc:
+        print(f"[map] cold prune skipped: archive failed: {exc}", flush=True)
+        return
+
+    _obstacle_memory.difference_update(cold)
+    _known_obstacles = frozenset(_obstacle_memory)
+    _reset_dead_structure(_known_obstacles)
+    _map_dirty = True
+    try:
+        _save_map_memory(force=True)
+    except Exception as exc:
+        _obstacle_memory.update(cold)
+        _known_obstacles = frozenset(_obstacle_memory)
+        _reset_dead_structure(_known_obstacles)
+        _map_dirty = True
+        print(f"[map] cold prune save failed, restored walls: {exc}", flush=True)
+        return
+    try:
+        atomic_write_text(
+            MAP_COLD_PRUNE_MARKER,
+            json.dumps({
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "tick": record.get("tick"),
+                "removed": len(cold),
+                "remaining": len(_obstacle_memory),
+                "policy": {
+                    "core_radius": core_radius,
+                    "unit_radius": unit_radius,
+                    "path_radius": path_radius,
+                },
+                "backup": backup_path.name,
+                "archive": archive_path.name,
+            }, ensure_ascii=False),
+        )
+    except Exception as exc:
+        print(f"[map] cold prune marker write failed: {exc}", flush=True)
+    print(
+        f"[map] cold prune removed={len(cold)} remaining={len(_obstacle_memory)} "
+        f"core_r={core_radius} unit_r={unit_radius} path_r={path_radius} "
+        f"backup={backup_path.name} archive={archive_path.name}",
+        flush=True,
+    )
+
+
 
 def _dashboard_map_sig(data: dict) -> tuple:
     """Stable signature of dashboard-owned map fields."""
@@ -9742,6 +9945,10 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
     _skip_exit_map_save = False
     _pending_map_save_tick = None
     _load_map_memory()
+    try:
+        _prune_cold_map_memory()
+    except Exception as exc:
+        print(f"[map] cold prune failed: {exc}", flush=True)
     # Build the dead-end structure before connecting. Lazy-building it on the
     # first turn costs ~10s at 760k walls; the command window for that turn is
     # already gone by the time the plan finishes, which shows up as a
