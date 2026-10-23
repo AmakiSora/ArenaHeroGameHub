@@ -10173,9 +10173,10 @@ class CoreDriftLeashTests(unittest.TestCase):
 
     def _run_choose_actions(
         self, *, core_pos, worker_pos, core_state, config, anchor=None,
+        resource_cells=frozenset(),
     ):
         """One Tick with a single worker pulling the Core; returns
-        (core_action, issued_start_moves, anchor_after)."""
+        (core_action, issued_start_moves, anchor_after, assignments_after)."""
         moves: list = []
         core = SimpleNamespace(
             id="core", position=core_pos, hp=5, shield=10,
@@ -10205,7 +10206,7 @@ class CoreDriftLeashTests(unittest.TestCase):
             visible_enemies=(),
             core=core,
             resources=50,
-            resource_cells=frozenset(),
+            resource_cells=resource_cells,
             resource_space=0,
             beacon=beacon,
             state=SimpleNamespace(population=8),
@@ -10219,11 +10220,15 @@ class CoreDriftLeashTests(unittest.TestCase):
         prev_anchor = tactic._core_anchor
         prev_names = dict(tactic._object_names)
         prev_counters = dict(tactic._object_name_counters)
+        prev_assignments = dict(tactic._resource_assignments)
+        prev_resources = set(tactic._resource_memory)
         tactic._core_anchor = anchor
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             tactic._object_names.clear()
             tactic._object_name_counters.clear()
+            tactic._resource_assignments.clear()
+            tactic._resource_memory.clear()
             with patch.object(tactic, "load_config", return_value=config), \
                  patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
                  patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
@@ -10234,18 +10239,23 @@ class CoreDriftLeashTests(unittest.TestCase):
                 try:
                     core_action, _ = tactic.choose_actions(turn)
                     anchor_after = tactic._core_anchor
+                    assignments_after = dict(tactic._resource_assignments)
                 finally:
                     tactic._core_anchor = prev_anchor
                     tactic._object_names.clear()
                     tactic._object_names.update(prev_names)
                     tactic._object_name_counters.clear()
                     tactic._object_name_counters.update(prev_counters)
-        return core_action, moves, anchor_after
+                    tactic._resource_assignments.clear()
+                    tactic._resource_assignments.update(prev_assignments)
+                    tactic._resource_memory.clear()
+                    tactic._resource_memory.update(prev_resources)
+        return core_action, moves, anchor_after, assignments_after
 
     def test_start_move_not_reissued_while_core_is_moving(self) -> None:
         config = default_config()
         config["core_max_drift"] = 0  # isolate from the leash
-        action, moves, _ = self._run_choose_actions(
+        action, moves, _, _ = self._run_choose_actions(
             core_pos=(0, 0), worker_pos=(500, 0),
             core_state=CoreState.MOVING, config=config,
         )
@@ -10253,17 +10263,48 @@ class CoreDriftLeashTests(unittest.TestCase):
         self.assertEqual(action, "WAIT")
 
     def test_start_move_still_issued_when_core_is_normal(self) -> None:
-        action, moves, _ = self._run_choose_actions(
+        action, moves, _, _ = self._run_choose_actions(
             core_pos=(0, 0), worker_pos=(500, 0),
             core_state=CoreState.NORMAL, config=default_config(),
         )
         self.assertEqual(moves, [Direction.RIGHT])
         self.assertEqual(action, "MOVE_RIGHT")
 
+    def test_core_ignores_resource_under_its_own_cell(self) -> None:
+        # A mine under the Core cannot be harvested (empty workers vacate the
+        # chute first). Targeting it freezes the Core and makes idle workers
+        # bounce between the Core cell and the ring.
+        action, moves, _, assignments = self._run_choose_actions(
+            core_pos=(0, 0), worker_pos=(5, 0),
+            core_state=CoreState.NORMAL, config=default_config(),
+            resource_cells=frozenset({(0, 0)}),
+        )
+        self.assertEqual(action, "MOVE_RIGHT")
+        self.assertEqual(moves, [Direction.RIGHT])
+        self.assertNotIn((0, 0), assignments.values())
+
+    def test_core_does_not_step_onto_adjacent_mine(self) -> None:
+        action, moves, _, _ = self._run_choose_actions(
+            core_pos=(0, 0), worker_pos=(0, 5),
+            core_state=CoreState.NORMAL, config=default_config(),
+            resource_cells=frozenset({(1, 0)}),
+        )
+        self.assertEqual(action, "MOVE_DOWN")
+        self.assertEqual(moves, [Direction.DOWN])
+
+    def test_core_still_prefers_mine_beyond_adjacent_ring(self) -> None:
+        action, moves, _, _ = self._run_choose_actions(
+            core_pos=(0, 0), worker_pos=(0, 5),
+            core_state=CoreState.NORMAL, config=default_config(),
+            resource_cells=frozenset({(2, 0)}),
+        )
+        self.assertEqual(action, "MOVE_RIGHT")
+        self.assertEqual(moves, [Direction.RIGHT])
+
     def test_leash_blocks_step_beyond_anchor(self) -> None:
         config = default_config()
         config["core_max_drift"] = 2
-        action, moves, anchor_after = self._run_choose_actions(
+        action, moves, anchor_after, _ = self._run_choose_actions(
             core_pos=(2, 0), worker_pos=(500, 0),
             core_state=CoreState.NORMAL, config=config, anchor=(0, 0),
         )
@@ -10274,7 +10315,7 @@ class CoreDriftLeashTests(unittest.TestCase):
     def test_leash_allows_step_toward_anchor(self) -> None:
         config = default_config()
         config["core_max_drift"] = 2
-        action, moves, _ = self._run_choose_actions(
+        action, moves, _, _ = self._run_choose_actions(
             core_pos=(2, 0), worker_pos=(-500, 0),
             core_state=CoreState.NORMAL, config=config, anchor=(0, 0),
         )
@@ -10284,7 +10325,7 @@ class CoreDriftLeashTests(unittest.TestCase):
     def test_anchor_initialized_on_first_moving_tick(self) -> None:
         config = default_config()
         config["core_max_drift"] = 2
-        _, _, anchor_after = self._run_choose_actions(
+        _, _, anchor_after, _ = self._run_choose_actions(
             core_pos=(7, -3), worker_pos=(500, 0),
             core_state=CoreState.NORMAL, config=config, anchor=None,
         )
@@ -10296,7 +10337,7 @@ class CoreDriftLeashTests(unittest.TestCase):
         # cells back toward the stale anchor.
         config = default_config()
         config["core_max_drift"] = 2
-        action, moves, anchor_after = self._run_choose_actions(
+        action, moves, anchor_after, _ = self._run_choose_actions(
             core_pos=(100, 0), worker_pos=(600, 0),
             core_state=CoreState.NORMAL, config=config, anchor=(0, 0),
         )
@@ -10309,7 +10350,7 @@ class CoreDriftLeashTests(unittest.TestCase):
         config["core_target_enabled"] = True
         config["core_target_x"] = 500
         config["core_target_y"] = 0
-        action, moves, _ = self._run_choose_actions(
+        action, moves, _, _ = self._run_choose_actions(
             core_pos=(2, 0), worker_pos=(-500, 0),
             core_state=CoreState.NORMAL, config=config, anchor=(0, 0),
         )

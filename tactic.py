@@ -8988,9 +8988,16 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 )
             ]
 
+        # A mine under the Core is not mineable: an empty worker must vacate the
+        # chute before HARVEST, so assigning it produces a vacate/return A-B-A
+        # loop and starves Core production with CELL_UNIT_LIMIT.
+        assignable_resources = [
+            r for r in all_resources if tuple(r) != tuple(core_pos)
+        ]
+
         # Sticky validation must use the filtered set, otherwise a worker keeps
         # its old assignment to a mine that just became contested/out of range.
-        resource_set = set(all_resources)
+        resource_set = set(assignable_resources)
 
         sticky: dict[str, tuple[int, int]] = {}
         claimed_resources: set[tuple[int, int]] = set()
@@ -9003,7 +9010,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         _resource_assignments.update(sticky)
 
         available = [w for w in idle_workers if w[0] not in sticky]
-        open_resources = [r for r in all_resources if r not in claimed_resources]
+        open_resources = [r for r in assignable_resources if r not in claimed_resources]
         for res in sorted(
             open_resources,
             key=lambda p: min(_manhattan(p, w[1]) for w in available) if available else 0,
@@ -9182,10 +9189,20 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                     avg_y = sum(wy) // len(wy)
                 else:
                     avg_x, avg_y = core_pos
-                # Also consider nearest resource (visible or remembered)
+                # Also consider nearest resource (visible or remembered).
+                # Never target the Core's own cell or an adjacent mine: the
+                # Core would sit on it and leave it unminable (empty workers
+                # vacate the chute before HARVEST). Prefer the next resource.
                 res_target = None
                 if all_resources:
-                    res_target = min(all_resources, key=lambda p: _manhattan(core_pos, p))
+                    res_candidates = [
+                        r for r in all_resources
+                        if _manhattan(core_pos, r) > 1
+                    ]
+                    if res_candidates:
+                        res_target = min(
+                            res_candidates, key=lambda p: _manhattan(core_pos, p)
+                        )
                 # Choose target: nearest resource or worker center, whichever is closer
                 if (
                     config["prefer_resources_for_core"]
