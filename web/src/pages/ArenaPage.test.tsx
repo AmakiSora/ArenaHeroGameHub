@@ -148,6 +148,18 @@ describe('ArenaPage asset selection', () => {
 		}))
   })
 
+  it('cancels the shoot targeting mode with Escape', async () => {
+    const user = userEvent.setup()
+    render(<ArenaPage demo />)
+
+    await user.click(screen.getByText('Ranger'))
+    await user.click(screen.getByRole('button', { name: 'Shoot' }))
+    expect(screen.getByText('Choose a highlighted firing cell')).toBeInTheDocument()
+
+    await user.keyboard('{Escape}')
+    expect(screen.queryByText('Choose a highlighted firing cell')).not.toBeInTheDocument()
+  })
+
   it('picks the attack squad target coordinates from the map and saves both fields', async () => {
     const user = userEvent.setup()
     render(<ArenaPage />)

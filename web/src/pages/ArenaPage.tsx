@@ -347,6 +347,20 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   }
   const changeSquadTargets = (squad: SquadKey, index?: number) => void (index === undefined ? clearSquadTargets(squad) : removeSquadTarget(squad, index)).then((ok) => { if (ok) refreshSquadTargets() })
   const squadTargetPickHighlight = useMemo<Position[]>(() => squadTargetPick ? squadTargets[squadTargetPick] ?? [] : [], [squadTargetPick, squadTargets])
+  // Esc backs out of whichever map-picking mode is active (shoot/sweep
+  // targeting, move destination, coordinate/waypoint/squad/strategy picks)
+  // without reaching for the hint banner's cancel button.
+  useEffect(() => {
+    if (!targetMode && !moveSelecting && !coordPick && !waypointPick && !squadTargetPick && !strategyPick) return
+    const cancelOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      setTargetMode(null); setMoveSelecting(false); setMovementError(null)
+      setCoordPick(null); setWaypointPick(null); setSquadTargetPick(null)
+      if (strategyPick) { setStrategyPick(null); setStrategyConfigOpen(true) }
+    }
+    window.addEventListener('keydown', cancelOnEscape)
+    return () => window.removeEventListener('keydown', cancelOnEscape)
+  }, [coordPick, moveSelecting, squadTargetPick, strategyPick, targetMode, waypointPick])
   const chooseMoveDestination = (target: Position) => {
     if (!game.state || !selected?.id || !selected.position) return
     if (selected.position[0] === target[0] && selected.position[1] === target[1]) { removeMovementGoal(selected.id); if (selected.kind === 'CORE') setCoreAction(null); else setUnitAction(selected.id, null); select(null); return }
