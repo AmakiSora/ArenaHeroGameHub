@@ -5229,6 +5229,37 @@ class DemandSpawnTests(unittest.TestCase):
             "SPAWN_RANGER",
         )
 
+    def test_combat_units_alternate_after_workers_full(self) -> None:
+        # Workers are full: Vanguards and Rangers take turns. The type with
+        # fewer live units goes next, so the two grow evenly instead of the
+        # Vanguard filling up first.
+        self.assertEqual(
+            tactic._plan_demand_spawn(
+                self._turn(workers=10, vanguards=0, rangers=0), self.Core(), 100, self.config),
+            "SPAWN_VANGUARD",
+        )
+        self.assertEqual(
+            tactic._plan_demand_spawn(
+                self._turn(workers=10, vanguards=1, rangers=0), self.Core(), 100, self.config),
+            "SPAWN_RANGER",
+        )
+        self.assertEqual(
+            tactic._plan_demand_spawn(
+                self._turn(workers=10, vanguards=1, rangers=1), self.Core(), 100, self.config),
+            "SPAWN_VANGUARD",
+        )
+        self.assertIsNone(
+            tactic._plan_demand_spawn(
+                self._turn(workers=10, vanguards=2, rangers=2), self.Core(), 100, self.config))
+
+    def test_workers_still_first_while_below_target(self) -> None:
+        turn = self._turn(workers=9, vanguards=0, rangers=0)
+
+        self.assertEqual(
+            tactic._plan_demand_spawn(turn, self.Core(), 100, self.config),
+            "SPAWN_WORKER",
+        )
+
     def test_occupied_core_cell_blocks_spawn(self) -> None:
         blocking = self._unit("blocker", UnitType.WORKER, (0, 0))  # stands on the Core
         turn = self._turn(workers=8, extra_units=[blocking])

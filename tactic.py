@@ -109,6 +109,8 @@ UNIT_SPAWN_COSTS = {
     "RANGER": 12,
 }
 # Spawn priority when several types are below their target (economy first).
+# Once the worker target is met the combat types alternate instead of filling
+# Vanguards before Rangers — see _spawn_order.
 _SPAWN_PRIORITY = (UnitType.WORKER, UnitType.VANGUARD, UnitType.RANGER)
 # Config key for each unit type's target, and its fallback when unset.
 _TARGET_KEYS = {
@@ -8458,6 +8460,24 @@ def _spawn_cost(unit_type: UnitType, population: int) -> int:
         return UNIT_SPAWN_COSTS[unit_type.name]
 
 
+def _spawn_order(turn: Any, config: dict[str, Any]) -> tuple[UnitType, ...]:
+    """Production order for one Tick: workers first, then alternating combat.
+
+    While the worker count is below `target_workers`, the fixed worker-first
+    priority applies. Once workers are full, Vanguards and Rangers alternate —
+    the type with fewer live units goes next, ties go to the Vanguard — so the
+    two types grow evenly (V, R, V, R...) instead of Vanguards filling up first.
+    """
+    worker_target = int(config.get(_TARGET_KEYS[UnitType.WORKER], _TARGET_DEFAULTS[UnitType.WORKER]))
+    if _unit_type_count(turn, UnitType.WORKER) < worker_target:
+        return _SPAWN_PRIORITY
+    combat = sorted(
+        (UnitType.VANGUARD, UnitType.RANGER),
+        key=lambda unit_type: _unit_type_count(turn, unit_type),
+    )
+    return (UnitType.WORKER, *combat)
+
+
 def _plan_demand_spawn(turn: Any, core: Any, resources: int, config: dict[str, Any]) -> str | None:
     """Spawn the highest-priority type whose current count is below its target.
 
@@ -8475,7 +8495,7 @@ def _plan_demand_spawn(turn: Any, core: Any, resources: int, config: dict[str, A
 
     population = getattr(getattr(turn, "state", None), "population", 0) or 0
     reserve = int(config.get("resource_reserve", 0))
-    for unit_type in _SPAWN_PRIORITY:
+    for unit_type in _spawn_order(turn, config):
         count = _unit_type_count(turn, unit_type)
         target = int(config.get(_TARGET_KEYS[unit_type], _TARGET_DEFAULTS[unit_type]))
         if count >= target:
