@@ -5322,11 +5322,17 @@ def _kite_choose_move(
     progress stops outranking a safe detour step (progress=-1 versus WAIT's 0
     froze units forever), so the risk-free tie-break ignores progress and any
     safe non-dead-end step beats WAIT. Hit-count safety scoring is untouched:
-    the unlock only applies when there is no enemy threat whatsoever.
+    the unlock only applies when this unit sees no enemy threat whatsoever.
 
-    The unlock gate is deliberately global: ``global_enemies`` is the full
-    visible-enemy tuple of the whole army (not this unit's local sight), so a
-    threat outside this unit's vision still keeps the cover contract intact.
+    Two unlock tiers, because one gate is not enough. The cover contract is
+    deliberately kept for threats this unit cannot see: ``global_enemies`` is
+    the full visible-enemy tuple of the whole army, so an enemy outside this
+    unit's vision still keeps it in cover — but only up to
+    _KITE_STALL_HARD_UNLOCK_TICKS. In combat the army sees *something* on ~70%
+    of Ticks, so the short 12-Tick tier alone was unreachable and a hold-free
+    unit at a memory-dead-ended pocket mouth froze forever (observed V10 at
+    (-807,-2244): three walled neighbours, the single free one classified a
+    dead end, ``enemies=[]`` on 170/170 Ticks, immobile 1,670+ Ticks).
     The unlock is also suppressed once the unit already stands on its goal —
     arriving at a coordinate/beacon target is a deliberate hold, and letting
     the unlock fire there would jitter the unit one cell every threshold
@@ -5349,6 +5355,18 @@ def _kite_choose_move(
     # where it came from (observed V11/V6: ``kite-route`` one Tick, ``kite-position``
     # the reverse the next, 98% of Ticks, net displacement zero).
     came_from = _kite_prev_pos.get(str(unit.id))
+    # Decided once per plan, not per candidate: the unlock also has to lift the
+    # `-dead_end` penalty below, or a unit whose only exit memory calls a dead
+    # end keeps losing to WAIT and stays frozen whatever the tier.
+    stall_unlocked = (
+        pos != goal
+        and not enemies
+        and stall_ticks >= (
+            _KITE_STALL_UNLOCK_TICKS
+            if not global_enemies
+            else _KITE_STALL_HARD_UNLOCK_TICKS
+        )
+    )
     choices: list[tuple[tuple, Direction | None, tuple[int, int], dict[str, Any]]] = []
     directions: tuple[Direction | None, ...] = (
         Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT, None,
@@ -5370,6 +5388,7 @@ def _kite_choose_move(
         progress = _manhattan(pos, goal) - _manhattan(cell, goal)
         dead_end = int(
             direction is not None
+            and not stall_unlocked
             and _is_dead_end_step(cell, obstacle_cells, allow=(goal,))
         )
         backtrack = int(
@@ -5381,11 +5400,6 @@ def _kite_choose_move(
         # tie-break while every available cell is still dangerous.
         risk_free = not (
             assessment["current_hits"] or assessment["predicted_hits"]
-        )
-        stall_unlocked = (
-            stall_ticks >= _KITE_STALL_UNLOCK_TICKS
-            and not global_enemies
-            and pos != goal
         )
         tactical_ties = (
             ((0, assessment["nearest"]) if stall_unlocked else (progress, assessment["nearest"]))
@@ -6805,6 +6819,13 @@ _kite_collision_streak: dict[str, tuple[tuple[int, int], tuple[int, int], int]] 
 _kite_stall_pos: dict[str, tuple[int, int]] = {}
 _kite_stall_ticks: dict[str, int] = {}
 _KITE_STALL_UNLOCK_TICKS = 12
+# Ceiling for the cover contract. While any ally sees an enemy the short window
+# above never opens, and the army reports a sighting on ~70% of combat Ticks —
+# so a threat-free unit that only has memory-dead-ended exits left froze for
+# hours (V10: 1,670+ Ticks, enemies=[] every Tick). Past this many frozen Ticks
+# the detour unlocks anyway; a hold that lasts this long is not cover, it is a
+# freeze. 180 Ticks ≈ 48 min of real time at the observed cadence.
+_KITE_STALL_HARD_UNLOCK_TICKS = 180
 _KITE_STALL_DRIFT = 1
 # Where each kite unit stood when it last planned, so the single-step chooser
 # can rank a step back onto that cell below every other equally safe step.

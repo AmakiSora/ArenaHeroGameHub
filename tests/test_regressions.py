@@ -9209,20 +9209,72 @@ class KiteStallUnlockRegressionTests(KiteTeamPlannerTests):
         )
         self.assertIsNone(direction)
 
-    def test_stall_unlock_requires_the_global_enemy_pool_to_be_empty(self):
-        # Review fix: the unlock gate used to inspect only this unit's local
-        # threats, so an enemy visible to the rest of the army but outside
-        # this unit's sight still unlocked it from cover. The gate must use
-        # the full visible-enemy tuple the planner received.
+    def test_global_threats_only_delay_the_unlock_until_the_hard_ceiling(self):
+        # Review fix (kept, but bounded): the unlock gate must not ignore what
+        # the rest of the army sees, or a unit leaves cover for an enemy outside
+        # its own sight. Bounded, because the army reports a sighting on ~70% of
+        # combat Ticks, so an unbounded global gate made the unlock unreachable
+        # and froze V10 at (-807,-2244) for 1,670+ Ticks with enemies=[] every
+        # Tick. Cover now holds up to _KITE_STALL_HARD_UNLOCK_TICKS, then the
+        # detour wins.
         unit = self.unit("kite-unlock-global", (0, 0))
         walls = frozenset({(1, 0), (0, -1)})
         far_enemy = self.enemy("far-visible", (30, 30))
+        for stall_ticks in (
+            tactic._KITE_STALL_UNLOCK_TICKS,
+            tactic._KITE_STALL_HARD_UNLOCK_TICKS - 1,
+        ):
+            direction, _, _ = tactic._kite_choose_move(
+                unit, (0, 0), (10, 0), (), walls, 3, {},
+                must_move=False, stall_ticks=stall_ticks,
+                global_enemies=(far_enemy,),
+            )
+            self.assertIsNone(
+                direction,
+                f"an off-vision threat must keep cover at stall={stall_ticks}",
+            )
+        direction, _, _ = tactic._kite_choose_move(
+            unit, (0, 0), (10, 0), (), walls, 3, {},
+            must_move=False, stall_ticks=tactic._KITE_STALL_HARD_UNLOCK_TICKS,
+            global_enemies=(far_enemy,),
+        )
+        self.assertIsNotNone(
+            direction, "the hard ceiling must finally break the freeze"
+        )
+
+    def test_unlock_walks_out_of_a_memory_dead_end_pocket(self):
+        # Production shape: three walled neighbours and the single free exit
+        # memory calls a dead end. With the old ordering the `-dead_end` term
+        # sat above "any step outranks sitting still", so even an unlocked unit
+        # kept scoring WAIT over its only way out.
+        unit = self.unit("kite-unlock-pocket", (0, 0))
+        walls = frozenset({(1, 0), (-1, 0), (0, -1), (0, 2), (1, 1), (-1, 1)})
+        self.assertTrue(
+            tactic._is_dead_end_step((0, 1), walls),
+            "the test pocket must really present a dead-ended exit",
+        )
         direction, _, _ = tactic._kite_choose_move(
             unit, (0, 0), (10, 0), (), walls, 3, {},
             must_move=False, stall_ticks=tactic._KITE_STALL_UNLOCK_TICKS,
-            global_enemies=(far_enemy,),
         )
-        self.assertIsNone(direction)
+        self.assertIs(
+            direction, Direction.DOWN,
+            "a stalled threat-free unit must take its only exit, dead end or not",
+        )
+
+    def test_unlock_never_fires_for_a_locally_visible_threat(self):
+        # The bounding ceiling must not become "walk into what you can see".
+        unit = self.unit("kite-unlock-local", (0, 0))
+        walls = frozenset({(1, 0), (-1, 0), (0, -1), (0, 2), (1, 1), (-1, 1)})
+        enemy = self.enemy("local-blocker", (2, 1))
+        direction, _, _ = tactic._kite_choose_move(
+            unit, (0, 0), (10, 0), (enemy,), walls, 3, {},
+            must_move=False, stall_ticks=tactic._KITE_STALL_HARD_UNLOCK_TICKS,
+            global_enemies=(enemy,),
+        )
+        self.assertIsNone(
+            direction, "a threat in this unit's own sight keeps it in cover"
+        )
 
     def test_stall_unlock_is_suppressed_once_the_goal_is_reached(self):
         # Review fix: a kite squad that has arrived at its coordinate/beacon
