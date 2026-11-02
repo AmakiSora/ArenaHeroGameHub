@@ -2700,7 +2700,24 @@ def _plan_worker(
             else _worker_rally_goal(uid, pos, tuple(core.position), config)
         )
         if rally is not None:
-            marched = _long_march_step(
+            # A greedy step alone cannot break a wall island. On the live map
+            # memory two workers (W2/W9) circled the same 6 cells for 171 Ticks
+            # — net displacement 2, cargo 0 — 175 cells from the Core, while a
+            # real route home existed and cost ~2.5k expansions to find
+            # (replayed over 60 steps: greedy net 0, A* closed 50 cells).
+            # March the rally with the same cached A* the combat units use for
+            # home-return, and keep the budget-free greedy step for the Tick the
+            # search misses or the per-Tick march cap is already spent.
+            marched = _move_towards(
+                worker,
+                pos,
+                rally,
+                obstacle_cells,
+                detail_prefix="rally-home",
+                cell_counts=cell_counts,
+                extra_obstacles=move_blocked,
+                max_steps=int(config.get("bfs_max_steps", 2500)),
+            ) or _long_march_step(
                 worker,
                 pos,
                 rally,

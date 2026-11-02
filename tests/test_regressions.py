@@ -12848,12 +12848,20 @@ class WorkerExploreLoopBreakTests(unittest.TestCase):
             "rally": dict(tactic._worker_rally_home),
             "assign": dict(tactic._resource_assignments),
             "space": tactic.turn_context.resource_space,
+            "tick": tactic.turn_context.tick,
+            "combat_paths": {
+                k: dict(v) for k, v in tactic._combat_path_cache.items()
+            },
+            "march_miss": dict(tactic._march_route_miss),
+            "march_spent": tactic._march_budget_spent,
         }
         tactic._worker_last_pos.clear()
         tactic._worker_recent.clear()
         tactic._worker_explore_history.clear()
         tactic._worker_rally_home.clear()
         tactic._resource_assignments.clear()
+        tactic._combat_path_cache.clear()
+        tactic._march_route_miss.clear()
 
     def tearDown(self) -> None:
         tactic._worker_last_pos.clear()
@@ -12867,6 +12875,12 @@ class WorkerExploreLoopBreakTests(unittest.TestCase):
         tactic._resource_assignments.clear()
         tactic._resource_assignments.update(self._saved["assign"])
         tactic.turn_context.resource_space = self._saved["space"]
+        tactic.turn_context.tick = self._saved["tick"]
+        tactic._combat_path_cache.clear()
+        tactic._combat_path_cache.update(self._saved["combat_paths"])
+        tactic._march_route_miss.clear()
+        tactic._march_route_miss.update(self._saved["march_miss"])
+        tactic._march_budget_spent = self._saved["march_spent"]
 
     def test_never_walked_exit_outranks_a_ring_cell_lapped_seven_steps_ago(self):
         class Worker:
@@ -12967,6 +12981,145 @@ class WorkerExploreLoopBreakTests(unittest.TestCase):
              worker.position[1] + worker.direction.delta[1]),
             (0, 399),
         )
+
+    # 34 wall rows cropped out of the production map at radius 18 around
+    # (-1084, -2617) — the cell two workers (W2/W9, 171 Ticks each, net
+    # displacement 2, cargo 0) circled forever. Rows are (dy, ((dx0, dx1), ...))
+    # relative to the worker's start cell.
+    RALLY_TRAP_ROWS = (
+        (-18, ((0, 0),)),
+        (-15, ((-1, -1),)),
+        (-14, ((3, 3),)),
+        (-13, ((-4, -3),)),
+        (-12, ((-5, -5), (-2, -2), (5, 5))),
+        (-11, ((-4, -2),)),
+        (-10, ((-7, -7), (-5, -4))),
+        (-9, ((-8, -7), (-5, -5), (0, 0), (9, 9))),
+        (-8, ((-4, -4), (2, 2), (5, 5))),
+        (-7, ((-5, -5), (-2, -2), (9, 9))),
+        (-6, ((0, 0),)),
+        (-5, ((-5, -4), (2, 3), (5, 5))),
+        (-4, ((-10, -10), (-8, -8), (-4, -1), (3, 4), (7, 7))),
+        (-3, ((-15, -15), (-8, -8), (-6, -6), (-4, -4), (0, 0), (4, 4),
+              (6, 6), (14, 14))),
+        (-2, ((-10, -10), (1, 1), (14, 14), (16, 16))),
+        (-1, ((-17, -17), (-3, -2), (2, 2), (4, 4), (16, 16))),
+        (0, ((-8, -8), (2, 2))),
+        (1, ((-16, -16), (-13, -13), (-11, -11), (-8, -8), (-4, -4), (-1, -1),
+             (1, 1), (17, 17))),
+        (2, ((-15, -15), (-13, -11), (-5, -5), (0, 1), (5, 5), (15, 15))),
+        (3, ((-15, -14), (-11, -10), (-5, -5), (1, 2), (4, 4), (6, 6))),
+        (4, ((-14, -14), (-2, -2), (6, 6), (8, 8))),
+        (5, ((-8, -8), (-5, -4), (1, 1), (3, 3), (7, 7))),
+        (6, ((-12, -12), (-4, -4), (0, 0), (2, 2), (5, 5), (8, 8))),
+        (7, ((-11, -9), (-6, -6), (-1, -1), (1, 1), (3, 3), (9, 9))),
+        (8, ((-4, -3), (0, 1))),
+        (9, ((-4, -4), (-2, -2), (1, 2), (4, 4))),
+        (10, ((-8, -7), (-3, -3), (2, 2), (6, 6))),
+        (11, ((-2, -1),)),
+        (12, ((2, 2),)),
+        (13, ((-5, -5),)),
+        (15, ((-2, -2),)),
+        (16, ((-1, -1),)),
+        (17, ((-1, -1),)),
+        (18, ((0, 0),)),
+    )
+
+    @staticmethod
+    def _trap_obstacles() -> frozenset:
+        cells: set = set()
+        for dy, runs in WorkerExploreLoopBreakTests.RALLY_TRAP_ROWS:
+            for x0, x1 in runs:
+                cells.update((x, dy) for x in range(x0, x1 + 1))
+        return frozenset(cells)
+
+    def test_rally_home_routes_around_a_wall_island_instead_of_circling(self) -> None:
+        class Worker:
+            id = "w-island"
+
+            def __init__(self) -> None:
+                self.position = (0, 0)
+                self.cargo = 0
+                self.direction = None
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.direction = None
+
+        config = default_config()
+        config["worker_mine_max_distance"] = 100
+        core = (174, 8)  # 182 cells out, as in the production crop
+        tactic.turn_context.resource_space = 100
+        # Hysteresis as observed on site: rally was already latched, so the
+        # Core stays the goal until the worker is inside radius // 2.
+        tactic._worker_rally_home["w-island"] = True
+        worker = Worker()
+        obstacles = self._trap_obstacles()
+
+        for tick in range(1, 31):
+            tactic.turn_context.tick = tick
+            tactic._march_budget_spent = 0
+            worker.direction = None
+            action, detail = tactic._plan_worker(
+                worker,
+                SimpleNamespace(position=core),
+                resource_cells=frozenset(),
+                obstacle_cells=obstacles,
+                depleted=set(),
+                config=config,
+            )
+            self.assertEqual(action, "MOVE", f"tick {tick}: {detail}")
+            self.assertIn("rally-home", detail)
+            if worker.direction is not None:
+                delta = worker.direction.delta
+                worker.position = (worker.position[0] + delta[0],
+                                   worker.position[1] + delta[1])
+
+        remaining = abs(worker.position[0] - core[0]) + abs(worker.position[1] - core[1])
+        # The greedy-only march replayed over these very walls ended exactly
+        # where it began (net 0 over 60 Ticks); the routed march has to close a
+        # real share of the distance instead of walking the perimeter.
+        self.assertLessEqual(
+            remaining, 160,
+            f"rally-home made no progress around the island: {worker.position}",
+        )
+
+    def test_rally_home_falls_back_to_the_greedy_march_when_routing_misses(self) -> None:
+        class Worker:
+            id = "w-starved"
+
+            def __init__(self) -> None:
+                self.position = (0, 400)
+                self.cargo = 0
+                self.direction = None
+
+            def move(self, direction) -> None:
+                self.direction = direction
+
+            def wait(self) -> None:
+                self.direction = None
+
+        config = default_config()
+        config["worker_mine_max_distance"] = 100
+        tactic.turn_context.resource_space = 100
+        worker = Worker()
+        with patch.object(tactic, "_move_towards", return_value=None) as routed, \
+             patch.object(tactic, "_long_march_step",
+                          return_value=("MOVE", "UP rally-home (0, 0)")) as greedy:
+            action, detail = tactic._plan_worker(
+                worker,
+                SimpleNamespace(position=(0, 0)),
+                resource_cells=frozenset(),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+            )
+        self.assertTrue(routed.called, "rally-home must try a real route first")
+        self.assertTrue(greedy.called, "a starved search must keep the greedy step")
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(detail, "UP rally-home (0, 0)")
 
 
 class HomeReturnFarStrandedTests(unittest.TestCase):
