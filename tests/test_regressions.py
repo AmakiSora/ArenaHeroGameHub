@@ -10965,7 +10965,13 @@ class WorkerContestedBackoffTests(unittest.TestCase):
             any(v.startswith("MOVE") for v in details.values()), details,
         )
 
-    def test_non_worker_actors_never_enter_the_worker_tracker(self) -> None:
+    def test_unknown_actors_never_enter_the_tracker(self) -> None:
+        """Rejections from ids this Tick has no unit for are ignored.
+
+        Combat teammates now do enter the tracker (the attack branch parks the
+        refused neighbour); this guards the other half — an enemy or a unit that
+        already died cannot hold a slot.
+        """
         event = SimpleNamespace(
             event_type="UNIT_MOVE_FAILED",
             reason_code="MOVE_CONTESTED",
@@ -11070,6 +11076,126 @@ class WorkerContestedBackoffTests(unittest.TestCase):
         self._run(tick=tactic._WORKER_CONTEST_BLOCK_AFTER + 3, worker_id="worker-1",
                   position=(9, 9))
         self.assertEqual(tactic._worker_contest_repeat, {})
+
+
+class AttackContestAvoidanceTests(unittest.TestCase):
+    """An attack unit kept out of a neighbour by a claimant it cannot see must
+    park that cell and march around it, not re-issue the refused step forever.
+
+    Production R5: 152 straight Ticks of ``MOVE:RIGHT`` rejected with
+    MOVE_CONTESTED out of (-1182,-2391), net displacement 0. A visible blocker
+    already reaches the planner through ``adjacent_enemies``; the rejection
+    naming only the actor's own cell was the gap, and the park-and-route-around
+    breaker existed for carriers only.
+    """
+
+    GLOBALS = (
+        "_map_dirty", "_worker_contest_streak", "_worker_contest_repeat",
+        "_worker_contest_blocked", "_worker_planned_step", "_cell_limit_streak",
+        "_combat_path_cache", "_object_names", "_object_name_counters",
+        "_worker_last_pos", "_worker_recent",
+    )
+
+    def setUp(self) -> None:
+        self._snap = {
+            name: copy.copy(getattr(tactic, name)) for name in self.GLOBALS
+        }
+        for name in self.GLOBALS:
+            value = getattr(tactic, name)
+            if isinstance(value, dict):
+                value.clear()
+        tactic._object_names[("R", "ranger-5")] = "R5"
+
+    def tearDown(self) -> None:
+        for name, value in self._snap.items():
+            setattr(tactic, name, copy.copy(value))
+
+    @staticmethod
+    def _refusal():
+        return SimpleNamespace(
+            event_type="UNIT_MOVE_FAILED", reason_code="MOVE_CONTESTED",
+            actor_id="ranger-5", target_id=None, position=(3, 0), values={},
+        )
+
+    def _run(self, *, tick, events=(), team="attack"):
+        """One Tick: a lone attack ranger at (3,0) marching on the Core at (7,0).
+
+        (4,0) is the straight line to the goal, so the refused step is exactly
+        what the march keeps asking for.
+        """
+        core = SimpleNamespace(
+            id="core", position=(7, 0), hp=5, shield=10,
+            view=SimpleNamespace(state=CoreState.NORMAL),
+            spawn=lambda unit_type: None, heal=lambda: None,
+            repair_shield=lambda: None, pickup_beacon=lambda: None,
+            start_move=lambda direction: None, wait=lambda: None,
+        )
+        unit = SimpleNamespace(
+            id="ranger-5", unit_type=UnitType.RANGER, position=(3, 0),
+            hp=3, shield=0, cargo=0, direction=None,
+        )
+        unit.move = lambda direction: None
+        unit.wait = lambda: None
+        unit.shoot = lambda target, *, expected_cell=None: None
+        unit.sweep = lambda direction: None
+        turn = SimpleNamespace(
+            tick=tick, units=(unit,), workers=(), vanguards=(), rangers=(unit,),
+            visible_enemies=(), core=core, resources=50, resource_cells=frozenset(),
+            resource_space=3,
+            beacon=SimpleNamespace(position=None, status=SimpleNamespace(name="GROUND")),
+            state=SimpleNamespace(population=1), events=tuple(events),
+            obstacle_cells=frozenset(),
+        )
+        config = default_config()
+        config["attack_team"] = "R5" if team == "attack" else ""
+        config["kite_team"] = "R5" if team == "kite" else ""
+        config["home_team"] = ""
+        config["guerrilla_team"] = ""
+        config["attack_mode"] = "coords"
+        config["attack_target_x"] = 7
+        config["attack_target_y"] = 0
+        config["target_workers"] = 0
+        config["target_vanguards"] = 0
+        config["target_rangers"] = 1
+        tactic.turn_context.tick = tick
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            with patch.object(tactic, "load_config", return_value=config), \
+                 patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
+                 patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
+                 patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"), \
+                 patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"), \
+                 patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"):
+                tactic._map_dirty = False
+                _, details = tactic.choose_actions(turn)
+        return details
+
+    def test_march_records_the_step_it_asked_for(self) -> None:
+        details = self._run(tick=1)
+        self.assertTrue(details["ranger-5"].startswith("MOVE:RIGHT"), details)
+        self.assertEqual(
+            tactic._worker_planned_step["ranger-5"], ((3, 0), (4, 0)),
+        )
+
+    def test_repeated_refusals_park_the_cell_and_route_around_it(self) -> None:
+        details = {}
+        for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 2):
+            details = self._run(tick=tick, events=[self._refusal()])
+        blocked = tactic._worker_contest_blocked.get("ranger-5")
+        self.assertIsNotNone(blocked, "combat repeats must park the refused cell")
+        self.assertEqual(blocked[0], (4, 0))
+        self.assertTrue(details["ranger-5"].startswith("MOVE"), details)
+        self.assertIn("contest-avoid=(4, 0)", details["ranger-5"], details)
+        self.assertNotEqual(
+            tactic._worker_planned_step["ranger-5"][1], (4, 0), details,
+        )
+
+    def test_other_teams_keep_their_own_breakers(self) -> None:
+        """Kite/guerrilla are tracked but never consume the parked cell, so the
+        kite collision breaker stays the only mechanism for them."""
+        for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 2):
+            self._run(tick=tick, events=[self._refusal()], team="kite")
+        self.assertEqual(tactic._worker_contest_blocked, {})
 
 
 class CapacityAwareCombatMoveTests(unittest.TestCase):

@@ -7023,6 +7023,39 @@ def _cell_limit_block_cell(uid: str, tick: int) -> tuple[int, int] | None:
     return block[0]
 
 
+def _attack_contest_cell(uid: str, tick: int) -> tuple[int, int] | None:
+    """The neighbour ``uid`` keeps being refused entry to, or None.
+
+    The invisible-claimant case: a visible blocker already reaches the planners
+    through ``adjacent_enemies``, but a claimant outside vision only shows up as
+    a MOVE_CONTESTED rejection naming the unit's own cell. Parking the refused
+    destination (the worker backoff's mechanism) makes the regroup march route
+    around it instead of re-issuing the doomed step forever.
+    """
+    block = _worker_contest_blocked.get(uid)
+    if block is None or block[1] <= tick:
+        return None
+    return block[0]
+
+
+def _record_combat_planned_step(unit: Any, detail: str) -> None:
+    """Remember which neighbour this combat step aimed at, for the breaker above."""
+    try:
+        direction = Direction[detail.split(" ", 1)[0]]
+    except (KeyError, IndexError, ValueError):
+        return
+    origin = tuple(unit.position)
+    _worker_planned_step[str(unit.id)] = (
+        origin,
+        (origin[0] + direction.delta[0], origin[1] + direction.delta[1]),
+    )
+
+
+def _attack_contest_note(cell: tuple[int, int] | None) -> str:
+    """Suffix marking that this step was planned around a parked refusal."""
+    return f" contest-avoid={cell}" if cell is not None else ""
+
+
 # Cache of per-name home-team patrol slot indices. Keyed by (radius, sorted
 # roster tuple) so changing the roster or radius recomputes the assignment.
 # Prevents multiple home defenders from hashing onto the same patrol slot and
@@ -9526,12 +9559,21 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         _key: _cell_limit_streak.get(_key, 0) + 1 for _key in _failed_again
     }
 
-    # Worker MOVE_CONTESTED repeat bookkeeping: two workers whose deterministic
-    # plans submit the same cell every Tick cancel both moves every Tick. A
-    # worker rejected twice in a row from the same cell toward the same
-    # destination backs off for one Tick (worker branch below) so the peer's
-    # move can land. Same rebuild-from-scratch semantics as the streak above.
-    _worker_pos_by_id = {str(w.id): tuple(w.position) for w in turn.workers}
+    # MOVE_CONTESTED repeat bookkeeping (workers and the attack team): two
+    # workers whose deterministic plans submit the same cell every Tick cancel
+    # both moves every Tick. A worker rejected twice in a row from the same cell
+    # toward the same destination backs off for one Tick (worker branch below)
+    # so the peer's move can land. Same rebuild-from-scratch semantics as the
+    # streak above. Combat units are tracked here too because an attack march can
+    # be refused by a claimant it cannot see: production R5 re-issued the same
+    # MOVE:RIGHT out of (-1182,-2391) for 152 straight Ticks, net displacement 0,
+    # and the rejection only ever names the unit's own cell. Only the attack
+    # branch reads the parked cell back, so kite/guerrilla keep their own
+    # breakers untouched.
+    _worker_pos_by_id = {
+        str(u.id): tuple(u.position)
+        for u in (*turn.workers, *turn.vanguards, *turn.rangers)
+    }
     _contested_now: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {}
     for _ev in getattr(turn, "events", ()) or ():
         if (
@@ -9542,7 +9584,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             _key = str(getattr(_ev, "actor_id", None))
             _wpos = _worker_pos_by_id.get(_key)
             if _wpos is None:
-                continue  # non-worker actors: kite has its own breaker
+                continue  # unknown actor (enemy or already dead)
             _contested_now[_key] = (_wpos, tuple(_ev.position))
     _worker_contest_streak = {
         _key: (
@@ -10021,10 +10063,14 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         elif unit.unit_type == UnitType.VANGUARD:
             team = _combat_team_for(name, config)
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
+            _contest_cell = (
+                _attack_contest_cell(str(unit.id), turn.tick)
+                if team == "attack"
+                else None
+            )
+            _extra_block = {c for c in (_blocked_cell, _contest_cell) if c is not None}
             _unit_obstacles = (
-                obstacle_cells | {_blocked_cell}
-                if _blocked_cell is not None
-                else obstacle_cells
+                obstacle_cells | _extra_block if _extra_block else obstacle_cells
             )
             _ut0 = time.monotonic()
             action, detail = _plan_vanguard(
@@ -10037,14 +10083,23 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 cell_counts=friendly_cell_counts,
             )
             unit_phase_ms["vanguard"] += time.monotonic() - _ut0
-            unit_actions_detail[uid] = f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
+            unit_actions_detail[uid] = (
+                f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
+                + _attack_contest_note(_contest_cell)
+            )
+            if action == "MOVE" and team == "attack":
+                _record_combat_planned_step(unit, detail)
         elif unit.unit_type == UnitType.RANGER:
             team = _combat_team_for(name, config)
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
+            _contest_cell = (
+                _attack_contest_cell(str(unit.id), turn.tick)
+                if team == "attack"
+                else None
+            )
+            _extra_block = {c for c in (_blocked_cell, _contest_cell) if c is not None}
             _unit_obstacles = (
-                obstacle_cells | {_blocked_cell}
-                if _blocked_cell is not None
-                else obstacle_cells
+                obstacle_cells | _extra_block if _extra_block else obstacle_cells
             )
             _ut0 = time.monotonic()
             action, detail = _plan_ranger(
@@ -10057,7 +10112,12 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 cell_counts=friendly_cell_counts,
             )
             unit_phase_ms["ranger"] += time.monotonic() - _ut0
-            unit_actions_detail[uid] = f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
+            unit_actions_detail[uid] = (
+                f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
+                + _attack_contest_note(_contest_cell)
+            )
+            if action == "MOVE" and team == "attack":
+                _record_combat_planned_step(unit, detail)
 
     # Ack the dashboard's 自裁 commands we just issued; concurrent new commands
     # added while planning stay pending for the next Tick.
