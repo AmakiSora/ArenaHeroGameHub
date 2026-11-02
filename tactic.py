@@ -2176,6 +2176,38 @@ def _worker_rally_goal(
     return None
 
 
+def _rally_route_goal(
+    goal: tuple[int, int],
+    pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    blocked: frozenset[tuple[int, int]],
+) -> tuple[int, int]:
+    """Pick the cell a home march should be routed *to*, beside the Core.
+
+    While any carrier is delivering, the chute reservation puts the Core cell in
+    every empty worker's transient blockers, so an A* whose goal is that cell has
+    no legal final step: on the live map the search burned its whole 11,000
+    expansion budget, failed, armed the 120-Tick miss cooldown and left the
+    worker walking the same 8 cells 185 from home (W9, ticks 541306-541343).
+    Routing to an open neighbour of the same goal finds the identical route for
+    1.1k expansions, and the worker still hands back to normal mining inside
+    ``radius // 2`` — it never needs the Core cell itself.
+    """
+    neighbours = [
+        (goal[0] + dx, goal[1] + dy)
+        for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0))
+    ]
+    open_cells = [cell for cell in neighbours if cell not in obstacle_cells]
+    if not open_cells:
+        return goal
+    enterable = [cell for cell in open_cells if cell not in blocked]
+    pool = enterable or open_cells
+    return min(
+        pool,
+        key=lambda cell: (abs(cell[0] - pos[0]) + abs(cell[1] - pos[1]), cell),
+    )
+
+
 def _plan_worker(
     worker,
     core,
@@ -2703,15 +2735,16 @@ def _plan_worker(
             # A greedy step alone cannot break a wall island. On the live map
             # memory two workers (W2/W9) circled the same 6 cells for 171 Ticks
             # — net displacement 2, cargo 0 — 175 cells from the Core, while a
-            # real route home existed and cost ~2.5k expansions to find
-            # (replayed over 60 steps: greedy net 0, A* closed 50 cells).
-            # March the rally with the same cached A* the combat units use for
-            # home-return, and keep the budget-free greedy step for the Tick the
-            # search misses or the per-Tick march cap is already spent.
+            # real route home existed. March the rally with the same cached A*
+            # the combat units use for home-return, and keep the budget-free
+            # greedy step for the Tick the search misses or the per-Tick march
+            # cap is already spent. The search is aimed at a cell beside the
+            # Core, never at the Core cell itself (see _rally_route_goal).
+            route_goal = _rally_route_goal(rally, pos, obstacle_cells, move_blocked)
             marched = _move_towards(
                 worker,
                 pos,
-                rally,
+                route_goal,
                 obstacle_cells,
                 detail_prefix="rally-home",
                 cell_counts=cell_counts,
@@ -2720,7 +2753,7 @@ def _plan_worker(
             ) or _long_march_step(
                 worker,
                 pos,
-                rally,
+                route_goal,
                 obstacle_cells,
                 detail_prefix="rally-home",
                 cell_counts=cell_counts,

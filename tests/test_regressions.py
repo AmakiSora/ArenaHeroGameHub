@@ -12854,6 +12854,7 @@ class WorkerExploreLoopBreakTests(unittest.TestCase):
             },
             "march_miss": dict(tactic._march_route_miss),
             "march_spent": tactic._march_budget_spent,
+            "chute": tactic._chute_in_demand,
         }
         tactic._worker_last_pos.clear()
         tactic._worker_recent.clear()
@@ -12881,6 +12882,7 @@ class WorkerExploreLoopBreakTests(unittest.TestCase):
         tactic._march_route_miss.clear()
         tactic._march_route_miss.update(self._saved["march_miss"])
         tactic._march_budget_spent = self._saved["march_spent"]
+        tactic._chute_in_demand = self._saved["chute"]
 
     def test_never_walked_exit_outranks_a_ring_cell_lapped_seven_steps_ago(self):
         class Worker:
@@ -13052,6 +13054,10 @@ class WorkerExploreLoopBreakTests(unittest.TestCase):
         config["worker_mine_max_distance"] = 100
         core = (174, 8)  # 182 cells out, as in the production crop
         tactic.turn_context.resource_space = 100
+        # Production always has some carrier mid-delivery, and that reservation
+        # hard-blocks the Core cell for every empty worker — the exact condition
+        # that made the first version of this fix useless.
+        tactic._chute_in_demand = True
         # Hysteresis as observed on site: rally was already latched, so the
         # Core stays the goal until the worker is inside radius // 2.
         tactic._worker_rally_home["w-island"] = True
@@ -13085,41 +13091,29 @@ class WorkerExploreLoopBreakTests(unittest.TestCase):
             remaining, 160,
             f"rally-home made no progress around the island: {worker.position}",
         )
+        # And the march must be aimed beside the Core: routing *onto* a cell the
+        # chute reservation blocks has no legal final step, so the A* exhausts
+        # its budget, fails and the worker is thrown back on the greedy step.
+        self.assertNotIn(str(core), detail)
 
-    def test_rally_home_falls_back_to_the_greedy_march_when_routing_misses(self) -> None:
-        class Worker:
-            id = "w-starved"
+    def test_rally_route_goal_avoids_a_blocked_or_walled_core_cell(self) -> None:
+        walls = frozenset({(5, 0), (5, 1), (5, -1), (6, 0)})
+        self.assertEqual(
+            tactic._rally_route_goal((5, 0), (0, 0), walls, frozenset({(5, 0)})),
+            (4, 0),
+            "a walled-in Core still gets its one open neighbour",
+        )
+        self.assertEqual(
+            tactic._rally_route_goal((5, 0), (0, 1), frozenset(), frozenset({(4, 0)})),
+            (5, 1),
+            "a transient-blocked neighbour loses to an enterable one",
+        )
+        self.assertEqual(
+            tactic._rally_route_goal((5, 0), (0, 0), frozenset({(5, 1), (5, -1), (4, 0), (6, 0)}), frozenset()),
+            (5, 0),
+            "a fully walled Core keeps the old goal",
+        )
 
-            def __init__(self) -> None:
-                self.position = (0, 400)
-                self.cargo = 0
-                self.direction = None
-
-            def move(self, direction) -> None:
-                self.direction = direction
-
-            def wait(self) -> None:
-                self.direction = None
-
-        config = default_config()
-        config["worker_mine_max_distance"] = 100
-        tactic.turn_context.resource_space = 100
-        worker = Worker()
-        with patch.object(tactic, "_move_towards", return_value=None) as routed, \
-             patch.object(tactic, "_long_march_step",
-                          return_value=("MOVE", "UP rally-home (0, 0)")) as greedy:
-            action, detail = tactic._plan_worker(
-                worker,
-                SimpleNamespace(position=(0, 0)),
-                resource_cells=frozenset(),
-                obstacle_cells=frozenset(),
-                depleted=set(),
-                config=config,
-            )
-        self.assertTrue(routed.called, "rally-home must try a real route first")
-        self.assertTrue(greedy.called, "a starved search must keep the greedy step")
-        self.assertEqual(action, "MOVE")
-        self.assertEqual(detail, "UP rally-home (0, 0)")
 
 
 class HomeReturnFarStrandedTests(unittest.TestCase):
