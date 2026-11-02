@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import signal
 import time
 import traceback
 import gzip
@@ -7605,13 +7606,124 @@ def _save_map_memory(
         _last_map_save_tick = tick
 
 
-def _flush_pending_map_memory() -> None:
-    """Write a save deferred out of the planning phase, after submit."""
+# ── background map-memory writer ─────────────────────────────────────────────
+# Only one child may be outstanding: two writers would serialize on the map
+# flock and the second one would still be holding the loop hostage. The child
+# never prints, because fork() carries only the forking thread and an inherited
+# stdio lock could wedge it forever; it reports through its exit code instead,
+# and the timeout below is the backstop for exactly that case (kill releases
+# the flock, and the save retries on the next due Tick).
+_MAP_SAVE_CHILD_TIMEOUT_SECONDS = 240.0
+_MAP_SAVE_CHILD_KILL_SIGNAL = getattr(signal, "SIGKILL", getattr(signal, "SIGTERM", 15))
+_map_save_child_pid: int | None = None
+_map_save_child_started = 0.0
+
+
+def _reap_map_save_child(*, block: bool = False) -> None:
+    """Collect the background writer.
+
+    ``block`` waits for it instead of polling — used before the exit save, so a
+    snapshot forked minutes earlier cannot land on top of the newer file the
+    loop is about to write.
+    """
+    global _map_save_child_pid, _map_save_child_started, _map_dirty
+    if _map_save_child_pid is None:
+        return
+    waitpid = getattr(os, "waitpid", None)
+    wnohang = getattr(os, "WNOHANG", None)
+    if waitpid is None or (not block and wnohang is None):
+        # A child can only exist where fork exists; a checkout without the
+        # POSIX wait primitives has nothing to collect.
+        _map_save_child_pid = None
+        return
+    flags = 0 if block else wnohang
+    if not block and (
+        time.monotonic() - _map_save_child_started > _MAP_SAVE_CHILD_TIMEOUT_SECONDS
+    ):
+        print(
+            f"[map] background save pid={_map_save_child_pid} exceeded "
+            f"{_MAP_SAVE_CHILD_TIMEOUT_SECONDS:.0f}s, killed",
+            flush=True,
+        )
+        try:
+            os.kill(_map_save_child_pid, _MAP_SAVE_CHILD_KILL_SIGNAL)
+        except OSError:
+            pass
+        _map_save_child_pid = None
+        return
+    try:
+        pid, status = waitpid(_map_save_child_pid, flags)
+    except (ChildProcessError, OSError):
+        _map_save_child_pid = None
+        return
+    if not pid:
+        return
+    _map_save_child_pid = None
+    code = os.waitstatus_to_exitcode(status)
+    if code != 0:
+        _map_dirty = True
+        print(f"[map] background save failed exit={code}", flush=True)
+
+
+def _fork_map_save(tick: int) -> bool:
+    """Write this save in a child process. False means the caller saves inline."""
+    global _map_save_child_pid, _map_save_child_started, _last_map_save_tick
+    if _map_save_child_pid is not None:
+        return False
+    fork = getattr(os, "fork", None)
+    if fork is None:  # Windows dev boxes have no fork: keep the inline write
+        return False
+    try:
+        pid = fork()
+    except OSError as exc:
+        print(f"[map] background save fork failed: {exc}", flush=True)
+        return False
+    if pid == 0:
+        code = 0
+        try:
+            _save_map_memory(tick=tick, force=True)
+        except BaseException:
+            code = 1
+        os._exit(code)
+    _map_save_child_pid = pid
+    _map_save_child_started = time.monotonic()
+    # The parent owns the schedule: this snapshot is already on its way to disk.
+    _last_map_save_tick = tick
+    return True
+
+
+def _flush_pending_map_memory(*, background: bool = False) -> None:
+    """Write a save deferred out of the planning phase, after submit.
+
+    ``background`` hands the encode to a forked child (POSIX only). A deferred
+    save serializes every remembered wall cell; at 800k+ cells on the 2-core VPS
+    that measured 33s, and since it sits between the submit and the next command
+    window it cost 2 Ticks — a TICK_MISMATCH — on every single slow save. The
+    child needs no loop state, so the parent keeps planning on copy-on-write
+    pages and collects the result on a later Tick.
+    """
     global _pending_map_save_tick, _map_dirty
+    if background:
+        # Collected on every Tick, not only when a save comes due: the parent
+        # must notice the child finished long before the next interval.
+        _reap_map_save_child()
     tick = _pending_map_save_tick
     if tick is None:
         return
     _pending_map_save_tick = None
+    if background:
+        if _fork_map_save(tick):
+            print(f"[map] deferred save forked tick={tick}", flush=True)
+            return
+        if _map_save_child_pid is not None:
+            # The running child already covers this Tick's cells; blocking here
+            # would put the stall back, so the save just waits for the next due
+            # interval (_map_dirty stays set, which is what gates it).
+            print(
+                f"[map] deferred save held tick={tick}: background save running",
+                flush=True,
+            )
+            return
     started = time.monotonic()
     try:
         _save_map_memory(tick=tick, force=True)
@@ -10094,7 +10206,7 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                             # write, then persist outside the submit window.
                             latency = (time.monotonic() - tick_start) * 1000
                             if not _skip_exit_map_save:
-                                _flush_pending_map_memory()
+                                _flush_pending_map_memory(background=True)
                         stale_streak = 0
                         _finalize_kite_collision_state(accepted.accepted)
                         _commit_shadow_predictions(accepted.accepted)
@@ -10169,6 +10281,7 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                     f"[tactic] unexpected error session={session}: {type(e).__name__}: {e}",
                     flush=True,
                 )
+            _reap_map_save_child(block=True)
             _save_map_memory(force=True)
             print(
                 f"[tactic] reconnecting in {reconnect_delay:.1f}s…",
@@ -10186,6 +10299,9 @@ def play(api_key: str, log_path: str = DEFAULT_LOG_PATH) -> None:
                 flush=True,
             )
         else:
+            # The exit file must be the newest word: an outstanding child writes
+            # the snapshot it forked, which is older than what is about to land.
+            _reap_map_save_child(block=True)
             _save_map_memory(force=True)
         logger.close()
         _print_summary(log_path)

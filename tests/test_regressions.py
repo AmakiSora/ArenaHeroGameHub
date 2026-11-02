@@ -84,6 +84,7 @@ class DeferredMapSaveTests(unittest.TestCase):
         "_map_dirty", "_last_map_save_tick", "_pending_map_save_tick",
         "_last_dashboard_map_sig", "_obstacle_sorted_cache",
         "_obstacle_pending_adds", "_core_anchor", "_map_file_sig_cache",
+        "_map_save_child_pid", "_map_save_child_started",
     )
 
     def setUp(self) -> None:
@@ -107,6 +108,8 @@ class DeferredMapSaveTests(unittest.TestCase):
         tactic._obstacle_pending_adds = set()
         tactic._core_anchor = None
         tactic._map_file_sig_cache.clear()
+        tactic._map_save_child_pid = None
+        tactic._map_save_child_started = 0.0
 
     def tearDown(self) -> None:
         for name, value in self._saved.items():
@@ -136,6 +139,94 @@ class DeferredMapSaveTests(unittest.TestCase):
                 )
                 self.assertFalse(path.exists())
                 self.assertIsNone(tactic._pending_map_save_tick)
+
+    def test_background_flush_forks_instead_of_stalling_the_loop(self) -> None:
+        """A forked save must not touch the disk from the live loop: that 33s
+        encode is what ate the next command window (2 lost Ticks per save)."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            tactic._obstacle_memory = {(0, 0)}
+            with patch.object(tactic, "MAP_MEMORY_PATH", path), patch.object(
+                tactic.os, "fork", create=True, return_value=4242,
+            ):
+                tactic._save_map_memory(tick=10, save_interval_ticks=8, defer=True)
+                tactic._flush_pending_map_memory(background=True)
+            self.assertEqual(tactic._map_save_child_pid, 4242)
+            self.assertEqual(tactic._last_map_save_tick, 10)
+            self.assertIsNone(tactic._pending_map_save_tick)
+            self.assertFalse(path.exists())
+
+    def test_background_flush_writes_inline_without_fork(self) -> None:
+        """No fork (Windows dev boxes) keeps the original inline save."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            tactic._obstacle_memory = {(0, 0)}
+            with patch.object(tactic, "MAP_MEMORY_PATH", path), patch.object(
+                tactic.os, "fork", None, create=True,
+            ):
+                tactic._save_map_memory(tick=10, save_interval_ticks=8, defer=True)
+                tactic._flush_pending_map_memory(background=True)
+            self.assertTrue(path.exists())
+            self.assertIsNone(tactic._map_save_child_pid)
+
+    def test_second_save_is_held_while_a_child_writes(self) -> None:
+        """Two writers would queue on the map flock, so a due save just waits."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "map_memory.json"
+            tactic._map_save_child_pid = 4242
+            tactic._map_save_child_started = time.monotonic()
+            tactic._pending_map_save_tick = 10
+            tactic._map_dirty = True
+            with patch.object(tactic, "MAP_MEMORY_PATH", path), patch.object(
+                tactic.os, "waitpid", return_value=(0, 0),
+            ), patch.object(tactic.os, "WNOHANG", 1, create=True), patch.object(
+                tactic.os, "fork", create=True,
+            ) as fork:
+                tactic._flush_pending_map_memory(background=True)
+            fork.assert_not_called()
+            self.assertFalse(path.exists())
+            self.assertEqual(tactic._map_save_child_pid, 4242)
+            self.assertEqual(tactic._last_map_save_tick, -1)
+
+    def test_failed_child_marks_the_map_dirty_again(self) -> None:
+        tactic._map_save_child_pid = 4242
+        tactic._map_save_child_started = time.monotonic()
+        tactic._map_dirty = False
+        with patch.object(tactic.os, "waitpid", return_value=(4242, 256)), patch.object(
+            tactic.os, "WNOHANG", 1, create=True,
+        ):
+            tactic._reap_map_save_child()
+        self.assertIsNone(tactic._map_save_child_pid)
+        self.assertTrue(tactic._map_dirty)
+
+    def test_stuck_child_is_killed_so_the_map_lock_cannot_leak(self) -> None:
+        tactic._map_save_child_pid = 4242
+        tactic._map_save_child_started = (
+            time.monotonic() - tactic._MAP_SAVE_CHILD_TIMEOUT_SECONDS - 1
+        )
+        tactic._map_dirty = False
+        with patch.object(tactic.os, "kill") as kill, patch.object(
+            tactic.os, "waitpid",
+        ) as waitpid, patch.object(tactic.os, "WNOHANG", 1, create=True):
+            tactic._reap_map_save_child()
+        kill.assert_called_once_with(4242, tactic._MAP_SAVE_CHILD_KILL_SIGNAL)
+        waitpid.assert_not_called()
+        self.assertIsNone(tactic._map_save_child_pid)
+
+    def test_blocking_reap_waits_even_past_the_poll_timeout(self) -> None:
+        """The exit save must be the newest word, so it waits instead of giving up."""
+        tactic._map_save_child_pid = 4242
+        tactic._map_save_child_started = (
+            time.monotonic() - tactic._MAP_SAVE_CHILD_TIMEOUT_SECONDS - 1
+        )
+        tactic._map_dirty = False
+        with patch.object(tactic.os, "waitpid", return_value=(4242, 0)) as waitpid, \
+                patch.object(tactic.os, "kill") as kill:
+            tactic._reap_map_save_child(block=True)
+        waitpid.assert_called_once_with(4242, 0)
+        kill.assert_not_called()
+        self.assertIsNone(tactic._map_save_child_pid)
+        self.assertFalse(tactic._map_dirty)
 
 
 class ColdMapPruneTests(unittest.TestCase):
