@@ -3225,6 +3225,58 @@ class CombatTeamPlannerTests(unittest.TestCase):
             tactic._guerrilla_core_target.pop("r-g-core-lock-guard", None)
             tactic.turn_context.tick = 0
 
+    def test_guerrilla_preys_behind_a_corner_keeps_its_route(self) -> None:
+        # 生产复现（V6, 92 拍绕圈）：猎物在墙角每隔一拍消失一次，而消失的那一拍
+        # 正是自己刚离开的那格。盲区拍若回落到 guerrilla-roam，就会原路踩回去，
+        # 与 kite-route 互相抵消，永远打不到两格外的工人。
+        unit = self.CombatUnit("r-g-prey-flicker", (0, 0))
+        prey = SimpleNamespace(position=(4, 0), unit_type="WORKER", id="prey-flicker")
+        tactic.turn_context.tick = 400
+        try:
+            action, detail = tactic._plan_ranger(
+                unit,
+                enemies=(prey,),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 40),
+                team="guerrilla",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("kite-route (4, 0)", detail)
+            self.assertIn("r-g-prey-flicker", tactic._guerrilla_unit_target)
+
+            tactic.turn_context.tick = 401
+            unit.position = (1, 0)
+            action, detail = tactic._plan_ranger(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 40),
+                team="guerrilla",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("kite-route (4, 0)", detail)
+            self.assertNotIn("guerrilla-roam", detail)
+
+            # Past the two-tick memory the prey is really gone: roam again.
+            tactic.turn_context.tick = 404
+            unit.position = (2, 0)
+            action, detail = tactic._plan_ranger(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 40),
+                team="guerrilla",
+            )
+            self.assertIn("guerrilla-roam", detail)
+            self.assertNotIn("r-g-prey-flicker", tactic._guerrilla_unit_target)
+        finally:
+            tactic._guerrilla_unit_target.pop("r-g-prey-flicker", None)
+            tactic._guerrilla_core_target.pop("r-g-prey-flicker", None)
+            tactic.turn_context.tick = 0
+
     def test_summary_reads_jsonl_tick_records(self) -> None:
         records = [
             {"_meta": "test"},

@@ -2914,6 +2914,15 @@ _GUERRILLA_CORE_GUARD_RADIUS = 1
 # immediately reverting to the roam bearing makes the unit A-B-A. The lock
 # lets the normal A* route commit around the corner instead.
 _GUERRILLA_CORE_MEMORY_TICKS = 6
+# A flickering non-core prey needs the same lock, but a much shorter one. The
+# oscillation feeds itself: the cell the unit just left is the one that had
+# sight of the prey, so the blind Tick reverts to the roam bearing, steps
+# straight back, and sees the prey again. Holding the last-seen cell for one
+# Tick breaks that cycle, while a longer leash would send a guerrilla chasing a
+# fleeing worker across the map.
+# (observed: V6 shuttled (-978,-2765)/(-978,-2766)/(-977,-2766) for 92 Ticks
+# against a worker parked two cells north behind a corner.)
+_GUERRILLA_TARGET_MEMORY_TICKS = 2
 # Auto-attack core hunting only trusts recent sightings: cores move, and an
 # old marker would send the squad to a cell that has been empty for hours.
 _CORE_HUNT_MEMORY_MAX_AGE_TICKS = 2000
@@ -6070,6 +6079,10 @@ def _plan_kite_combat(
     if solo and target is not None and _enemy_unit_type_name(target) == "CORE":
         # Refresh the lock every tick the exposed core is actually visible.
         _guerrilla_core_target[uid] = (tuple(target.position), tick)
+    elif solo and target is not None:
+        # Non-core prey gets the shorter lock: the flicker cycle is driven by
+        # this unit's own step, so the cell has to survive one blind tick.
+        _guerrilla_unit_target[uid] = (tuple(target.position), tick)
     current_assessment = _kite_cell_assessment(
         pos, threats, obstacle_cells, attack_range,
     )
@@ -6447,6 +6460,21 @@ def _plan_kite_combat(
             else:
                 _guerrilla_core_target.pop(uid, None)
         if uid not in _guerrilla_core_target:
+            locked_unit = _guerrilla_unit_target.get(uid)
+            if locked_unit is not None:
+                prey_cell, prey_seen = locked_unit
+                if (
+                    not threats
+                    and tick - prey_seen <= _GUERRILLA_TARGET_MEMORY_TICKS
+                    and pos != prey_cell
+                ):
+                    objective = prey_cell
+                else:
+                    _guerrilla_unit_target.pop(uid, None)
+        if (
+            uid not in _guerrilla_core_target
+            and uid not in _guerrilla_unit_target
+        ):
             roam_action, roam_detail = _guerrilla_roam(
                 unit,
                 pos,
@@ -6775,6 +6803,12 @@ _home_engage_target: dict[str, tuple[str, int]] = {}
 # Keeps the A* route committed when a wall corner makes the core flicker out
 # of sight instead of flipping back to the roam bearing.
 _guerrilla_core_target: dict[str, tuple[tuple[int, int], int]] = {}
+# Solo guerrilla flicker lock for non-core prey: unit id -> (last-seen enemy
+# cell, tick). The Core lock above only covers Cores, so a worker or combat
+# unit behind a corner left every blind Tick to the roam bearing, which stepped
+# straight back into sight range and restarted the cycle (see
+# _GUERRILLA_TARGET_MEMORY_TICKS).
+_guerrilla_unit_target: dict[str, tuple[tuple[int, int], int]] = {}
 _pending_shot_predictions: list[dict[str, Any]] = []
 # Last applied dashboard enemy-clear sequence from map_memory.json.
 _enemy_clear_seq: int = 0
@@ -8794,6 +8828,8 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _home_engage_target.pop(dead_id, None)
     for dead_id in set(_guerrilla_core_target) - alive_ids:
         _guerrilla_core_target.pop(dead_id, None)
+    for dead_id in set(_guerrilla_unit_target) - alive_ids:
+        _guerrilla_unit_target.pop(dead_id, None)
     for dead_id in set(_worker_stuck_ticks) - alive_ids:
         _worker_stuck_ticks.pop(dead_id, None)
     for dead_id in set(_worker_stuck_pos) - alive_ids:
