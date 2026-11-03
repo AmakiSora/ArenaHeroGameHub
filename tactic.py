@@ -360,6 +360,15 @@ _MARCH_BUDGET_FACTOR = 60
 _MARCH_BUDGET_MAX = 120_000
 _MARCH_MISS_COOLDOWN = 120
 _MARCH_BUDGET_PER_TICK = 300_000
+# A march may keep following its cached route while the caller's objective stays
+# within this many cells of the route's own goal. Objectives are re-picked every
+# Tick (a kited enemy cluster jitters one cell, a migrating Core slides its ring
+# slot), and an exact-equality cache check turns that jitter into a fresh
+# full-budget A* (measured: 254/360 production Ticks over 2s, with V10 alone
+# re-searching 150 times at the 120k cap for a goal that had moved <=8 cells).
+# The last approach still re-anchors, so a unit always finishes on the cell the
+# caller actually asked for.
+_MARCH_GOAL_DRIFT_CELLS = 8
 _march_route_miss: dict[str, tuple[tuple[int, int], int]] = {}
 _march_budget_spent: int = 0
 
@@ -3741,6 +3750,15 @@ def _move_towards(
         return step_filter is None or bool(step_filter(cell))
 
     cached = _combat_path_cache.get(uid)
+    if cached is not None:
+        cached_goal = cached.get("goal")
+        if (
+            isinstance(cached_goal, tuple)
+            and cached_goal != goal
+            and _manhattan(cached_goal, goal) <= _MARCH_GOAL_DRIFT_CELLS
+            and _manhattan(pos, goal) > _MARCH_GOAL_DRIFT_CELLS
+        ):
+            goal = cached_goal
     path: list[tuple[int, int]] | None = None
     if cached is not None and cached.get("goal") == goal:
         cached_path = cached.get("path") or []

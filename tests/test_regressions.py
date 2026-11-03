@@ -2280,6 +2280,74 @@ class CombatTeamPlannerTests(unittest.TestCase):
         self.assertEqual(unit.arg.name, "RIGHT")
         self.assertEqual(bfs.call_count, 1)
 
+    def test_march_keeps_its_route_when_the_objective_jitters(self) -> None:
+        # The kite/attack objective in auto mode is a live enemy position, so it
+        # slides a cell per Tick, and an exact-equality cache check threw away a
+        # 2,000-cell route for every one of those cells: production paid 254/360
+        # Ticks over 2s planning, V10 alone re-searched 150 times at the 120k
+        # expansion cap for a goal that had moved <=8 cells.
+        unit = self.CombatUnit("v-jitter", (0, 0))
+        self.config["attack_target_x"] = 0
+        self.config["attack_target_y"] = -40
+        route = [(0, y) for y in range(0, -41, -1)]
+
+        with patch.object(tactic, "_bfs_path", return_value=route) as bfs:
+            action1, _ = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+            unit.position = (0, -1)
+            self.config["attack_target_y"] = -41
+            action2, detail2 = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+        self.assertEqual((action1, action2), ("MOVE", "MOVE"))
+        self.assertEqual(
+            bfs.call_count, 1,
+            "a one-cell objective jitter must not re-plan a 40-cell route",
+        )
+        self.assertEqual(unit.arg.name, "UP")
+        self.assertIn("(0, -40)", detail2)
+
+    def test_march_reanchors_on_the_final_approach(self) -> None:
+        # Drift tolerance must never leave a unit standing 8 cells short of the
+        # cell the caller actually asked for, so the last approach re-anchors.
+        unit = self.CombatUnit("v-final", (0, -35))
+        tactic._combat_path_cache["v-final"] = {
+            "goal": (0, -40),
+            "path": [(0, y) for y in range(-35, -41, -1)],
+            "index": 0,
+        }
+        self.config["attack_target_x"] = 0
+        self.config["attack_target_y"] = -41
+        fresh = [(0, y) for y in range(-35, -42, -1)]
+
+        with patch.object(tactic, "_bfs_path", return_value=fresh) as bfs:
+            action, detail = tactic._plan_vanguard(
+                unit,
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(
+            bfs.call_count, 1, "the final approach must aim at the real objective"
+        )
+        self.assertIn("(0, -41)", detail)
+
     def test_combat_path_replans_when_next_step_becomes_blocked(self) -> None:
         unit = self.CombatUnit("v-replan", (0, 0))
         self.config["attack_target_x"] = 2
