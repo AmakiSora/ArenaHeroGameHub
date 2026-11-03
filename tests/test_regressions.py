@@ -3393,6 +3393,38 @@ class KiteTeamPlannerTests(unittest.TestCase):
             hp = 4 if unit_type == UnitType.VANGUARD else 2
         return self.Unit(uid, position, unit_type, hp)
 
+    def test_far_objective_ranger_does_not_trigger_the_face_to_face_dance(self) -> None:
+        # V13/V15 生产实录：auto 风筝目标是一个 357 格外的敌弓手，满血先锋的
+        # 贴脸周旋分支没有距离闸门，于是一拍朝它迈出去、下一拍又被走位选择器
+        # 拽回真正的目标方向，1 格里来回 52/38 拍，行军毫无进展。
+        self.config.update({"kite_mode": "auto", "kite_auto_radius": 300})
+        unit = self.unit("v-far-ranger", (0, 0))
+        ranger = self.enemy("far-ranger", (0, 60), UnitType.RANGER)
+
+        action, detail = tactic._plan_kite_combat(
+            unit,
+            unit_kind="vanguard",
+            enemies=(ranger,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertNotIn("full-vanguard", detail)
+        self.assertIn("kite-route", detail)
+
+        # A Ranger within reach still gets the dance, including the trade.
+        near = self.unit("v-near-ranger", (0, 0))
+        close = self.enemy("near-ranger", (1, 0), UnitType.RANGER)
+        _, near_detail = tactic._plan_kite_combat(
+            near,
+            unit_kind="vanguard",
+            enemies=(close,),
+            obstacle_cells=frozenset(),
+            config=self.config,
+        )
+        self.assertIn("full-vanguard", near_detail)
+
     def test_motion_classifies_advance_and_retreat_from_previous_tick(self):
         enemy = self.enemy("enemy-motion", (2, 0))
         tactic._enemy_motion_tracks[enemy.id] = [(3, (3, 0)), (4, (2, 0))]

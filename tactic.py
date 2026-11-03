@@ -5930,6 +5930,18 @@ def _kite_ranger_fire_legal(
     )
 
 
+# The full-HP Vanguard vs Ranger dance is a face-to-face manoeuvre: step out of
+# the cell the Ranger is aiming at, then close the last cell and trade blows.
+# It had no range gate, so a Ranger that merely happened to be the squad's
+# long-distance objective hijacked it and reversed the march every other Tick —
+# the direct step ran at the Ranger while the spacing chooser stepped back
+# toward the real objective. (observed: V13 52 Ticks and V15 38 Ticks of
+# one-cell ping-pong against a Ranger 357-391 cells away.) The slack still lets
+# the dance finish closing on a Ranger one step outside its reach; anything
+# farther is the cached A* march's job.
+_FULL_V_DANCE_REACH_SLACK = 1
+
+
 def _plan_kite_combat(
     unit: Any,
     *,
@@ -6095,6 +6107,8 @@ def _plan_kite_combat(
         and int(getattr(unit, "hp", 0) or 0) >= 4
         and target is not None
         and _enemy_unit_type_name(target) == "RANGER"
+        and _chebyshev(pos, tuple(target.position))
+        <= attack_range + _FULL_V_DANCE_REACH_SLACK
     )
     # Predictive attack on a contested cell. If this unit already had two
     # same-tick move attempts toward the same cell cancelled by collision
