@@ -5084,11 +5084,21 @@ def _plan_attack_combat(
         ):
             # 沿途接敌同样受半径约束：只追击距核心 N 格内的可见敌人；
             # 子集为空则跳过接敌落入行军。radius=0 或非 auto 模式保持原逻辑。
+            # `enemies` 是全军视野的并集，所以半径之外还必须按本单位视野收口：
+            # 一个斥候在 300 格外看见敌弓手，就会把正在向西清矿的先锋整个调头
+            # 向东，两拍一换方向、行军永远走不完（observed: V19 456 拍净位移 19
+            # 格、V20 368 拍净位移 9 格；同样的调头把 V17/V18/R8 送进了敌火力）。
+            # attack_march_engage_radius=0 时维持旧行为（只受半径约束）。
             engage_core = getattr(turn_context, "core_pos", None)
+            engage_leash = max(int(config.get("attack_march_engage_radius", 0) or 0), 0)
             engage_pool = tuple(
                 e
                 for e in enemies
                 if _manhattan(tuple(e.position), engage_core) <= attack_radius
+                and (
+                    engage_leash <= 0
+                    or _manhattan(pos, tuple(e.position)) <= engage_leash
+                )
             )
         elif mode in ("coords", "beacon"):
             # 坐标/信标模式只接战"顺路"敌人：该敌人到目标点的距离不超过

@@ -2701,6 +2701,46 @@ class CombatTeamPlannerTests(unittest.TestCase):
             tactic._enemy_memory.discard((10, 0))
             tactic.turn_context.core_pos = None
 
+    def test_attack_auto_engage_stays_inside_the_units_own_sight(self) -> None:
+        # 视野并集：半径内但 25 格外的敌人是别人看见的，不该把行军单位整个调头。
+        tactic._enemy_memory.update({(-10, 0)})
+        tactic.turn_context.core_pos = (0, 0)
+        try:
+            self.config["attack_mode"] = "auto"
+            self.config["attack_auto_radius"] = 30
+            self.config["attack_march_engage_radius"] = 10
+            self.config["attack_target_x"] = 90
+            self.config["attack_target_y"] = 90
+
+            march_unit = self.CombatUnit("v-attack-leash", (0, 0))
+            action, detail = tactic._plan_vanguard(
+                march_unit,
+                enemies=(self.Enemy((25, 0)),),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertNotIn("attack-engage", detail)
+            self.assertIn("attack-march-auto (-10, 0)", detail)
+
+            # 同一配置下，本单位视野内的敌人照常接战。
+            near_unit = self.CombatUnit("v-attack-near", (0, 0))
+            action, detail = tactic._plan_vanguard(
+                near_unit,
+                enemies=(self.Enemy((8, 0)),),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+            self.assertEqual(action, "MOVE")
+            self.assertIn("attack-engage", detail)
+        finally:
+            tactic._enemy_memory.discard((-10, 0))
+            tactic.turn_context.core_pos = None
+
     def test_attack_auto_prefers_unguarded_core_memory(self) -> None:
         # (2,0) 更近，但 (6,0) 是新鲜的落单核心记忆点 -> 优先清核。
         tactic._enemy_memory.update({(2, 0), (6, 0)})
