@@ -2926,6 +2926,15 @@ _GUERRILLA_TARGET_MEMORY_TICKS = 2
 # Auto-attack core hunting only trusts recent sightings: cores move, and an
 # old marker would send the squad to a cell that has been empty for hours.
 _CORE_HUNT_MEMORY_MAX_AGE_TICKS = 2000
+# Auto 目标打分必须区分"这拍看见的"和"几千拍前看见的"：`_enemy_memory` 只在友方
+# 亲眼看到该格已空时才遗忘，被墙挡住的目击点永远留着（实测堆到 3001 格、最老
+# 4800 拍）。只按距离打分时，一个 4153 拍前的幽灵格 (-976,-2788) 会和当期目击
+# (-887,-2816) 逐拍互换 argmin 胜者：V15 与风筝 V9/V11/V13 在 450 拍里来回翻转
+# 311-363 次那个 117 格长的目标，净位移只剩 92-131 格，而且每次翻转都重跑一次
+# A*（寻路展开中位数 78 → 4786，慢拍 4 → 28）。惩罚封顶后两个同样陈旧的格子
+# 之间仍只比距离，没有目击时刻的单位（测试/裸对象）按新鲜处理。
+_AUTO_TARGET_STALE_MAX_AGE_TICKS = 200
+_AUTO_TARGET_STALE_PENALTY_PER_TICK = 2
 
 
 def _core_position_unguarded(
@@ -2998,6 +3007,30 @@ def _auto_core_targets(
             continue
         targets.add(pos)
     return targets, drop
+
+
+def _auto_target_rank(
+    cell: tuple[int, int],
+    core_pos: tuple[int, int] | None,
+    squad_pos: tuple[int, int],
+) -> int:
+    """Score an auto-mode target candidate; lower wins.
+
+    Distance to the Core (threat to the base) plus distance to the squad
+    centroid (reachable now), then a stale-sighting penalty so the whole team
+    commits to prey somebody actually saw instead of penduluming between two
+    remembered cells whose relative score swaps every Tick.
+    """
+    score = _manhattan(cell, squad_pos)
+    if core_pos is not None:
+        score += _manhattan(cell, core_pos)
+    tick = int(getattr(turn_context, "tick", 0) or 0)
+    seen = int(_enemy_memory_ticks.get(cell, 0) or 0)
+    age = tick - seen
+    if seen > 0 and age > 0:
+        score += min(age, _AUTO_TARGET_STALE_MAX_AGE_TICKS) \
+            * _AUTO_TARGET_STALE_PENALTY_PER_TICK
+    return score
 
 
 def _guerrilla_roam_goal(unit: Any, pos: tuple[int, int]) -> tuple[int, int]:
@@ -5018,12 +5051,9 @@ def _plan_attack_combat(
             # memory only holds the cluster): regroup toward the home coords
             # instead of charging back into the losing fight.
             target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
-        elif core_pos is None:
-            target = min(candidates, key=lambda p: _manhattan(p, squad_pos))
         else:
             target = min(
-                candidates,
-                key=lambda p: _manhattan(p, core_pos) + _manhattan(p, squad_pos),
+                candidates, key=lambda p: _auto_target_rank(p, core_pos, squad_pos)
             )
     else:
         # A queued squad target (队首) outranks the static attack coordinates;
@@ -5579,11 +5609,8 @@ def _kite_mode_target(
         if core_targets:
             candidates = core_targets
         if candidates:
-            if core_pos is None:
-                return mode, min(candidates, key=lambda p: _manhattan(p, squad_pos))
             return mode, min(
-                candidates,
-                key=lambda p: _manhattan(p, core_pos) + _manhattan(p, squad_pos),
+                candidates, key=lambda p: _auto_target_rank(p, core_pos, squad_pos)
             )
     return mode, fallback
 

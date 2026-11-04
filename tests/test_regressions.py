@@ -2582,6 +2582,76 @@ class CombatTeamPlannerTests(unittest.TestCase):
             tactic.turn_context.core_pos = None
             tactic.turn_context.attack_squad_pos = None
 
+    def test_attack_auto_target_prefers_fresh_sighting_over_ghost_cell(self) -> None:
+        # `_enemy_memory` 只在友方看到该格已空时遗忘，墙后目击点会永久留着；
+        # 只按距离打分时一个很旧的格子能和当期目击逐拍互换胜者。
+        tactic._enemy_memory.update({(17, 0), (14, 3)})
+        tactic._enemy_memory_ticks[(17, 0)] = 100
+        tactic._enemy_memory_ticks[(14, 3)] = 999
+        tactic.turn_context.tick = 1000
+        tactic.turn_context.core_pos = (0, 0)
+        tactic.turn_context.attack_squad_pos = (20, 0)
+        self.config["attack_mode"] = "auto"
+        self.config["attack_auto_radius"] = 300
+        self.config["attack_target_x"] = 90
+        self.config["attack_target_y"] = 90
+        try:
+            # 距离打分 (17,0)=20 分优于 (14,3)=26 分，但它已经过期 900 拍。
+            stale_action, stale_detail = tactic._plan_vanguard(
+                self.CombatUnit("v-ghost", (0, 0)),
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+            self.assertEqual(stale_action, "MOVE")
+            self.assertIn("attack-march-auto (14, 3)", stale_detail)
+            self.assertNotIn("attack-march-auto (17, 0)", stale_detail)
+
+            # 两处目击同样新鲜时，仍按"距核心+距队心"取近者（原权重不变）。
+            tactic._enemy_memory_ticks[(17, 0)] = 999
+            fresh_action, fresh_detail = tactic._plan_vanguard(
+                self.CombatUnit("v-fresh", (0, 0)),
+                enemies=(),
+                obstacle_cells=frozenset(),
+                config=self.config,
+                core_pos=(0, 0),
+                team="attack",
+            )
+            self.assertEqual(fresh_action, "MOVE")
+            self.assertIn("attack-march-auto (17, 0)", fresh_detail)
+        finally:
+            tactic._enemy_memory.discard((17, 0))
+            tactic._enemy_memory.discard((14, 3))
+            tactic._enemy_memory_ticks.pop((17, 0), None)
+            tactic._enemy_memory_ticks.pop((14, 3), None)
+            tactic.turn_context.tick = 0
+            tactic.turn_context.core_pos = None
+            tactic.turn_context.attack_squad_pos = None
+
+    def test_kite_auto_target_prefers_fresh_sighting_over_ghost_cell(self) -> None:
+        tactic._enemy_memory.update({(17, 0), (14, 3)})
+        tactic._enemy_memory_ticks[(17, 0)] = 100
+        tactic._enemy_memory_ticks[(14, 3)] = 999
+        tactic.turn_context.tick = 1000
+        tactic.turn_context.core_pos = (0, 0)
+        tactic.turn_context.kite_squad_pos = (20, 0)
+        self.config["kite_mode"] = "auto"
+        self.config["kite_auto_radius"] = 300
+        try:
+            mode, target = tactic._kite_mode_target((0, 0), self.config, ())
+            self.assertEqual(mode, "auto")
+            self.assertEqual(target, (14, 3))
+        finally:
+            tactic._enemy_memory.discard((17, 0))
+            tactic._enemy_memory.discard((14, 3))
+            tactic._enemy_memory_ticks.pop((17, 0), None)
+            tactic._enemy_memory_ticks.pop((14, 3), None)
+            tactic.turn_context.tick = 0
+            tactic.turn_context.core_pos = None
+            tactic.turn_context.kite_squad_pos = None
+
     def test_attack_auto_radius_filters_target_candidates(self) -> None:
         # radius=3、core=(0,0)：唯一目击点 (10,0) 距核心 10 格 > 3，
         # 候选被滤空后回退静态进攻坐标。
