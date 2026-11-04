@@ -2652,6 +2652,53 @@ class CombatTeamPlannerTests(unittest.TestCase):
             tactic.turn_context.core_pos = None
             tactic.turn_context.kite_squad_pos = None
 
+    def test_attack_auto_target_ranks_older_ghost_below_newer_ghost(self) -> None:
+        # 惩罚不能封顶：两个都是过期目击时，"更近的旧格"不能压过"更新一点的格"，
+        # 否则整队会一直在几个看不见敌人的记忆格之间逐拍换目标（observed：进攻/风筝
+        # 448 拍内 204 次相邻目标跳变 >40 格，75% 的拍次目标是距可见敌人 ≥60 格的记忆格）。
+        tactic._enemy_memory.update({(18, 0), (6, 10)})
+        tactic._enemy_memory_ticks[(18, 0)] = 100
+        tactic._enemy_memory_ticks[(6, 10)] = 700
+        tactic.turn_context.tick = 1000
+        tactic.turn_context.core_pos = (0, 0)
+        self.config["attack_mode"] = "auto"
+        self.config["attack_auto_radius"] = 300
+        self.config["attack_target_x"] = 90
+        self.config["attack_target_y"] = 90
+        try:
+            targets = []
+            for squad_pos in ((20, 0), (21, 0)):
+                # 队心每拍只挪 1 格，胜者必须不变，否则就是逐拍摆锤。
+                tactic.turn_context.attack_squad_pos = squad_pos
+                action, detail = tactic._plan_vanguard(
+                    self.CombatUnit(f"v-ghost-{squad_pos[0]}", (0, 0)),
+                    enemies=(),
+                    obstacle_cells=frozenset(),
+                    config=self.config,
+                    core_pos=(0, 0),
+                    team="attack",
+                )
+                self.assertEqual(action, "MOVE")
+                self.assertIn("attack-march-auto (6, 10)", detail)
+                self.assertNotIn("attack-march-auto (18, 0)", detail)
+                targets.append(detail)
+            self.assertEqual(
+                tactic._auto_target_rank((18, 0), (0, 0), (20, 0)),
+                20 + 900 * 2,
+            )
+            self.assertEqual(
+                tactic._auto_target_rank((6, 10), (0, 0), (20, 0)),
+                40 + 300 * 2,
+            )
+        finally:
+            tactic._enemy_memory.discard((18, 0))
+            tactic._enemy_memory.discard((6, 10))
+            tactic._enemy_memory_ticks.pop((18, 0), None)
+            tactic._enemy_memory_ticks.pop((6, 10), None)
+            tactic.turn_context.tick = 0
+            tactic.turn_context.core_pos = None
+            tactic.turn_context.attack_squad_pos = None
+
     def test_attack_auto_radius_filters_target_candidates(self) -> None:
         # radius=3、core=(0,0)：唯一目击点 (10,0) 距核心 10 格 > 3，
         # 候选被滤空后回退静态进攻坐标。

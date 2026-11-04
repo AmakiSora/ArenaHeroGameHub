@@ -2927,13 +2927,15 @@ _GUERRILLA_TARGET_MEMORY_TICKS = 2
 # old marker would send the squad to a cell that has been empty for hours.
 _CORE_HUNT_MEMORY_MAX_AGE_TICKS = 2000
 # Auto 目标打分必须区分"这拍看见的"和"几千拍前看见的"：`_enemy_memory` 只在友方
-# 亲眼看到该格已空时才遗忘，被墙挡住的目击点永远留着（实测堆到 3001 格、最老
-# 4800 拍）。只按距离打分时，一个 4153 拍前的幽灵格 (-976,-2788) 会和当期目击
-# (-887,-2816) 逐拍互换 argmin 胜者：V15 与风筝 V9/V11/V13 在 450 拍里来回翻转
-# 311-363 次那个 117 格长的目标，净位移只剩 92-131 格，而且每次翻转都重跑一次
-# A*（寻路展开中位数 78 → 4786，慢拍 4 → 28）。惩罚封顶后两个同样陈旧的格子
-# 之间仍只比距离，没有目击时刻的单位（测试/裸对象）按新鲜处理。
-_AUTO_TARGET_STALE_MAX_AGE_TICKS = 200
+# 亲眼看到该格已空时才遗忘，被墙挡住的目击点永远留着（实测堆到 3005 格）。只按距离
+# 打分时，一个 4153 拍前的幽灵格 (-976,-2788) 会和当期目击 (-887,-2816) 逐拍互换
+# argmin 胜者：V15 与风筝 V9/V11/V13 在 450 拍里来回翻转 311-363 次那个 117 格长的
+# 目标，净位移只剩 92-131 格，而且每次翻转都重跑一次 A*（寻路展开中位数 78 → 4786）。
+# 惩罚不能封顶：封成 200 拍后，所有更旧的格子拿到同一个 400 分，彼此又退化成"只比
+# 距离"，于是换目标只是从"幽灵 vs 活的"变成"幽灵 vs 幽灵"（observed 549776-550223：
+# 进攻 V19/V21 与风筝 V20 有 75% 的拍次目标是"当期看不见、且离最近可见敌人 ≥60 格"
+# 的记忆格，448 拍内相邻目标跳变 >40 格 204 次，净位移只剩 45-91 格）。不封顶后，
+# 越新的目击严格压制越旧的，整队只在一个格子的记忆真的消失时才换目标。
 _AUTO_TARGET_STALE_PENALTY_PER_TICK = 2
 
 
@@ -3028,8 +3030,7 @@ def _auto_target_rank(
     seen = int(_enemy_memory_ticks.get(cell, 0) or 0)
     age = tick - seen
     if seen > 0 and age > 0:
-        score += min(age, _AUTO_TARGET_STALE_MAX_AGE_TICKS) \
-            * _AUTO_TARGET_STALE_PENALTY_PER_TICK
+        score += age * _AUTO_TARGET_STALE_PENALTY_PER_TICK
     return score
 
 
