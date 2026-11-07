@@ -7204,13 +7204,24 @@ def _attack_contest_cell(uid: str, tick: int) -> tuple[int, int] | None:
     The invisible-claimant case: a visible blocker already reaches the planners
     through ``adjacent_enemies``, but a claimant outside vision only shows up as
     a MOVE_CONTESTED rejection naming the unit's own cell. Parking the refused
-    destination (the worker backoff's mechanism) makes the regroup march route
-    around it instead of re-issuing the doomed step forever.
+    destination (the worker backoff's mechanism) makes the march route around it
+    instead of re-issuing the doomed step forever. Only the teams in
+    ``_CONTEST_PARK_TEAMS`` consume it; kite/guerrilla aim at the claimant's cell
+    through ``_kite_collision_streak`` instead.
     """
     block = _worker_contest_blocked.get(uid)
     if block is None or block[1] <= tick:
         return None
     return block[0]
+
+
+# Long-march teams with no collision breaker of their own. Production V7
+# (2d735308) spent 346 straight Ticks on one cell re-issuing ``MOVE:DOWN
+# home-return (-218,-2620)`` out of (-1599,-1870), every attempt rejected with
+# MOVE_CONTESTED and no friendly unit within 4 cells — the breaker existed for
+# the attack march only, so a home defender refused by an unseen claimant had no
+# way to learn the destination was lost.
+_CONTEST_PARK_TEAMS = ("attack", "home")
 
 
 def _record_combat_planned_step(unit: Any, detail: str) -> None:
@@ -9744,9 +9755,9 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     # streak above. Combat units are tracked here too because an attack march can
     # be refused by a claimant it cannot see: production R5 re-issued the same
     # MOVE:RIGHT out of (-1182,-2391) for 152 straight Ticks, net displacement 0,
-    # and the rejection only ever names the unit's own cell. Only the attack
-    # branch reads the parked cell back, so kite/guerrilla keep their own
-    # breakers untouched.
+    # and the rejection only ever names the unit's own cell. Only the teams in
+    # _CONTEST_PARK_TEAMS read the parked cell back, so kite/guerrilla keep their
+    # own breakers untouched.
     _worker_pos_by_id = {
         str(u.id): tuple(u.position)
         for u in (*turn.workers, *turn.vanguards, *turn.rangers)
@@ -10242,7 +10253,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
             _contest_cell = (
                 _attack_contest_cell(str(unit.id), turn.tick)
-                if team == "attack"
+                if team in _CONTEST_PARK_TEAMS
                 else None
             )
             _extra_block = {c for c in (_blocked_cell, _contest_cell) if c is not None}
@@ -10264,14 +10275,14 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
                 + _attack_contest_note(_contest_cell)
             )
-            if action == "MOVE" and team == "attack":
+            if action == "MOVE" and team in _CONTEST_PARK_TEAMS:
                 _record_combat_planned_step(unit, detail)
         elif unit.unit_type == UnitType.RANGER:
             team = _combat_team_for(name, config)
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
             _contest_cell = (
                 _attack_contest_cell(str(unit.id), turn.tick)
-                if team == "attack"
+                if team in _CONTEST_PARK_TEAMS
                 else None
             )
             _extra_block = {c for c in (_blocked_cell, _contest_cell) if c is not None}
@@ -10293,7 +10304,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
                 + _attack_contest_note(_contest_cell)
             )
-            if action == "MOVE" and team == "attack":
+            if action == "MOVE" and team in _CONTEST_PARK_TEAMS:
                 _record_combat_planned_step(unit, detail)
 
     # Ack the dashboard's 自裁 commands we just issued; concurrent new commands

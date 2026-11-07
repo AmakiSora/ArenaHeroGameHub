@@ -11472,14 +11472,14 @@ class AttackContestAvoidanceTests(unittest.TestCase):
             setattr(tactic, name, copy.copy(value))
 
     @staticmethod
-    def _refusal():
+    def _refusal(position=(3, 0)):
         return SimpleNamespace(
             event_type="UNIT_MOVE_FAILED", reason_code="MOVE_CONTESTED",
-            actor_id="ranger-5", target_id=None, position=(3, 0), values={},
+            actor_id="ranger-5", target_id=None, position=position, values={},
         )
 
-    def _run(self, *, tick, events=(), team="attack"):
-        """One Tick: a lone attack ranger at (3,0) marching on the Core at (7,0).
+    def _run(self, *, tick, events=(), team="attack", pos=(3, 0)):
+        """One Tick: a lone ranger at ``pos`` marching on the Core at (7,0).
 
         (4,0) is the straight line to the goal, so the refused step is exactly
         what the march keeps asking for.
@@ -11492,7 +11492,7 @@ class AttackContestAvoidanceTests(unittest.TestCase):
             start_move=lambda direction: None, wait=lambda: None,
         )
         unit = SimpleNamespace(
-            id="ranger-5", unit_type=UnitType.RANGER, position=(3, 0),
+            id="ranger-5", unit_type=UnitType.RANGER, position=pos,
             hp=3, shield=0, cargo=0, direction=None,
         )
         unit.move = lambda direction: None
@@ -11510,7 +11510,7 @@ class AttackContestAvoidanceTests(unittest.TestCase):
         config = default_config()
         config["attack_team"] = "R5" if team == "attack" else ""
         config["kite_team"] = "R5" if team == "kite" else ""
-        config["home_team"] = ""
+        config["home_team"] = "R5" if team == "home" else ""
         config["guerrilla_team"] = ""
         config["attack_mode"] = "coords"
         config["attack_target_x"] = 7
@@ -11557,6 +11557,34 @@ class AttackContestAvoidanceTests(unittest.TestCase):
         for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 2):
             self._run(tick=tick, events=[self._refusal()], team="kite")
         self.assertEqual(tactic._worker_contest_blocked, {})
+
+    def test_home_return_march_parks_the_refused_cell(self) -> None:
+        """A defender marched home by an unseen claimant must route around it.
+
+        Production V7 (2d735308): 346 straight Ticks of ``MOVE:DOWN home-return``
+        out of (-1599,-1870) rejected with MOVE_CONTESTED, net displacement 0,
+        with no friendly unit within 4 cells. The breaker existed, but only the
+        attack march recorded its step and read the parked cell back.
+        """
+        # 7 cells from the Core, past home-return's return_radius=ring+1.
+        first = self._run(tick=1, pos=(0, 0), team="home")
+        self.assertIn("home-return", first["ranger-5"], first)
+        origin, dest = tactic._worker_planned_step["ranger-5"]
+        self.assertEqual(origin, (0, 0), first)
+
+        details = {}
+        for tick in range(2, tactic._WORKER_CONTEST_BLOCK_AFTER + 3):
+            details = self._run(
+                tick=tick, events=[self._refusal((0, 0))], pos=(0, 0), team="home",
+            )
+        blocked = tactic._worker_contest_blocked.get("ranger-5")
+        self.assertIsNotNone(blocked, "home repeats must park the refused cell")
+        self.assertEqual(blocked[0], dest, details)
+        self.assertTrue(details["ranger-5"].startswith("MOVE"), details)
+        self.assertIn(f"contest-avoid={dest}", details["ranger-5"], details)
+        self.assertNotEqual(
+            tactic._worker_planned_step["ranger-5"][1], dest, details,
+        )
 
 
 class CapacityAwareCombatMoveTests(unittest.TestCase):
