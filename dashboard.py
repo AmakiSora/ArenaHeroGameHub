@@ -12,6 +12,7 @@ import os
 import re
 import socket
 import ssl
+import sys
 import threading
 import time
 import urllib.error
@@ -151,6 +152,23 @@ def _stream_signature() -> tuple:
             return None
 
     return tuple(_sig(p) for p in (LOG_FILE, MAP_FILE, BATTLE_LOG_FILE))
+
+
+# Every SSE client used to stat all three data files on its own 0.25 s timer,
+# so N open dashboards cost N stat bursts per second. Share one snapshot across
+# clients: refresh at most once per 0.2 s, everyone else reads the cached tuple.
+_stream_sig_cache: tuple[float, tuple] | None = None
+
+
+def _stream_signature_cached() -> tuple:
+    global _stream_sig_cache
+    now = time.monotonic()
+    cached = _stream_sig_cache
+    if cached is not None and now - cached[0] < 0.2:
+        return cached[1]
+    sig = _stream_signature()
+    _stream_sig_cache = (now, sig)
+    return sig
 
 
 # build_parts() runs on every /api/state poll (every 2s per client) and always
@@ -2820,6 +2838,11 @@ LOGIN_HTML = """<!DOCTYPE html>
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Release idle / slow-loris connections instead of letting one blocked
+    # readline() pin a worker thread forever. Long-lived upgrades (WebSocket)
+    # restore blocking mode explicitly before they take over the socket.
+    timeout = 30
+
     # ---- token auth -------------------------------------------------------
 
     def _is_loopback(self) -> bool:
@@ -2874,8 +2897,21 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _read_raw_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", "0") or 0)
+        try:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+        except (ValueError, TypeError):
+            # Malformed Content-Length (scanners / broken clients): treat as an
+            # empty body rather than letting ValueError print a full traceback.
+            return b""
         return self.rfile.read(min(length, 1_048_576)) if length > 0 else b""
+
+    @staticmethod
+    def _parse_body(raw: bytes) -> dict:
+        try:
+            parsed = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def _send_json(self, code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -3159,6 +3195,13 @@ class Handler(BaseHTTPRequestHandler):
             upstream.close()
             return
         self.close_connection = True
+        # The request-read timeout must not apply to a long-lived WebSocket:
+        # an idle watcher sends no frames for minutes, and a recv() timeout
+        # here would tear down the whole pipe. Restore blocking mode.
+        try:
+            self.connection.settimeout(None)
+        except OSError:
+            pass
         self._pipe_pair(self.connection, upstream)
         print("[arena-proxy] WS closed", flush=True)
 
@@ -3259,11 +3302,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.wfile.write(b"retry: 2000\n: connected\n\n")
             self.wfile.flush()
-            last = _stream_signature()
+            last = _stream_signature_cached()
             idle = 0.0
             while True:
                 time.sleep(0.25)
-                sig = _stream_signature()
+                sig = _stream_signature_cached()
                 if sig != last:
                     last = sig
                     self.wfile.write(b"event: tick\ndata: 1\n\n")
@@ -3483,13 +3526,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         raw = self._read_raw_body()
-        try:
-            parsed = json.loads(raw.decode("utf-8") or "{}")
-        except Exception:
-            parsed = {}
-        data = parsed if isinstance(parsed, dict) else {}
         if path == "/api/login":
             # Login is the one endpoint that must work without auth.
+            data = self._parse_body(raw)
             token = str(data.get("token", "")).strip()
             if self._token_ok(token):
                 self.send_response(200)
@@ -3521,6 +3560,10 @@ class Handler(BaseHTTPRequestHandler):
             # Game command plan: forward upstream with the server-side key.
             self._proxy_arena_post(path, raw)
             return
+        # The proxy paths above forward the raw body untouched; only the
+        # config/management endpoints below need it parsed, so the high-volume
+        # game commands skip a full JSON parse of every request body.
+        data = self._parse_body(raw)
         if path in {"/api/config", "/api/config/reset"}:
             try:
                 is_reset = path.endswith("/reset")
@@ -3730,15 +3773,28 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
-    def log_message(self, fmt, *args):
-        pass
 
+class _QuietHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that does not spam tracebacks for dropped peers.
 
+    The dashboard port is public, so internet scanners connect and reset
+    constantly; each one used to print a full ConnectionResetError traceback
+    via socketserver.handle_error. Swallow the benign disconnect/timeout
+    errors and keep real failures visible.
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError,
+                            ConnectionAbortedError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def main():
-    srv = ThreadingHTTPServer((HOST, PORT), Handler)
-    srv.daemon_threads = True
+    srv = _QuietHTTPServer((HOST, PORT), Handler)
     print(f"[dashboard] http://localhost:{PORT}")
     print("[dashboard] soft refresh /api/state · Ctrl+C 停止")
     try:

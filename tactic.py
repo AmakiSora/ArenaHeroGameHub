@@ -2620,8 +2620,6 @@ def _plan_worker(
                 "path": path,
                 # Cursor of the unit on the path — path[0] is the current cell.
                 "index": 0,
-                # Debug only — never compared for cache validity.
-                "obstacles_used": obstacles_here | extras_here,
             }
         else:
             _worker_path_cache.pop(uid, None)
@@ -8425,7 +8423,7 @@ def _forget_resource(position: tuple[int, int]) -> None:
     _map_dirty = True
 
 
-def _update_resource_memory(turn) -> None:
+def _update_resource_memory(turn) -> set[tuple[int, int]]:
     """Remember visible resources permanently until depletion is confirmed.
 
     A node is forgotten only when the server actually reports it gone:
@@ -8434,13 +8432,19 @@ def _update_resource_memory(turn) -> None:
     depletion signal — it is the server refusing a harvest because the worker
     already carries cargo (harvest fills the full capacity in one action), so
     the node stays remembered for the next empty worker.
+
+    Returns the cells newly remembered this Tick so the battle log can diff
+    discoveries without copying the whole (20k+) resource set every Tick.
     """
     global _resource_memory, _map_dirty
-    before = set(_resource_memory)
+    added: set[tuple[int, int]] = set()
 
     for p in turn.resource_cells:
         pos = tuple(p) if not isinstance(p, tuple) else p
-        _resource_memory.add(pos)
+        if pos not in _resource_memory:
+            _resource_memory.add(pos)
+            added.add(pos)
+            _map_dirty = True
         _resource_tombstones.discard(pos)
 
     for event in turn.events:
@@ -8452,15 +8456,20 @@ def _update_resource_memory(turn) -> None:
             pos = tuple(event.position)
             _forget_resource(pos)
 
-    if _resource_memory != before:
-        _map_dirty = True
+    return added
 
 
-def _update_enemy_sightings(turn) -> None:
+def _update_enemy_sightings(
+    turn, obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]] | None = None
+) -> set[tuple[int, int]]:
     """Record every position where enemies were seen.  Remove stale sightings
     only when a friendly unit can genuinely see the cell (within its own vision
     radius, with unobstructed line of sight) and no enemy is there.  A sighting
-    no friendly can actually see is kept as last-known enemy info."""
+    no friendly can actually see is kept as last-known enemy info.
+
+    ``obstacles`` lets the live loop hand in the cached known-wall frozenset so
+    this does not rebuild a ~500k-cell copy every Tick. Returns the newly added
+    sighting cells for the battle-log discovery diff."""
     global _enemy_memory, _enemy_memory_types, _enemy_memory_ticks, _map_dirty
     before = len(_enemy_memory)
 
@@ -8490,10 +8499,12 @@ def _update_enemy_sightings(turn) -> None:
     # several enemies share a cell (an enemy CORE has workers standing on its
     # own square), the higher-priority type wins so a worker never overwrites
     # the HQ label.
+    added: set[tuple[int, int]] = set()
     for enemy in visible_enemies:
         pos = tuple(enemy.position)
         if pos not in _enemy_memory:
             _enemy_memory.add(pos)
+            added.add(pos)
         new_type = _enemy_unit_type_name(enemy) or "ENEMY"
         if _enemy_type_priority(new_type) >= _enemy_type_priority(
             _enemy_memory_types.get(pos)
@@ -8509,27 +8520,41 @@ def _update_enemy_sightings(turn) -> None:
     # Remove stale sightings: some friendly unit can actually see the cell
     # (within its own vision radius, line of sight unobstructed) but no enemy
     # is there.  Obstacles block sight, so a spot behind a wall stays a hint.
-    obstacles = frozenset(_obstacle_memory) | turn.obstacle_cells
-    stale: set[tuple[int, int]] = set()
-    for sighting in _enemy_memory:
-        if sighting in visible_enemy_positions:
-            continue  # still there
+    # Only a sighting inside *some* friendly's vision diamond can ever be
+    # confirmed empty, so intersect the memory with the union of those diamonds
+    # first instead of scanning every sighting against every friendly. The
+    # expensive wall set is only materialised when a candidate survives.
+    if _enemy_memory:
+        candidates: set[tuple[int, int]] = set()
         for fpos, radius in friendly_views:
-            if (
-                _manhattan(fpos, sighting) <= radius
-                and not _vision_obstructed(fpos, sighting, obstacles)
-            ):
-                stale.add(sighting)
-                break
-
-    if stale:
-        _enemy_memory -= stale
-        for pos in stale:
-            _enemy_memory_types.pop(pos, None)
-            _enemy_memory_ticks.pop(pos, None)
+            fx, fy = fpos
+            for dx in range(-radius, radius + 1):
+                rem = radius - abs(dx)
+                for dy in range(-rem, rem + 1):
+                    candidates.add((fx + dx, fy + dy))
+        stale_candidates = (_enemy_memory & candidates) - visible_enemy_positions
+        if stale_candidates:
+            if obstacles is None:
+                obstacles = frozenset(_obstacle_memory) | turn.obstacle_cells
+            stale: set[tuple[int, int]] = set()
+            for sighting in stale_candidates:
+                for fpos, radius in friendly_views:
+                    if (
+                        _manhattan(fpos, sighting) <= radius
+                        and not _vision_obstructed(fpos, sighting, obstacles)
+                    ):
+                        stale.add(sighting)
+                        break
+            if stale:
+                _enemy_memory -= stale
+                for pos in stale:
+                    _enemy_memory_types.pop(pos, None)
+                    _enemy_memory_ticks.pop(pos, None)
 
     if len(_enemy_memory) != before:
         _map_dirty = True
+
+    return added
 
 
 # ── Categorized battle log (dashboard「战斗日志」panel) ────────────────────────
@@ -8861,88 +8886,27 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
     without bound. Core (C) and enemy (E) names are kept — enemy visibility is
     intermittent, so pruning those would churn their names.
     """
-    for dead_id in set(_worker_last_pos) - alive_ids:
-        _worker_last_pos.pop(dead_id, None)
-    for dead_id in set(_worker_recent) - alive_ids:
-        _worker_recent.pop(dead_id, None)
-    for dead_id in set(_worker_explore_history) - alive_ids:
-        _worker_explore_history.pop(dead_id, None)
-    for dead_id in set(_worker_rally_home) - alive_ids:
-        _worker_rally_home.pop(dead_id, None)
-    for dead_id in set(_worker_planned_step) - alive_ids:
-        _worker_planned_step.pop(dead_id, None)
-    for dead_id in set(_worker_contest_blocked) - alive_ids:
-        _worker_contest_blocked.pop(dead_id, None)
-    for dead_id in set(_worker_contest_repeat) - alive_ids:
-        _worker_contest_repeat.pop(dead_id, None)
-    for dead_id in set(_resource_assignments) - alive_ids:
-        _resource_assignments.pop(dead_id, None)
-    for dead_id in set(_worker_path_cache) - alive_ids:
-        _worker_path_cache.pop(dead_id, None)
-    for dead_id in set(_cargo_route_miss_dist) - alive_ids:
-        _cargo_route_miss_dist.pop(dead_id, None)
-    for dead_id in set(_march_route_miss) - alive_ids:
-        _march_route_miss.pop(dead_id, None)
-    for dead_id in set(_cell_limit_blocked) - alive_ids:
-        _cell_limit_blocked.pop(dead_id, None)
-    for dead_id in set(_combat_path_cache) - alive_ids:
-        _combat_path_cache.pop(dead_id, None)
-    for dead_id in set(_home_engage_target) - alive_ids:
-        _home_engage_target.pop(dead_id, None)
-    for dead_id in set(_guerrilla_core_target) - alive_ids:
-        _guerrilla_core_target.pop(dead_id, None)
-    for dead_id in set(_guerrilla_unit_target) - alive_ids:
-        _guerrilla_unit_target.pop(dead_id, None)
-    for dead_id in set(_worker_stuck_ticks) - alive_ids:
-        _worker_stuck_ticks.pop(dead_id, None)
-    for dead_id in set(_worker_stuck_pos) - alive_ids:
-        _worker_stuck_pos.pop(dead_id, None)
-    for dead_id in set(_waypoint_stuck) - alive_ids:
-        _waypoint_stuck.pop(dead_id, None)
-    for dead_id in set(_kite_collision_streak) - alive_ids:
-        _kite_collision_streak.pop(dead_id, None)
-    for dead_id in set(_kite_stall_pos) - alive_ids:
-        _kite_stall_pos.pop(dead_id, None)
-    for dead_id in set(_kite_stall_ticks) - alive_ids:
-        _kite_stall_ticks.pop(dead_id, None)
-    for dead_id in set(_kite_prev_pos) - alive_ids:
-        _kite_prev_pos.pop(dead_id, None)
-    for dead_id in set(_kite_shuttle_ticks) - alive_ids:
-        _kite_shuttle_ticks.pop(dead_id, None)
-    for dead_id in set(_kite_prev_prev_pos) - alive_ids:
-        _kite_prev_prev_pos.pop(dead_id, None)
-    for dead_id in set(_kite_friendly_split) - alive_ids:
-        _kite_friendly_split.pop(dead_id, None)
-    for dead_id in set(_roam_pos_history) - alive_ids:
-        _roam_pos_history.pop(dead_id, None)
-    for dead_id in set(_roam_escape_left) - alive_ids:
-        _roam_escape_left.pop(dead_id, None)
-    for dead_id in set(_roam_stall_cells) - alive_ids:
-        _roam_stall_cells.pop(dead_id, None)
-    for dead_id in set(_roam_stall_origin) - alive_ids:
-        _roam_stall_origin.pop(dead_id, None)
-    for dead_id in set(_roam_banned) - alive_ids:
-        _roam_banned.pop(dead_id, None)
-    for dead_id in set(_roam_bearing_offset) - alive_ids:
-        _roam_bearing_offset.pop(dead_id, None)
-    for dead_id in set(_roam_flip_pending) - alive_ids:
-        _roam_flip_pending.pop(dead_id, None)
-    for dead_id in set(_roam_discovered) - alive_ids:
-        _roam_discovered.pop(dead_id, None)
-    for dead_id in set(_roam_seen) - alive_ids:
-        _roam_seen.pop(dead_id, None)
-    for dead_id in set(_roam_new_stall) - alive_ids:
-        _roam_new_stall.pop(dead_id, None)
-    for dead_id in set(_roam_recent) - alive_ids:
-        _roam_recent.pop(dead_id, None)
-    for dead_id in set(_roam_break_tick) - alive_ids:
-        _roam_break_tick.pop(dead_id, None)
-    for dead_id in set(_sweep_miss_streak) - alive_ids:
-        _sweep_miss_streak.pop(dead_id, None)
-    for dead_id in set(_sweep_fuse_until) - alive_ids:
-        _sweep_fuse_until.pop(dead_id, None)
-    for dead_id in set(_roam_flips_used) - alive_ids:
-        _roam_flips_used.pop(dead_id, None)
+    # Every table below is a {unit_id: ...} dict; drop entries for units that
+    # no longer exist. The keys() view's set difference avoids materialising a
+    # full copy of each table's keys every Tick (~40 tables on the live server).
+    for table in (
+        _worker_last_pos, _worker_recent, _worker_explore_history,
+        _worker_rally_home, _worker_planned_step, _worker_contest_blocked,
+        _worker_contest_repeat, _resource_assignments, _worker_path_cache,
+        _cargo_route_miss_dist, _march_route_miss, _cell_limit_blocked,
+        _combat_path_cache, _home_engage_target, _guerrilla_core_target,
+        _guerrilla_unit_target, _worker_stuck_ticks, _worker_stuck_pos,
+        _waypoint_stuck, _kite_collision_streak, _kite_stall_pos,
+        _kite_stall_ticks, _kite_prev_pos, _kite_shuttle_ticks,
+        _kite_prev_prev_pos, _kite_friendly_split, _roam_pos_history,
+        _roam_escape_left, _roam_stall_cells, _roam_stall_origin,
+        _roam_banned, _roam_bearing_offset, _roam_flip_pending,
+        _roam_discovered, _roam_seen, _roam_new_stall, _roam_recent,
+        _roam_break_tick, _sweep_miss_streak, _sweep_fuse_until,
+        _roam_flips_used,
+    ):
+        for dead_id in table.keys() - alive_ids:
+            table.pop(dead_id, None)
     for (prefix, obj_id), name in list(_object_names.items()):
         if prefix in ("W", "V", "R") and str(obj_id) not in alive_ids:
             _object_names.pop((prefix, obj_id), None)
@@ -9133,10 +9097,8 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     _phase.start("map_memory")
     _apply_dashboard_map_edits()
     known_obstacles = _update_obstacle_memory(turn)
-    res_before = set(_resource_memory)
-    enemy_before = set(_enemy_memory)
-    _update_resource_memory(turn)
-    _update_enemy_sightings(turn)
+    new_resources = _update_resource_memory(turn)
+    new_enemy_sightings = _update_enemy_sightings(turn, known_obstacles)
     _save_map_memory(
         tick=getattr(turn, "tick", None),
         save_interval_ticks=int(config["map_save_interval_ticks"]),
@@ -9151,8 +9113,8 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     _phase.start("battle_log")
     battle_entries = _battle_log_entries(
         turn,
-        new_resources=set(_resource_memory) - res_before,
-        new_enemy_sightings=set(_enemy_memory) - enemy_before,
+        new_resources=new_resources,
+        new_enemy_sightings=new_enemy_sightings,
     )
     if battle_entries:
         try:
