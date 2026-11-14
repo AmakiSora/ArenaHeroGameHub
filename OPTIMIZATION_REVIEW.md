@@ -21,7 +21,7 @@
 | 7 | A\* 每次重建 81 万格 `blocked` | ✅ | `_BlockedView` 成员视图：**81.7 ms → 5.6 ms/次（14.6×）**；220 组等价性验证 0 差异 |
 | 8 | 战斗单位复制墙集 → 4.2 s 批处理 | ✅ | `_ObstacleOverlay` 保持身份缓存；`_dead_end_cells_batch` 加 >10 万墙熔断（**5.5 s → 2.2 ms**） |
 | 9 | fork 存盘后父进程重解析 map | ✅ | `_reap_map_save_child` 成功后刷新签名缓存；defer 空转拍 **1 → 0 次加锁** |
-| 10 | 每拍日志 53 KB | ✅ | 未变更路线只记 `path: null` + `path_len`，dashboard 反向恢复：**51.8 KB → 11.1 KB（−79%）**，20 MB 轮转容纳 395 → 1,847 拍 |
+| 10 | 每拍日志 53 KB | ✅ | 未变更路线只记 `path: null` + `path_len`，dashboard 反向恢复。离线估算 −79%；**上线后实测同一台机器：旧格式 72.2 KB → 新格式 27.0 KB（p50 20.9 KB，−63%），38% 的单位-路线被省略**（首批拍次仍会全量输出，因为 logger 换文件时清空签名） |
 | 11 | dashboard 33% 死 SSR | ✅ | **3,861 → 2,890 行**（净 −1,037），顺带删除 `/api/log`、`/api/stream`、`/api/trends` 与 3 个死全局 |
 | 12 | `tactic.py` 单体与 185 个全局 | ⚠️ 部分 | 已消除「新增临时障碍就复制整张墙集」这一根因（`_ObstacleOverlay`）、`_object_names` 敌人名 LRU 封顶 4096；**`_choose_actions` 拆分留待独立一轮**（10,928 行文件的重构在发布前做风险过高） |
 | 13 | 4 份 `_data_dir()` | ✅ | 收敛为 `state_io.data_dir()/data_path()`，5 处调用点统一（tactic / tactic_config / game_stats / dashboard / status） |
