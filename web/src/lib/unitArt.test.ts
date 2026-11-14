@@ -4,10 +4,10 @@ import { UNIT_SPRITE_PATHS, positionNearViewport, unitArtType, unitSpriteRect } 
 describe('unit art', () => {
   it('maps every unit type to its game sprite', () => {
     expect(UNIT_SPRITE_PATHS).toEqual({
-      CORE: '/assets/game/units/core.png',
-      WORKER: '/assets/game/units/worker.png',
-      VANGUARD: '/assets/game/units/vanguard.png',
-      RANGER: '/assets/game/units/ranger.png',
+      CORE: '/assets/game/units/core.webp',
+      WORKER: '/assets/game/units/worker.webp',
+      VANGUARD: '/assets/game/units/vanguard.webp',
+      RANGER: '/assets/game/units/ranger.webp',
     })
     expect(unitArtType({ kind: 'CORE' })).toBe('CORE')
     expect(unitArtType({ kind: 'UNIT', unit_type: 'VANGUARD' })).toBe('VANGUARD')

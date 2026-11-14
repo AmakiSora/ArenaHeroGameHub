@@ -2,9 +2,11 @@ import type { Position } from './types'
 import { positionKey } from './visibility'
 import { publicAsset } from './publicAsset'
 
+// 128x128 WebP: the largest obstacle draw is cell * .86 = 67 CSS px, so 128 px
+// covers a 2x device-pixel-ratio screen without sending the original 256 px PNG.
 export const OBSTACLE_SPRITE_PATHS = [
-  publicAsset('/assets/game/obstacles/asteroid-large-1.png'),
-  publicAsset('/assets/game/obstacles/asteroid-large-2.png'),
+  publicAsset('/assets/game/obstacles/asteroid-large-1.webp'),
+  publicAsset('/assets/game/obstacles/asteroid-large-2.webp'),
 ] as const
 
 export interface ObstacleCellShape {

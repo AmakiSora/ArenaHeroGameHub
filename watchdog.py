@@ -1,7 +1,6 @@
-"""Watchdog: ensure direct_wrapper.py stays running and producing ticks.
+"""Watchdog: per-unit stall alerts for the tactic loop.
 
-The second half of this module is the per-unit stall alert used by the
-tactic loop. tactic.py feeds one position snapshot per Tick through
+tactic.py feeds one position snapshot per Tick through
 ``update_stall_tracking``; the watchdog raises a ``stall_alert`` line (the
 tactic process' stdout is redirected into tactic_play.log by
 docker-entrypoint.py, so the alert lands in the same raw play log as every
@@ -14,19 +13,15 @@ unit that disappears from a snapshot is treated as gone and pruned. The
 dedup flag is cleared once the unit resumes moving (net displacement > 1),
 so a later second stall episode raises a second alert — while a unit that
 keeps sitting still is only alerted once per episode (no per-Tick spam).
+
+Process supervision is NOT part of this module: the container entrypoint owns
+process lifecycle (docker-entrypoint.py), and the old Windows-only
+``wmic``/``taskkill`` supervisor it used to carry could never run in the
+Linux image.
 """
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-import time
-import xml.etree.ElementTree as ET
 from collections.abc import Callable, Iterable
-
-WRAPPER_SCRIPT = os.path.join(os.path.dirname(__file__), "direct_wrapper.py")
-CHECK_INTERVAL = 20  # seconds
-STUCK_THRESHOLD = 60  # seconds without new tick = stuck
 
 # ── unit stall alert (fed by tactic.py once per Tick) ────────────────────────
 
@@ -208,132 +203,3 @@ def _update_stall_tracking_impl(
         _stall_anchor.pop(uid, None)
         _emitted_stall_alerts.discard(uid)
     return alerts
-
-
-# ── process watchdog (direct_wrapper.py supervision) ─────────────────────────
-
-def get_wrapper_pids() -> list[str]:
-    """Find PIDs of processes running direct_wrapper.py."""
-    try:
-        result = subprocess.run(
-            ["wmic", "process", "where", "CommandLine like '%direct_wrapper%'", "get", "ProcessId"],
-            capture_output=True, text=True, timeout=5,
-        )
-        pids = []
-        for line in result.stdout.strip().split("\n"):
-            line = line.strip()
-            if line.isdigit():
-                pids.append(line)
-        return pids
-    except Exception:
-        return []
-
-
-def get_last_tick_from_log() -> int | None:
-    """Parse the last tick number from direct_play.log."""
-    try:
-        with open("direct_play.log", "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        for line in reversed(lines):
-            if "[wrapper] tick=" in line:
-                parts = line.strip().split("tick=")
-                if len(parts) >= 2:
-                    tick_str = parts[1].split()[0].rstrip("]")
-                    return int(tick_str)
-    except Exception:
-        pass
-    return None
-
-
-def get_log_mtime() -> float | None:
-    """Get modification time of direct_play.log."""
-    try:
-        return os.path.getmtime("direct_play.log")
-    except Exception:
-        return None
-
-
-def start_wrapper() -> subprocess.Popen | None:
-    """Start the wrapper as a fully detached process."""
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, WRAPPER_SCRIPT],
-            stdout=open("direct_play.log", "a", encoding="utf-8"),
-            stderr=subprocess.STDOUT,
-            cwd=os.getcwd(),
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-        )
-        print(f"[watchdog] started wrapper pid={proc.pid}", flush=True)
-        return proc
-    except Exception as exc:
-        print(f"[watchdog] failed to start: {exc}", flush=True)
-        return None
-
-
-def main() -> int:
-    print("[watchdog] starting watchdog", flush=True)
-    
-    # Start wrapper initially
-    proc = start_wrapper()
-    if proc is None:
-        print("[watchdog] cannot start wrapper, exiting", flush=True)
-        return 1
-    
-    last_tick = get_last_tick_from_log()
-    last_mtime = get_log_mtime()
-    print(f"[watchdog] monitoring pid={proc.pid}  initial_tick={last_tick}", flush=True)
-    
-    while True:
-        time.sleep(CHECK_INTERVAL)
-        
-        # Check 1: Is wrapper process still alive?
-        pids = get_wrapper_pids()
-        if not pids:
-            print("[watchdog] wrapper process dead, restarting...", flush=True)
-            proc = start_wrapper()
-            if proc is None:
-                continue
-            last_tick = None
-            last_mtime = None
-            continue
-        
-        # Check 2: Is log file still being updated?
-        current_mtime = get_log_mtime()
-        if last_mtime is not None and current_mtime is not None:
-            if current_mtime == last_mtime:
-                # Log hasn't changed in STUCK_THRESHOLD seconds
-                age = time.time() - current_mtime
-                if age > STUCK_THRESHOLD:
-                    print(f"[watchdog] log stuck for {age:.0f}s, restarting...", flush=True)
-                    for pid in pids:
-                        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
-                    proc = start_wrapper()
-                    if proc is None:
-                        continue
-                    last_tick = None
-                    last_mtime = None
-                    continue
-        last_mtime = current_mtime
-        
-        # Check 3: Is tick advancing?
-        current_tick = get_last_tick_from_log()
-        if last_tick is not None and current_tick is not None:
-            if current_tick <= last_tick:
-                age = time.time() - (current_mtime or time.time())
-                if age > STUCK_THRESHOLD:
-                    print(f"[watchdog] tick stuck at {current_tick} for {age:.0f}s, restarting...", flush=True)
-                    for pid in pids:
-                        subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
-                    proc = start_wrapper()
-                    if proc is None:
-                        continue
-                    last_tick = None
-                    last_mtime = None
-                    continue
-        last_tick = current_tick
-    
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

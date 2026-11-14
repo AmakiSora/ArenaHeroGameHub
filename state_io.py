@@ -10,6 +10,28 @@ from pathlib import Path
 from typing import Iterator
 
 
+def data_dir() -> Path:
+    """Directory holding every mutable runtime file (map memory, logs, stats).
+
+    ``ARENA_DATA_DIR`` (set by Docker/compose to the mounted volume) wins; the
+    fallback is the directory containing this module, NOT the process cwd. The
+    old per-module copies disagreed here — tactic.py wrote map_memory.json and
+    tactic_log.jsonl to ``Path.cwd()`` while tactic_config.py / game_stats.py
+    wrote next to the sources — so starting ``python /srv/tactic.py`` from any
+    other directory silently split runtime state across two directories.
+
+    Resolved once per call (not cached) so tests and tools can repoint
+    ``ARENA_DATA_DIR`` at a temp directory at runtime.
+    """
+    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
+    return Path(raw).resolve() if raw else Path(__file__).resolve().parent
+
+
+def data_path(name: str) -> Path:
+    """Absolute path of one runtime file inside :func:`data_dir`."""
+    return data_dir() / name
+
+
 _registry_guard = threading.Lock()
 _thread_locks: dict[str, threading.RLock] = {}
 

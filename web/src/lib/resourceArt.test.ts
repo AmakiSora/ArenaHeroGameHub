@@ -4,8 +4,8 @@ import { RESOURCE_SPRITE_PATHS, resourceSpriteIndex, resourceSpriteRect } from '
 describe('resource art', () => {
   it('uses the game resource sprites', () => {
     expect(RESOURCE_SPRITE_PATHS).toEqual([
-      '/assets/game/resources/crystal-1.png',
-      '/assets/game/resources/crystal-2.png',
+      '/assets/game/resources/crystal-1.webp',
+      '/assets/game/resources/crystal-2.webp',
     ])
   })
 

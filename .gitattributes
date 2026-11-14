@@ -1,0 +1,13 @@
+# Normalise every text file to LF in the repository and on checkout, so the
+# bytes we commit are the bytes the Docker image and the SFTP deploy see.
+# `tactic.py` is currently CRLF in this working tree (core.autocrlf=true); the
+# next `git add`/checkout re-normalises it to LF — see README/OPTIMIZATION_REVIEW
+# #15 about the deploy byte mismatch.
+* text=auto eol=lf
+
+# Binary assets: never touch their bytes.
+*.png binary
+*.webp binary
+
+# npm's lock file must stay byte-identical to what npm wrote.
+package-lock.json -text

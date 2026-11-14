@@ -1,9 +1,11 @@
 import type { Position } from './types'
 import { publicAsset } from './publicAsset'
 
+// 128x128 WebP: the largest crystal draw is cell * .92 = 72 CSS px, so 128 px
+// covers 2x device pixels and still costs a few KB.
 export const RESOURCE_SPRITE_PATHS = [
-  publicAsset('/assets/game/resources/crystal-1.png'),
-  publicAsset('/assets/game/resources/crystal-2.png'),
+  publicAsset('/assets/game/resources/crystal-1.webp'),
+  publicAsset('/assets/game/resources/crystal-2.webp'),
 ] as const
 
 export function resourceSpriteIndex([x, y]: Position, count: number = RESOURCE_SPRITE_PATHS.length) {

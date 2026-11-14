@@ -1,0 +1,6 @@
+# Development / CI tooling. Runtime dependencies stay in requirements.txt —
+# do NOT repeat or re-pin arena-hero here.
+pytest>=9.0
+paramiko>=3.4
+ruff>=0.17
+coverage>=7.4

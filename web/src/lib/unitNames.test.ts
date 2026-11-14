@@ -26,7 +26,7 @@ describe('unitNames', () => {
 
     await expect(loadUnitNames()).resolves.toEqual({ aaaaaaaa: 'W1', bbbbbbbb: 'V2' })
 
-    expect(fetchMock).toHaveBeenCalledWith('/api/unit-names', { credentials: 'same-origin' })
+    expect(fetchMock).toHaveBeenCalledWith('/api/unit-names', expect.objectContaining({ credentials: 'same-origin', signal: expect.anything() }))
   })
 
   it('drops invalid entries from the payload', async () => {

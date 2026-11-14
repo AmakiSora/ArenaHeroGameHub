@@ -23,13 +23,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
-def _data_dir() -> Path:
-    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
-    return Path(raw).resolve() if raw else Path(__file__).resolve().parent
+from state_io import data_path
 
 
-STATS_PATH = _data_dir() / "game_stats.json"
+STATS_PATH = data_path("game_stats.json")
 
 _SAVE_INTERVAL_TICKS = 20
 _SAMPLE_INTERVAL_TICKS = 200

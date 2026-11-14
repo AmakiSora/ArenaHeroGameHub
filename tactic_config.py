@@ -1,22 +1,17 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from state_io import atomic_write_text, file_lock
+from state_io import atomic_write_text, data_path, file_lock
 
-# ARENA_DATA_DIR lets Docker keep mutable state on a volume.
-
-
-def _data_dir() -> Path:
-    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
-    return Path(raw).resolve() if raw else Path(__file__).resolve().parent
+# ARENA_DATA_DIR lets Docker keep mutable state on a volume; the single
+# implementation (and its module-directory fallback) lives in state_io.
 
 
-CONFIG_PATH = _data_dir() / "tactic_config.json"
+CONFIG_PATH = data_path("tactic_config.json")
 
 
 @dataclass(frozen=True)

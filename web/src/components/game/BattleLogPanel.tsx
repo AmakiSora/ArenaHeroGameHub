@@ -11,6 +11,7 @@ import {
   type BattleLogEntry,
 } from '../../lib/battleLog'
 import type { Position } from '../../lib/types'
+import { useTickLoader } from '../../hooks/useTickLoader'
 
 interface Props {
   // Refresh trigger: a new tick (or a window change) re-fetches the rows.
@@ -94,12 +95,11 @@ export const BattleLogPanel = memo(function BattleLogPanel({ tick, enabled, onJu
     const timer = window.setInterval(() => setNow(Date.now()), 5000)
     return () => window.clearInterval(timer)
   }, [logWindow, tick])
-  useEffect(() => {
-    if (!enabled) { setEntries(demoEntries()); return }
-    let cancelled = false
-    void loadBattleLog(battleLogLimitFor(logWindow)).then((next) => { if (!cancelled) setEntries(next) })
-    return () => { cancelled = true }
-  }, [tick, enabled, logWindow])
+  // The log is the largest per-tick fetch (up to 3,000 rows): abort it with
+  // the shared tick signal and skip it entirely while the tab is hidden.
+  const loadForWindow = useMemo(() => (signal: AbortSignal) => loadBattleLog(battleLogLimitFor(logWindow), signal), [logWindow])
+  useTickLoader(tick, enabled, loadForWindow, setEntries)
+  useEffect(() => { if (!enabled) setEntries(demoEntries()) }, [enabled])
   const timeFormat = useMemo(() =>
     new Intl.DateTimeFormat(i18n.language, { hour: '2-digit', minute: '2-digit', second: '2-digit' }), [i18n.language])
   // Rows older than the selected time window are hidden; 'all' disables it.

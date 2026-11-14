@@ -1,4 +1,5 @@
 import type { Position } from './types'
+import { dashboardRequest } from './dashboardRequest'
 
 // Manual per-unit target queues (the tactic dashboard's 手动目标 panel), kept
 // in waypoints.json and consumed by the bot every Tick: the unit marches to
@@ -13,39 +14,24 @@ export interface WaypointEntry {
 
 export type WaypointMap = Record<string, WaypointEntry>
 
-export async function loadWaypoints(): Promise<WaypointMap> {
-  try {
-    const response = await fetch('/api/waypoints', { credentials: 'same-origin' })
-    if (!response.ok) return {}
-    const data = await response.json() as { ok?: boolean; waypoints?: Record<string, { queue?: number[][]; mode?: string }> }
-    if (data?.ok !== true || !data.waypoints || typeof data.waypoints !== 'object') return {}
-    const out: WaypointMap = {}
-    for (const [name, raw] of Object.entries(data.waypoints)) {
-      if (!raw || !Array.isArray(raw.queue)) continue
-      const queue = raw.queue.filter((point) => Array.isArray(point) && point.length === 2 && Number.isFinite(point[0]) && Number.isFinite(point[1])).map((point) => [point[0], point[1]] as Position)
-      if (!queue.length) continue
-      out[name] = { queue, mode: raw.mode === 'rush' ? 'rush' : 'attack' }
-    }
-    return out
-  } catch {
-    return {}
+export async function loadWaypoints(signal?: AbortSignal): Promise<WaypointMap> {
+  const result = await dashboardRequest<{ ok?: boolean; waypoints?: Record<string, { queue?: number[][]; mode?: string }> }>('/api/waypoints', { signal })
+  if (!result.ok) return {}
+  const data = result.data
+  if (data?.ok !== true || !data.waypoints || typeof data.waypoints !== 'object') return {}
+  const out: WaypointMap = {}
+  for (const [name, raw] of Object.entries(data.waypoints)) {
+    if (!raw || !Array.isArray(raw.queue)) continue
+    const queue = raw.queue.filter((point) => Array.isArray(point) && point.length === 2 && Number.isFinite(point[0]) && Number.isFinite(point[1])).map((point) => [point[0], point[1]] as Position)
+    if (!queue.length) continue
+    out[name] = { queue, mode: raw.mode === 'rush' ? 'rush' : 'attack' }
   }
+  return out
 }
 
 async function waypointPost(path: string, body: Record<string, unknown>): Promise<boolean> {
-  try {
-    const response = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify(body),
-    })
-    if (!response.ok) return false
-    const data = await response.json() as { ok?: boolean }
-    return data?.ok === true
-  } catch {
-    return false
-  }
+  const result = await dashboardRequest<{ ok?: boolean }>(path, { method: 'POST', body })
+  return result.ok && result.data?.ok === true
 }
 
 // Append one target to the unit's queue; mode keeps the unit's current march

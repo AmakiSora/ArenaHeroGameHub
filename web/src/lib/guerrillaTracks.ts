@@ -1,4 +1,5 @@
 import { WORKER_ROUTE_COLORS } from './unitRoutes'
+import { dashboardRequest } from './dashboardRequest'
 
 // A whole day of guerrilla positions, straight from the tactic bot's route
 // recorder: /api/guerrilla-tracks reads
@@ -67,37 +68,33 @@ const parseBounds = (raw: unknown): [number, number, number, number] | null =>
     ? raw as [number, number, number, number]
     : null
 
-export async function loadGuerrillaTracks(date?: string): Promise<GuerrillaTrackData> {
-  try {
-    const response = await fetch(`/api/guerrilla-tracks${date ? `?date=${date}` : ''}`, { credentials: 'same-origin' })
-    if (!response.ok) return EMPTY_GUERRILLA_TRACKS
-    const data = await response.json() as { ok?: boolean; date?: unknown; dates?: unknown; units?: unknown[] }
-    if (data?.ok !== true || !Array.isArray(data.units)) return EMPTY_GUERRILLA_TRACKS
-    const units: GuerrillaTrack[] = []
-    for (const raw of data.units) {
-      if (!raw || typeof raw !== 'object') continue
-      const entry = raw as Record<string, unknown>
-      const id = typeof entry.id === 'string' ? entry.id : ''
-      if (!id) continue
-      const points = parsePoints(entry.points)
-      if (!points.length) continue
-      units.push({
-        id,
-        name: typeof entry.name === 'string' ? entry.name : id,
-        type: entry.type === 'RANGER' ? 'RANGER' : 'VANGUARD',
-        points,
-        ticks: Number(entry.ticks) || points.length,
-        distinct: Number(entry.distinct) || new Set(points.map((point) => point.join(','))).size,
-        net: Number(entry.net) || 0,
-        bounds: parseBounds(entry.bounds),
-      })
-    }
-    return {
-      date: typeof data.date === 'string' ? data.date : null,
-      dates: Array.isArray(data.dates) ? data.dates.filter((item): item is string => typeof item === 'string') : [],
-      units,
-    }
-  } catch {
-    return EMPTY_GUERRILLA_TRACKS
+export async function loadGuerrillaTracks(date?: string, signal?: AbortSignal): Promise<GuerrillaTrackData> {
+  const result = await dashboardRequest<{ ok?: boolean; date?: unknown; dates?: unknown; units?: unknown[] }>(`/api/guerrilla-tracks${date ? `?date=${date}` : ''}`, { signal })
+  if (!result.ok) return EMPTY_GUERRILLA_TRACKS
+  const data = result.data
+  if (data?.ok !== true || !Array.isArray(data.units)) return EMPTY_GUERRILLA_TRACKS
+  const units: GuerrillaTrack[] = []
+  for (const raw of data.units) {
+    if (!raw || typeof raw !== 'object') continue
+    const entry = raw as Record<string, unknown>
+    const id = typeof entry.id === 'string' ? entry.id : ''
+    if (!id) continue
+    const points = parsePoints(entry.points)
+    if (!points.length) continue
+    units.push({
+      id,
+      name: typeof entry.name === 'string' ? entry.name : id,
+      type: entry.type === 'RANGER' ? 'RANGER' : 'VANGUARD',
+      points,
+      ticks: Number(entry.ticks) || points.length,
+      distinct: Number(entry.distinct) || new Set(points.map((point) => point.join(','))).size,
+      net: Number(entry.net) || 0,
+      bounds: parseBounds(entry.bounds),
+    })
+  }
+  return {
+    date: typeof data.date === 'string' ? data.date : null,
+    dates: Array.isArray(data.dates) ? data.dates.filter((item): item is string => typeof item === 'string') : [],
+    units,
   }
 }

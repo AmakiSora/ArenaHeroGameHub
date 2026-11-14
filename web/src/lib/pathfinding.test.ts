@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ExploredCell } from './exploration'
-import { applyAutonomousMovement, findMovementPath, reachableMovementDestinations, readMovementGoals } from './pathfinding'
+import { applyAutonomousMovement, buildMovementRoutes, createNavigationContextCached, findMovementPath, plansEqual, reachableMovementDestinations, readMovementGoals } from './pathfinding'
 import type { PlayerState, Position, WorldObject } from './types'
 import { positionKey } from './visibility'
 
@@ -85,5 +85,61 @@ describe('autonomous pathfinding', () => {
     expect(destinations).toEqual(expect.arrayContaining([[1, 0], [0, 1], [2, 0], [1, 1]]))
     expect(destinations).not.toContainEqual([0, -1])
     expect(destinations).not.toContainEqual([-1, 0])
+  })
+})
+
+describe('plansEqual', () => {
+  const plan = { tick: 5, unit_actions: { a: { type: 'MOVE' as const, direction: 'UP' as const }, b: { type: 'SHOOT' as const, expected_cell: [2, 3] as Position } } }
+
+  it('compares structurally, independent of action key order', () => {
+    expect(plansEqual(plan, { tick: 5, unit_actions: { b: { type: 'SHOOT', expected_cell: [2, 3] }, a: { type: 'MOVE', direction: 'UP' } } })).toBe(true)
+    expect(plansEqual(plan, plan)).toBe(true)
+  })
+
+  it('detects tick, action, direction, target-cell and core-action changes', () => {
+    expect(plansEqual(plan, { ...plan, tick: 6 })).toBe(false)
+    expect(plansEqual(plan, { tick: 5, unit_actions: { ...plan.unit_actions, a: { type: 'MOVE', direction: 'DOWN' } } })).toBe(false)
+    expect(plansEqual(plan, { tick: 5, unit_actions: { ...plan.unit_actions, b: { type: 'SHOOT', expected_cell: [2, 4] } } })).toBe(false)
+    expect(plansEqual(plan, { tick: 5, unit_actions: { a: plan.unit_actions.a } })).toBe(false)
+    expect(plansEqual({ tick: 5, unit_actions: {}, core_action: { type: 'START_MOVE', direction: 'LEFT' } }, { tick: 5, unit_actions: {}, core_action: { type: 'START_MOVE', direction: 'RIGHT' } })).toBe(false)
+    expect(plansEqual({ tick: 5, unit_actions: {}, core_action: { type: 'WAIT' } }, { tick: 5, unit_actions: {} })).toBe(false)
+  })
+
+  it('treats a copied plan with equal values as unchanged', () => {
+    const copy = { tick: plan.tick, unit_actions: { ...plan.unit_actions } }
+    expect(plansEqual(plan, copy)).toBe(true)
+  })
+})
+
+describe('cached navigation context', () => {
+  it('builds once per state/explored identity and rebuilds when either changes', () => {
+    const world = state([unit])
+    const known = explored([0, 0], [1, 0])
+    const first = createNavigationContextCached(world, known)
+    expect(createNavigationContextCached(world, known)).toBe(first)
+    // Same tick but a larger explored map (IndexedDB merge landed late).
+    expect(createNavigationContextCached(world, new Map(known))).not.toBe(first)
+    // New tick: new state identity.
+    expect(createNavigationContextCached(state([unit]), known)).not.toBe(first)
+  })
+
+  it('accepts a prebuilt context and returns the same routes as an uncached call', () => {
+    const world = state([unit])
+    const known = explored([0, 0], [1, 0], [2, 0])
+    const context = createNavigationContextCached(world, known)
+    expect(buildMovementRoutes(world, known, { unit: [2, 0] }, { tick: 1, unit_actions: {} }, context)).toEqual([
+      { objectId: 'unit', destination: [2, 0], path: [[0, 0], [1, 0], [2, 0]], blocked: false },
+    ])
+    expect(findMovementPath(world, known, unit, [2, 0], undefined, context).path).toEqual([[0, 0], [1, 0], [2, 0]])
+    expect(reachableMovementDestinations(world, known, unit, undefined, context)).toEqual(expect.arrayContaining([[1, 0], [2, 0]]))
+  })
+
+  it('returns the routes it already path-found so the caller never runs a second A*', () => {
+    const world = state([unit])
+    const known = explored([0, 0], [1, 0], [2, 0])
+    const result = applyAutonomousMovement(world, known, { unit: [2, 0] }, { tick: 4, unit_actions: {} }, createNavigationContextCached(world, known))
+    expect(result.changed).toBe(true)
+    expect(result.routes).toEqual([{ objectId: 'unit', destination: [2, 0], path: [[0, 0], [1, 0], [2, 0]], blocked: false }])
+    expect(buildMovementRoutes(world, known, { unit: [2, 0] }, { tick: 4, unit_actions: {} })).toEqual(result.routes)
   })
 })

@@ -10,14 +10,12 @@ from collections import defaultdict
 # Streaming reverse-tail JSONL reader shared with the dashboard. This avoids
 # slurping the whole (potentially many-MB) tactic_log.jsonl on every call.
 from dashboard import _iter_log_lines_reverse
+from state_io import data_path
 
 
 def _data_path(name: str) -> str:
-    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
-    if raw:
-        from pathlib import Path
-        return str(Path(raw).resolve() / name)
-    return name
+    # Same resolution as tactic.py / dashboard.py (see state_io.data_dir).
+    return str(data_path(name))
 
 
 LOG_FILE = _data_path("tactic_log.jsonl")

@@ -22,9 +22,9 @@ export function StrategyConfigDialog({ returnFocusRef, onClose, onPickCoords }: 
   const [values, setValues] = useState<StrategyConfigValues>({})
   const [error, setError] = useState<string | null>(null)
   useEffect(() => {
-    let cancelled = false
-    void loadStrategyValues().then((next) => { if (!cancelled) setValues(next) })
-    return () => { cancelled = true }
+    const controller = new AbortController()
+    void loadStrategyValues(controller.signal).then((next) => { if (!controller.signal.aborted) setValues(next) })
+    return () => controller.abort()
   }, [])
   const commit = (field: string, value: number | boolean) => {
     if (values[field] === value) return

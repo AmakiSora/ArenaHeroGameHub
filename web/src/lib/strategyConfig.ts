@@ -1,3 +1,5 @@
+import { dashboardRequest } from './dashboardRequest'
+
 // Strategy settings surfaced by the arena's 配置 dialog — the tactic
 // dashboard's 核心 / 运行 / 生产 config groups. Everything else is already
 // editable in the arena (worker strategy + squad settings in the sidebar,
@@ -56,16 +58,12 @@ export const STRATEGY_GROUPS: StrategyGroupSpec[] = [
   },
 ]
 
-export async function loadStrategyValues(): Promise<StrategyConfigValues> {
-  try {
-    const response = await fetch('/api/config', { credentials: 'same-origin' })
-    if (!response.ok) return {}
-    const data = await response.json() as { ok?: boolean; config?: Record<string, StrategyFieldValue> }
-    if (data?.ok !== true || !data.config || typeof data.config !== 'object') return {}
-    return data.config
-  } catch {
-    return {}
-  }
+export async function loadStrategyValues(signal?: AbortSignal): Promise<StrategyConfigValues> {
+  const result = await dashboardRequest<{ ok?: boolean; config?: Record<string, StrategyFieldValue> }>('/api/config', { signal })
+  if (!result.ok) return {}
+  const data = result.data
+  if (data?.ok !== true || !data.config || typeof data.config !== 'object') return {}
+  return data.config
 }
 
 // Saving reuses teamRoster's saveStrategyConfig: same /api/config partial

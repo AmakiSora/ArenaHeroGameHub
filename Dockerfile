@@ -49,7 +49,10 @@ USER arena
 
 EXPOSE 4399
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4399/api/health', timeout=3)"
+# Keep in sync with compose.yml: /api/health answers 503 when the newest tick
+# is stale, and a cold start has to load the (large) map memory before the
+# first tick — 20s/3s used to paint a healthy container as unhealthy.
+HEALTHCHECK --interval=30s --timeout=8s --start-period=60s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4399/api/health', timeout=7)"
 
 ENTRYPOINT ["python", "/app/docker-entrypoint.py"]

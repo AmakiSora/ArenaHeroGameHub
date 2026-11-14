@@ -35,10 +35,11 @@ import { directionTo, moveTargets, plannedMoveArrows } from '../lib/movementPrev
 import { getErrorMessage } from '../lib/errorMessage'
 import { getActionAvailability } from '../lib/actionAvailability'
 import { coreDestructionFromEvents } from '../lib/destruction'
-import { applyAutonomousMovement, buildMovementRoutes, findMovementPath, reachableMovementDestinations, readMovementGoals, type MovementGoals, type PathFailure } from '../lib/pathfinding'
+import { applyAutonomousMovement, createNavigationContextCached, findMovementPath, reachableMovementDestinations, readMovementGoals, type MovementGoals, type MovementRoute, type PathFailure } from '../lib/pathfinding'
 import { mergeCommandPlans, prepareManualUnitActionPlan } from '../lib/commandPlans'
 import type { CommandPlan, CoreAction, Position, UnitAction, WorldObject } from '../lib/types'
 import { positionKey } from '../lib/visibility'
+import { WORLD_BACKGROUND_PATH } from '../lib/worldArt'
 
 // Cap for the top-left remembered-enemy strip: 21 chips fill exactly three
 // rows of seven. The cap applies to whatever type-filter combination is
@@ -47,6 +48,23 @@ const MEMORY_SIGHTINGS_MAX = 21
 // Stable empty array so the memoized WorldCanvas does not see a fresh route
 // list on every page render while the layer is hidden.
 const EMPTY_UNIT_ROUTES: UnitRoute[] = []
+const EMPTY_MOVEMENT_ROUTES: MovementRoute[] = []
+
+// The autonomous pass returns fresh route objects every tick; only replace the
+// stored list when something actually changed so the canvas does not get a new
+// identity (and an extra render) for an idle tick.
+function sameMovementRoutes(left: MovementRoute[], right: MovementRoute[]): boolean {
+  if (left === right) return true
+  if (left.length !== right.length) return false
+  return left.every((route, index) => {
+    const other = right[index]
+    return route.objectId === other.objectId
+      && route.blocked === other.blocked
+      && route.destination[0] === other.destination[0] && route.destination[1] === other.destination[1]
+      && route.path.length === other.path.length
+      && route.path.every((point, pathIndex) => point[0] === other.path[pathIndex][0] && point[1] === other.path[pathIndex][1])
+  })
+}
 
 // Show the raw upstream error code alongside the friendly text: it is the
 // decisive clue when an order is rejected (CSRF_INVALID, TICK_MISMATCH...).
@@ -189,15 +207,29 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
       try { await submitGamePlan(nextPlan) } catch { /* surfaced by the game stream */ }
     })
   }, [submitGamePlan])
+  // One navigation snapshot per tick: the autonomous pass, the rendering pass
+  // and the map-click handler all reuse it instead of rebuilding the obstacle
+  // and occupancy indexes for every A* call.
+  const navigationContext = useMemo(() => game.state ? createNavigationContextCached(game.state, game.explored) : null, [game.explored, game.state])
+  // Routes are a by-product of the autonomous-movement pass (it already ran A*
+  // for every goal), so the canvas never path-finds a second time per tick.
+  const [autonomousRoutes, setAutonomousRoutes] = useState<MovementRoute[]>([])
+  const movementRoutes = useMemo(() => {
+    if (!autonomousRoutes.length) return EMPTY_MOVEMENT_ROUTES
+    const activeGoals = new Set(Object.keys(movementGoals))
+    const active = autonomousRoutes.filter((route) => activeGoals.has(route.objectId))
+    return active.length === autonomousRoutes.length ? autonomousRoutes : active
+  }, [autonomousRoutes, movementGoals])
   useEffect(() => {
     if (!game.tick || !game.state || game.phase !== 'open' || respawning || autoMovementTickRef.current === game.tick) return
     autoMovementTickRef.current = game.tick
     const currentPlan = planRef.current.tick === game.tick ? planRef.current : { tick: game.tick, unit_actions: {} }
-    const result = applyAutonomousMovement(game.state, game.explored, movementGoalsRef.current, currentPlan)
+    const result = applyAutonomousMovement(game.state, game.explored, movementGoalsRef.current, currentPlan, navigationContext ?? undefined)
+    setAutonomousRoutes((current) => sameMovementRoutes(current, result.routes) ? current : result.routes)
     const stale = new Set([...result.completed, ...result.removed])
     if (stale.size) replaceMovementGoals(Object.fromEntries(Object.entries(movementGoalsRef.current).filter(([objectId]) => !stale.has(objectId))))
     if (result.changed) commitManualPlan(result.plan)
-  }, [commitManualPlan, game.explored, game.phase, game.state, game.tick, replaceMovementGoals, respawning])
+  }, [commitManualPlan, game.explored, game.phase, game.state, game.tick, navigationContext, replaceMovementGoals, respawning])
   const selected = useMemo(() => game.state?.objects.find((object) => object.id === selectedId) ?? null, [game.state, selectedId])
   const attackOptions = useMemo(() => {
     if (!selected || !targetMode) return []
@@ -207,7 +239,6 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   const attackPositions = useMemo(() => attackOptions.map((option) => option.position), [attackOptions])
   const effective = useMemo(() => mergeCommandPlans(game.tick ?? 0, game.receipts, plan), [game.receipts, game.tick, plan])
   const actionAvailability = useMemo(() => game.state && selected ? getActionAvailability(game.state, selected, effective.plan) : null, [effective.plan, game.state, selected])
-  const movementRoutes = useMemo(() => game.state ? buildMovementRoutes(game.state, game.explored, movementGoals, effective.plan) : [], [effective.plan, game.explored, game.state, movementGoals])
   const moveArrows = useMemo(() => game.state ? plannedMoveArrows(game.state, effective.plan, movementRoutes, effective) : [], [effective, game.state, movementRoutes])
   const plannedRouteDestinations = useMemo(() => {
     const routesByObject = new Map(movementRoutes.map((route) => [route.objectId, route] as const))
@@ -219,9 +250,9 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
       : []
     if (!moveSelecting || !game.state || !selected?.id) return [...plannedRouteDestinations, ...attackDestinations]
     const immediate = new Set(moveTargets(game.state, selected, effective.plan).map(positionKey))
-    const selectable = reachableMovementDestinations(game.state, game.explored, selected, effective.plan).map((position) => ({ objectId: selected.id!, position, blocked: false, selectable: true, immediate: immediate.has(positionKey(position)) }))
+    const selectable = reachableMovementDestinations(game.state, game.explored, selected, effective.plan, navigationContext ?? undefined).map((position) => ({ objectId: selected.id!, position, blocked: false, selectable: true, immediate: immediate.has(positionKey(position)) }))
     return [...plannedRouteDestinations.filter((destination) => destination.objectId !== selected.id), ...selectable]
-  }, [attackOptions, effective.plan, game.explored, game.state, moveSelecting, plannedRouteDestinations, selected, targetMode])
+  }, [attackOptions, effective.plan, game.explored, game.state, moveSelecting, navigationContext, plannedRouteDestinations, selected, targetMode])
   const sweepMarkers = useMemo(() => game.state ? plannedSweepMarkers(game.state, effective.plan, effective.unitSources) : [], [effective.plan, effective.unitSources, game.state])
   const shotMarkers = useMemo(() => game.state ? plannedShotMarkers(game.state, effective.plan, effective.unitSources) : [], [effective.plan, effective.unitSources, game.state])
   const targetableIds = useMemo(() => {
@@ -377,14 +408,15 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   const chooseMoveDestination = useCallback((target: Position) => {
     if (!game.state || !selected?.id || !selected.position) return
     if (selected.position[0] === target[0] && selected.position[1] === target[1]) { removeMovementGoal(selected.id); if (selected.kind === 'CORE') setCoreAction(null); else setUnitAction(selected.id, null); select(null); return }
-    const path = findMovementPath(game.state, game.explored, selected, target, planRef.current)
+    const path = findMovementPath(game.state, game.explored, selected, target, planRef.current, navigationContext ?? undefined)
     if (!path.path || path.path.length < 2) { setMovementError(path.reason ?? 'NO_ROUTE'); return }
     const nextGoals = { ...movementGoalsRef.current, [selected.id]: target }
-    const result = applyAutonomousMovement(game.state, game.explored, nextGoals, planRef.current)
+    const result = applyAutonomousMovement(game.state, game.explored, nextGoals, planRef.current, navigationContext ?? undefined)
     replaceMovementGoals(nextGoals); setMovementError(null); autoMovementTickRef.current = game.tick
+    setAutonomousRoutes((current) => sameMovementRoutes(current, result.routes) ? current : result.routes)
     if (result.changed) commitManualPlan(result.plan)
     select(null)
-  }, [commitManualPlan, game.explored, game.state, game.tick, removeMovementGoal, replaceMovementGoals, select, selected, setCoreAction, setUnitAction])
+  }, [commitManualPlan, game.explored, game.state, game.tick, navigationContext, removeMovementGoal, replaceMovementGoals, select, selected, setCoreAction, setUnitAction])
   const cancelMovementGoal = useCallback((object: WorldObject) => { if (!object.id) return; removeMovementGoal(object.id); if (object.kind === 'CORE') setCoreAction(null); else setUnitAction(object.id, null); select(null) }, [removeMovementGoal, select, setCoreAction, setUnitAction])
   const selectedWaypointName = selected?.kind === 'UNIT' ? unitDashboardName(selected, unitNames) : undefined
   const selectedWaypointEntry = selectedWaypointName ? waypoints[selectedWaypointName] : undefined
@@ -406,6 +438,16 @@ export function ArenaPage({ demo = false }: { demo?: boolean }) {
   const closeStrategyConfig = useCallback(() => setStrategyConfigOpen(false), [])
   const openGuerrillaTracks = useCallback(() => { setGuerrillaTracksDate(null); setGuerrillaTracksOpen(true) }, [])
   const closeGuerrillaTracks = useCallback(() => setGuerrillaTracksOpen(false), [])
+  // The arena is the only route that paints the world background, so its
+  // preload lives here instead of a global <link> in index.html that /login and
+  // /leaderboard fetched for nothing.
+  useEffect(() => {
+    const link = document.createElement('link')
+    link.rel = 'preload'; link.as = 'image'; link.type = 'image/webp'; link.href = WORLD_BACKGROUND_PATH
+    link.dataset.arenaBackground = 'true'
+    document.head.appendChild(link)
+    return () => { link.remove() }
+  }, [])
   if (!game.state) return <div className="grid h-dvh place-items-center"><div className="text-center"><div className="mx-auto mb-4 size-2 animate-pulse rounded-full bg-cyan-signal shadow-[0_0_14px_rgba(69,145,197,.45)]" /><p className="font-mono text-xs tracking-[.2em] text-zinc-500">{t(`game.${game.phase}`)}</p>{game.error && <p role="alert" className="mt-3 text-xs text-coral-hostile">{describeError(game.error)}</p>}</div></div>
   const fleetProps = { state: game.state, objects: game.state.objects, selectedId, onSelect: selectFromAssetList, unitNames, teamRoster, onAssignTeam: demo ? undefined : assignTeam, teamConfig, onUpdateConfig: demo ? undefined : updateConfig, onPickCoords: demo ? undefined : startCoordPick, pickingCoordsField: coordPick?.xField ?? null, squadTargets, onPickSquadTarget: demo ? undefined : startSquadTargetPick, onRemoveSquadTarget: demo ? undefined : changeSquadTargets, onClearSquadTargets: demo ? undefined : changeSquadTargets, pickingSquadTarget: squadTargetPick }
   return <div className="grid h-dvh min-h-[420px] grid-cols-1 overflow-hidden lg:grid-cols-[260px_1fr]">

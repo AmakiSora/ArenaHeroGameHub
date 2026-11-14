@@ -3,11 +3,14 @@ import { publicAsset } from './publicAsset'
 
 export type UnitArtType = UnitType | 'CORE'
 
+// 128 px tall WebP sheets: the tallest unit draw is cell * .72 = 56 CSS px, so
+// 128 px covers a 2x device-pixel-ratio screen. Aspect ratios are preserved, so
+// unitSpriteRect's computed layout is unchanged.
 export const UNIT_SPRITE_PATHS: Record<UnitArtType, string> = {
-  CORE: publicAsset('/assets/game/units/core.png'),
-  WORKER: publicAsset('/assets/game/units/worker.png'),
-  VANGUARD: publicAsset('/assets/game/units/vanguard.png'),
-  RANGER: publicAsset('/assets/game/units/ranger.png'),
+  CORE: publicAsset('/assets/game/units/core.webp'),
+  WORKER: publicAsset('/assets/game/units/worker.webp'),
+  VANGUARD: publicAsset('/assets/game/units/vanguard.webp'),
+  RANGER: publicAsset('/assets/game/units/ranger.webp'),
 }
 
 export function unitArtType(object: WorldObject): UnitArtType | null {

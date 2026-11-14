@@ -1,0 +1,104 @@
+[project]
+name = "arenagame"
+version = "0.1.0"
+description = "Arena Hero game bot + web control console, shipped as one Docker container."
+readme = "README.md"
+requires-python = ">=3.12"
+# Runtime dependencies are declared in requirements.txt (single source of truth
+# for both the Docker image and CI); this table only carries metadata so that
+# ruff / pytest / coverage pick up a project name and interpreter floor.
+dependencies = []
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["."]
+# Never lint inside build output, vendored deps or ignored agent scratch dirs.
+extend-exclude = [
+    ".git",
+    ".idea",
+    ".pi",
+    ".workbuddy",
+    ".ruff_cache",
+    "web/node_modules",
+    "web/dist",
+]
+
+[tool.ruff.lint]
+# Starting point from OPTIMIZATION_REVIEW.md #14, ratcheted down to what passes
+# cleanly on the current tree. Rules with pre-existing violations are ignored
+# here with their measured counts; everything else in E/F/I/UP/B IS enforced, so
+# new code cannot regress on them. Burn these down and delete the ignores.
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "F401",  # 18 unused imports (legacy modules)
+    "F541",  # 4 f-string-without-placeholders
+    "F841",  # 8 unused local variables
+    "E741",  # 8 ambiguous variable names (l, I, O)
+    "E701",  # 8 statements on one line after ":"
+    "E702",  # 1 statement on one line after ";"
+    "I001",  # 6 unsorted import blocks
+    "UP012",  # 1 unnecessary .encode("utf-8")
+    "UP015",  # 5 redundant open() modes
+    "UP017",  # 11 datetime.timezone.utc -> datetime.UTC
+    "UP031",  # 7 printf-style format strings
+    "UP035",  # 2 deprecated imports
+    "UP037",  # 1 quoted annotation
+    "B007",  # 3 unused loop control variables
+    "B023",  # 1 function definition uses loop variable
+    "B905",  # 2 zip() without explicit strict=
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 119 long lines are pre-existing in the legacy modules; every other file (all
+# new code, the deploy scripts, the tests except this giant one) must stay
+# within line-length = 100.
+"tests/test_regressions.py" = ["E501"]
+"tactic.py" = ["E501"]
+"dashboard.py" = ["E501"]
+"tactic_config.py" = ["E501"]
+"status.py" = ["E501"]
+"watchdog.py" = ["E501"]
+"direct_wrapper.py" = ["E501"]
+"deploy/check_guerrilla_exploration.py" = ["E501"]
+"deploy/analyze_phase_latency.py" = ["E501"]
+"deploy/diag_remote.py" = ["E501"]
+"deploy/diag_remote2.py" = ["E501"]
+"deploy/diag_remote3.py" = ["E501"]
+"deploy/diag_remote4.py" = ["E501"]
+"deploy/diag_remote5.py" = ["E501"]
+"deploy/diag_worker_stuck.py" = ["E501"]
+"deploy/diag_all_stuck.py" = ["E501"]
+"deploy/diag_enemy_memory.py" = ["E501"]
+"deploy/purge_typeless_enemy_memory.py" = ["E501"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-q"
+# Keep the suite warning-clean: a DeprecationWarning in our own code should fail
+# CI, while pytest's own collection internals stay quiet.
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:_pytest.*",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.coverage.run]
+# Measure the root modules the container actually runs (tactic.py, dashboard.py,
+# docker-entrypoint.py, …).  "." + omit is used instead of a module list because
+# `docker-entrypoint.py` is not an importable module name.
+source = ["."]
+branch = true
+omit = [
+    "tests/*",
+    "deploy/*",
+    "web/*",
+    "diagnose.py",
+    "direct_wrapper.py",
+]

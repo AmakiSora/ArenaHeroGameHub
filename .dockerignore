@@ -1,32 +1,74 @@
+# Docker build context = the working tree minus everything listed here.
+# Keep the context at ~3 MB: it is transferred to the daemon on every build and
+# `deploy/deploy.py` mirrors the same selection when it uploads files over SFTP.
+#
+# IMPORTANT: a pattern without a slash only matches at the context root (Go
+# filepath.Match semantics), so any rule that must bite at depth is repeated
+# with a `**/` prefix.
+
+# --- VCS / IDE / agent scratch ------------------------------------------------
 .git
 .github
 .idea
 .pi
 .claude
 .workbuddy
+.gitignore
+.gitattributes
+
+# --- Local scratch artifacts --------------------------------------------------
+# One generic rule instead of `_*.py`: the old rule let every `_remote_*.json[l]`
+# through, i.e. 112.8 MB of production dumps per build (OPTIMIZATION_REVIEW #3).
+_*
+**/_*
+
+# --- Python build / lint / test noise ----------------------------------------
 __pycache__
+**/__pycache__
 *.pyc
 *.pyo
-*.log
-*.db
-*.db-*
-.env
-.env.*
-deploy
-tests
+*.pyd
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+coverage
+htmlcov
+
+# --- Runtime state (lives on the arena-game-runtime volume) -------------------
 runtime
 backups
 map_memory.json
 tactic_config.json
+game_stats.json
 tactic_log.jsonl
+tactic_log.jsonl.*
+battle_log.jsonl
+battle_log.jsonl.*
+tactic_play.log
+tactic_play.log.*
+*.log
+*.lock
 direct_debug.json
 direct_play.log
-direct_wrapper.py
+
+# --- Secrets ------------------------------------------------------------------
+.env
+.env.*
+
+# --- Repo-only tooling: never needed inside the image -------------------------
+deploy
+tests
 diagnose.py
+direct_wrapper.py
 fix_*.py
-_*.py
-nul
+pyproject.toml
+requirements-dev.txt
 *.md
-!requirements.txt
+
+# --- Web console: source only, no local deps or build output -----------------
 web/node_modules
 web/dist
+web/coverage
+node_modules
+nul

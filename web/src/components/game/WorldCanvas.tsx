@@ -5,6 +5,7 @@ import { resolvedShotMarkers, resolvedSweepMarkers, type ResolvedShotMarker } fr
 import type { ShotMarker, SweepMarker } from '../../lib/combatPreview'
 import type { EnemySighting } from '../../lib/enemyMemory'
 import type { ExploredCell } from '../../lib/exploration'
+import { chunkHasFog, fogChunkSignature, indexFogTints, paintFogChunk, type FogTintEntry } from '../../lib/fogOverlay'
 import { coreResourceCapacity, maximumHealth, visibleCoreShieldLimit } from '../../lib/gameRules'
 import { mapFeaturesAt, type MapFeatureView } from '../../lib/mapFeatures'
 import { collectEntityPositions, continueOrStartMotionAnimation, interpolatePosition, type EntityMotion, type EntityMotionAnimation } from '../../lib/movementAnimation'
@@ -15,6 +16,7 @@ import type { PlayerState, Position, WorldObject } from '../../lib/types'
 import { UNIT_SPRITE_PATHS, unitArtType, unitSpriteRect, type UnitArtType } from '../../lib/unitArt'
 import { unitRouteColors, type UnitRoute } from '../../lib/unitRoutes'
 import { computeVisibility, positionKey } from '../../lib/visibility'
+import { useSpriteImages } from '../../hooks/useSpriteImages'
 import { WORLD_BACKGROUND_PATH } from '../../lib/worldArt'
 import { canvasPixelRatio, MAX_WORLD_CELL_SIZE, MIN_WORLD_CELL_SIZE, prioritizeSelectionCandidates, TERRAIN_CHUNK_CELLS, terrainChunkBounds, wheelZoomCell, type WorldCamera } from '../../lib/worldCanvasPerformance'
 import { BeaconDirectionIndicator } from './BeaconDirectionIndicator'
@@ -79,6 +81,10 @@ const CAMERA_FRAME_INTERVAL_MS = 1000 / 60
 const ZOOM_SETTLE_MS = 120
 const TERRAIN_CHUNK_PADDING_CELLS = 1
 const TERRAIN_CACHE_PIXEL_BUDGET = 12_000_000
+// Below this zoom the fog layer switches to one coarse block per 8x8 chunk:
+// individual cells are a handful of pixels, and per-cell bookkeeping is not
+// worth it while a 1600x900 viewport holds ~160k of them.
+const COARSE_FOG_CELL_SIZE = 8
 const SELECTED_GOLD = '#f6c453'
 const PRIMARY_BLUE = '#4591c5'
 const PRIMARY_BLUE_LIGHT = '#a8c8dd'
@@ -101,6 +107,13 @@ interface TerrainScene {
   obstaclesVisible: boolean
 }
 interface CachedTerrainTile { canvas: HTMLCanvasElement; pixels: number; cell: number; signature: string }
+// Fog-of-war + route-tint inputs: they change once per tick, never on a camera
+// frame, so their baked overlay tiles are keyed by these identities.
+interface FogOverlayState {
+  explored: Map<string, ExploredCell>
+  visible: Set<string>
+  tints: Map<string, string>
+}
 interface TerrainTileCache {
   scene: TerrainScene
   explored: Map<string, ExploredCell>
@@ -109,8 +122,18 @@ interface TerrainTileCache {
   ratio: number
   pixels: number
   tiles: Map<string, CachedTerrainTile>
+  fog: FogOverlayState | null
+  fogSignatures: Map<string, string>
+  fogTiles: Map<string, CachedTerrainTile>
+  // Coarse (<8 CSS px per cell) fog: one overlay block per 8x8 chunk.
+  coarseFogChunks: Map<string, boolean>
+  fogTintsByChunk: Map<string, FogTintEntry[]> | null
 }
 type UnitFaction = 'friendly' | 'hostile' | 'selected'
+const UNIT_ART_ORDER: UnitArtType[] = ['CORE', 'WORKER', 'VANGUARD', 'RANGER']
+// Stable path arrays: the sprite hooks compare identity, so an inline literal
+// would restart the (cached) load on every render.
+const BEACON_SPRITE_PATHS = [BEACON_SPRITE_PATH] as const
 const unitSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedUnitSprite>>()
 const beaconSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedBeaconSprite>>()
 
@@ -130,10 +153,6 @@ export const WorldCanvas = memo(function WorldCanvas({ state, explored, selected
   const terrainCacheRef = useRef<TerrainTileCache | null>(null)
   const [size, setSize] = useState({ width: 800, height: 600 })
   const [camera, setCamera] = useState<Camera>({ x: 0, y: 0, cell: 44 })
-  const [obstacleSprites, setObstacleSprites] = useState<HTMLImageElement[]>([])
-  const [resourceSprites, setResourceSprites] = useState<HTMLImageElement[]>([])
-  const [unitSprites, setUnitSprites] = useState<Partial<Record<UnitArtType, HTMLImageElement>>>({})
-  const [beaconSprite, setBeaconSprite] = useState<HTMLImageElement | null>(null)
   const [inspectedFeature, setInspectedFeature] = useState<MapFeatureView | null>(null)
   const [zooming, setZooming] = useState(false)
   const drag = useRef<{ x: number; y: number; cameraX: number; cameraY: number; moved: boolean } | null>(null)
@@ -169,6 +188,51 @@ export const WorldCanvas = memo(function WorldCanvas({ state, explored, selected
     }
     return tints
   }, [unitRoutes])
+  // Sprite loading is demand-driven: the obstacle sheets only load while the
+  // obstacle layer is (or has been) shown, crystals once a resource actually
+  // appears, beacon once it is near the viewport and a unit sheet once that
+  // unit type appears in the state (or in the remembered-enemy markers). Each
+  // path is fetched at most once — `loadSpriteImage` caches the decoded image.
+  const [obstaclesEverVisible, setObstaclesEverVisible] = useState(obstaclesVisible)
+  useEffect(() => { if (obstaclesVisible) setObstaclesEverVisible(true) }, [obstaclesVisible])
+  const obstacleSpriteImages = useSpriteImages(OBSTACLE_SPRITE_PATHS, obstaclesEverVisible)
+  const obstacleSprites = useMemo(() => obstacleSpriteImages.filter((image): image is HTMLImageElement => image !== null), [obstacleSpriteImages])
+  const hasResourceObjects = useMemo(() => state.objects.some((object) => object.kind === 'RESOURCE'), [state.objects])
+  const [resourcesEverSeen, setResourcesEverSeen] = useState(hasResourceObjects)
+  useEffect(() => { if (hasResourceObjects) setResourcesEverSeen(true) }, [hasResourceObjects])
+  const resourceSpriteImages = useSpriteImages(RESOURCE_SPRITE_PATHS, resourcesEverSeen)
+  const resourceSprites = useMemo(() => resourceSpriteImages.filter((image): image is HTMLImageElement => image !== null), [resourceSpriteImages])
+  // Keyed by the set of visible unit types, not the state object: a new tick
+  // produces a new objects array every time but usually the same four sheets.
+  const presentUnitArtKey = useMemo(() => {
+    const present = new Set<UnitArtType>()
+    for (const object of state.objects) {
+      const type = unitArtType(object)
+      if (type) present.add(type)
+    }
+    for (const sighting of memoryEnemies) if (sighting.type !== 'ENEMY') present.add(sighting.type)
+    return UNIT_ART_ORDER.filter((type) => present.has(type)).join(',')
+  }, [memoryEnemies, state.objects])
+  const neededUnitTypes = useMemo<UnitArtType[]>(
+    () => presentUnitArtKey ? UNIT_ART_ORDER.filter((type) => presentUnitArtKey.includes(type)) : [],
+    [presentUnitArtKey],
+  )
+  const unitSpritePaths = useMemo(() => neededUnitTypes.map((type) => UNIT_SPRITE_PATHS[type]), [neededUnitTypes])
+  const unitSpriteImages = useSpriteImages(unitSpritePaths, neededUnitTypes.length > 0)
+  const unitSprites = useMemo(() => {
+    const loaded: Partial<Record<UnitArtType, HTMLImageElement>> = {}
+    if (unitSpriteImages.length !== neededUnitTypes.length) return loaded
+    neededUnitTypes.forEach((type, index) => {
+      const image = unitSpriteImages[index]
+      if (image) loaded[type] = image
+    })
+    return loaded
+  }, [neededUnitTypes, unitSpriteImages])
+  // The beacon sheet is only useful once the beacon can actually be drawn:
+  // near the viewport, or carried by a unit that may be on screen.
+  const beaconNearViewport = state.champion_beacon.status === 'CARRIED' || positionInViewport(state.champion_beacon.position, camera, size, 4)
+  const beaconSpriteImages = useSpriteImages(BEACON_SPRITE_PATHS, beaconNearViewport)
+  const beaconSprite = beaconSpriteImages[0] ?? null
   const terrainScene = useMemo<TerrainScene>(() => ({
     obstacleSprites,
     resourceSprites,
@@ -249,41 +313,6 @@ export const WorldCanvas = memo(function WorldCanvas({ state, explored, selected
     terrainCacheRef.current = null
   }, [])
   useEffect(() => {
-    let active = true
-    const sprites = OBSTACLE_SPRITE_PATHS.map(() => new Image())
-    let settledSprites = 0
-    const settleSprite = () => {
-      settledSprites++
-      if (active && settledSprites === sprites.length) setObstacleSprites(sprites.filter((sprite) => sprite.complete && sprite.naturalWidth > 0))
-    }
-    sprites.forEach((sprite, index) => {
-      sprite.decoding = 'async'; sprite.onload = settleSprite; sprite.onerror = settleSprite; sprite.src = OBSTACLE_SPRITE_PATHS[index]
-    })
-    const crystals = RESOURCE_SPRITE_PATHS.map(() => new Image())
-    let settledCrystals = 0
-    const settleCrystal = () => {
-      settledCrystals++
-      if (active && settledCrystals === crystals.length) setResourceSprites(crystals.filter((crystal) => crystal.complete && crystal.naturalWidth > 0))
-    }
-    crystals.forEach((crystal, index) => {
-      crystal.decoding = 'async'; crystal.onload = settleCrystal; crystal.onerror = settleCrystal; crystal.src = RESOURCE_SPRITE_PATHS[index]
-    })
-    const unitEntries = Object.entries(UNIT_SPRITE_PATHS) as [UnitArtType, string][]
-    const units: Partial<Record<UnitArtType, HTMLImageElement>> = {}
-    let settledUnits = 0
-    const settleUnit = (type: UnitArtType, image: HTMLImageElement) => {
-      settledUnits++
-      if (image.complete && image.naturalWidth > 0) units[type] = image
-      if (active && settledUnits === unitEntries.length) setUnitSprites({ ...units })
-    }
-    unitEntries.forEach(([type, path]) => {
-      const image = new Image(); image.decoding = 'async'; image.onload = () => settleUnit(type, image); image.onerror = () => settleUnit(type, image); image.src = path
-    })
-    const beacon = new Image()
-    beacon.decoding = 'async'; beacon.onload = () => { if (active) setBeaconSprite(beacon) }; beacon.onerror = () => { if (active) setBeaconSprite(null) }; beacon.src = BEACON_SPRITE_PATH
-    return () => { active = false }
-  }, [])
-  useEffect(() => {
     const explicitlyRequested = centerRequest !== previousCenterRequest.current
     previousCenterRequest.current = centerRequest
     if (explicitlyRequested && centerPosition) {
@@ -314,7 +343,7 @@ export const WorldCanvas = memo(function WorldCanvas({ state, explored, selected
     const context = canvas.getContext('2d'); if (!context) return
     context.setTransform(ratio, 0, 0, ratio, 0, 0)
     drawTiledWorldTerrain(backgroundContext, size, camera, ratio, terrainScene, explored, terrainCacheRef, zooming)
-    drawFogAndRouteTints(backgroundContext, size, camera, explored, visible, unitRouteTints)
+    drawTiledFogOverlay(backgroundContext, size, camera, explored, visible, unitRouteTints, terrainCacheRef)
     drawWorldPlanMarkers(backgroundContext, size, camera, routeDestinations, moveArrows, sweepMarkers, shotMarkers)
     const nextPositions = collectEntityPositions(state)
     const reduceMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -562,7 +591,10 @@ function drawTiledWorldTerrain(
   let cache = cacheRef.current
   if (!cache || cache.scene !== scene || (!allowScaledCache && cache.cell !== camera.cell) || cache.ratio !== ratio) {
     if (cache) releaseTerrainTiles(cache)
-    cache = { scene, explored, signatures: new Map(), cell: camera.cell, ratio, pixels: 0, tiles: new Map() }
+    cache = {
+      scene, explored, signatures: new Map(), cell: camera.cell, ratio, pixels: 0, tiles: new Map(),
+      fog: null, fogSignatures: new Map(), fogTiles: new Map(), coarseFogChunks: new Map(), fogTintsByChunk: null,
+    }
     cacheRef.current = cache
   } else if (cache.explored !== explored) {
     // New discovery: keep every baked tile, drop only the stale signatures.
@@ -627,24 +659,38 @@ function createTerrainTile(chunkX: number, chunkY: number, cell: number, ratio: 
   return { canvas, pixels: canvas.width * canvas.height, cell, signature }
 }
 
+function releaseTileCanvas(tile: CachedTerrainTile) {
+  tile.canvas.width = 1
+  tile.canvas.height = 1
+}
+
 function evictTerrainTiles(cache: TerrainTileCache, visibleKeys: Set<string>) {
   if (cache.pixels <= TERRAIN_CACHE_PIXEL_BUDGET) return
-  for (const [key, tile] of cache.tiles) {
-    if (visibleKeys.has(key)) continue
-    cache.tiles.delete(key)
-    cache.pixels -= tile.pixels
-    tile.canvas.width = 1
-    tile.canvas.height = 1
-    if (cache.pixels <= TERRAIN_CACHE_PIXEL_BUDGET) break
+  const evict = (tiles: Map<string, CachedTerrainTile>) => {
+    for (const [key, tile] of tiles) {
+      if (visibleKeys.has(key)) continue
+      tiles.delete(key)
+      cache.pixels -= tile.pixels
+      releaseTileCanvas(tile)
+      if (cache.pixels <= TERRAIN_CACHE_PIXEL_BUDGET) return true
+    }
+    return false
   }
+  // Terrain first, then the fog overlay: both live under the same budget and
+  // are released by the same invalidation path.
+  if (evict(cache.tiles)) return
+  evict(cache.fogTiles)
 }
 
 function releaseTerrainTiles(cache: TerrainTileCache) {
-  for (const tile of cache.tiles.values()) {
-    tile.canvas.width = 1
-    tile.canvas.height = 1
-  }
+  for (const tile of cache.tiles.values()) releaseTileCanvas(tile)
   cache.tiles.clear()
+  for (const tile of cache.fogTiles.values()) releaseTileCanvas(tile)
+  cache.fogTiles.clear()
+  cache.fogSignatures.clear()
+  cache.coarseFogChunks.clear()
+  cache.fogTintsByChunk = null
+  cache.fog = null
   cache.pixels = 0
 }
 
@@ -690,27 +736,149 @@ function drawWorldTerrain(ctx: CanvasRenderingContext2D, size: { width: number; 
 }
 
 // Dynamic pass: fog of war over explored-but-unseen cells plus the tactic
-// route tints. Both are cheap fills keyed by the live visibility set, kept
-// out of the baked tiles so they never trigger sprite re-rendering.
-function drawFogAndRouteTints(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, explored: Map<string, ExploredCell>, visible: Set<string>, unitRouteTints: Map<string, string>) {
+// route tints. Both only change when `visible` / `explored` / the route tint
+// map change (once per tick), never when the camera moves — so they are baked
+// into world-space overlay tiles keyed by those identities and every camera
+// frame only blits the cached tiles with the camera transform.
+function drawTiledFogOverlay(
+  ctx: CanvasRenderingContext2D,
+  size: { width: number; height: number },
+  camera: Camera,
+  explored: Map<string, ExploredCell>,
+  visible: Set<string>,
+  unitRouteTints: Map<string, string>,
+  cacheRef: { current: TerrainTileCache | null },
+) {
+  const cache = cacheRef.current
+  if (!cache) return
+  syncFogCache(cache, explored, visible, unitRouteTints)
+  if (camera.cell < COARSE_FOG_CELL_SIZE) {
+    drawCoarseFogOverlay(ctx, size, camera, cache)
+    return
+  }
+  const fog = cache.fog
+  if (!fog) return
+  const bounds = terrainChunkBounds(camera, size)
+  const visibleKeys = new Set<string>()
+  const chunkWorldSize = TERRAIN_CHUNK_CELLS * camera.cell
+  for (let chunkY = bounds.minY; chunkY <= bounds.maxY; chunkY++) {
+    for (let chunkX = bounds.minX; chunkX <= bounds.maxX; chunkX++) {
+      const key = `${chunkX},${chunkY}`
+      visibleKeys.add(key)
+      let signature = cache.fogSignatures.get(key)
+      if (signature === undefined) {
+        signature = fogChunkSignature(fog.explored, fog.visible, fog.tints, chunkX, chunkY)
+        cache.fogSignatures.set(key, signature)
+      }
+      let tile = cache.fogTiles.get(key)
+      if (!tile || tile.signature !== signature) {
+        if (tile) { cache.pixels -= tile.pixels; releaseTileCanvas(tile) }
+        tile = createFogTile(cache, chunkX, chunkY, cache.cell, signature)
+        cache.fogTiles.set(key, tile)
+        cache.pixels += tile.pixels
+      } else {
+        cache.fogTiles.delete(key)
+        cache.fogTiles.set(key, tile)
+      }
+      const worldLeft = chunkX * TERRAIN_CHUNK_CELLS - .5
+      const worldTop = chunkY * TERRAIN_CHUNK_CELLS - .5
+      const screenX = size.width / 2 + (worldLeft - camera.x) * camera.cell
+      const screenY = size.height / 2 + (worldTop - camera.y) * camera.cell
+      const sourceSize = TERRAIN_CHUNK_CELLS * tile.cell * cache.ratio
+      ctx.drawImage(tile.canvas, 0, 0, sourceSize, sourceSize, screenX, screenY, chunkWorldSize, chunkWorldSize)
+    }
+  }
+  evictTerrainTiles(cache, visibleKeys)
+}
+
+function syncFogCache(cache: TerrainTileCache, explored: Map<string, ExploredCell>, visible: Set<string>, tints: Map<string, string>) {
+  const fog = cache.fog
+  if (fog && fog.explored === explored && fog.visible === visible && fog.tints === tints) return
+  // New tick: keep every baked tile, drop only the stale per-chunk signatures
+  // (the same discipline the terrain tiles use for `explored`).
+  cache.fog = { explored, visible, tints }
+  cache.fogSignatures.clear()
+  cache.coarseFogChunks.clear()
+  cache.fogTintsByChunk = null
+}
+
+function fogTintsByChunk(cache: TerrainTileCache) {
+  if (cache.fogTintsByChunk) return cache.fogTintsByChunk
+  const fog = cache.fog!
+  const byChunk = indexFogTints(fog.explored, fog.visible, fog.tints)
+  cache.fogTintsByChunk = byChunk
+  return byChunk
+}
+
+function createFogTile(cache: TerrainTileCache, chunkX: number, chunkY: number, cell: number, signature: string): CachedTerrainTile {
+  const cssSize = TERRAIN_CHUNK_CELLS * cell
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.ceil(cssSize * cache.ratio))
+  canvas.height = Math.max(1, Math.ceil(cssSize * cache.ratio))
+  const context = canvas.getContext('2d')
+  if (!context) return { canvas, pixels: canvas.width * canvas.height, cell, signature }
+  context.setTransform(cache.ratio, 0, 0, cache.ratio, 0, 0)
+  context.clearRect(0, 0, cssSize, cssSize)
+  const fog = cache.fog!
+  paintFogChunk(context, fog.explored, fog.visible, fogTintsByChunk(cache), chunkX, chunkY, cell)
+  return { canvas, pixels: canvas.width * canvas.height, cell, signature }
+}
+
+// At <8 CSS px per cell the per-cell pass is pointless: draw one overlay block
+// per 8x8 chunk that contains any explored-but-unseen cell. Chunk results are
+// cached per fog version, and a sparse exploration map is iterated directly
+// (instead of scanning the viewport) when it is much smaller than the
+// viewport's cell count.
+function drawCoarseFogOverlay(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, cache: TerrainTileCache) {
+  const fog = cache.fog
+  if (!fog) return
+  const bounds = terrainChunkBounds(camera, size)
+  const chunkWorldSize = TERRAIN_CHUNK_CELLS * camera.cell
+  const drawChunk = (chunkX: number, chunkY: number) => {
+    const worldLeft = chunkX * TERRAIN_CHUNK_CELLS - .5
+    const worldTop = chunkY * TERRAIN_CHUNK_CELLS - .5
+    ctx.fillRect(size.width / 2 + (worldLeft - camera.x) * camera.cell, size.height / 2 + (worldTop - camera.y) * camera.cell, chunkWorldSize, chunkWorldSize)
+  }
+  ctx.fillStyle = 'rgba(2,2,4,.62)'
+  const viewportCells = (size.width / camera.cell + 2) * (size.height / camera.cell + 2)
+  if (fog.explored.size * 4 < viewportCells) {
+    const halfWidth = size.width / camera.cell / 2 + 1, halfHeight = size.height / camera.cell / 2 + 1
+    const chunks = new Set<string>()
+    for (const [key, memory] of fog.explored) {
+      if (fog.visible.has(key)) continue
+      const [x, y] = memory.position
+      if (Math.abs(x - camera.x) > halfWidth || Math.abs(y - camera.y) > halfHeight) continue
+      chunks.add(`${Math.floor(x / TERRAIN_CHUNK_CELLS)},${Math.floor(y / TERRAIN_CHUNK_CELLS)}`)
+    }
+    for (const key of chunks) {
+      const comma = key.indexOf(',')
+      drawChunk(Number(key.slice(0, comma)), Number(key.slice(comma + 1)))
+    }
+  } else {
+    for (let chunkY = bounds.minY; chunkY <= bounds.maxY; chunkY++) {
+      for (let chunkX = bounds.minX; chunkX <= bounds.maxX; chunkX++) {
+        const key = `${chunkX},${chunkY}`
+        let fogged = cache.coarseFogChunks.get(key)
+        if (fogged === undefined) {
+          fogged = chunkHasFog(fog.explored, fog.visible, chunkX, chunkY)
+          cache.coarseFogChunks.set(key, fogged)
+        }
+        if (fogged) drawChunk(chunkX, chunkY)
+      }
+    }
+  }
+  // Route tints stay per-cell: there are only as many as the planned paths,
+  // never as many as the viewport.
+  if (!fog.tints.size) return
   const minX = Math.floor(camera.x - size.width / camera.cell / 2) - 1, maxX = Math.ceil(camera.x + size.width / camera.cell / 2) + 1
   const minY = Math.floor(camera.y - size.height / camera.cell / 2) - 1, maxY = Math.ceil(camera.y + size.height / camera.cell / 2) + 1
-  const half = camera.cell / 2
-  ctx.fillStyle = 'rgba(2,2,4,.62)'
-  for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
-    const key = `${x},${y}`
-    if (visible.has(key) || !explored.has(key)) continue
-    const sx = size.width / 2 + (x - camera.x) * camera.cell, sy = size.height / 2 + (y - camera.y) * camera.cell
-    ctx.fillRect(sx - half, sy - half, camera.cell, camera.cell)
-  }
-  if (!unitRouteTints.size) return
+  const half = camera.cell / 2, inset = camera.cell * .08
   ctx.globalAlpha = .28
-  const inset = camera.cell * .08
-  for (const [key, color] of unitRouteTints) {
+  for (const [key, color] of fog.tints) {
     const comma = key.indexOf(',')
     const x = Number(key.slice(0, comma)), y = Number(key.slice(comma + 1))
     if (x < minX || x > maxX || y < minY || y > maxY) continue
-    if (!visible.has(key) && !explored.has(key)) continue
+    if (!fog.visible.has(key) && !fog.explored.has(key)) continue
     const sx = size.width / 2 + (x - camera.x) * camera.cell, sy = size.height / 2 + (y - camera.y) * camera.cell
     ctx.fillStyle = color
     ctx.fillRect(sx - half + inset, sy - half + inset, camera.cell - inset * 2, camera.cell - inset * 2)

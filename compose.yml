@@ -9,7 +9,11 @@ services:
       ARENA_DATA_DIR: /app/runtime
       ARENA_HERO_API_KEY: ${ARENA_HERO_API_KEY:?Set ARENA_HERO_API_KEY in .env}
       DASHBOARD_TOKEN: ${DASHBOARD_TOKEN:?Set DASHBOARD_TOKEN in .env}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Supervisor guards read by docker-entrypoint.py. Logs are plain stdout
+      # (docker json-file below + tactic_play.log); there is no LOG_LEVEL knob.
+      TACTIC_MAX_CRASHES: ${TACTIC_MAX_CRASHES:-10}
+      TACTIC_STALL_SECONDS: ${TACTIC_STALL_SECONDS:-180}
+      PLAY_LOG_MAX_MB: ${PLAY_LOG_MAX_MB:-20}
       # Local timezone for log stamps; overridable via TZ in the server .env.
       TZ: ${TZ:-Asia/Shanghai}
     ports:
@@ -19,18 +23,31 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 20s
+    # The container only needs to bind 4399 and read/write its volume: never
+    # let a child process gain privileges through a setuid binary.
+    security_opt:
+      - no-new-privileges:true
+    # Cap container stdout on disk (tactic_play.log has its own 20MB rotation;
+    # this covers everything the entrypoint/dashboard print).
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4399/api/health', timeout=3)",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4399/api/health', timeout=7)",
         ]
       interval: 30s
-      timeout: 5s
+      timeout: 8s
       retries: 3
-      start_period: 20s
+      # A cold start has to load the (large) map memory before the first tick:
+      # 20s was too short and painted a healthy container as unhealthy.
+      start_period: 60s
 
 volumes:
   arena-game-runtime:

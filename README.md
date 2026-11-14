@@ -88,18 +88,24 @@ ArenaGame/
 ├── game_stats.py          # 累计战报统计聚合与持久化
 ├── state_io.py            # 跨进程文件锁、原子写、JSONL 追加与裁剪
 ├── status.py              # 命令行实时状态查看器
-├── direct_wrapper.py      # 直接控制桥接器（备用，带自动重启）
-├── watchdog.py            # 看门狗：守护 direct_wrapper 不挂、不卡
-├── docker-entrypoint.py   # 容器入口：启动 tactic + dashboard 并守护
-├── diagnose.py            # 诊断辅助脚本
-├── requirements.txt       # 依赖：arena-hero>=0.2.9,<0.3
+├── watchdog.py            # 卡死检测：update_stall_tracking 产出 stall_alert
+├── docker-entrypoint.py   # 容器入口：启动 tactic + dashboard，负责退避重启/崩溃熔断/卡死看门狗/日志轮转
+├── diagnose.py            # 诊断辅助脚本（本地用，git 忽略）
+├── requirements.txt       # 运行依赖：arena-hero>=0.2.9,<0.3
+├── requirements-dev.txt   # 开发/CI 依赖：pytest、paramiko、ruff、coverage
+├── pyproject.toml         # 项目元数据 + ruff / pytest / coverage 配置
 ├── Dockerfile             # 单容器镜像（python:3.12-slim）
-├── compose.yml            # 单服务编排 + volume + healthcheck
+├── compose.yml            # 单服务编排 + volume + healthcheck + 日志上限
+├── .dockerignore          # 构建上下文裁剪（_* 一律排除，上下文约 2–3 MB）
+├── .gitattributes         # 统一 LF，二进制/锁文件例外
 ├── .env.example           # 本地运行环境变量模板
 ├── BEHAVIOR.md            # 战术行为逻辑完整说明（中文）
+├── tests/                 # pytest 套件（conftest.py 负责隔离运行时数据目录）
 └── deploy/                # VPS 一键部署脚本
-    ├── deploy.py           #   SFTP + docker compose 一键部署
+    ├── deploy.py          #   SFTP（显式清单 + 上传体积预检）+ docker compose 一键部署
     ├── deploy_source_only.py
+    ├── ssh_common.py      #   主机密钥固定（known_hosts + RejectPolicy）、TOFU、密钥/密码登录、密钥打码
+    ├── .ssh_known_hosts   #   已固定的服务器主机密钥（本机生成，git 忽略）
     ├── .env.deploy.example #   部署凭据模板
     └── DEPLOYMENT.md       #   部署手册
 ```
@@ -280,7 +286,7 @@ curl -X POST http://localhost:4399/api/config/reset \
 
 ### 鉴权
 
-设置 `DASHBOARD_TOKEN` 后，非环回请求必须携带该 token（cookie / `Authorization: Bearer` / `?token=`）。来自 `127.0.0.1` 的环回请求始终放行，便于容器 healthcheck 与部署冒烟测试。未设 token 时鉴权关闭（仅本地开发用）。
+设置 `DASHBOARD_TOKEN` 后，非环回请求必须携带该 token（cookie / `Authorization: Bearer` / `?token=`）。来自 `127.0.0.1` 的环回请求放行，供容器 healthcheck 使用；部署冒烟测试走 docker-proxy（源地址是网桥网关，不算环回），因此仍显式带 Bearer 头。未设 token 时鉴权关闭（仅本地开发用）。
 
 ---
 
@@ -322,9 +328,10 @@ curl -i http://localhost:4399/ -H "Authorization: Bearer $DASHBOARD_TOKEN"
 
 容器特性：
 
-- 非 root 用户 `arena`（uid 10001）运行
-- `docker-entrypoint.py` 守护 tactic 进程（崩溃自动重启）与 dashboard 进程
-- healthcheck 命中环回 `/api/health`（`/api/state` 为轻量 tick 探针）
+- 非 root 用户 `arena`（uid 10001）运行，`no-new-privileges`
+- `docker-entrypoint.py` 守护 tactic 进程：指数退避（2→4→8→16→30s 封顶）+ 崩溃计数，10 分钟内非零退出超过 `TACTIC_MAX_CRASHES`（默认 10）次就退出容器，交给 `restart: unless-stopped` 重启；`tactic_log.jsonl` 超过 `TACTIC_STALL_SECONDS`（默认 180s）没有新写入时会 SIGTERM/SIGKILL 掉 tactic 并走重启流程
+- `tactic_play.log` 在打开前按 `PLAY_LOG_MAX_MB`（默认 20）轮转，保留 2 份备份；容器 stdout 另由 compose 的 `logging: json-file`（10m × 3）兜底
+- healthcheck 命中环回 `/api/health`（timeout 8s、start_period 60s，避免冷加载 `map_memory` 时误判）；`/api/state` 为轻量 tick 探针
 - `stop_grace_period: 20s` 给 tactic 留时间保存地图记忆
 - runtime volume 备份与恢复见 [单 VPS 部署](#单-vps-部署)
 
@@ -336,26 +343,36 @@ curl -i http://localhost:4399/ -H "Authorization: Bearer $DASHBOARD_TOKEN"
 
 ```bash
 cp deploy/.env.deploy.example deploy/.env.deploy
-# 填入 DEPLOY_HOST / DEPLOY_USER / DEPLOY_PASSWORD / ARENA_HERO_API_KEY / DASHBOARD_TOKEN
+# 填入 DEPLOY_HOST / DEPLOY_USER（建议非 root）/ DEPLOY_KEY_PATH 或 DEPLOY_PASSWORD
+# 以及 ARENA_HERO_API_KEY / DASHBOARD_TOKEN
 
-pip install paramiko
+pip install -r requirements.txt -r requirements-dev.txt
 python deploy/deploy.py
 ```
 
-脚本会：SFTP 上传项目文件 → 远端写入 `.env` → `docker compose up --build --detach` → 冒烟测试 `/` 与 `/api/state`。
+脚本会：先打印**上传清单**（文件数 + 体积，只上传 `deploy/deploy.py` 里显式列出的清单，不再整树遍历，单次约 2–3 MB）→ SFTP 上传 → 远端写入 `.env`（控制台只打印打码后的值）→ `docker compose up --build --detach` → 冒烟测试 `/`、`/api/health`、`/api/state`（后两者要求 JSON 里 `"ok": true`，`/api/health` 返回 503 只告警不判失败，表示「容器起来了但机器人还没开始 tick」）。
 
-**安全须知**：部署使用未加密 HTTP，全靠 `DASHBOARD_TOKEN` 把关（连查看仪表盘都需要令牌）。强烈建议在云防火墙/安全组把 TCP 4399 限制到可信来源 IP 或 VPN。
+**安全须知**：
+
+- 部署走未加密 HTTP，全靠 `DASHBOARD_TOKEN` 把关（连查看仪表盘都需要令牌）。强烈建议在云防火墙/安全组把 TCP 4399 限制到可信来源 IP 或 VPN。
+- SSH 主机密钥现在会被**固定校验**：首次连接新服务器时脚本拒绝并打印 SHA256 指纹与操作提示；核对无误后带 `DEPLOY_TRUST_NEW_HOST=1` 再跑一次即写入 `deploy/.ssh_known_hosts`（git 忽略、本机保存）。之后密钥一旦变化（服务器重装或中间人）会直接拒绝，不会静默接受。
+- 优先用密钥登录（`DEPLOY_KEY_PATH` + 可选 `DEPLOY_KEY_PASSPHRASE`），密码登录（`DEPLOY_PASSWORD`）继续可用。`DEPLOY_USER` 留空会回退到 `root` 并打印告警，建议换成有 docker 权限的普通账号。
+- 令牌/密钥在控制台输出中一律打码（`abc...yz`），不会再像以前那样把 `Authorization: Bearer <token>` 的命令原样打印。
 
 ---
 
 ## 测试
 
 ```bash
-python -m pytest tests/
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest
 ```
 
 - `tests/test_tactic_config.py`：配置字段、校验、迁移、热加载
-- `tests/test_regressions.py`：行为回归（约 165 个用例，覆盖寻路、死胡同、采集、卸货、回避、分队等）
+- `tests/test_regressions.py`：行为回归，**610 个用例方法 / 约 1.3 万行**，覆盖寻路、死胡同、采集、卸货、回避、分队等
+- `tests/conftest.py`：autouse 的 session 级 fixture，把 `ARENA_DATA_DIR` 指到临时目录，套件不再往仓库根写 `tactic_log.jsonl` / `game_stats.json` / `*.lock`
+
+完整套件约 850 个用例，本地约 15 秒跑完。CI（`.github/workflows/ci.yml`）在 Python 3.12 上依次跑 `ruff check .` 与 `python -m pytest`，另有独立的 `web` job（`npm ci` → lint → test → build）。ruff 规则集与已知技术债见 `pyproject.toml`。
 
 ---
 
@@ -366,17 +383,21 @@ python -m pytest tests/
 | `ARENA_HERO_API_KEY` | ✅ | Arena Hero API key（vps 上若未设，容器跳过 tactic 仅起 dashboard） |
 | `DASHBOARD_TOKEN` | ✅* | 仪表盘鉴权令牌；空则鉴权关闭，仅本地用 |
 | `ARENA_DATA_DIR` | 否 | 可变状态目录（Docker 指向 `/app/runtime` volume） |
-| `ARENA_LOG_MAX_MB` | 否 | 日志轮转阈值 MB，默认 20 |
-| `LOG_LEVEL` | 否 | 日志级别，默认 info |
+| `ARENA_LOG_MAX_MB` | 否 | `tactic_log.jsonl` 轮转阈值 MB，默认 20 |
+| `PLAY_LOG_MAX_MB` | 否 | `tactic_play.log` 轮转阈值 MB，默认 20（保留 2 份备份） |
+| `TACTIC_MAX_CRASHES` | 否 | 10 分钟内 tactic 非零退出次数上限，默认 10，超过则容器退出交给 Docker 重启 |
+| `TACTIC_STALL_SECONDS` | 否 | `tactic_log.jsonl` 无新写入的卡死阈值秒数，默认 180 |
 | `HOST` / `PORT` | 否 | 仪表盘监听，默认 `0.0.0.0:4399` |
 
-部署专用（`deploy/.env.deploy`）：`DEPLOY_HOST`、`DEPLOY_PORT`、`DEPLOY_USER`、`DEPLOY_PASSWORD`、`DEPLOY_REMOTE_BASE`、`APP_PORT`。
+日志一律走 stdout / `tactic_play.log`，**没有** `LOG_LEVEL` 之类的日志级别开关（历史配置项已删除）。
+
+部署专用（`deploy/.env.deploy`）：`DEPLOY_HOST`、`DEPLOY_PORT`、`DEPLOY_USER`、`DEPLOY_KEY_PATH`、`DEPLOY_KEY_PASSPHRASE`、`DEPLOY_PASSWORD`、`DEPLOY_TRUST_NEW_HOST`、`DEPLOY_REMOTE_BASE`、`APP_PORT`。
 
 ---
 
 ## 技术细节
 
-- **零前端框架**：`dashboard.py` 用 Python `http.server` 起服务，前端 HTML/CSS/JS 全部内联字符串，无 npm 构建步骤
+- **零前端框架（Python 侧）**：`dashboard.py` 只用标准库 `http.server` 起服务，提供 `/api/*` 与把 `/api/v1/*` 代理到游戏 API 的接口，并托管 `web/dist`（React + Vite 构建产物）的 `/arena` 控制台；原先内联 HTML/CSS/JS 的服务端渲染面板已下线
 - **跨进程文件锁 `state_io.file_lock`**：Linux 用 `fcntl.flock`，Windows 用 `msvcrt.locking`；tactic 与 dashboard 并发写 `battle_log.jsonl` / `tactic_config.json` 时串行化
 - **原子写 `atomic_write_text`**：临时同名文件 + `os.replace`，避免写一半的配置被读到
 - **流式反向读日志 `_iter_log_lines_reverse`**：按块从尾部读 JSONL，不在内存装载整个（可达数十 MB 的）日志，dashboard 与 `status.py` 共用

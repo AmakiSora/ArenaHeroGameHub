@@ -1,4 +1,5 @@
 import type { Position } from './types'
+import { dashboardRequest } from './dashboardRequest'
 
 // Categorized battle log rows (battle_log.jsonl), served by the dashboard as
 // /api/battle-log — the very same data the server-rendered dashboard shows in
@@ -20,27 +21,23 @@ export interface BattleLogEntry {
 
 const KNOWN_CATEGORIES: ReadonlySet<string> = new Set(BATTLE_LOG_CATEGORIES)
 
-export async function loadBattleLog(limit = 3000): Promise<BattleLogEntry[]> {
-  try {
-    const response = await fetch(`/api/battle-log?limit=${limit}`, { credentials: 'same-origin' })
-    if (!response.ok) return []
-    const data = await response.json() as { ok?: boolean; entries?: Array<{ tick?: unknown; ts?: unknown; cat?: unknown; msg?: unknown }> }
-    if (data?.ok !== true || !Array.isArray(data.entries)) return []
-    return data.entries.flatMap((item) => {
-      if (!item || typeof item.msg !== 'string' || !item.msg) return []
-      const tick = Number(item.tick)
-      const ts = Number(item.ts)
-      const rawCat = String(item.cat ?? '')
-      return [{
-        tick: Number.isFinite(tick) && item.tick !== null ? tick : null,
-        ts: Number.isFinite(ts) && item.ts !== null ? ts : null,
-        cat: KNOWN_CATEGORIES.has(rawCat) ? rawCat : '',
-        msg: item.msg,
-      }]
-    })
-  } catch {
-    return []
-  }
+export async function loadBattleLog(limit = 3000, signal?: AbortSignal): Promise<BattleLogEntry[]> {
+  const result = await dashboardRequest<{ ok?: boolean; entries?: Array<{ tick?: unknown; ts?: unknown; cat?: unknown; msg?: unknown }> }>(`/api/battle-log?limit=${limit}`, { signal })
+  if (!result.ok) return []
+  const data = result.data
+  if (data?.ok !== true || !Array.isArray(data.entries)) return []
+  return data.entries.flatMap((item) => {
+    if (!item || typeof item.msg !== 'string' || !item.msg) return []
+    const tick = Number(item.tick)
+    const ts = Number(item.ts)
+    const rawCat = String(item.cat ?? '')
+    return [{
+      tick: Number.isFinite(tick) && item.tick !== null ? tick : null,
+      ts: Number.isFinite(ts) && item.ts !== null ? ts : null,
+      cat: KNOWN_CATEGORIES.has(rawCat) ? rawCat : '',
+      msg: item.msg,
+    }]
+  })
 }
 
 // Messages from the tactic carry "(x,y)" or "(x1,y1)→(x2,y2)" coordinates

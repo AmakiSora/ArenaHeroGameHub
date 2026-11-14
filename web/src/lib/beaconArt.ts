@@ -1,6 +1,8 @@
 import { publicAsset } from './publicAsset'
 
-export const BEACON_SPRITE_PATH = publicAsset('/assets/game/beacon.png')
+// Re-encoded to WebP at 256x256, i.e. ~2x the largest drawn size
+// (ceil(cell * 1.5) = 117 CSS px at MAX_WORLD_CELL_SIZE 78).
+export const BEACON_SPRITE_PATH = publicAsset('/assets/game/beacon.webp')
 
 export function beaconSpriteRect(screenX: number, screenY: number, cell: number, attached: boolean, aspectRatio = 1) {
   const maxSize = Math.max(1, Math.round(cell * (attached ? .58 : .98)))

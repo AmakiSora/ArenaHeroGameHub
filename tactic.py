@@ -17,8 +17,8 @@ import shutil
 
 import watchdog
 
-from collections import defaultdict, deque
-from collections.abc import Callable, Iterable, Mapping
+from collections import OrderedDict, defaultdict, deque
+from collections.abc import Callable, Iterable, Mapping, Set as AbstractSet
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from functools import wraps
@@ -37,33 +37,28 @@ from arena_hero import (
 from arena_hero.errors import APIError, ProtocolError, TransportError
 import game_stats
 import map_codec
-from state_io import append_jsonl, atomic_write_text, file_lock
+from state_io import append_jsonl, atomic_write_text, data_dir, data_path, file_lock
 from tactic_config import CONFIG_PATH, load_config, mutate_config, parse_team_ratio
 
-def _data_dir() -> Path:
-    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
-    return Path(raw).resolve() if raw else Path.cwd()
-
-
-MAP_MEMORY_PATH = _data_dir() / "map_memory.json"
-DEFAULT_LOG_PATH = str(_data_dir() / "tactic_log.jsonl")
+MAP_MEMORY_PATH = data_path("map_memory.json")
+DEFAULT_LOG_PATH = str(data_path("tactic_log.jsonl"))
 MAP_COLD_PRUNE_MARKER = MAP_MEMORY_PATH.parent / "map_cold_prune.done"
 # Categorized battle log (discoveries / kills / defeats / config changes) that
 # both the tactic process and the dashboard process append to.
-BATTLE_LOG_PATH = _data_dir() / "battle_log.jsonl"
+BATTLE_LOG_PATH = data_path("battle_log.jsonl")
 # Manual per-unit target coordinates set from the dashboard (display-name keyed).
-WAYPOINTS_PATH = _data_dir() / "waypoints.json"
+WAYPOINTS_PATH = data_path("waypoints.json")
 # Manual per-unit self-destruct commands set from the dashboard (display-name keyed).
-SELF_DESTRUCT_PATH = _data_dir() / "self_destruct.json"
+SELF_DESTRUCT_PATH = data_path("self_destruct.json")
 # Manual per-unit hold-position (驻守) commands set from the dashboard
 # (display-name keyed): a held unit stands in place and auto-attacks enemies
 # entering its range instead of following its normal program.
-HOLDS_PATH = _data_dir() / "holds.json"
+HOLDS_PATH = data_path("holds.json")
 # Ordered attack-target queues per combat squad ("attack" / "kite"), set from
 # the dashboard / web console: {"attack": [[x, y], ...], "kite": [...]}. Only
 # the coords mode consumes a queue; the head pops once the squad arrived and
 # the area is cleared (see _advance_squad_target_queue).
-SQUAD_TARGETS_PATH = _data_dir() / "squad_targets.json"
+SQUAD_TARGETS_PATH = data_path("squad_targets.json")
 
 # Display-name prefix per unit type (W / V / R), shared with the dashboard.
 _UNIT_NAME_PREFIX = {
@@ -260,6 +255,10 @@ def _vision_obstructed(
 _CARDINAL_DELTAS: tuple[tuple[int, int], ...] = ((0, -1), (1, 0), (0, 1), (-1, 0))
 _dead_end_cache_key: frozenset[tuple[int, int]] | None = None
 _dead_end_cache: frozenset[tuple[int, int]] = frozenset()
+# Largest wall set a from-scratch dead-end batch may be computed for (see the
+# report #8 safety net in _dead_end_cells_batch). The persistent structure
+# seeds the production map (~488k walls) through the seeding_structure flag.
+_DEAD_END_BATCH_MAX_WALLS = 100_000
 
 # Persistent incremental dead-end structure for the permanent obstacle memory.
 # _dead_obstacles is the exact obstacle set the structure covers — the same
@@ -274,6 +273,62 @@ _dead_structure_built: bool = False
 # Stable per-tick view of _obstacle_memory: the same frozenset object across
 # ticks unless walls actually grew (see _update_obstacle_memory).
 _known_obstacles: frozenset[tuple[int, int]] = frozenset()
+# Monotone version of _obstacle_memory plus the version _known_obstacles (and the
+# persistent structure above) currently mirrors. The per-Tick "did the wall map
+# change?" test used to be `_known_obstacles != _obstacle_memory` — a ~488k-cell
+# set comparison on every no-growth Tick (21-32 ms measured, ×2-3 on the VPS, see
+# OPTIMIZATION_REVIEW.md #6). Two integers decide it instead. Every mutation site
+# must bump the version (direct in-place mutation: call _bump_obstacle_generation);
+# _reset_dead_structure records the version it rebased the structure to.
+_obstacle_mem_generation: int = 0
+_known_obstacles_generation: int = 0
+# Cells sampled per side by _obstacle_view_is_current. Small maps (all tests) are
+# probed exhaustively; the production map costs O(1) per Tick.
+_OBSTACLE_VIEW_PROBE_CELLS = 8
+
+
+def _bump_obstacle_generation() -> None:
+    """Mark _obstacle_memory as changed outside _update_obstacle_memory.
+
+    Call this after mutating the wall set directly (a wholesale reload, the cold
+    prune, or the Core's learned blocked cell) so the next _update_obstacle_memory
+    rebases the stable view and the incremental dead-end structure.
+    """
+    global _obstacle_mem_generation
+    _obstacle_mem_generation += 1
+
+
+def _obstacle_view_is_current() -> bool:
+    """True when _known_obstacles still mirrors _obstacle_memory.
+
+    Cheap replacement for the full set comparison: the version counter catches
+    every mutation this module performs, and a constant-size sample probe is the
+    safety net for code that clears/restores the set directly (tests, tools).
+    The probe is exhaustive for maps of at most _OBSTACLE_VIEW_PROBE_CELLS walls.
+    """
+    if _known_obstacles_generation != _obstacle_mem_generation:
+        return False
+    if len(_known_obstacles) != len(_obstacle_memory):
+        return False
+    known = _known_obstacles
+    probe = 0
+    for cell in _obstacle_memory:
+        if cell not in known:
+            return False
+        probe += 1
+        if probe >= _OBSTACLE_VIEW_PROBE_CELLS:
+            break
+    if probe < len(_obstacle_memory):
+        # Memory is larger than the probe: sample the stable view as well, so a
+        # same-cardinality replacement is still noticed.
+        probe = 0
+        for cell in known:
+            if cell not in _obstacle_memory:
+                return False
+            probe += 1
+            if probe >= _OBSTACLE_VIEW_PROBE_CELLS:
+                break
+    return True
 
 
 def _neighbor_cells(pos: tuple[int, int]) -> tuple[tuple[int, int], ...]:
@@ -477,6 +532,8 @@ def _publish_plan_profile(phase: _PhaseTimer) -> None:
 
 def _dead_end_cells_batch(
     obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]],
+    *,
+    seeding_structure: bool = False,
 ) -> tuple[set[tuple[int, int]], dict[tuple[int, int], int]]:
     """Dead-end closure + final open-count, computed from scratch (batch).
 
@@ -488,7 +545,22 @@ def _dead_end_cells_batch(
     Cascade parity invariant: the cascade only propagates through *candidate*
     cells (free cells adjacent to at least one obstacle). A free cell adjacent
     to no obstacle is never a candidate and is never touched.
+
+    Safety net (report #8): a from-scratch batch over the production map
+    (~488k walls) costs 4.2 s and allocates two 2.1M-entry containers. Only the
+    persistent structure's own seeding may do that; any other caller asking for
+    a batch this large reuses the persistent result and warns instead. The
+    primary fix keeps transient obstacle sets small — this is the backstop.
     """
+    if not seeding_structure and len(obstacles) > _DEAD_END_BATCH_MAX_WALLS:
+        print(
+            f"[map] dead-end batch refused: {len(obstacles)} walls > "
+            f"{_DEAD_END_BATCH_MAX_WALLS}; reusing persistent structure "
+            f"(report #8 safety net)",
+            flush=True,
+        )
+        _ensure_dead_structure()
+        return set(_dead_view), {}
     obs = frozenset(obstacles)
     candidates: set[tuple[int, int]] = set()
     for cell in obs:
@@ -545,7 +617,11 @@ def _ensure_dead_structure() -> None:
     if _dead_structure_built:
         return
     _dt0 = time.monotonic()
-    _dead_set, _dead_open_count = _dead_end_cells_batch(_dead_obstacles)
+    # Only the structure's own seeding may batch the production wall set; see
+    # the size guard in _dead_end_cells_batch.
+    _dead_set, _dead_open_count = _dead_end_cells_batch(
+        _dead_obstacles, seeding_structure=True,
+    )
     _dead_view = frozenset(_dead_set)
     _dead_structure_built = True
     # Count the batch build as a dead-end run for telemetry so the first call of
@@ -557,10 +633,18 @@ def _ensure_dead_structure() -> None:
 
 def _reset_dead_structure(obstacles: frozenset) -> None:
     """Rebase after a wholesale obstacle reload (_load_map_memory / out-of-band
-    test mutation). The batch build is deferred to the next _ensure_dead_structure."""
+    test mutation). The batch build is deferred to the next _ensure_dead_structure.
+
+    Also rebases the stable _known_obstacles view and records the wall-map
+    generation it now reflects, so the next _update_obstacle_memory does not
+    rebuild the structure a second time. Every caller passes exactly the set it
+    just published as _known_obstacles.
+    """
     global _dead_obstacles, _dead_open_count, _dead_set, _dead_view, \
-        _dead_structure_built
+        _dead_structure_built, _known_obstacles, _known_obstacles_generation
     _dead_obstacles = obstacles
+    _known_obstacles = obstacles
+    _known_obstacles_generation = _obstacle_mem_generation
     _dead_open_count = {}
     _dead_set = set()
     _dead_view = frozenset()
@@ -722,8 +806,58 @@ def _dead_ends_with_extras(obstacles, extras) -> frozenset[tuple[int, int]]:
     return frozenset((base_dead - removed) | new_dead)
 
 
+class _ObstacleOverlay(AbstractSet):
+    """``base | extra`` obstacle test without copying the base wall set.
+
+    The combat planners receive one obstacle collection and consult it in a
+    hundred places (`in` checks, dead-end lookups, A* calls). Handing them
+    ``obstacle_cells | {one or two transient cells}`` copied the ~488k-cell wall
+    set per unit and — worse — broke the `_dead_obstacles` identity cache, so
+    `_get_dead_ends` fell into the from-scratch batch (measured 4,176 ms and
+    ~200 MB transient on the live map, see OPTIMIZATION_REVIEW.md #8).
+
+    This read-only view answers membership exactly like that union. Every
+    consumer of the obstacle argument either does `in` tests or goes through
+    `_get_dead_ends` / `_path_blockers`, which unwrap the overlay back into the
+    stable wall set + the existing transient-`extras` channel, so the dead-end
+    result stays bit-identical to the folded union.
+    """
+
+    __slots__ = ("base", "extra")
+    _from_iterable = frozenset  # set operators (`|`, `-`) return real frozensets
+
+    def __init__(
+        self,
+        base: frozenset[tuple[int, int]],
+        extra: frozenset[tuple[int, int]],
+    ) -> None:
+        self.base = base
+        self.extra = extra
+
+    def __contains__(self, cell: object) -> bool:
+        return cell in self.base or cell in self.extra
+
+    def __iter__(self):
+        yield from self.base
+        for cell in self.extra:
+            if cell not in self.base:
+                yield cell
+
+    def __len__(self) -> int:
+        return len(self.base) + sum(
+            1 for cell in self.extra if cell not in self.base
+        )
+
+    def unwrap(
+        self,
+        extras: frozenset[tuple[int, int]],
+    ) -> tuple[frozenset[tuple[int, int]], frozenset[tuple[int, int]]]:
+        """Split into (stable obstacle set, extras ∪ this overlay)."""
+        return self.base, extras | self.extra
+
+
 def _get_dead_ends(
-    obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]],
+    obstacles: frozenset[tuple[int, int]] | set[tuple[int, int]] | _ObstacleOverlay,
     *,
     extras: frozenset[tuple[int, int]] = frozenset(),
 ) -> frozenset[tuple[int, int]]:
@@ -736,6 +870,8 @@ def _get_dead_ends(
     identity/equality cache.
     """
     global _dead_end_cache_key, _dead_end_cache
+    if isinstance(obstacles, _ObstacleOverlay):
+        obstacles, extras = obstacles.unwrap(extras)
     if extras:
         return _dead_ends_with_extras(obstacles, extras)
     if obstacles is _dead_obstacles:
@@ -783,6 +919,51 @@ _path_blockers_union_key: frozenset[tuple[int, int]] | None = None
 _path_blockers_union: frozenset[tuple[int, int]] = frozenset()
 
 
+class _BlockedView:
+    """Lazy ``obstacles | dead | extras`` membership test for one A* call.
+
+    Materialising that union costs ~72 ms per call on the production wall set
+    (810k cells) and can never be cached while ``extras`` is non-empty — every
+    worker/combat search carries transient occupied cells (see
+    OPTIMIZATION_REVIEW.md #7). A* only ever asks "is this cell blocked?", so
+    three set lookups replace the copy.
+
+    ``allow`` carries cells that must stay enterable even though they are in the
+    union: the dead-end pocket containing start/goal (formerly ``union - allowed``)
+    and the goal itself (formerly ``blocked = blocked - {goal}``). Both were full
+    union copies per call.
+    """
+
+    __slots__ = ("obstacles", "dead", "extras", "allow")
+
+    def __init__(
+        self,
+        obstacles: frozenset[tuple[int, int]],
+        dead: frozenset[tuple[int, int]] | set[tuple[int, int]],
+        extras: frozenset[tuple[int, int]],
+        allow: frozenset[tuple[int, int]] = frozenset(),
+    ) -> None:
+        self.obstacles = obstacles
+        self.dead = dead
+        self.extras = extras
+        self.allow = allow
+
+    def __contains__(self, cell: tuple[int, int]) -> bool:
+        if cell in self.allow:
+            return False
+        return (
+            cell in self.obstacles
+            or cell in self.dead
+            or cell in self.extras
+        )
+
+    def with_allowed(self, cell: tuple[int, int]) -> "_BlockedView":
+        """Return a copy of this view that also lets ``cell`` be entered."""
+        return _BlockedView(
+            self.obstacles, self.dead, self.extras, self.allow | {cell},
+        )
+
+
 def _path_blockers(
     obstacles: frozenset[tuple[int, int]],
     *,
@@ -790,37 +971,44 @@ def _path_blockers(
     goal: tuple[int, int] | None = None,
     avoid_dead_ends: bool = True,
     extras: frozenset[tuple[int, int]] = frozenset(),
-) -> frozenset[tuple[int, int]]:
+) -> frozenset[tuple[int, int]] | _BlockedView:
     """Obstacles plus dead ends, keeping corridors that contain start/goal.
 
     `extras` are transient occupied cells the caller treats as blocked this tick
     but which must not defeat the wall dead-end cache: dead-ends are computed
     from `obstacles` (cached) and `extras` are unioned in as plain blockers.
+
+    Returns the cached frozenset union when nothing has to be subtracted (the
+    common no-`extras` shape), otherwise a `_BlockedView` that answers the same
+    membership questions without copying the wall set.
     """
+    if isinstance(obstacles, _ObstacleOverlay):
+        obstacles, extras = obstacles.unwrap(extras)
+    empty = frozenset()
     if not avoid_dead_ends:
-        return obstacles | extras
+        return _BlockedView(obstacles, empty, extras)
     dead = _get_dead_ends(obstacles, extras=extras)
     if not dead:
-        return obstacles | extras
-    global _path_blockers_union_key, _path_blockers_union
-    if not extras and (obstacles is _path_blockers_union_key
-                       or obstacles == _path_blockers_union_key):
-        union = _path_blockers_union
-    else:
-        union = obstacles | extras | dead
-        if not extras:
-            _path_blockers_union_key = obstacles
-            _path_blockers_union = union
+        return _BlockedView(obstacles, empty, extras)
     allowed: set[tuple[int, int]] = set()
     if start is not None and start in dead:
         allowed |= _dead_component(start, dead)
     if goal is not None and goal in dead:
         allowed |= _dead_component(goal, dead)
-    if not allowed:
-        return union
-    # allowed ⊆ dead and dead cells are free by construction, so subtracting
-    # it from the union equals obstacles | (dead - allowed).
-    return union - allowed
+    if extras or allowed:
+        # Never materialise the union for a transient search (report #7): every
+        # planner call carries occupied cells, so this is the production shape.
+        return _BlockedView(obstacles, dead, extras, frozenset(allowed))
+    # Purely wall-based search: return the cached identity-stable union so
+    # repeated calls share one frozenset (the pre-existing cache).
+    global _path_blockers_union_key, _path_blockers_union
+    if obstacles is _path_blockers_union_key \
+            or obstacles == _path_blockers_union_key:
+        return _path_blockers_union
+    union = obstacles | dead
+    _path_blockers_union_key = obstacles
+    _path_blockers_union = union
+    return union
 
 
 def _is_dead_end_step(
@@ -872,9 +1060,14 @@ def _bfs_path(
         extras=extras,
     )
     # Goal itself must remain enterable even if classified as a dead end, but
-    # NOT if it is an obstacle or occupied-by-other this tick (extras).
+    # NOT if it is an obstacle or occupied-by-other this tick (extras). This used
+    # to be `blocked = blocked - {goal}` — another full union copy per call; the
+    # view carries the exception as a membership test instead.
     if goal in blocked and goal not in obstacles and goal not in extras:
-        blocked = blocked - {goal}
+        if isinstance(blocked, _BlockedView):
+            blocked = blocked.with_allowed(goal)
+        else:
+            blocked = blocked - {goal}
 
     # A*: f = g + h. tie-break on h so we bias toward the goal.
     # Heap entries: (f, h, counter, g, cell). counter breaks remaining ties.
@@ -956,14 +1149,42 @@ def _path_index(
 
 _object_names: dict[tuple[str, str], str] = {}
 _object_name_counters: defaultdict[str, int] = defaultdict(int)
+# Recency order of the enemy ("E") half of _object_names, least recently seen
+# first. Enemy ids churn (every spawn is a fresh UUID), so this table used to
+# grow for the whole process lifetime — days on the live server — and the
+# per-Tick prune materialised list(_object_names.items()) over it (report #15).
+# C/W/V/R names are never evicted: Core and unit names must stay stable, and
+# live-unit entries are pruned by life cycle in _prune_dead_unit_bookkeeping.
+_OBJECT_NAME_ENEMY_LIMIT = 4096
+_object_name_enemy_order: OrderedDict[tuple[str, str], None] = OrderedDict()
+
+
+def _remember_enemy_name(key: tuple[str, str]) -> None:
+    """Mark an enemy name most-recently-seen; evict the oldest past the cap."""
+    order = _object_name_enemy_order
+    order[key] = None
+    order.move_to_end(key)
+    while len(order) > _OBJECT_NAME_ENEMY_LIMIT:
+        oldest, _ = order.popitem(last=False)
+        _object_names.pop(oldest, None)
 
 
 def _object_name(object_id: Any, prefix: str) -> str:
     key = prefix, str(object_id)
-    if key not in _object_names:
-        _object_name_counters[prefix] += 1
-        _object_names[key] = f"{prefix}{_object_name_counters[prefix]}"
-    return _object_names[key]
+    name = _object_names.get(key)
+    if name is not None:
+        if prefix == "E":
+            # Touch: an enemy that is still visible (named every Tick) must never
+            # be the least-recently-seen entry, so its name cannot drift.
+            _object_name_enemy_order[key] = None
+            _object_name_enemy_order.move_to_end(key)
+        return name
+    _object_name_counters[prefix] += 1
+    name = f"{prefix}{_object_name_counters[prefix]}"
+    _object_names[key] = name
+    if prefix == "E":
+        _remember_enemy_name(key)
+    return name
 
 
 def _set_unit_route(
@@ -1051,6 +1272,22 @@ class TacticLogger:
         self._tick_count = 0
         self._start_time = time.monotonic()
         self._last_tick_time = 0.0
+        # uid -> hash of the route polyline written for that unit last Tick.
+        # Cached A* routes are re-emitted unchanged for every Tick a unit walks
+        # them, and the worker polylines were 87% of a 53 KB record; an
+        # unchanged route is logged as ``path: null`` + ``path_len`` and the
+        # dashboard recovers the coordinates from an earlier record.
+        self._last_path_sig: dict[str, int] = {}
+
+    def _route_fields(self, uid: str, route: Mapping, *, seen: set[str]) -> dict:
+        """Path fields for one unit, omitting a route unchanged since last Tick."""
+        path = route.get("path") or []
+        sig = hash(tuple(path))
+        seen.add(uid)
+        if self._last_path_sig.get(uid) == sig:
+            return {"path": None, "path_len": len(path)}
+        self._last_path_sig[uid] = sig
+        return {"path": [list(p) for p in path], "path_len": len(path)}
 
     def open(self) -> None:
         self._file = open(self.path, "a", encoding="utf-8")
@@ -1097,6 +1334,9 @@ class TacticLogger:
                     backup.unlink()
                 log_path.rename(backup)
             self._file = open(self.path, "a", encoding="utf-8")
+            # A reader can no longer look across the rotation boundary for the
+            # route coordinates we omitted, so re-emit every full path once.
+            self._last_path_sig.clear()
             self._write_header()
             print(f"[log] rotated {self.path} -> {backup.name}", flush=True)
         except Exception as exc:
@@ -1177,6 +1417,7 @@ class TacticLogger:
             rec.core_shield = core.shield
             rec.core_state = core.view.state.value if hasattr(core.view.state, "value") else str(core.view.state)
 
+        logged_uids: set[str] = set()
         for w in turn.workers:
             wid = str(w.id)[:8]
             route = turn_context.worker_routes.get(wid, {})
@@ -1185,7 +1426,7 @@ class TacticLogger:
                 "name": _object_name(w.id, "W"),
                 "pos": list(w.position),
                 "target": list(route["target"]) if route.get("target") else None,
-                "path": [list(position) for position in route.get("path", [])],
+                **self._route_fields(wid, route, seen=logged_uids),
                 "path_complete": bool(route.get("complete", False)),
                 "cargo": w.cargo,
                 "hp": w.hp,
@@ -1199,7 +1440,7 @@ class TacticLogger:
                 "name": _object_name(v.id, "V"),
                 "pos": list(v.position),
                 "target": list(v_route["target"]) if v_route.get("target") else None,
-                "path": [list(p) for p in v_route.get("path", [])],
+                **self._route_fields(vid, v_route, seen=logged_uids),
                 "path_complete": bool(v_route.get("complete", False)),
                 "hp": v.hp,
             })
@@ -1212,10 +1453,16 @@ class TacticLogger:
                 "name": _object_name(r.id, "R"),
                 "pos": list(r.position),
                 "target": list(r_route["target"]) if r_route.get("target") else None,
-                "path": [list(p) for p in r_route.get("path", [])],
+                **self._route_fields(rid, r_route, seen=logged_uids),
                 "path_complete": bool(r_route.get("complete", False)),
                 "hp": r.hp,
             })
+        # Drop signatures of units that are gone so the table cannot grow with
+        # the respawn churn of a multi-day run.
+        if len(self._last_path_sig) > 256:
+            self._last_path_sig = {
+                uid: sig for uid, sig in self._last_path_sig.items() if uid in logged_uids
+            }
 
         for enemy in turn.visible_enemies:
             rec.enemies.append({
@@ -1251,7 +1498,7 @@ _guerrilla_route_state = {"date": "", "paused": False}
 
 
 def _guerrilla_route_path(date: str) -> Path:
-    return _data_dir() / f"{GUERRILLA_ROUTE_PREFIX}{date}.jsonl"
+    return data_path(f"{GUERRILLA_ROUTE_PREFIX}{date}.jsonl")
 
 
 def _prune_guerrilla_route_logs(today: str) -> None:
@@ -1260,7 +1507,7 @@ def _prune_guerrilla_route_logs(today: str) -> None:
         today_date = datetime.strptime(today, "%Y%m%d").date()
     except ValueError:
         return
-    for path in _data_dir().glob(f"{GUERRILLA_ROUTE_PREFIX}*.jsonl"):
+    for path in data_dir().glob(f"{GUERRILLA_ROUTE_PREFIX}*.jsonl"):
         stamp = path.name[len(GUERRILLA_ROUTE_PREFIX):-len(".jsonl")]
         try:
             logged_date = datetime.strptime(stamp, "%Y%m%d").date()
@@ -6708,7 +6955,13 @@ def _plan_vanguard(
     team: str,
     cell_counts: Mapping | None = None,
 ) -> tuple[str, str]:
-    """Dispatch a Vanguard according to its combat team assignment."""
+    """Dispatch a Vanguard according to its combat team assignment.
+
+    `obstacle_cells` may be an `_ObstacleOverlay` (wall set + the unit's 1-2
+    CELL_UNIT_LIMIT / MOVE_CONTESTED refusal cells). Every membership test and
+    every `_get_dead_ends` / `_bfs_path` call below sees the folded union, while
+    the dead-end structure keeps its wall-set identity (see report #8).
+    """
     if team == "home":
         return _plan_home_combat(
             vanguard,
@@ -6768,7 +7021,11 @@ def _plan_ranger(
     team: str,
     cell_counts: Mapping | None = None,
 ) -> tuple[str, str]:
-    """Dispatch a Ranger according to its combat team assignment."""
+    """Dispatch a Ranger according to its combat team assignment.
+
+    See _plan_vanguard: `obstacle_cells` may carry an `_ObstacleOverlay` with the
+    unit's transient refusal cells.
+    """
     if team == "home":
         return _plan_home_combat(
             ranger,
@@ -7332,6 +7589,8 @@ def _load_map_memory() -> None:
         data = json.loads(MAP_MEMORY_PATH.read_text(encoding="utf-8"))
         forgotten = _coords_from_payload(data.get("forgotten_resources"))
         _obstacle_memory = map_codec.decode_obstacles(data)
+        # Wholesale replacement: tell the dead-end rebase check the wall map moved.
+        _bump_obstacle_generation()
         resources = _coords_from_payload(data.get("resources"))
         manual = _coords_from_payload(data.get("manual_resources"))
         _resource_memory = (resources | manual) - forgotten
@@ -7530,6 +7789,7 @@ def _prune_cold_map_memory() -> None:
         return
 
     _obstacle_memory.difference_update(cold)
+    _bump_obstacle_generation()
     _known_obstacles = frozenset(_obstacle_memory)
     _reset_dead_structure(_known_obstacles)
     _map_dirty = True
@@ -7537,6 +7797,7 @@ def _prune_cold_map_memory() -> None:
         _save_map_memory(force=True)
     except Exception as exc:
         _obstacle_memory.update(cold)
+        _bump_obstacle_generation()
         _known_obstacles = frozenset(_obstacle_memory)
         _reset_dead_structure(_known_obstacles)
         _map_dirty = True
@@ -7724,7 +7985,6 @@ def _obstacles_sorted_payload() -> list[tuple[int, int]]:
     return rebuilt
 
 
-@_map_transaction
 def _save_map_memory(
     tick: int | None = None,
     force: bool = False,
@@ -7738,7 +7998,46 @@ def _save_map_memory(
 
     ``defer`` performs the dashboard-memory reconciliation and due checks but
     leaves the expensive encode/write to the live loop after submit.
+
+    The cheap no-op gates run BEFORE the cross-process map lock: _choose_actions
+    calls this every Tick with ``defer=True``, and taking map_memory.lock on a
+    Tick that only sets a pending marker (or returns immediately) serialized the
+    live loop against the dashboard for nothing. _apply_dashboard_map_edits() is
+    not newly-unlocked code — _choose_actions already calls it outside this lock
+    every Tick — and the actual write below still holds the lock.
     """
+    global _pending_map_save_tick
+    # Always honor dashboard deletions, even on a non-dirty no-op path.
+    _apply_dashboard_map_edits()
+    if not force and not _map_dirty:
+        return
+    if (
+        not force
+        and tick is not None
+        and _last_map_save_tick >= 0
+        and tick - _last_map_save_tick < save_interval_ticks
+    ):
+        return
+    if defer and not force and tick is not None:
+        if _pending_map_save_tick is None:
+            _pending_map_save_tick = tick
+        return
+    _save_map_memory_locked(
+        tick=tick,
+        force=force,
+        save_interval_ticks=save_interval_ticks,
+        defer=defer,
+    )
+
+
+@_map_transaction
+def _save_map_memory_locked(
+    tick: int | None = None,
+    force: bool = False,
+    save_interval_ticks: int = 10,
+    defer: bool = False,
+) -> None:
+    """Write body of :func:`_save_map_memory`; always called under the map lock."""
     global _map_dirty, _last_map_save_tick, _enemy_clear_seq, _last_dashboard_map_sig
     global _pending_map_save_tick
     # Always honor dashboard deletions, even on a non-dirty no-op path.
@@ -7877,9 +8176,24 @@ def _reap_map_save_child(*, block: bool = False) -> None:
         return
     _map_save_child_pid = None
     code = os.waitstatus_to_exitcode(status)
+    if code == 2:
+        # The child absorbed a dashboard edit that landed after this process'
+        # last sync (see _fork_map_save). Its write is good, but leaving the
+        # stale signature in place is deliberate: the next Tick re-parses the
+        # file so the edit is not dropped from live memory.
+        return
     if code != 0:
         _map_dirty = True
         print(f"[map] background save failed exit={code}", flush=True)
+        return
+    # The child wrote the file in its own address space and exited, so the parent
+    # never saw the new signature. Without this refresh the next Tick's
+    # _apply_dashboard_map_edits() concludes "changed", re-parses the whole
+    # multi-MB map_memory.json and only then finds the dashboard sig unchanged
+    # (production: one 2,124 ms map_memory phase per successful fork; report #9).
+    saved_sig = _file_signature(MAP_MEMORY_PATH)
+    if saved_sig is not None:
+        _map_file_sig_cache[str(MAP_MEMORY_PATH)] = saved_sig
 
 
 def _fork_map_save(tick: int) -> bool:
@@ -7897,7 +8211,16 @@ def _fork_map_save(tick: int) -> bool:
         return False
     if pid == 0:
         code = 0
+        # Signatures inherited from the parent. If the file moved after that sync
+        # the child re-reads it inside _save_map_memory; the parent's copy of the
+        # dashboard-owned fields would then be stale, so flag it (exit 2) and let
+        # the parent re-parse on its next Tick instead of trusting the new
+        # signature (report #9's refresh must not skip a real dashboard edit).
+        inherited_sig = _map_file_sig_cache.get(str(MAP_MEMORY_PATH))
         try:
+            current_sig = _file_signature(MAP_MEMORY_PATH)
+            if inherited_sig is None or current_sig != inherited_sig:
+                code = 2
             _save_map_memory(tick=tick, force=True)
         except BaseException:
             code = 1
@@ -8386,13 +8709,15 @@ def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
     wall-only dead-end fast-path in _get_dead_ends is an O(1) identity hit on
     no-growth ticks and a tiny incremental update on growth ticks.
     """
-    global _obstacle_memory, _map_dirty, _known_obstacles, _obstacle_sorted_cache
-    before = len(_obstacle_memory)
-    if len(_known_obstacles) != before or _known_obstacles != _obstacle_memory:
-        # _obstacle_memory changed outside this function (tests clear/restore it
-        # directly): rebase the incremental structure before accumulating. The
-        # equality check also catches a same-cardinality coordinate replacement;
-        # length alone cannot distinguish that from an unchanged map.
+    global _obstacle_memory, _map_dirty, _known_obstacles, _obstacle_sorted_cache, \
+        _known_obstacles_generation
+    if not _obstacle_view_is_current():
+        # _obstacle_memory changed outside this function — either a version bump
+        # (wholesale reload / cold prune / learned Core cell) or code that
+        # clears/restores the set directly. Rebase the incremental structure
+        # before accumulating; the sampled probe (see _obstacle_view_is_current)
+        # also catches a same-cardinality replacement, which a length check alone
+        # cannot distinguish from an unchanged map.
         _known_obstacles = frozenset(_obstacle_memory)
         _reset_dead_structure(_known_obstacles)
         _ensure_dead_structure()
@@ -8411,6 +8736,11 @@ def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
         _obstacle_pending_adds.update(added)
         _dead_add_walls(added)
         _known_obstacles = _dead_obstacles
+        # The incremental fold above brought the stable view along with the
+        # mutation, so record the new version as already mirrored (a bump without
+        # this would force a full rebase on the next Tick).
+        _bump_obstacle_generation()
+        _known_obstacles_generation = _obstacle_mem_generation
     return _known_obstacles
 
 
@@ -9441,6 +9771,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 and _dest not in _resource_memory
             ):
                 _obstacle_memory.add(_dest)
+                _bump_obstacle_generation()
                 _obstacle_pending_adds.add(_dest)
                 _map_dirty = True
                 core_blocked_now.add(_dest)
@@ -10218,9 +10549,17 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 if team in _CONTEST_PARK_TEAMS
                 else None
             )
+            # Thread the 1-2 refusal cells through the transient channel instead
+            # of copying the whole wall set: `obstacle_cells | _extra_block`
+            # broke the persistent dead-end structure's identity cache, so every
+            # unit in the congestion episode paid a from-scratch 4.2 s batch
+            # (report #8). The overlay keeps the planner's obstacle argument a
+            # complete blocked set (identical membership) without the copy.
             _extra_block = {c for c in (_blocked_cell, _contest_cell) if c is not None}
             _unit_obstacles = (
-                obstacle_cells | _extra_block if _extra_block else obstacle_cells
+                _ObstacleOverlay(obstacle_cells, frozenset(_extra_block))
+                if _extra_block
+                else obstacle_cells
             )
             _ut0 = time.monotonic()
             action, detail = _plan_vanguard(
@@ -10247,9 +10586,12 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 if team in _CONTEST_PARK_TEAMS
                 else None
             )
+            # Same transient-channel treatment as the Vanguard branch above.
             _extra_block = {c for c in (_blocked_cell, _contest_cell) if c is not None}
             _unit_obstacles = (
-                obstacle_cells | _extra_block if _extra_block else obstacle_cells
+                _ObstacleOverlay(obstacle_cells, frozenset(_extra_block))
+                if _extra_block
+                else obstacle_cells
             )
             _ut0 = time.monotonic()
             action, detail = _plan_ranger(

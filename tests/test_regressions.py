@@ -4081,56 +4081,6 @@ class KiteTeamPlannerTests(unittest.TestCase):
 
 
 class DashboardLogTests(unittest.TestCase):
-    def test_svg_contains_worker_route_target_and_object_names(self) -> None:
-        rec = {
-            "core_pos": [0, 0],
-            "core_name": "C1",
-            "workers": [{
-                "id": "worker-1",
-                "name": "W1",
-                "pos": [0, 0],
-                "target": [2, 0],
-                "path": [[0, 0], [0, 1], [1, 1], [2, 1], [2, 0]],
-                "path_complete": True,
-                "cargo": 0,
-            }],
-            "vanguards": [{"name": "V1", "pos": [1, 2]}],
-            "rangers": [{"name": "R1", "pos": [2, 2]}],
-            "enemies": [{"name": "E1", "pos": [3, 2]}],
-            "resource_cells": [],
-        }
-        memory = {"obstacles": [], "resources": []}
-
-        svg = dashboard.render_svg(rec, memory)
-
-        self.assertIn('<pattern id="gridPat" x="24" y="24"', svg)
-        self.assertIn('class="worker-route"', svg)
-        self.assertIn('class="worker-route-target"', svg)
-        for name in ("C1", "W1", "V1", "R1", "E1"):
-            self.assertIn(f">{name}</text>", svg)
-
-    def test_svg_unit_markers_carry_data_unit_only_for_own_units(self) -> None:
-        """Manual-target map-pick needs the clicked marker to identify its unit.
-        Own units (W/V/R) carry data-unit; enemies and the core must not, so a
-        stray click on them cannot pick a phantom manual-target name."""
-        rec = {
-            "core_pos": [0, 0],
-            "core_name": "C1",
-            "workers": [{"name": "W1", "pos": [0, 1]}],
-            "vanguards": [{"name": "V2", "pos": [1, 2]}],
-            "rangers": [{"name": "R3", "pos": [2, 2]}],
-            "enemies": [{"name": "E9", "pos": [3, 3]}],
-            "resource_cells": [],
-        }
-        memory = {"obstacles": [], "resources": []}
-
-        svg = dashboard.render_svg(rec, memory)
-
-        for name in ("W1", "V2", "R3"):
-            self.assertIn(f'data-unit="{name}"', svg)
-        self.assertNotIn('data-unit="E9"', svg)
-        self.assertNotIn('data-unit="C1"', svg)
-
     def test_unit_display_names_maps_short_ids_to_dashboard_names(self) -> None:
         """The arena SPA looks up tactic display names by short unit id so it
         labels units exactly like the dashboard (W1/V2/R3)."""
@@ -4155,188 +4105,6 @@ class DashboardLogTests(unittest.TestCase):
         })
         self.assertEqual(dashboard.unit_display_names(None), {})
         self.assertEqual(dashboard.unit_display_names({}), {})
-
-    def test_svg_route_is_trimmed_to_unwalked_remainder(self) -> None:
-        """Routes only draw the segment ahead of the unit, not the ground it
-        has already crossed. A unit mid-path must not re-render the cells it
-        already walked through."""
-        rec = {
-            "core_pos": [0, 0],
-            "core_name": "C1",
-            "workers": [{
-                "name": "W1", "pos": [1, 0],
-                "target": [3, 0],
-                "path": [[0, 0], [1, 0], [2, 0], [3, 0]],
-                "path_complete": True,
-            }],
-            "vanguards": [], "rangers": [], "enemies": [],
-            "resource_cells": [],
-        }
-        memory = {"obstacles": [], "resources": []}
-        svg = dashboard.render_svg(rec, memory)
-
-        m = re.search(
-            r'<polyline class="worker-route"[^>]*points="([^"]+)"', svg
-        )
-        self.assertIsNotNone(m, "worker route polyline should be drawn")
-        points = m.group(1).split()
-
-        # Decode the polyline back to grid cells via the SVG's own viewport
-        # attributes, so this does not depend on cell/pad/min-map-size internals.
-        xmin = int(re.search(r'data-xmin="(-?\d+)"', svg).group(1))
-        ymin = int(re.search(r'data-ymin="(-?\d+)"', svg).group(1))
-        cell = int(re.search(r'data-cell="(\d+)"', svg).group(1))
-        pad = int(re.search(r'data-pad="(\d+)"', svg).group(1))
-
-        def center(gx: int, gy: int) -> str:
-            return (f"{pad + (gx - xmin) * cell + cell / 2:.1f},"
-                    f"{pad + (gy - ymin) * cell + cell / 2:.1f}")
-
-        # Trimmed polyline starts at the unit's current cell (1,0) and never
-        # re-draws the already-walked origin (0,0).
-        self.assertEqual(points[0], center(1, 0))
-        self.assertNotIn(center(0, 0), points)
-
-    def test_svg_elements_are_tagged_for_map_filters(self) -> None:
-        """Every drawable category carries a data-cat so legend toggles can
-        show/hide it client-side."""
-        rec = {
-            "core_pos": [0, 0],
-            "core_name": "C1",
-            "beacon_pos": [1, 1],
-            "workers": [{
-                "name": "W1", "pos": [1, 0], "cargo": 0,
-                "path": [[0, 0], [1, 0], [2, 0]], "path_complete": True,
-                "target": [2, 0],
-            }],
-            "vanguards": [{"name": "V1", "pos": [1, 2]}],
-            "rangers": [{"name": "R1", "pos": [2, 2]}],
-            "enemies": [{"name": "E1", "pos": [3, 2]}],
-            "resource_cells": [[4, 4]],
-        }
-        memory = {
-            "obstacles": [[5, 5]],
-            "resources": [[6, 6]],
-            "enemy_sightings": [[7, 7]],
-        }
-        svg = dashboard.render_svg(rec, memory, waypoints={"W1": [2, 0]})
-
-        for cat, minimum in (
-            ("core", 1), ("worker", 1), ("vanguard", 1), ("ranger", 1),
-            ("enemy", 1), ("enemy-trace", 1), ("wall", 1), ("ore", 1),
-            ("ore-mem", 1), ("route", 1), ("target", 1), ("beacon", 1),
-            ("wp", 1),
-        ):
-            self.assertGreaterEqual(
-                svg.count(f'data-cat="{cat}"'), minimum,
-                f"category {cat} should be tagged in the map SVG",
-            )
-
-    def test_svg_enemy_type_is_filtered_per_type(self) -> None:
-        """Visible enemies carry their unit type and are tagged with a per-type
-        category (enemy-worker / enemy-vanguard / enemy-ranger / enemy-core /
-        enemy) so the legend can hide each enemy class independently."""
-        rec = {
-            "core_pos": [0, 0],
-            "core_name": "C1",
-            "workers": [], "vanguards": [], "rangers": [],
-            "resource_cells": [],
-            "enemies": [
-                {"name": "E1", "pos": [1, 0], "type": "WORKER"},
-                {"name": "E2", "pos": [2, 0], "type": "VANGUARD"},
-                {"name": "E3", "pos": [3, 0], "type": "RANGER"},
-                {"name": "E4", "pos": [4, 0], "type": "CORE"},
-                {"name": "E5", "pos": [5, 0], "type": None},
-            ],
-        }
-        svg = dashboard.render_svg(rec, {"obstacles": [], "resources": []})
-
-        for cat in ("enemy-worker", "enemy-vanguard", "enemy-ranger",
-                    "enemy-core", "enemy"):
-            self.assertGreaterEqual(
-                svg.count(f'data-cat="{cat}"'), 2,
-                f"enemy category {cat} should be tagged",
-            )
-
-        # A live enemy HQ has its own diamond silhouette, rather than looking
-        # like another circular enemy unit with only a different label.
-        self.assertIn('data-marker="enemy-core-live"', svg)
-        self.assertRegex(
-            svg,
-            r'<polygon data-cat="enemy-core" data-marker="enemy-core-live"',
-        )
-
-    def test_svg_remembered_enemy_core_uses_star_diamond_marker(self) -> None:
-        """Unknown enemy and HQ memories must remain obvious at tiny scale."""
-        rec = {
-            "core_pos": [0, 0], "core_name": "C1",
-            "workers": [], "vanguards": [], "rangers": [], "enemies": [],
-            "resource_cells": [],
-        }
-        memory = {
-            "obstacles": [], "resources": [],
-            "enemy_sightings": [[2, 0], [4, 0, "CORE"]],
-        }
-
-        svg = dashboard.render_svg(rec, memory)
-
-        self.assertIn('data-marker="enemy-core-memory"', svg)
-        self.assertIn(">★</text>", svg)
-        self.assertIn(">敌</text>", svg)
-        self.assertEqual(dashboard._enemy_type_char("CORE"), "★")
-
-    def test_svg_same_cell_enemy_keeps_highest_priority_type(self) -> None:
-        """When a worker stands on the enemy CORE's own cell, only the CORE
-        marker is drawn there — the blue worker must not cover the enemy HQ."""
-        rec = {
-            "core_pos": [0, 0],
-            "core_name": "C1",
-            "workers": [], "vanguards": [], "rangers": [],
-            "resource_cells": [],
-            "enemies": [
-                {"name": "E1", "pos": [3, 0], "type": "CORE"},
-                {"name": "E2", "pos": [3, 0], "type": "WORKER"},
-                {"name": "E3", "pos": [5, 0], "type": "WORKER"},
-            ],
-        }
-        svg = dashboard.render_svg(rec, {"obstacles": [], "resources": []})
-
-        # The shared cell renders exactly one enemy marker, and it is the core.
-        self.assertGreaterEqual(svg.count('data-cat="enemy-core"'), 1)
-        self.assertEqual(svg.count(">E1</text>"), 1)
-        # The worker duplicated on the HQ cell is suppressed; the other worker
-        # (its own cell) is still drawn.
-        self.assertGreaterEqual(svg.count('data-cat="enemy-worker"'), 1)
-        self.assertEqual(svg.count(">E2</text>"), 0)
-        self.assertEqual(svg.count(">E3</text>"), 1)
-
-    def test_svg_y_axis_matches_game_up_direction(self) -> None:
-        """Smaller world-Y must render higher because Direction.UP is (0, -1)."""
-        rec = {
-            "core_pos": [0, 0],
-            "core_name": "C1",
-            "workers": [
-                {"name": "W-north", "pos": [0, -2], "cargo": 0},
-                {"name": "W-south", "pos": [0, 2], "cargo": 0},
-            ],
-            "vanguards": [],
-            "rangers": [],
-            "enemies": [],
-            "resource_cells": [],
-        }
-
-        svg = dashboard.render_svg(rec, {"obstacles": [], "resources": []}, margin=4)
-
-        def unit_cy(label: str) -> float:
-            marker = f">{label}</text>"
-            index = svg.index(marker)
-            text_tag_start = svg.rfind("<text", 0, index)
-            y_token = 'y="'
-            y_start = svg.index(y_token, text_tag_start) + len(y_token)
-            y_end = svg.index('"', y_start)
-            return float(svg[y_start:y_end])
-
-        self.assertLess(unit_cy("W-north"), unit_cy("W-south"))
 
     def test_reverse_reader_handles_small_chunk_boundaries(self) -> None:
         lines = ["first", "第二行", "third line is longer"]
@@ -4449,6 +4217,148 @@ class LoggerRotationTests(unittest.TestCase):
             lines = log_path.read_text(encoding="utf-8").splitlines()
 
         self.assertGreaterEqual(len(lines), 6)  # header + summary + records
+
+
+class TickLogRouteDedupTests(unittest.TestCase):
+    """A cached A* route is logged once, not on every Tick it is walked.
+
+    Production records measured 51.8 KB each, 87% of it worker polylines that
+    were byte-identical tick after tick. The logger now writes ``path: null``
+    + ``path_len`` for an unchanged route and the dashboard recovers the
+    coordinates from an older record (``_resolve_unit_paths``).
+    """
+
+    ROUTE = [(1, 0), (2, 0), (3, 0), (4, 0)]
+
+    @staticmethod
+    def _fake_turn(tick: int, workers: list):
+        state = SimpleNamespace(population=5)
+        core = SimpleNamespace(
+            id="core-1",
+            position=(0, 0),
+            hp=10,
+            shield=5,
+            view=SimpleNamespace(state=SimpleNamespace(value="ALIVE")),
+        )
+        beacon = SimpleNamespace(
+            position=(5, 5),
+            status=SimpleNamespace(name="GROUND"),
+        )
+        return SimpleNamespace(
+            tick=tick,
+            state=state,
+            core=core,
+            resources=10,
+            resource_capacity=20,
+            visible_enemies=[],
+            resource_cells=frozenset(),
+            obstacle_cells=frozenset(),
+            beacon=beacon,
+            workers=workers,
+            vanguards=[],
+            rangers=[],
+            events=[],
+        )
+
+    def setUp(self) -> None:
+        self._names = dict(tactic._object_names)
+        self._counters = dict(tactic._object_name_counters)
+        self._worker_routes = tactic.turn_context.worker_routes
+        tactic._object_names.clear()
+        tactic._object_name_counters.clear()
+
+    def tearDown(self) -> None:
+        tactic._object_names.clear()
+        tactic._object_names.update(self._names)
+        tactic._object_name_counters.clear()
+        tactic._object_name_counters.update(self._counters)
+        tactic.turn_context.worker_routes = self._worker_routes
+
+    def _ticks(self, log_path: Path) -> list[dict]:
+        rows = []
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if "_meta" not in rec and "_summary" not in rec:
+                rows.append(rec)
+        return rows
+
+    def test_unchanged_route_is_logged_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "tactic_log.jsonl"
+            logger = tactic.TacticLogger(str(log_path))
+            logger.open()
+            tactic.turn_context.worker_routes = {
+                "uid-w1"[:8]: {"target": (4, 0), "path": list(self.ROUTE), "complete": True},
+            }
+            worker = SimpleNamespace(id="uid-w1", position=(2, 0), cargo=0, hp=2)
+            try:
+                logger.record_tick(self._fake_turn(1, [worker]), core_action="WAIT")
+                logger.record_tick(self._fake_turn(2, [worker]), core_action="WAIT")
+            finally:
+                logger.close()
+            recs = self._ticks(log_path)
+
+        self.assertEqual(len(recs), 2)
+        first = recs[0]["workers"][0]
+        self.assertEqual(first["path"], [list(cell) for cell in self.ROUTE])
+        self.assertEqual(first["path_len"], len(self.ROUTE))
+        second = recs[1]["workers"][0]
+        self.assertIsNone(second["path"])
+        self.assertEqual(second["path_len"], len(self.ROUTE))
+
+    def test_changed_route_is_logged_again(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "tactic_log.jsonl"
+            logger = tactic.TacticLogger(str(log_path))
+            logger.open()
+            worker = SimpleNamespace(id="uid-w1", position=(2, 0), cargo=0, hp=2)
+            try:
+                tactic.turn_context.worker_routes = {
+                    "uid-w1"[:8]: {"target": (4, 0), "path": list(self.ROUTE), "complete": True},
+                }
+                logger.record_tick(self._fake_turn(1, [worker]), core_action="WAIT")
+                tactic.turn_context.worker_routes = {
+                    "uid-w1"[:8]: {"target": (1, 0), "path": [(2, 0), (1, 0)], "complete": True},
+                }
+                logger.record_tick(self._fake_turn(2, [worker]), core_action="WAIT")
+            finally:
+                logger.close()
+            recs = self._ticks(log_path)
+
+        self.assertEqual(recs[1]["workers"][0]["path"], [[2, 0], [1, 0]])
+        self.assertEqual(recs[1]["workers"][0]["path_len"], 2)
+
+
+class DashboardRouteRecoveryTests(unittest.TestCase):
+    def test_recovers_a_route_omitted_by_the_logger(self) -> None:
+        full = {"tick": 2, "workers": [{
+            "id": "w1", "name": "W1", "pos": [2, 0],
+            "path": [[1, 0], [2, 0], [3, 0], [4, 0]], "path_complete": True,
+        }]}
+        slim = {"tick": 3, "workers": [{
+            "id": "w1", "name": "W1", "pos": [3, 0],
+            "path": None, "path_len": 4, "path_complete": True,
+        }]}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "tactic_log.jsonl"
+            log_path.write_text(
+                json.dumps(full) + "\n" + json.dumps(slim) + "\n", encoding="utf-8",
+            )
+            with patch.object(dashboard, "LOG_FILE", str(log_path)):
+                recovered = dashboard._resolve_unit_paths(slim)
+                remaining = dashboard._remaining_path(
+                    slim["workers"][0], recovered.get("w1"),
+                )
+        self.assertEqual(recovered["w1"], full["workers"][0]["path"])
+        self.assertEqual(remaining, [[3, 0], [4, 0]])
+
+    def test_no_lookback_when_the_record_carries_its_own_paths(self) -> None:
+        rec = {"workers": [{"id": "w1", "pos": [0, 0], "path": [[0, 0], [1, 0]]}]}
+        with patch.object(dashboard, "LOG_FILE", "/nonexistent/tactic_log.jsonl"):
+            self.assertEqual(dashboard._resolve_unit_paths(rec), {})
 
 
 class StatusLogTests(unittest.TestCase):
@@ -7297,73 +7207,6 @@ class DashboardWaypointTests(unittest.TestCase):
                 self.assertTrue(dashboard.clear_waypoints()["ok"])
                 self.assertEqual(dashboard.load_waypoints(), {})
 
-    def test_render_waypoints_panel_controls(self) -> None:
-        html = dashboard.render_waypoints_panel(
-            {
-                "W3": {"queue": [[10, 20], [30, 40]], "mode": "attack"},
-                "V2": {"queue": [[5, 5]], "mode": "rush"},
-            },
-            workers=["W3"], vanguards=["V2"], rangers=[],
-        )
-        self.assertIn('id="waypointPanel"', html)
-        self.assertIn('id="wpName"', html)
-        self.assertIn('<option value="W3">W3（工人）</option>', html)
-        self.assertIn('<option value="V2">V2（先锋）</option>', html)
-        self.assertIn('id="wpX"', html)
-        self.assertIn('id="wpY"', html)
-        self.assertIn('id="pickWpBtn"', html)
-        self.assertIn('id="wpSetBtn"', html)
-        self.assertIn('id="wpClearBtn"', html)
-        self.assertIn('id="wpMode"', html)
-        self.assertIn('<option value="attack" selected>攻击</option>', html)
-        # 每个目标一个可删 chip；每个单位一个模式切换 + 清空按钮。
-        self.assertIn('data-wp-remove="W3" data-wp-index="0"', html)
-        self.assertIn('data-wp-remove="W3" data-wp-index="1"', html)
-        self.assertIn('data-wp-mode-toggle="W3" data-mode="attack"', html)
-        self.assertIn('data-wp-mode-toggle="V2" data-mode="rush"', html)
-        self.assertIn('data-wp-clear-unit="W3"', html)
-        self.assertIn("(10, 20)", html)
-        self.assertIn("(30, 40)", html)
-        self.assertIn("赶路", html)
-
-    def test_svg_draws_waypoint_marker(self) -> None:
-        rec = {
-            "core_pos": [0, 0],
-            "workers": [], "vanguards": [], "rangers": [], "enemies": [],
-            "resource_cells": [],
-        }
-        memory = {"obstacles": [], "resources": []}
-        svg = dashboard.render_svg(rec, memory, waypoints={"W3": [0, 0]})
-        self.assertIn("W3→(0,0)", svg)
-
-    def test_svg_draws_each_queued_target_marker(self) -> None:
-        rec = {
-            "core_pos": [0, 0],
-            "workers": [], "vanguards": [], "rangers": [], "enemies": [],
-            "resource_cells": [],
-        }
-        memory = {"obstacles": [], "resources": []}
-        svg = dashboard.render_svg(
-            rec, memory,
-            waypoints={"W3": {"queue": [[0, 0], [0, 1]], "mode": "attack"}},
-        )
-        self.assertIn("W3→(0,0)", svg)
-        self.assertIn("W3→(0,1)", svg)
-
-    def test_waypoint_name_rejects_markup_and_renderer_escapes(self) -> None:
-        malicious = '\"><img src=x onerror=alert(1)>'
-        with tempfile.TemporaryDirectory() as temp_dir:
-            wp_file = Path(temp_dir) / "waypoints.json"
-            with patch.object(dashboard, "WAYPOINTS_FILE", str(wp_file)):
-                with self.assertRaises(ValueError):
-                    dashboard.set_waypoint(malicious, 1, 2)
-
-        html_output = dashboard.render_waypoints_panel(
-            {malicious: [1, 2]}, workers=[], vanguards=[], rangers=[],
-        )
-        self.assertNotIn("<img", html_output)
-        self.assertIn("&lt;img", html_output)
-
     def test_concurrent_waypoint_updates_preserve_every_target(self) -> None:
         failures = []
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7458,91 +7301,6 @@ class DashboardSelfDestructTests(unittest.TestCase):
                     dashboard.request_self_destruct('<img onerror=alert(1)>')
                 with self.assertRaises(ValueError):
                     dashboard.request_self_destruct("not-a-unit")
-
-    def test_unit_cards_render_self_destruct_button(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            log_path = Path(temp_dir) / "tactic_log.jsonl"
-            rec = {
-                "tick": 1,
-                "plan_unit_actions": {
-                    "aaaaaaaa": "HARVEST",
-                    "bbbbbbbb": "MOVE",
-                    "cccccccc": "MOVE",
-                },
-                "workers": [{
-                    "id": "aaaaaaaa", "name": "W1", "pos": [0, 0],
-                    "target": [2, 0], "path": [[0, 0], [1, 0], [2, 0]],
-                    "path_complete": True, "cargo": 0, "hp": 3,
-                }],
-                "vanguards": [{"id": "bbbbbbbb", "name": "V1", "pos": [1, 1], "hp": 5}],
-                "rangers": [{"id": "cccccccc", "name": "R1", "pos": [2, 2], "hp": 5}],
-                "resources": 0,
-                "resource_capacity": 50,
-                "visible_enemies": 0,
-                "resource_cells": [],
-                "core_pos": [0, 0],
-                "core_name": "C1",
-            }
-            log_path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
-            game_stats_path = Path(temp_dir) / "game_stats.json"
-            config_path = Path(temp_dir) / "tactic_config.json"
-            with patch.object(dashboard, "LOG_FILE", str(log_path)), \
-                 patch.object(dashboard, "MAP_FILE", str(Path(temp_dir) / "map_memory.json")), \
-                 patch.object(dashboard, "WAYPOINTS_FILE", str(Path(temp_dir) / "waypoints.json")), \
-                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")), \
-                 patch.object(game_stats, "STATS_PATH", game_stats_path), \
-                 patch.object(tactic_config, "CONFIG_PATH", config_path):
-                parts = dashboard.build_parts()
-
-        self.assertIsNotNone(parts)
-        for unit_name in ("W1", "V1", "R1"):
-            self.assertIn(
-                f'data-sd-unit="{unit_name}"',
-                parts["workersHtml"] + parts["vgHtml"] + parts["rgHtml"],
-                f"{unit_name} card should carry a 自裁 button",
-            )
-        self.assertIn('class="sd-btn"', parts["workersHtml"])
-        self.assertIn('class="sd-btn"', parts["vgHtml"])
-        self.assertIn('class="sd-btn"', parts["rgHtml"])
-
-    def test_unit_cards_carry_map_focus_coords(self) -> None:
-        """Each right-rail unit card embeds its live world position so a click
-        can jump the map view to the unit (focusWorld)."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            log_path = Path(temp_dir) / "tactic_log.jsonl"
-            rec = {
-                "tick": 1,
-                "plan_unit_actions": {},
-                "workers": [{
-                    "id": "aaaaaaaa", "name": "W1", "pos": [3, -2],
-                    "target": [3, -2], "path": [], "path_complete": True,
-                    "cargo": 0, "hp": 3,
-                }],
-                "vanguards": [{"id": "bbbbbbbb", "name": "V1", "pos": [1, 1], "hp": 5}],
-                "rangers": [{"id": "cccccccc", "name": "R1", "pos": [-4, 7], "hp": 5}],
-                "resources": 0,
-                "resource_capacity": 50,
-                "visible_enemies": 0,
-                "resource_cells": [],
-                "core_pos": [0, 0],
-                "core_name": "C1",
-            }
-            log_path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
-            game_stats_path = Path(temp_dir) / "game_stats.json"
-            config_path = Path(temp_dir) / "tactic_config.json"
-            with patch.object(dashboard, "LOG_FILE", str(log_path)), \
-                 patch.object(dashboard, "MAP_FILE", str(Path(temp_dir) / "map_memory.json")), \
-                 patch.object(dashboard, "WAYPOINTS_FILE", str(Path(temp_dir) / "waypoints.json")), \
-                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")), \
-                 patch.object(game_stats, "STATS_PATH", game_stats_path), \
-                 patch.object(tactic_config, "CONFIG_PATH", config_path):
-                parts = dashboard.build_parts()
-
-        self.assertIsNotNone(parts)
-        self.assertIn('data-focus-wx="3" data-focus-wy="-2"', parts["workersHtml"])
-        self.assertIn('data-focus-wx="1" data-focus-wy="1"', parts["vgHtml"])
-        self.assertIn('data-focus-wx="-4" data-focus-wy="7"', parts["rgHtml"])
-
 
 class ManualHoldTests(unittest.TestCase):
     """Dashboard「驻守」commands consumed by the tactic each Tick."""
@@ -7690,57 +7448,6 @@ class DashboardHoldTests(unittest.TestCase):
                     dashboard.set_hold('<img onerror=alert(1)>')
                 with self.assertRaises(ValueError):
                     dashboard.clear_hold("not-a-unit")
-
-    def test_unit_cards_render_hold_toggle(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            log_path = Path(temp_dir) / "tactic_log.jsonl"
-            rec = {
-                "tick": 1,
-                "plan_unit_actions": {},
-                "workers": [{
-                    "id": "aaaaaaaa", "name": "W1", "pos": [0, 0],
-                    "target": [2, 0], "path": [[0, 0], [1, 0], [2, 0]],
-                    "path_complete": True, "cargo": 0, "hp": 3,
-                }],
-                "vanguards": [{"id": "bbbbbbbb", "name": "V1", "pos": [1, 1], "hp": 5}],
-                "rangers": [{"id": "cccccccc", "name": "R1", "pos": [2, 2], "hp": 5}],
-                "resources": 0,
-                "resource_capacity": 50,
-                "visible_enemies": 0,
-                "resource_cells": [],
-                "core_pos": [0, 0],
-                "core_name": "C1",
-            }
-            log_path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
-            game_stats_path = Path(temp_dir) / "game_stats.json"
-            config_path = Path(temp_dir) / "tactic_config.json"
-            holds_file = Path(temp_dir) / "holds.json"
-            holds_file.write_text(json.dumps({
-                "updated_at": "2025-01-01T00:00:00",
-                "units": ["V1"],
-            }), encoding="utf-8")
-            with patch.object(dashboard, "LOG_FILE", str(log_path)), \
-                 patch.object(dashboard, "MAP_FILE", str(Path(temp_dir) / "map_memory.json")), \
-                 patch.object(dashboard, "WAYPOINTS_FILE", str(Path(temp_dir) / "waypoints.json")), \
-                 patch.object(dashboard, "BATTLE_LOG_FILE", str(Path(temp_dir) / "battle_log.jsonl")), \
-                 patch.object(dashboard, "HOLDS_FILE", str(holds_file)), \
-                 patch.object(game_stats, "STATS_PATH", game_stats_path), \
-                 patch.object(tactic_config, "CONFIG_PATH", config_path):
-                parts = dashboard.build_parts()
-
-        self.assertIsNotNone(parts)
-        for unit_name in ("W1", "V1", "R1"):
-            self.assertIn(
-                f'data-hold-unit="{unit_name}"',
-                parts["workersHtml"] + parts["vgHtml"] + parts["rgHtml"],
-                f"{unit_name} card should carry a 驻守 toggle",
-            )
-        # V1 is held: its card is highlighted and shows 解除驻守, the others 驻守.
-        self.assertIn('class="unit combat hold"', parts["vgHtml"])
-        self.assertIn("解除驻守", parts["vgHtml"])
-        self.assertNotIn("解除驻守", parts["workersHtml"])
-        self.assertIn("驻守", parts["workersHtml"])
-
 
 class EnemySightingsMemoryTests(unittest.TestCase):
     """Stale enemy sightings are removed only when a friendly unit can
@@ -8122,102 +7829,6 @@ class BattleLogTests(unittest.TestCase):
         self.assertIn("工人目标=8", msg)
         self.assertIn("游侠开火距离=2", msg)
 
-    def test_log_panel_html_renders_rows_with_categories(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "battle_log.jsonl"
-            path.write_text(
-                json.dumps({"tick": 1, "cat": "discover", "msg": "发现矿点"}) + "\n"
-                + json.dumps({"tick": 2, "cat": "kill", "msg": "参与摧毁"}) + "\n",
-                encoding="utf-8",
-            )
-            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
-                html, count = dashboard._battle_log_html()
-        self.assertEqual(count, 2)
-        self.assertIn('data-cat="discover"', html)
-        self.assertIn('data-cat="kill"', html)
-        self.assertIn("发现矿点", html)
-        self.assertIn("tick 1", html)
-
-    def test_log_panel_coords_are_clickable_map_jumps(self) -> None:
-        """日志消息里的 (x,y) 坐标渲染成带 data-focus 属性的可点击 span，
-        前端点击后调用 focusWorld 把地图视角重置到战斗发生的位置。"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "battle_log.jsonl"
-            path.write_text(
-                json.dumps({"tick": 1, "cat": "kill", "msg": "W1 参与摧毁 E3 (12,-34)"}) + "\n"
-                + json.dumps({"tick": 2, "cat": "combat", "msg": "W1 击中 E3 (5,6)→(9,10)"}) + "\n"
-                + json.dumps({"tick": 3, "cat": "discover", "msg": "发现新矿点 (3,4)"}) + "\n"
-                + json.dumps({"tick": 4, "cat": "config", "msg": "配置调整"}) + "\n",
-                encoding="utf-8",
-            )
-            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
-                html, count = dashboard._battle_log_html()
-        self.assertEqual(count, 4)
-        # 每个坐标都被包成可点击 span 且携带跳转属性（负数坐标也支持）
-        self.assertIn('class="log-coord" data-focus-wx="12" data-focus-wy="-34"', html)
-        # 箭头形式的战斗事件两个坐标都能跳转
-        self.assertIn('data-focus-wx="5" data-focus-wy="6"', html)
-        self.assertIn('data-focus-wx="9" data-focus-wy="10"', html)
-        self.assertIn('data-focus-wx="3" data-focus-wy="4"', html)
-        # 无坐标的消息不生成跳转属性
-        self.assertNotIn('data-focus-wx="0"', html)
-
-    def test_log_panel_html_shows_time_beside_tick(self) -> None:
-        """Rows carrying both tick and ts render the wall-clock time next to
-        the tick label (config rows already render ts-only as a time)."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "battle_log.jsonl"
-            path.write_text(
-                json.dumps({"tick": 5, "ts": 1234567890.0, "cat": "economy", "msg": "挖矿"})
-                + "\n" + json.dumps({"ts": 1234567890.0, "cat": "config", "msg": "配置调整"}) + "\n",
-                encoding="utf-8",
-            )
-            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
-                html, count = dashboard._battle_log_html()
-        self.assertEqual(count, 2)
-        self.assertIn("tick 5", html)
-        # The wall-clock time must be shown next to the tick, not dropped.
-        self.assertIn(" · ", html)
-        expected_time = dashboard.time.strftime(
-            "%H:%M:%S", dashboard.time.localtime(1234567890.0)
-        )
-        self.assertIn(expected_time, html)
-
-
-
-    def test_battle_log_rows_carry_ts_for_time_filtering(self) -> None:
-        """Each rendered row carries its wall-clock ts so the client can hide
-        rows older than the selected time window."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "battle_log.jsonl"
-            path.write_text(
-                json.dumps({"tick": 7, "ts": 1234567890.0, "cat": "warn", "msg": "告警"}) + "\n",
-                encoding="utf-8",
-            )
-            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
-                html, _count = dashboard._battle_log_html()
-        self.assertIn('data-ts="1234567890.0"', html)
-        # Time is shown first, tick second.
-        self.assertLess(html.find(":"), html.index("tick 7"))
-
-    def test_battle_log_limit_controls_rows_rendered(self) -> None:
-        """The server sends only ``limit`` newest rows; larger windows ask for
-        more so "全部" can cover more history than a fixed newest-200."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "battle_log.jsonl"
-            path.write_text(
-                "".join(json.dumps({"tick": i, "cat": "warn", "msg": f"行{i}"}) + "\n"
-                        for i in range(10)),
-                encoding="utf-8",
-            )
-            with patch.object(dashboard, "BATTLE_LOG_FILE", str(path)):
-                html, count = dashboard._battle_log_html(limit=4)
-        self.assertEqual(count, 4)
-        # Newest four rows: ticks 9,8,7,6.
-        self.assertIn("tick 9", html)
-        self.assertIn("tick 6", html)
-        self.assertNotIn("tick 5", html)
-
     def test_battle_log_json_entries_normalize_rows(self) -> None:
         """The arena SPA's /api/battle-log gets plain tick/ts/cat/msg rows
         (newest first); raw battle-log records never leak extra keys."""
@@ -8243,8 +7854,11 @@ class BattleLogTests(unittest.TestCase):
         import types
         req = types.SimpleNamespace(path="/api/state?log=999999")
         self.assertEqual(dashboard._clamp_log_limit(req), 8000)
-        req2 = types.SimpleNamespace(path="/api/log?limit=50")
-        self.assertEqual(dashboard._clamp_log_limit(req2), 200)
+        req2 = types.SimpleNamespace(path="/api/battle-log?limit=50")
+        self.assertEqual(dashboard._clamp_log_limit(req2), 50)
+        # The floor is 1 so a "newest line only" probe actually returns one row.
+        req2b = types.SimpleNamespace(path="/api/battle-log?limit=1")
+        self.assertEqual(dashboard._clamp_log_limit(req2b), 1)
         req3 = types.SimpleNamespace(path="/api/state?log=abc")
         self.assertEqual(dashboard._clamp_log_limit(req3), 200)
         req4 = types.SimpleNamespace(path="/api/state")
@@ -8265,7 +7879,7 @@ class ApiHealthProbeTests(unittest.TestCase):
     """
 
     def _get(self, path: str, log_file: str):
-        recorded = {"build_parts": 0}
+        recorded = {"load_map_memory": 0}
 
         class _Wire:
             def __init__(self) -> None:
@@ -8275,11 +7889,11 @@ class ApiHealthProbeTests(unittest.TestCase):
                 self.body += data
 
         def boom(*_args, **_kwargs):
-            recorded["build_parts"] += 1
-            return None
+            recorded["load_map_memory"] += 1
+            return {}
 
         with (
-            patch.object(dashboard, "build_parts", boom),
+            patch.object(dashboard, "load_map_memory", boom),
             patch.object(dashboard, "LOG_FILE", log_file),
             patch.object(dashboard.Handler, "_is_loopback", lambda self: True),
         ):
@@ -8306,8 +7920,8 @@ class ApiHealthProbeTests(unittest.TestCase):
             statuses, body, recorded = self._get("/api/health", str(log))
         self.assertEqual(statuses, [200])
         self.assertLess(len(body), 256)
-        # The whole point: the probe must not pay for the map render.
-        self.assertEqual(recorded["build_parts"], 0)
+        # The whole point: the probe must not pay for the map render/parse.
+        self.assertEqual(recorded["load_map_memory"], 0)
         self.assertEqual(json.loads(body)["tick"], 435397)
 
     def test_probe_reports_no_tick_without_a_log_but_still_answers(self) -> None:
@@ -8316,12 +7930,18 @@ class ApiHealthProbeTests(unittest.TestCase):
             statuses, body, _recorded = self._get(
                 "/api/health", str(Path(tmp) / "absent.jsonl"),
             )
-        self.assertEqual(statuses, [200])
-        self.assertIsNone(json.loads(body)["tick"])
+        # No tick at all means the bot is not playing: the probe must say so
+        # with 503 so Docker/compose and any uptime monitor can see it.
+        self.assertEqual(statuses, [503])
+        payload = json.loads(body)
+        self.assertIsNone(payload["tick"])
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["tactic_alive"])
 
     def test_state_endpoint_is_compact_by_default(self) -> None:
-        # Routine /api/state probes stay tiny; the full panel payload moved
-        # behind ?full=1 so a probe can never pay the map-render cost.
+        # /api/state is a liveness probe only — the retired server-rendered
+        # panel payload (every remembered wall drawn into one SVG) is gone, so
+        # ?full=1 is accepted and ignored rather than re-rendering anything.
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "tactic_log.jsonl"
@@ -8329,112 +7949,11 @@ class ApiHealthProbeTests(unittest.TestCase):
                 json.dumps({"tick": 435397, "plan_unit_actions": {}}) + "\n",
                 encoding="utf-8",
             )
-            statuses, body, recorded = self._get("/api/state", str(log))
+            statuses, body, recorded = self._get("/api/state?full=1", str(log))
         self.assertEqual(statuses, [200])
-        self.assertEqual(recorded["build_parts"], 0)
+        self.assertEqual(recorded["load_map_memory"], 0)
         self.assertLess(len(body), 256)
         self.assertEqual(json.loads(body)["tick"], 435397)
-
-    def test_full_state_is_still_available_on_request(self) -> None:
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            statuses, _body, recorded = self._get(
-                "/api/state?full=1", str(Path(tmp) / "x.jsonl"),
-            )
-        self.assertEqual(statuses, [200])
-        self.assertEqual(recorded["build_parts"], 1)
-
-
-class CoreRailBarTests(unittest.TestCase):
-    """Core vitals bars come from the live helpers (_seg_cells /
-    _core_rail_html) that /api/state still emits for the arena console."""
-
-    def test_seg_cells_one_cell_per_point_with_filled_prefix(self) -> None:
-        self.assertEqual(
-            dashboard._seg_cells(3, 5),
-            '<i class="on"></i><i class="on"></i><i class="on"></i><i></i><i></i>',
-        )
-        # Unknown / out-of-range values never overflow the bar.
-        self.assertEqual(dashboard._seg_cells(None, 5), "<i></i>" * 5)
-        self.assertEqual(dashboard._seg_cells(99, 5), '<i class="on"></i>' * 5)
-        self.assertEqual(dashboard._seg_cells(2, 0), "")
-
-    def test_core_rail_shield_cap_grows_when_beacon_is_on_core(self) -> None:
-        """No beacon → shield bar holds 5 cells; beacon on the Core → 10."""
-        base = {"core_pos": [3, 4], "core_name": "C1", "core_hp": 4,
-                "core_shield": 3, "population": 7, "core_action": "HEAL_CORE"}
-        html = dashboard._core_rail_html(base)
-        self.assertIn("4/5", html)
-        self.assertIn("3/5", html)
-        self.assertIn('class="vital-cells hp">' + '<i class="on"></i>' * 4 + "<i></i>", html)
-
-        carried = dict(base, beacon_pos=[3, 4])
-        self.assertIn("3/10", dashboard._core_rail_html(carried))
-
-        away = dict(base, beacon_pos=[0, 0])
-        self.assertIn("3/5", dashboard._core_rail_html(away))
-
-
-
-
-class TrendTimeWindowTests(unittest.TestCase):
-    """The trend series is laid out by wall-clock time, not tick index."""
-
-    def test_parse_iso_ts_handles_utc_and_z(self) -> None:
-        dt = dashboard.datetime(2026, 8, 12, 3, 14, 30, 123456, tzinfo=dashboard.timezone.utc)
-        self.assertAlmostEqual(
-            dashboard._parse_iso_ts("2026-08-12T03:14:30.123456+00:00"),
-            dt.timestamp(),
-            places=2,
-        )
-        self.assertAlmostEqual(
-            dashboard._parse_iso_ts("2026-08-12T03:14:30Z"),
-            dashboard.datetime(2026, 8, 12, 3, 14, 30, tzinfo=dashboard.timezone.utc).timestamp(),
-            places=2,
-        )
-        self.assertIsNone(dashboard._parse_iso_ts("not-a-date"))
-        self.assertIsNone(dashboard._parse_iso_ts(""))
-        self.assertIsNone(dashboard._parse_iso_ts(None))
-
-    def test_trend_points_use_epoch_time_and_drop_untimestamped(self) -> None:
-        base = 1760000000.0
-        records = [
-            {"tick": 3, "plan_unit_actions": {}, "_ts": base + 40,
-             "resources": 8, "resource_capacity": 50, "workers": [], "vanguards": [], "rangers": [], "visible_enemies": 0},
-            {"tick": 2, "plan_unit_actions": {}, "_ts": None,
-             "resources": 9, "resource_capacity": 50, "workers": [{"id": "w"}], "vanguards": [], "rangers": [], "visible_enemies": 2},
-            {"tick": 1, "plan_unit_actions": {}, "_ts": base + 10,
-             "resources": 5, "resource_capacity": 50, "workers": [{"id": "a"}, {"id": "b"}], "vanguards": [], "rangers": [{"id": "r"}], "visible_enemies": 1},
-        ]
-        points = dashboard._trend_points(records)
-        # Chronological order; the untimestamped middle record is dropped.
-        self.assertEqual([p["t"] for p in points], [base + 10, base + 40])
-        self.assertEqual(points[0]["w"], 2)
-        self.assertEqual(points[1]["e"], 0)
-
-    def test_read_tick_records_since_stops_at_oldest_in_window(self) -> None:
-        now = dashboard.time.time()
-        # The tactic log appends chronologically (oldest tick first); reverse
-        # iteration yields newest-first, so the reader must stop at the first
-        # record older than the window cutoff.
-        lines = [
-            json.dumps({"tick": 1, "plan_unit_actions": {},
-                        "timestamp": dashboard.datetime.fromtimestamp(now - 600, dashboard.timezone.utc).isoformat()}),
-            json.dumps({"tick": 2, "plan_unit_actions": {},
-                        "timestamp": dashboard.datetime.fromtimestamp(now - 40, dashboard.timezone.utc).isoformat()}),
-            json.dumps({"tick": 3, "plan_unit_actions": {},
-                        "timestamp": dashboard.datetime.fromtimestamp(now - 5, dashboard.timezone.utc).isoformat()}),
-        ]
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "tactic_log.jsonl"
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            with patch.object(dashboard, "LOG_FILE", str(path)):
-                records = dashboard._read_tick_records_since(now - 60)
-        self.assertEqual([r["tick"] for r in records], [3, 2])
-        self.assertTrue(all(r["_ts"] is not None for r in records))
-
-
-
 
 class TickMismatchSelfHealTests(unittest.TestCase):
     """The bot must self-heal from 409 TICK_MISMATCH instead of stalling forever.
@@ -8624,105 +8143,6 @@ class EntrypointRestartLogTests(unittest.TestCase):
                 self.assertIn("战术会话失同步", battle[1]["msg"])
             finally:
                 de.tactic_log.close()
-
-
-class CombatHotspotTests(unittest.TestCase):
-    """战斗热点：把"哪里在打仗"聚合成可点击跳转的告警条与地图光圈。"""
-
-    def _write_battle_log(self, path: Path, rows: list[dict]) -> None:
-        path.write_text(
-            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
-            encoding="utf-8",
-        )
-
-    def test_three_levels_sorted_by_severity(self) -> None:
-        now = time.time()
-        rec = {
-            "core_pos": [0, 0],
-            "workers": [{"name": "W1", "pos": [10, 10]}],
-            "vanguards": [], "rangers": [],
-            "enemies": [
-                # 贴着 W1 → engaged；远离所有我方 → sighted
-                {"name": "E1", "type": "WORKER", "pos": [11, 10]},
-                {"name": "E2", "type": "RANGER", "pos": [40, 40]},
-            ],
-        }
-        with tempfile.TemporaryDirectory() as temp_dir:
-            log = Path(temp_dir) / "battle_log.jsonl"
-            # 箭头坐标取最后一个（结算目标格）；economy 行不算交火
-            self._write_battle_log(log, [
-                {"tick": 1, "ts": now - 30, "cat": "economy",
-                 "msg": "W1 挖矿 +5 (50,50)"},
-                {"tick": 2, "ts": now - 20, "cat": "combat",
-                 "msg": "W1 击中 E3 造成 3 伤害 (5,5)→(6,5)"},
-            ])
-            with patch.object(dashboard, "BATTLE_LOG_FILE", str(log)):
-                spots = dashboard._combat_hotspots(rec)
-
-        self.assertEqual(
-            [(s["x"], s["y"], s["level"]) for s in spots],
-            [(11, 10, "engaged"), (6, 5, "recent"), (40, 40, "sighted")],
-        )
-        self.assertEqual(spots[0]["enemies"], 1)
-        self.assertEqual(spots[0]["friendlies"], 1)
-        self.assertEqual(spots[1]["events"], 1)
-
-    def test_window_cutoff_and_same_cell_merge(self) -> None:
-        now = time.time()
-        rec = {
-            "core_pos": [0, 0],
-            "workers": [{"name": "W1", "pos": [10, 10]}],
-            "vanguards": [], "rangers": [],
-            "enemies": [{"name": "E1", "type": "WORKER", "pos": [11, 10]}],
-        }
-        with tempfile.TemporaryDirectory() as temp_dir:
-            log = Path(temp_dir) / "battle_log.jsonl"
-            self._write_battle_log(log, [
-                # 窗口外：不该出现
-                {"tick": 1, "ts": now - 3600, "cat": "combat",
-                 "msg": "旧战斗 (90,90)"},
-                # 与 engaged 同格：并入且保持 engaged 级别
-                {"tick": 2, "ts": now - 5, "cat": "combat",
-                 "msg": "W1 击中 E1 (10,10)→(11,10)"},
-                {"tick": 3, "ts": now - 4, "cat": "kill",
-                 "msg": "W1 参与摧毁 E1 (11,10)"},
-            ])
-            with patch.object(dashboard, "BATTLE_LOG_FILE", str(log)):
-                spots = dashboard._combat_hotspots(rec)
-
-        self.assertEqual(len(spots), 1)
-        spot = spots[0]
-        self.assertEqual((spot["x"], spot["y"], spot["level"]), (11, 10, "engaged"))
-        self.assertEqual(spot["events"], 2)
-
-    def test_hotspot_chips_are_clickable_and_empty_state(self) -> None:
-        html = dashboard._hotspots_html([
-            {"x": 11, "y": 10, "level": "engaged", "enemies": 2, "friendlies": 3,
-             "events": 0, "last_ts": None, "age_s": None},
-            {"x": 6, "y": 5, "level": "recent", "enemies": 0, "friendlies": 0,
-             "events": 1, "last_ts": time.time() - 30, "age_s": 30},
-        ])
-        self.assertIn('class="hotspot engaged"', html)
-        self.assertIn('data-focus-wx="11" data-focus-wy="10"', html)
-        self.assertIn("敌2", html)
-        self.assertIn('data-focus-wx="6" data-focus-wy="5"', html)
-        self.assertIn("30秒前交火", html)
-        self.assertIn("当前无战斗", dashboard._hotspots_html([]))
-
-    def test_svg_draws_combat_rings_only_for_engaged_and_recent(self) -> None:
-        rec = {"core_pos": [0, 0], "workers": [], "vanguards": [], "rangers": [],
-               "enemies": [], "resource_cells": []}
-        memory = {"obstacles": [], "resources": []}
-        spots = [
-            {"x": 3, "y": 3, "level": "engaged"},
-            {"x": 5, "y": 5, "level": "recent"},
-            {"x": 7, "y": 7, "level": "sighted"},
-        ]
-        svg = dashboard.render_svg(rec, memory, hotspots=spots)
-        # engaged 双环（2 个）+ recent 虚线环（1 个）；sighted 不画
-        self.assertEqual(svg.count('data-cat="combat"'), 3)
-        self.assertIn('class="hotspot-ring engaged"', svg)
-
 
 
 class ArenaConsoleRoutingTests(unittest.TestCase):
@@ -9369,8 +8789,17 @@ class RoamOscillationConfigTests(unittest.TestCase):
             tactic_config.validate_config({"roam_oscillation_escape": 1})
 
     def test_shipped_config_file_contains_the_field(self) -> None:
-        path = Path(__file__).parent.parent / "tactic_config.json"
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        # The old version read the repo-root tactic_config.json, which is a
+        # gitignored runtime artifact — so it failed on any fresh clone. Assert
+        # the field is registered in the shipped defaults and survives a
+        # save/load round-trip through the real writer instead.
+        defaults = tactic_config.default_config()
+        self.assertTrue(defaults.get("roam_oscillation_escape"))
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tactic_config.json"
+            tactic_config.save_config(dict(defaults), path)
+            raw = json.loads(path.read_text(encoding="utf-8"))
         self.assertTrue(raw.get("roam_oscillation_escape"))
 
 

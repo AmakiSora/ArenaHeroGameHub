@@ -1,4 +1,7 @@
-"""Arena Hero dashboard - pan/zoom SVG map + Chinese dark UI.
+"""Arena Hero dashboard - JSON control API + arena SPA host on port 4399.
+
+Serves the built React console under /arena, proxies the game API (injecting
+the server-side key), and exposes the tactic bot's state as JSON.
 Run: python dashboard.py  -> http://localhost:4399
 """
 from __future__ import annotations
@@ -7,7 +10,6 @@ import base64
 import gzip
 import hashlib
 import hmac
-import html
 import json
 import os
 import re
@@ -16,9 +18,9 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
-from collections import defaultdict
 from datetime import datetime, timezone
 from functools import wraps
 from http.cookies import SimpleCookie
@@ -26,7 +28,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlsplit
 
-import game_stats
 import map_codec
 from tactic_config import (
     CONFIG_PATH,
@@ -36,11 +37,14 @@ from tactic_config import (
     load_config,
     update_config,
 )
-from state_io import append_jsonl, atomic_write_text, file_lock
+from state_io import append_jsonl, atomic_write_text, data_path, file_lock
+
 
 def _data_path(name: str) -> str:
-    raw = os.environ.get("ARENA_DATA_DIR", "").strip()
-    return str(Path(raw).resolve() / name) if raw else name
+    # Single source of truth (state_io.data_dir): ARENA_DATA_DIR, else the
+    # module directory — never the process cwd, which used to split runtime
+    # state from the tactic process's own files.
+    return str(data_path(name))
 
 
 LOG_FILE = _data_path("tactic_log.jsonl")
@@ -49,12 +53,31 @@ WAYPOINTS_FILE = _data_path("waypoints.json")
 SELF_DESTRUCT_FILE = _data_path("self_destruct.json")
 HOLDS_FILE = _data_path("holds.json")
 BATTLE_LOG_FILE = _data_path("battle_log.jsonl")
-HOST = "0.0.0.0"
-PORT = 4399
+def _env_host() -> str:
+    return os.environ.get("HOST", "").strip() or "0.0.0.0"
+
+
+def _env_port() -> int:
+    raw = os.environ.get("PORT", "").strip()
+    if not raw:
+        return 4399
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[dashboard] ignoring non-integer PORT={raw!r}; using 4399", flush=True)
+        return 4399
+
+
+# Bind address. Both were hard-coded before, so the HOST/PORT documented in
+# compose.yml, the Dockerfile and the README were silently ignored.
+HOST = _env_host()
+PORT = _env_port()
 # Auth gate: requests from outside must present this token (cookie / Bearer /
-# ?token=). Empty => auth disabled (local dev without env). Loopback always
-# bypasses so the Docker healthcheck and deploy smoke-tests keep working.
+# ?token=). Empty => auth disabled (local dev without env). From loopback only
+# the two liveness probes (GET /api/health, GET /api/state) skip the token, so
+# the container healthcheck and deploy smoke-tests keep working.
 DASHBOARD_TOKEN = os.environ.get("DASHBOARD_TOKEN", "").strip()
+
 
 # ---------- arena web console (React SPA under /arena) ---------------------
 # The dashboard serves the built frontend from web/dist and reverse-proxies
@@ -82,11 +105,13 @@ _ARENA_MIME = {
     ".map": "application/json; charset=utf-8",
 }
 
+
 # Vite emits content-hashed bundles (assets/<name>-<hash>.js/css/woff2); only
 # those may be cached forever. Unhashed files (index.html, assets/game art)
 # must revalidate so a deploy or sprite swap takes effect on the next load.
 _ARENA_HASHED_ASSET = re.compile(r"^assets/(?!game/).+-[A-Za-z0-9_-]{8}\.(?:js|css|woff2?)$")
 _GZIP_TYPES = {"text/html", "text/css", "text/javascript", "application/javascript", "application/json", "image/svg+xml", "text/plain"}
+
 
 # Upstream endpoints the browser may reach through the dashboard proxy.
 _ARENA_GET_PATHS = {"/api/v1/leaderboard", "/api/v1/me", "/api/v1/me/stats"}
@@ -103,7 +128,124 @@ _WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _SESSION_DRAFT: dict[str, str] | None = None
 
 
+# ---------- security / freshness knobs ------------------------------------
+# Content-Security-Policy for every response this server produces. The Vite
+# SPA loads only same-origin bundles (web/dist/index.html carries no inline
+# script, only module/link tags), so script-src stays strict. Styles need
+# 'unsafe-inline' because the build inlines critical CSS, art/fonts are data:
+# or same-origin, and connect-src must allow the ws proxy on this origin.
+_CSP = (
+    "default-src 'self'; img-src 'self' data: blob:; "
+    "style-src 'self' 'unsafe-inline'; script-src 'self'; "
+    "connect-src 'self' ws: wss:; font-src 'self' data:; frame-ancestors 'none'"
+)
+# LOGIN_HTML is one static document with a single inline submit handler, so it
+# gets its own policy: the SPA keeps the strict script-src above.
+_CSP_LOGIN = _CSP.replace("script-src 'self';", "script-src 'self' 'unsafe-inline';")
+_SECURITY_HEADERS = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),
+    ("X-Frame-Options", "DENY"),
+)
+# 415 body for a POST whose body is not declared application/json.
+_JSON_ONLY_ERROR = {"ok": False, "error": "content-type must be application/json"}
+# Upper bound for a request body: the largest legitimate payload is a config
+# save or a session import, so anything bigger is never buffered.
+_MAX_BODY_BYTES = 1_048_576
+
+
+def _split_origin(value: str) -> tuple[str, str]:
+    """Split an Origin URL or a Host header into (scheme, "host:port").
+
+    Ports are defaulted from the scheme (https/wss 443, everything else 80) so
+    ``https://ops.example.com`` and ``https://ops.example.com:443`` compare
+    equal. Returns ("", "") for values that cannot name an origin, including
+    the literal ``null`` origin a sandboxed document sends.
+    """
+    raw = (value or "").strip().lower()
+    if not raw or raw == "null":
+        return "", ""
+    if "//" not in raw:
+        raw = "//" + raw
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return "", ""
+    host = parts.hostname or ""
+    if not host:
+        return "", ""
+    if port is None:
+        port = 443 if parts.scheme in ("https", "wss") else 80
+    return parts.scheme, f"{host}:{port}"
+
+
+def _origin_key(value: str) -> str:
+    """Normalize an origin to ``scheme://host:port`` ("" when unparseable)."""
+    scheme, host = _split_origin(value)
+    return f"{scheme or 'http'}://{host}" if host else ""
+
+
+def _origin_host(value: str) -> str:
+    """``host:port`` of an origin/Host header ("" when unparseable)."""
+    return _split_origin(value)[1]
+
+
+# Extra origins allowed to reach state-changing endpoints (comma separated,
+# compared case-insensitively on scheme+host+port). Same-origin requests are
+# always accepted, and requests carrying no Origin header at all (curl, the
+# Docker healthcheck, server-to-server calls, deploy smoke tests) are not a
+# browser CSRF vector and stay allowed.
+DASHBOARD_ALLOWED_ORIGINS = frozenset(
+    key for key in (_origin_key(item) for item in
+                    os.environ.get("DASHBOARD_ALLOWED_ORIGINS", "").split(","))
+    if key
+)
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# /api/health answers 503 once the newest tick is older than this: a container
+# whose tactic process died (or never started) must not report healthy.
+DASHBOARD_STALE_TICK_SECONDS = _env_seconds("DASHBOARD_STALE_TICK_SECONDS", 300.0)
+
+
+def _accepts_gzip(value: str) -> bool:
+    """True when Accept-Encoding actually allows gzip (q > 0).
+
+    A plain ``"gzip" in header`` test treats ``gzip;q=0`` (an explicit refusal)
+    as consent; parse the weights instead, letting an explicit gzip entry win
+    over a ``*`` wildcard.
+    """
+    wildcard = None
+    for chunk in (value or "").split(","):
+        name, _, params = chunk.strip().partition(";")
+        name = name.strip().lower()
+        if not name:
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            key, _, raw = param.partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    quality = float(raw.strip())
+                except (TypeError, ValueError):
+                    quality = 0.0
+        if name == "gzip":
+            return quality > 0
+        if name == "*":
+            wildcard = quality
+    return wildcard is not None and wildcard > 0
+
+
 # ---------- data loading --------------------------------------------------
+
 
 def _iter_log_lines_reverse(path: str, chunk_size: int = 64 * 1024):
     """Yield non-empty log lines from newest to oldest without loading the file."""
@@ -128,13 +270,6 @@ def _iter_log_lines_reverse(path: str, chunk_size: int = 64 * 1024):
             yield remainder.decode("utf-8", errors="replace")
 
 
-def read_latest():
-    if not os.path.exists(LOG_FILE):
-        return None, time.time()
-    history = read_history(1)
-    return (history[0] if history else None), os.path.getmtime(LOG_FILE)
-
-
 def _log_signature() -> tuple[int, int] | None:
     """(mtime_ns, size) signature for the tactic log, or None when unreadable.
 
@@ -148,46 +283,11 @@ def _log_signature() -> tuple[int, int] | None:
     return stat.st_mtime_ns, stat.st_size
 
 
-def _stream_signature() -> tuple:
-    """Snapshot of every data file whose change should push a live refresh.
-
-    The tactic appends one tick record per server tick, map memory is re-saved
-    every ~10 ticks, and the battle log grows per game event — any of them
-    moving is worth one SSE push. Same mtime+size heuristic as the other file
-    signatures, so an idle dashboard costs a handful of stat() calls per scan.
-    """
-    def _sig(path: str):
-        try:
-            st = os.stat(path)
-            return (st.st_mtime_ns, st.st_size)
-        except OSError:
-            return None
-
-    return tuple(_sig(p) for p in (LOG_FILE, MAP_FILE, BATTLE_LOG_FILE))
-
-
-# Every SSE client used to stat all three data files on its own 0.25 s timer,
-# so N open dashboards cost N stat bursts per second. Share one snapshot across
-# clients: refresh at most once per 0.2 s, everyone else reads the cached tuple.
-_stream_sig_cache: tuple[float, tuple] | None = None
-
-
-def _stream_signature_cached() -> tuple:
-    global _stream_sig_cache
-    now = time.monotonic()
-    cached = _stream_sig_cache
-    if cached is not None and now - cached[0] < 0.2:
-        return cached[1]
-    sig = _stream_signature()
-    _stream_sig_cache = (now, sig)
-    return sig
-
-
-# build_parts() runs on every /api/state poll (every 2s per client) and always
-# asks for the newest 40 tick records. Between polls with no new tick the log
-# file is unchanged, so re-reading + re-parsing those 40 (large) records is pure
-# overhead. Cache the result by (log signature, ticks); a single appended tick
-# bumps the signature and invalidates the entry.
+# The tick history is re-read on every poll (the SPA asks for the newest record
+# several times per tick) and always asks for the newest N tick records. Between
+# polls with no new tick the log file is unchanged, so re-reading + re-parsing
+# those (large) records is pure overhead. Cache the result by (log signature,
+# ticks); a single appended tick bumps the signature and invalidates the entry.
 _history_cache: dict[tuple[int, int, int], list[dict]] = {}
 
 
@@ -251,12 +351,20 @@ def _guerrilla_route_signature(path: str) -> tuple[int, int] | None:
     return stat.st_mtime_ns, stat.st_size
 
 
-# Keyed by (path, max_points, since_epoch) -> (signature, built_at, payload).
-# The route file gains rows every Tick, so a signature-only cache would
-# re-parse several MB on every poll; the tracks layer is a review tool, so one
-# refresh per minute is plenty and keeps this process off the tactic bot's CPU.
+# Keyed by (path, max_points, hours) -> (signature, built_at, payload). The
+# route file gains rows every Tick, so a signature-only cache would re-parse
+# several MB on every poll; the tracks layer is a review tool, so one refresh
+# per minute is plenty and keeps this process off the tactic bot's CPU.
+# The requested window stays in the key because the payload is filtered by it,
+# but the derived wall-clock ``since_epoch`` does NOT: keying on
+# int(time.time()) made every request a fresh miss, so the throttle never hit
+# and every poll re-read the whole day file.
 _guerrilla_track_cache: dict[tuple, tuple[tuple[int, int] | None, float, dict]] = {}
 GUERRILLA_TRACK_REFRESH_SECONDS = 60.0
+# Hard bound on rows scanned from one day file (newest→oldest). A full day is
+# ~100k rows at the live Tick cycle; the cap only guards against a pathological
+# file while keeping the response bounded.
+GUERRILLA_TRACK_MAX_ROWS = 400_000
 
 
 def read_guerrilla_tracks(
@@ -269,6 +377,10 @@ def read_guerrilla_tracks(
     Consecutive duplicate cells are folded first (a unit that WAITs or is
     refused its MOVE still writes a row every Tick), then the remaining walk is
     strided down to ``max_points`` with the newest cell always kept.
+
+    Rows are streamed newest-first with the shared reverse tail reader and the
+    scan stops at the ``?hours=N`` cutoff, so the whole file is never loaded
+    into memory as one string.
     """
     files = _guerrilla_route_files()
     dates = [stamp for stamp, _ in files]
@@ -278,11 +390,9 @@ def read_guerrilla_tracks(
         date, path = files[0]
     else:
         path = next(p for stamp, p in files if stamp == date)
-    since_epoch = None
-    if hours and hours > 0:
-        since_epoch = int(time.time()) - hours * 3600
+    window_hours = int(hours or 0)
     signature = _guerrilla_route_signature(path)
-    key = (path, int(max_points), since_epoch)
+    key = (path, int(max_points), window_hours)
     cached = _guerrilla_track_cache.get(key)
     if cached is not None:
         cached_sig, built_at, payload = cached
@@ -290,50 +400,60 @@ def read_guerrilla_tracks(
         if throttled or cached_sig == signature:
             return {**payload, "dates": dates}
 
+    since_epoch = int(time.time()) - window_hours * 3600 if window_hours > 0 else None
     tracks: dict[str, dict] = {}
+    rows = 0
     try:
-        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        for line in _iter_log_lines_reverse(path):
+            rows += 1
+            if rows > GUERRILLA_TRACK_MAX_ROWS:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            pos = row.get("p")
+            uid = str(row.get("i") or row.get("u") or "")
+            if not uid or not isinstance(pos, list) or len(pos) != 2:
+                continue
+            if since_epoch is not None and int(row.get("e") or 0) < since_epoch:
+                # Rows are time-ordered: every remaining row is older still.
+                break
+            track = tracks.get(uid)
+            if track is None:
+                track = tracks[uid] = {
+                    "id": uid,
+                    "name": str(row.get("u") or uid),
+                    "type": "RANGER" if str(row.get("u") or "").upper().startswith("R") else "VANGUARD",
+                    "cells": [],
+                    "distinct": set(),
+                    "ticks": 0,
+                    # Reading newest-first: last_* comes from the first row seen,
+                    # first_* keeps being overwritten down to the oldest row.
+                    "first_tick": row.get("t"),
+                    "last_tick": row.get("t"),
+                    "first_epoch": row.get("e"),
+                    "last_epoch": row.get("e"),
+                }
+            cell = (int(pos[0]), int(pos[1]))
+            track["ticks"] += 1
+            track["first_tick"] = row.get("t")
+            track["first_epoch"] = row.get("e")
+            track["distinct"].add(cell)
+            if not track["cells"] or track["cells"][-1] != cell:
+                track["cells"].append(cell)
     except OSError:
-        lines = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(row, dict):
-            continue
-        pos = row.get("p")
-        uid = str(row.get("i") or row.get("u") or "")
-        if not uid or not isinstance(pos, list) or len(pos) != 2:
-            continue
-        if since_epoch is not None and int(row.get("e") or 0) < since_epoch:
-            continue
-        track = tracks.setdefault(uid, {
-            "id": uid,
-            "name": str(row.get("u") or uid),
-            "type": "RANGER" if str(row.get("u") or "").upper().startswith("R") else "VANGUARD",
-            "cells": [],
-            "distinct": set(),
-            "ticks": 0,
-            "first_tick": row.get("t"),
-            "last_tick": row.get("t"),
-            "first_epoch": row.get("e"),
-            "last_epoch": row.get("e"),
-        })
-        cell = (int(pos[0]), int(pos[1]))
-        track["ticks"] += 1
-        track["last_tick"] = row.get("t")
-        track["last_epoch"] = row.get("e")
-        track["distinct"].add(cell)
-        if not track["cells"] or track["cells"][-1] != cell:
-            track["cells"].append(cell)
+        pass
 
     units = []
     for track in tracks.values():
-        cells = track["cells"]
+        # The cells were appended newest-first; the rendered walk is oldest-first.
+        cells = track["cells"][::-1]
         stride = max(1, -(-len(cells) // max(1, int(max_points))))
         kept = cells[::stride]
         if not kept or kept[-1] != cells[-1]:
@@ -393,86 +513,36 @@ def _parse_iso_ts(value) -> float | None:
     return dt.timestamp()
 
 
-def _read_tick_records_since(cutoff: float | None, max_records: int = 30000) -> list[dict]:
-    """Return newest-first tick records with parsed wall-clock ``_ts``.
+def _tick_health() -> dict:
+    """Liveness + tick-freshness verdict for /api/health.
 
-    The tactic log is time-ordered, so reverse iteration can stop at the first
-    record older than ``cutoff`` (records after it are older still) — a time
-    window reads only as many lines as it needs.  ``max_records`` bounds the
-    read for very sparse logs.  Records without a parseable timestamp are
-    skipped without stopping the scan.
+    The Docker healthcheck, the deploy smoke test and the watchdog all use this
+    endpoint, so a container whose tactic process died (or never started) must
+    stop looking healthy. Freshness is reported in the body and in the status
+    code: 503 + ``ok: false`` once the newest tick is older than
+    DASHBOARD_STALE_TICK_SECONDS (default 300 s).
+
+    Age comes from the newest tick record's ISO ``timestamp`` (the wall-clock
+    time the bot produced it); when the record has no parseable timestamp the
+    log file's mtime is used instead, so at least a written log counts.
     """
-    out = []
-    for line in _iter_log_lines_reverse(LOG_FILE):
+    history = read_history(1)
+    rec = history[0] if history else None
+    stamp = _parse_iso_ts(rec.get("timestamp")) if rec else None
+    if stamp is None:
         try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not (isinstance(rec, dict) and "tick" in rec and "plan_unit_actions" in rec):
-            continue
-        ts = _parse_iso_ts(rec.get("timestamp"))
-        rec["_ts"] = ts
-        if ts is None:
-            continue
-        if cutoff is not None and ts < cutoff:
-            break
-        out.append(rec)
-        if len(out) >= max_records:
-            break
-    return out
-
-
-def _trend_points(records: list[dict], max_points: int = 240) -> list[dict]:
-    """Flatten newest-first tick records into a chronological compact series.
-
-    Each point carries the metrics the trend charts plot.  ``t`` is the wall-clock
-    epoch of the record so the charts lay out by real time; records without a
-    parseable timestamp are dropped.  Missing metric fields are treated as 0 so
-    both old (v2) and current (v3) log lines chart correctly.  Long windows are
-    downsampled by a stride so the JSON payload stays small.
-    """
-    records = [rec for rec in records if rec.get("_ts") is not None]
-    if not records:
-        return []
-    if len(records) > max_points:
-        stride = (len(records) + max_points - 1) // max_points
-        records = records[::stride]
-    points = []
-    for rec in reversed(records):
-        points.append({
-            "t": rec["_ts"],
-            "r": int(rec.get("resources") or 0),
-            "c": int(rec.get("resource_capacity") or 0),
-            "w": len(rec.get("workers") or []),
-            "v": len(rec.get("vanguards") or []),
-            "g": len(rec.get("rangers") or []),
-            "e": int(rec.get("visible_enemies") or 0),
-        })
-    return points
-
-
-# /api/trends is polled every 2 s; re-parsing full tick records per poll is pure
-# overhead while the log file has not grown. Cache the compact series by
-# (log mtime+size, window-seconds) — same heuristic as the tactic's file
-# signatures; every appended tick bumps mtime and invalidates the entry.
-_trends_cache: dict[tuple[int, int, int], list[dict]] = {}
-
-
-def _trends_points(window_seconds: int) -> list[dict]:
-    try:
-        stat = os.stat(LOG_FILE)
-    except OSError:
-        return []
-    key = (stat.st_mtime_ns, stat.st_size, window_seconds)
-    cached = _trends_cache.get(key)
-    if cached is not None:
-        return cached
-    cutoff = time.time() - window_seconds
-    points = _trend_points(_read_tick_records_since(cutoff))
-    # Keep only the newest entry so an old window or rotated log frees memory.
-    _trends_cache.clear()
-    _trends_cache[key] = points
-    return points
+            stamp = os.path.getmtime(LOG_FILE)
+        except OSError:
+            stamp = None
+    age = None if stamp is None else max(0.0, time.time() - stamp)
+    alive = age is not None and age <= DASHBOARD_STALE_TICK_SECONDS
+    return {
+        "ok": alive,
+        "tick": rec.get("tick") if rec else None,
+        "tick_age_s": None if age is None else round(age, 1),
+        "tactic_alive": alive,
+        "stale_after_s": DASHBOARD_STALE_TICK_SECONDS,
+    }
 
 
 # ── Categorized battle log (「战斗日志」panel below the config) ──────────────
@@ -480,17 +550,8 @@ def _trends_points(window_seconds: int) -> list[dict]:
 # the dashboard process appends config-change rows on save.  Filter chips in
 # the panel map to the entry "cat" field.
 
-# Log-category chips shown in the panel header (label + default visibility).
-LOG_CATEGORIES = (
-    ("discover", "发现", True),
-    ("kill", "击杀", True),
-    ("defeat", "被击败", True),
-    ("combat", "战斗", False),
-    ("economy", "经济", False),
-    ("config", "配置", True),
-    ("warn", "异常", True),
-)
 
+# Log-category chips shown in the panel header (label + default visibility).
 _CONFIG_FIELD_LABELS = {f["key"]: f["label"] for f in config_schema()["fields"]}
 
 
@@ -514,9 +575,9 @@ def read_battle_log(n: int = 200) -> list[dict]:
 def battle_log_json_entries(limit: int = 200) -> list[dict]:
     """Normalized tick/ts/cat/msg rows for the arena SPA's battle-log panel.
 
-    The server-rendered dashboard gets HTML rows from /api/log; the arena
-    page under /arena renders its own panel and needs plain JSON. Only the
-    four fields the panel uses are sent, so raw rows never leak extra keys.
+    The arena page under /arena renders its own panel and needs plain JSON
+    (the retired server-rendered HTML panel is gone). Only the four fields the
+    panel uses are sent, so raw rows never leak extra keys.
     """
     return [
         {
@@ -551,219 +612,24 @@ def append_config_log(updates: dict, *, action: str = "") -> None:
         pass
 
 
-def _battle_log_html(limit: int = 200) -> tuple[str, int]:
-    """Render the newest battle-log rows for the panel.
-
-    ``limit`` bounds how many rows the server sends; the client asks for more
-    when a larger time window (or 'all') is selected so the "全部" filter can
-    actually cover the full retained log instead of a fixed newest-200.
-    """
-    entries = read_battle_log(limit)
-    if not entries:
-        return '<div class="muted">暂无日志</div>', 0
-    rows = []
-    for e in entries:
-        tick = e.get("tick")
-        ts = e.get("ts")
-        label_parts = []
-        if ts:
-            label_parts.append(time.strftime("%H:%M:%S", time.localtime(float(ts))))
-        if tick is not None:
-            label_parts.append(f"tick {tick}")
-        tick_label = " · ".join(label_parts)
-        ts_attr = f' data-ts="{ts}"' if ts is not None else ""
-        msg = html.escape(str(e.get("msg", "")))
-        rows.append(
-            f'<div class="log-row" data-cat="{html.escape(str(e.get("cat", "")))}"{ts_attr}>'
-            f'<span class="log-tick">{html.escape(tick_label)}</span>'
-            f'<span class="log-msg">{_log_coord_spans(msg)}</span></div>'
-        )
-    return "".join(rows), len(entries)
-
-
-# 消息里的 (x,y) 坐标：tactic 的发现日志与战斗事件消息都以 "(x,y)" 或
-# "(x1,y1)→(x2,y2)" 结尾（见 tactic._fmt_cell），这里把每个坐标包成可点击
-# 跳转的 span。正则跑在 html.escape 之后的字符串上，数字/括号/逗号不受转义
-# 影响，所以直接匹配即可。
-_LOG_COORD_RE = re.compile(r"\((-?\d+)\s*,\s*(-?\d+)\)")
-
-
-def _log_coord_spans(msg: str) -> str:
-    """把已转义消息里的 (x,y) 坐标包成带 data-focus 属性的可点击 span。
-
-    前端对带 data-focus-wx/wy 的元素做委托点击，调用 focusWorld 把地图视角
-    重置到该坐标（与右侧单位卡片跳转同一机制），这里只需输出属性无需额外 JS。
-    无坐标的消息原样返回。
-    """
-    return _LOG_COORD_RE.sub(
-        lambda m: (
-            f'<span class="log-coord" data-focus-wx="{m.group(1)}" '
-            f'data-focus-wy="{m.group(2)}" title="点击定位到地图">'
-            f"({m.group(1)},{m.group(2)})</span>"
-        ),
-        msg,
-    )
-
-
-# ── 战斗热点（哪里在打仗） ──────────────────────────────────────────────
-# 把"哪里发生战斗"聚合成可点击热点：地图上方告警条 + 地图脉冲光圈。
-# 三级危险度：engaged（可见敌人贴着我方单位）、recent（窗口内战斗日志
-# 行，坐标取结算目标格）、sighted（可见但未接战）。
-_HOTSPOT_ENGAGE_RADIUS = 2      # 敌我 Chebyshev 距离 ≤ 该值视为交战中
-_HOTSPOT_RECENT_WINDOW = 180.0  # 近期交火窗口（秒）
-_HOTSPOT_LEVEL_ORDER = {"engaged": 0, "recent": 1, "sighted": 2}
-
-
-def _recent_combat_cells(window: float = _HOTSPOT_RECENT_WINDOW) -> dict:
-    """Collect {cell: {ts, events}} from combat/kill/defeat rows in the window.
-
-    Scans the battle log newest-first and stops at the first row older than
-    the window (the file is time-ordered), so an idle stretch costs only the
-    newest few lines. Coordinates come from the trailing "(x,y)" /
-    "(ax,ay)→(tx,ty)" suffix the tactic appends; an arrow resolves to the
-    target cell (the last coordinate), i.e. where the hit landed.
-    """
-    if not os.path.exists(BATTLE_LOG_FILE):
-        return {}
-    cutoff = time.time() - window
-    out: dict = {}
-    for line in _iter_log_lines_reverse(BATTLE_LOG_FILE):
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(row, dict):
-            continue
-        try:
-            ts = float(row.get("ts"))
-        except (TypeError, ValueError):
-            continue
-        if ts < cutoff:
-            break
-        if row.get("cat") not in ("combat", "kill", "defeat"):
-            continue
-        coords = _LOG_COORD_RE.findall(str(row.get("msg", "")))
-        if not coords:
-            continue
-        cell = (int(coords[-1][0]), int(coords[-1][1]))
-        info = out.get(cell)
-        if info is None:
-            out[cell] = {"ts": ts, "events": 1}
-        else:
-            info["events"] += 1
-            info["ts"] = max(info["ts"], ts)
-    return out
-
-
-def _combat_hotspots(rec: dict) -> list:
-    """Aggregate combat locations into sorted hotspot dicts.
-
-    Order: engaged > recent > sighted, then newest / most enemies first.
-    Each entry: {x, y, level, enemies, friendlies, events, last_ts, age_s}.
-    """
-    friendlies: list = []
-    core = rec.get("core_pos")
-    if core and len(core) == 2:
-        friendlies.append((int(core[0]), int(core[1])))
-    for group in ("workers", "vanguards", "rangers"):
-        for u in rec.get(group, []) or []:
-            p = u.get("pos") or []
-            if len(p) == 2:
-                friendlies.append((int(p[0]), int(p[1])))
-
-    hotspots: dict = {}
-
-    def spot(x: int, y: int, level: str) -> dict:
-        s = hotspots.get((x, y))
-        if s is None:
-            s = {"x": x, "y": y, "level": level, "enemies": 0,
-                 "friendlies": 0, "events": 0, "last_ts": None}
-            hotspots[(x, y)] = s
-        elif _HOTSPOT_LEVEL_ORDER[level] < _HOTSPOT_LEVEL_ORDER[s["level"]]:
-            s["level"] = level  # a live fight outranks a stale event cell
-        return s
-
-    for enemy in rec.get("enemies", []) or []:
-        p = enemy.get("pos") or []
-        if len(p) != 2:
-            continue
-        x, y = int(p[0]), int(p[1])
-        near = sum(
-            1 for fx, fy in friendlies
-            if max(abs(fx - x), abs(fy - y)) <= _HOTSPOT_ENGAGE_RADIUS
-        )
-        s = spot(x, y, "engaged" if near else "sighted")
-        s["enemies"] += 1
-        s["friendlies"] += near
-
-    for (x, y), info in _recent_combat_cells().items():
-        s = spot(x, y, "recent")
-        s["events"] += info["events"]
-        s["last_ts"] = info["ts"] if s["last_ts"] is None else max(s["last_ts"], info["ts"])
-
-    out = list(hotspots.values())
-    now = time.time()
-    for s in out:
-        s["age_s"] = (now - s["last_ts"]) if s["last_ts"] is not None else None
-    out.sort(key=lambda s: (
-        _HOTSPOT_LEVEL_ORDER[s["level"]],
-        -(s["last_ts"] or 0.0),
-        -s["enemies"],
-    ))
-    return out
-
-
-def _hotspots_html(hotspots: list, limit: int = 12) -> str:
-    """Render the hotspot strip above the map; chips jump the map on click.
-
-    Chips carry data-focus-wx/wy, so the existing document-level delegation
-    (focusWorld) handles the jump — no extra JS needed.
-    """
-    if not hotspots:
-        return '<span class="muted">当前无战斗 · 视野内无敌人</span>'
-    chips = []
-    for s in hotspots[:limit]:
-        level = s["level"]
-        coord = f"({s['x']},{s['y']})"
-        if level == "engaged":
-            label = f"⚔ 交战 {coord} · 敌{s['enemies']}"
-            if s["friendlies"]:
-                label += f" 我{s['friendlies']}"
-        elif level == "recent":
-            age = int(s.get("age_s") or 0)
-            ago = f"{age}秒前" if age < 60 else f"{age // 60}分钟前"
-            label = f"✦ {ago}交火 {coord}"
-        else:
-            label = f"👁 敌人 {coord}"
-            if s["enemies"] > 1:
-                label += f" ×{s['enemies']}"
-        chips.append(
-            f'<button type="button" class="hotspot {level}" data-focus-wx="{s["x"]}" '
-            f'data-focus-wy="{s["y"]}" title="点击定位到地图">{html.escape(label)}</button>'
-        )
-    extra = len(hotspots) - len(chips)
-    tail = f'<span class="hotspot-more">+{extra} 处</span>' if extra > 0 else ""
-    return "".join(chips) + tail
-
-
 def _clamp_log_limit(request) -> int:
     """Parse the ``?log=`` / ``?limit=`` query into a bounded row count.
 
-    The client scales how many battle-log rows it wants by the selected time
-    window; the cap keeps a single poll from serializing the whole file (which
-    can hold tens of thousands of lines before the 2 MB trim kicks in).
+    The arena page scales how many battle-log rows it wants; the cap keeps a
+    single poll from serializing the whole file (which can hold tens of
+    thousands of lines before the 2 MB trim kicks in). The floor is 1, not 200:
+    ``?limit=1`` must actually return one row (a "newest line only" probe).
     """
     try:
         qs = parse_qs(urlsplit(request.path).query)
         n = int((qs.get("log") or qs.get("limit") or ["200"])[0])
     except (TypeError, ValueError):
         return 200
-    return max(200, min(n, 8000))
+    return max(1, min(n, 8000))
 
 
-def _read_map_file() -> dict:
-    """Load raw map_memory.json, or an empty structure when missing/invalid."""
-    empty = {
+def _empty_map() -> dict:
+    return {
         "obstacles": [],
         "resources": [],
         "manual_resources": [],
@@ -775,16 +641,38 @@ def _read_map_file() -> dict:
         "enemy_sighting_count": 0,
         "enemy_clear_seq": 0,
     }
-    if not os.path.exists(MAP_FILE):
-        return empty
+
+
+def _load_map_json() -> tuple[dict, bool]:
+    """Load raw map_memory.json as (data, cacheable).
+
+    "missing" and "unreadable" are distinct: a missing file is a stable state
+    whose empty result may be cached, while a parse failure is usually a torn
+    read racing the tactic's rewrite — caching that empty structure would
+    poison the signature cache until the file changes again (and report zero
+    resources / walls for a whole polling interval).
+    """
+    empty = _empty_map()
     try:
         with open(MAP_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
-        if isinstance(loaded, dict):
-            empty.update(loaded)
-        return empty
+    except FileNotFoundError:
+        return empty, True
     except Exception:
-        return empty
+        return empty, False
+    if isinstance(loaded, dict):
+        empty.update(loaded)
+    return empty, True
+
+
+def _read_map_file() -> dict:
+    """Load raw map_memory.json, or an empty structure when missing/invalid.
+
+    Mutating callers (save/remove/clear) want the raw document and rewrite it
+    wholesale; they deliberately ignore the cacheable flag because the next
+    write replaces the file anyway.
+    """
+    return _load_map_json()[0]
 
 
 def _map_mutation(func):
@@ -828,25 +716,6 @@ def _obstacle_fields(data: dict) -> dict:
 
 
 # ── remembered enemy sightings (last-known positions + unit type) ───────────
-
-# Color + short label per enemy unit type, matching the live-enemy map colors.
-_ENEMY_TYPE_STYLE = {
-    "WORKER": ("#8aa4ff", "工"),
-    "VANGUARD": ("#ff8c42", "先"),
-    "RANGER": ("#b38cff", "游"),
-    # A star stays legible at the map's tiny label size and cannot be confused
-    # with the similarly dense "敌" glyph used by legacy/unknown sightings.
-    "CORE": ("#ff4964", "★"),
-}
-
-
-def _enemy_type_char(etype: str) -> str:
-    """Short map label for an enemy type (★/工/先/游, default 敌)."""
-    return _ENEMY_TYPE_STYLE.get(str(etype or "").upper(), ("#ff6464", "敌"))[1]
-
-
-def _enemy_type_color(etype: str) -> str:
-    return _ENEMY_TYPE_STYLE.get(str(etype or "").upper(), ("#ff6464", "敌"))[0]
 
 
 def _parse_enemy_sighting(item) -> tuple[tuple[int, int], str, int] | None:
@@ -922,7 +791,7 @@ def load_map_memory():
         cached = _map_memory_cache.get(sig)
         if cached is not None:
             return cached
-    d = _read_map_file()
+    d, cacheable = _load_map_json()
     forgotten = _coord_set(d.get("forgotten_resources"))
     resources = _coord_set(d.get("resources")) - forgotten
     manual = _coord_set(d.get("manual_resources")) - forgotten
@@ -948,10 +817,47 @@ def load_map_memory():
         "enemy_clear_seq": int(d.get("enemy_clear_seq", 0) or 0),
         "updated_tick": d.get("updated_tick"),
     }
-    if sig is not None:
+    if sig is not None and cacheable:
         # Keep only the newest entry so a rewritten map frees the stale parse.
         _map_memory_cache.clear()
         _map_memory_cache[sig] = result
+    return result
+
+
+# /api/enemy-memory is polled every tick but only needs the sighting list.
+# Reaching it through load_map_memory() decodes and sorts every remembered wall
+# cell (~450k cells measured at 0.73 s cold / 65 MB peak) — and because the
+# tactic rewrites map_memory.json every few ticks, the cache misses exactly when
+# the page polls. Read the raw JSON and keep only the small fields this endpoint
+# returns, behind its own single-slot signature cache.
+_enemy_sightings_cache: dict[tuple[int, int], dict] = {}
+
+
+def load_enemy_sightings_memory() -> dict:
+    """Cheap ``{enemy_sightings, enemy_clear_seq}`` view of map_memory.json."""
+    sig = _map_file_signature()
+    if sig is not None:
+        cached = _enemy_sightings_cache.get(sig)
+        if cached is not None:
+            return cached
+    data, cacheable = _load_map_json()
+    parsed = [
+        s for s in (
+            _parse_enemy_sighting(item) for item in data.get("enemy_sightings", []) or []
+        )
+        if s is not None
+    ]
+    parsed.sort(key=lambda s: s[0])
+    result = {
+        "enemy_sightings": [
+            {"pos": pos, "type": etype, "tick": tick}
+            for pos, etype, tick in parsed
+        ],
+        "enemy_clear_seq": int(data.get("enemy_clear_seq", 0) or 0),
+    }
+    if sig is not None and cacheable:
+        _enemy_sightings_cache.clear()
+        _enemy_sightings_cache[sig] = result
     return result
 
 
@@ -1092,56 +998,6 @@ def clear_enemy_sightings() -> dict:
 
 # ── manual per-unit waypoints (⌖ map pick) ──────────────────────────────────
 
-# SVG render cache for build_parts: keyed on everything that can change the
-# map — the newest tick record, the map file, the waypoints file, and the
-# config markers (attack/core target) drawn onto the map. A hit skips the
-# full obstacle/route re-render; any change bumps a signature and re-renders.
-_svg_cache: dict[tuple, str] = {}
-
-
-def _file_sig(path: str) -> tuple[int, int] | None:
-    try:
-        stat = os.stat(path)
-    except OSError:
-        return None
-    return stat.st_mtime_ns, stat.st_size
-
-
-def _render_svg_cached(rec: dict, mm: dict, waypoints: dict,
-                       hotspots: list | None = None) -> str:
-    config = load_config(CONFIG_PATH)
-    marker_sig = (
-        str(config.get("attack_mode", "coords")),
-        int(config.get("attack_target_x", 0)),
-        int(config.get("attack_target_y", 0)),
-        str(config.get("kite_mode", "coords")),
-        int(config.get("kite_target_x", 0)),
-        int(config.get("kite_target_y", 0)),
-        bool(config.get("core_target_enabled", False)),
-        int(config.get("core_target_x", 0)),
-        int(config.get("core_target_y", 0)),
-    )
-    # The combat rings change with the battle log even between ticks, so the
-    # hotspot set joins the cache signature.
-    hotspot_sig = tuple(
-        (s["x"], s["y"], s["level"]) for s in (hotspots or [])
-    )
-    key = (
-        rec.get("tick"),
-        _file_sig(MAP_FILE),
-        _file_sig(WAYPOINTS_FILE),
-        marker_sig,
-        hotspot_sig,
-    )
-    cached = _svg_cache.get(key)
-    if cached is not None:
-        return cached
-    svg = render_svg(rec, mm, config=config, waypoints=waypoints, hotspots=hotspots)
-    # Keep only the newest entry so a moved map frees the stale render.
-    _svg_cache.clear()
-    _svg_cache[key] = svg
-    return svg
-
 
 def _read_waypoints_file() -> dict:
     try:
@@ -1227,16 +1083,6 @@ def load_waypoints() -> dict[str, dict]:
             except (TypeError, ValueError):
                 continue
     return out
-
-
-def _wp_count(waypoints: dict) -> int:
-    """Total queued targets across every unit."""
-    total = 0
-    for raw in waypoints.values():
-        entry = _normalize_wp_entry(raw)
-        if entry:
-            total += len(entry["queue"])
-    return total
 
 
 @_waypoint_mutation
@@ -1432,6 +1278,7 @@ def clear_squad_targets(squad: str) -> dict:
 # each Tick, issues SELF_DESTRUCT for units that are still alive, then prunes
 # the names. Same cross-process lock discipline as waypoints.json.
 
+
 def _read_self_destruct_file() -> set[str]:
     try:
         with open(SELF_DESTRUCT_FILE, "r", encoding="utf-8") as f:
@@ -1539,15 +1386,6 @@ def clear_hold(name: str) -> dict:
         }])
     return {"ok": True, "name": name, "held": len(units)}
 
-
-TEAM_BOARD_KEYS = ("unassigned", "home", "attack", "kite", "guerrilla")
-TEAM_BOARD_META = {
-    "unassigned": {"label": "待命池", "hint": "未编队", "tone": "idle"},
-    "home": {"label": "守家队", "hint": "巡逻+迎击驱赶", "tone": "home"},
-    "attack": {"label": "进攻队", "hint": "集体推进接战", "tone": "attack"},
-    "kite": {"label": "风筝队", "hint": "避开射程 · 预判打格", "tone": "kite"},
-    "guerrilla": {"label": "游击队", "hint": "八向分散袭扰", "tone": "guerrilla"},
-}
 TEAM_ROSTER_FIELDS = ("home_team", "attack_team", "kite_team", "guerrilla_team")
 TEAM_SETTING_FIELDS = tuple(
     field["key"]
@@ -1694,171 +1532,16 @@ def unit_display_names(rec: dict | None = None) -> dict[str, str]:
     return names
 
 
-def render_waypoints_panel(
-    waypoints: dict[str, dict],
-    workers: list[str],
-    vanguards: list[str],
-    rangers: list[str],
-) -> str:
-    """Manual per-unit target queue panel: list queues, append one for a unit."""
-    def _opts(label: str, names: list[str]) -> str:
-        return "".join(
-            f'<option value="{html.escape(n, quote=True)}">'
-            f'{html.escape(n)}（{label}）</option>'
-            for n in names
-        )
-
-    options = _opts("工人", workers) + _opts("先锋", vanguards) + _opts("游侠", rangers)
-    if not options:
-        options = '<option value="" disabled>暂无存活单位</option>'
-
-    if waypoints:
-        entries = []
-        for name, raw in sorted(waypoints.items()):
-            entry = _normalize_wp_entry(raw)
-            if entry is None:
-                continue
-            mode = entry["mode"]
-            mode_label = "攻击" if mode == "attack" else "赶路"
-            safe_name = html.escape(str(name), quote=True)
-            chips = "".join(
-                f'<span class="chip removable wp-target" title="第{idx + 1}个">'
-                f'{html.escape(f"({x}, {y})")}'
-                f'<button type="button" class="chip-x" '
-                f'data-wp-remove="{safe_name}" data-wp-index="{idx}" '
-                f'aria-label="删除 {safe_name} 第{idx + 1}个目标" title="删除">×</button></span>'
-                for idx, (x, y) in enumerate(entry["queue"])
-            )
-            entries.append(
-                '<div class="wp-entry" data-wp-unit="' + safe_name + '">'
-                '<div class="wp-entry-head">'
-                f'<span class="wp-unit-name">{html.escape(str(name))}</span>'
-                f'<button type="button" class="wp-mode-btn" data-wp-mode-toggle="{safe_name}" '
-                f'data-mode="{mode}" title="切换模式（攻击=沿途接敌 / 赶路=只行军）">{mode_label}</button>'
-                f'<button type="button" class="chip-x" data-wp-clear-unit="{safe_name}" '
-                f'title="清空 {html.escape(str(name))} 全部目标">×</button>'
-                '</div><div class="wp-targets">' + chips + '</div></div>'
-            )
-        list_html = f'<div class="wp-list">{"".join(entries)}</div>'
-    else:
-        list_html = '<div class="muted">暂无手动目标 · 到达后自动清除</div>'
-
-    return (
-        '<section class="panel waypoint-panel" id="waypointPanel">'
-        '<div class="panel-title"><span>手动目标</span>'
-        f'<span class="count" id="waypointCount">{_wp_count(waypoints)} 个</span></div>'
-        f'{list_html}'
-        '<div class="wp-add">'
-        f'<select id="wpName" title="选择单位"><option value="">选择单位…</option>{options}</select>'
-        '<input id="wpX" type="number" step="1" min="-1000" max="1000" placeholder="X" required>'
-        '<input id="wpY" type="number" step="1" min="-1000" max="1000" placeholder="Y" required>'
-        '<button type="button" class="pick-btn" id="pickWpBtn" '
-        'title="点击地图选择坐标（X 与 Y 一起填入）">⌖</button>'
-        '<select id="wpMode" title="行军模式">'
-        '<option value="attack" selected>攻击</option>'
-        '<option value="rush">赶路</option></select>'
-        '<button type="button" id="wpSetBtn">加入队列</button>'
-        '<button type="button" class="secondary" id="wpClearBtn">清空全部</button>'
-        '</div>'
-        '<div class="wp-msg" id="wpMsg">到达目标后自动恢复程序行动</div>'
-        '</section>'
-    )
-
-
 def short_id(uid: str) -> str:
     return (uid or "?")[:8]
 
 
-def fmt_pos(pos) -> str:
-    if not pos:
-        return "-"
-    return f"({int(pos[0])}, {int(pos[1])})"
+# ---------- planned route helpers ----------------------------------------
+# Kept from the retired SVG renderer: /api/unit-routes serves the same trimmed
+# polyline to the arena SPA's 路径 layer.
 
 
-def _seg_cells(cur, total: int) -> str:
-    """One <i> per point of a segmented vitality bar; filled cells are 'on'.
-
-    Values clamp to [0, total] so a stale log (e.g. shield already above the
-    display cap) never overflows the bar. None means unknown → all cells empty.
-    """
-    total = int(total)
-    if total <= 0:
-        return ""
-    cur = 0 if cur is None else max(0, min(int(cur), total))
-    return '<i class="on"></i>' * cur + '<i></i>' * (total - cur)
-
-
-def _core_rail_html(rec: dict) -> str:
-    """Left-rail core card: position + segmented HP/shield bars + quick rows."""
-    cp = rec.get("core_pos")
-    hp = rec.get("core_hp")
-    sh = rec.get("core_shield")
-    bp = rec.get("beacon_pos")
-    hp_total = 5
-    # The Core's shield caps at 10 only while it carries the champion beacon;
-    # otherwise the game (and the repair logic) keeps it at 5.
-    sh_total = 10 if (cp and bp and int(cp[0]) == int(bp[0]) and int(cp[1]) == int(bp[1])) else 5
-    return (
-        f'<div class="rail-focus"><div class="rail-focus-main"><span class="rail-eyebrow">当前位置</span>'
-        f'<strong class="rail-value">{fmt_pos(cp)}</strong></div></div>'
-        f'<div class="rail-vitals">'
-        f'<div class="vital"><span class="vital-label hp">HP</span>'
-        f'<span class="vital-cells hp">{_seg_cells(hp, hp_total)}</span>'
-        f'<span class="vital-num">{hp if hp is not None else "?"}/{hp_total}</span></div>'
-        f'<div class="vital"><span class="vital-label sh">盾</span>'
-        f'<span class="vital-cells sh">{_seg_cells(sh, sh_total)}</span>'
-        f'<span class="vital-num">{sh if sh is not None else "?"}/{sh_total}</span></div></div>'
-        f'<div class="rail-rows"><div class="rail-row"><span>当前动作</span><b>{rec.get("core_action") or "—"}</b></div>'
-        f'<div class="rail-row"><span>人口</span><b>{rec.get("population",0)}</b></div>'
-        f'<div class="rail-row"><span>信标坐标</span><b>{fmt_pos(bp)}</b></div></div>'
-    )
-
-
-def action_kind(action: str, cargo: int = 0) -> str:
-    a = action or ""
-    if "DEPOSIT" in a: return "deposit"
-    if "HARVEST" in a: return "harvest"
-    if "WAIT" in a: return "wait"
-    if cargo: return "cargo"
-    if "scout" in a or "explore" in a: return "explore"
-    if "enemy" in a or "SWEEP" in a or "SHOOT" in a: return "combat"
-    if "MOVE" in a: return "move"
-    return "other"
-
-
-def action_label(action: str, cargo: int = 0) -> str:
-    return {
-        "deposit": "交矿", "harvest": "挖矿", "wait": "等待",
-        "cargo": "回矿", "explore": "探索", "combat": "作战",
-        "move": "移动", "other": "其他",
-    }.get(action_kind(action, cargo), "其他")
-
-
-def check_stuck(history):
-    issues = []
-    if len(history) < 5:
-        return issues
-    pos_log = defaultdict(list)
-    for rec in history:
-        for w in rec.get("workers", []):
-            pos_log[w.get("id", "")].append(tuple(w.get("pos", [])))
-    for wid, positions in pos_log.items():
-        if len(positions) < 5:
-            continue
-        recent = positions[:8]
-        if len(set(recent)) == 1:
-            issues.append({"level": "danger", "title": "卡住",
-                           "detail": f"{short_id(wid)} 连续 {len(positions)} 帧停在 {fmt_pos(recent[0])}"})
-        elif len(set(recent)) <= 2 and len(set(recent)) < len(recent):
-            u = list(set(recent))
-            issues.append({"level": "warn", "title": "来回走",
-                           "detail": f"{short_id(wid)} 在 {fmt_pos(u[0])} / {fmt_pos(u[1])} 摆动"})
-    return issues
-
-
-# ---------- SVG map -------------------------------------------------------
-
-def _remaining_path(unit_data: dict) -> list:
+def _remaining_path(unit_data: dict, fallback_path: list | None = None) -> list:
     """Return the planned route minus the cells the unit has already walked.
 
     The planner re-emits the full A* polyline every tick while a unit advances
@@ -1866,9 +1549,16 @@ def _remaining_path(unit_data: dict) -> list:
     contains the origin the unit started from. Trim everything up to and
     including the unit's current cell so the map and step counts only show the
     route that is actually still ahead.
+
+    ``fallback_path`` is the route recovered from an older record when the
+    newest one logged ``path: null`` (unchanged since the previous Tick); see
+    :func:`_resolve_unit_paths`.
     """
+    source = unit_data.get("path")
+    if not source:
+        source = fallback_path or []
     path = []
-    for p in (unit_data.get("path") or []):
+    for p in source:
         if len(p) == 2:
             path.append([int(p[0]), int(p[1])])
     cur = unit_data.get("pos") or []
@@ -1881,906 +1571,57 @@ def _remaining_path(unit_data: dict) -> list:
     return path
 
 
-def _collect_points(rec, mm):
-    pts = []
-    c = rec.get("core_pos")
-    if c: pts.append((int(c[0]), int(c[1])))
-    for g in ("workers", "vanguards", "rangers", "enemies"):
-        for u in rec.get(g, []) or []:
-            p = u.get("pos") or []
-            if len(p) == 2: pts.append((int(p[0]), int(p[1])))
-            target = u.get("target") or []
-            if len(target) == 2: pts.append((int(target[0]), int(target[1])))
-            for route_pos in u.get("path", []) or []:
-                if len(route_pos) == 2:
-                    pts.append((int(route_pos[0]), int(route_pos[1])))
-    for p in rec.get("resource_cells", []) or []:
-        if len(p) == 2: pts.append((int(p[0]), int(p[1])))
-    for p in mm.get("obstacles", []): pts.append((int(p[0]), int(p[1])))
-    for p in mm.get("resources", []): pts.append((int(p[0]), int(p[1])))
-    for s in mm.get("enemy_sightings", []):
-        parsed = _parse_enemy_sighting(s)
-        if parsed is not None:
-            pts.append(parsed[0])
-    bp = rec.get("beacon_pos")
-    if bp and len(bp) == 2: pts.append((int(bp[0]), int(bp[1])))
-    return pts
+# How many older tick records the route resolver may scan. tactic.py omits a
+# route when it is unchanged since the previous Tick, so a unit on a long march
+# can point at a record dozens of ticks old; beyond this the route layer simply
+# shows the target marker (target is always logged).
+_ROUTE_LOOKBACK_RECORDS = 60
+_UNIT_ROUTE_GROUPS = (("workers", "WORKER"), ("vanguards", "VANGUARD"), ("rangers", "RANGER"))
 
 
-def render_svg(rec, mm, cell: int = 16, pad: int = 24, margin: int = 4,
-               config: dict | None = None, waypoints: dict | None = None,
-               hotspots: list | None = None):
-    if config is None:
-        config = load_config(CONFIG_PATH)
-    if waypoints is None:
-        waypoints = load_waypoints()
-    pts = _collect_points(rec, mm)
-    # Hotspot cells from the battle log may sit outside the live-unit bounds
-    # (e.g. a fight where every participant died) — keep them on the canvas.
-    for s in (hotspots or []):
-        pts.append((s["x"], s["y"]))
-    core = rec.get("core_pos")
-    if not pts:
-        return '<div class="muted">暂无地图数据</div>'
-    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
-    xmin, xmax = min(xs) - margin, max(xs) + margin
-    ymin, ymax = min(ys) - margin, max(ys) + margin
-    if xmax - xmin < 24:
-        m = (xmin + xmax) // 2; xmin, xmax = m - 12, m + 12
-    if ymax - ymin < 24:
-        m = (ymin + ymax) // 2; ymin, ymax = m - 12, m + 12
+def _resolve_unit_paths(rec: dict) -> dict[str, list]:
+    """Recover routes omitted from the newest tick record.
 
-    cols, rows = xmax - xmin + 1, ymax - ymin + 1
-    W, H = cols * cell + pad * 2, rows * cell + pad * 2
-
-    def to_xy(x, y):
-        # Game UP decreases Y, so smaller world-Y must sit higher on screen.
-        return pad + (x - xmin) * cell, pad + (y - ymin) * cell
-
-    obs = {(int(a), int(b)) for a, b in mm.get("obstacles", [])}
-    mem_r = {(int(a), int(b)) for a, b in mm.get("resources", [])}
-    vis_r = {(int(a), int(b)) for a, b in mm.get("resources", [])}  # placeholder
-    vis_r = set()
-    for p in rec.get("resource_cells", []) or []:
-        if len(p) == 2: vis_r.add((int(p[0]), int(p[1])))
-
-    core_cx = core_cy = None
-    if core and len(core) == 2:
-        cx_, cy_ = to_xy(int(core[0]), int(core[1]))
-        core_cx, core_cy = cx_ + cell / 2, cy_ + cell / 2
-
-    out = []
-    a = out.append
-    a(f'<svg class="game-map" id="gameMap" width="{W}" height="{H}" viewBox="0 0 {W} {H}" '
-      f'data-width="{W}" data-height="{H}" data-xmin="{xmin}" data-xmax="{xmax}" '
-      f'data-ymin="{ymin}" data-ymax="{ymax}" data-cell="{cell}" data-pad="{pad}" '
-      f'data-focus-x="{(core_cx if core_cx is not None else W/2):.1f}" '
-      f'data-focus-y="{(core_cy if core_cy is not None else H/2):.1f}" '
-      f'role="img" aria-label="known-map" style="width:{W}px;height:{H}px">')
-    a('<defs>'
-      '<pattern id="gridPat" x="{p}" y="{p}" width="{c}" height="{c}" patternUnits="userSpaceOnUse">'
-      '<rect width="{c}" height="{c}" fill="#10182c"/>'
-      '<rect width="{c}" height="{c}" fill="#152038" opacity="0.35"/>'
-      '<path d="M {c} 0 L 0 0 0 {c}" fill="none" stroke="rgba(255,255,255,0.04)" stroke-width="1"/>'
-      '</pattern>'
-      '<radialGradient id="coreGlow" cx="50%" cy="50%" r="50%">'
-      '<stop offset="0%" stop-color="#6ea8ff" stop-opacity="0.55"/>'
-      '<stop offset="100%" stop-color="#6ea8ff" stop-opacity="0"/>'
-      '</radialGradient>'
-      '<filter id="glow" x="-50%" y="-50%" width="200%" height="200%">'
-      '<feGaussianBlur stdDeviation="2.2" result="b"/>'
-      '<feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>'
-      '</filter>'
-      '</defs>'.format(c=cell, p=pad))
-    a(f'<rect x="0" y="0" width="{W}" height="{H}" fill="#0b1222"/>')
-    a(f'<rect x="{pad}" y="{pad}" width="{cols*cell}" height="{rows*cell}" fill="url(#gridPat)" '
-      f'stroke="rgba(255,255,255,0.06)" rx="8"/>')
-    # major grid
-    step = 5 if max(cols, rows) <= 80 else 10
-    for x in range(xmin, xmax + 1):
-        if x % step == 0:
-            px, _ = to_xy(x, ymin)
-            a(f'<line x1="{px}" y1="{pad}" x2="{px}" y2="{pad+rows*cell}" stroke="rgba(110,168,255,0.08)"/>')
-    for y in range(ymin, ymax + 1):
-        if y % step == 0:
-            _, py = to_xy(xmin, y)
-            a(f'<line x1="{pad}" y1="{py}" x2="{pad+cols*cell}" y2="{py}" stroke="rgba(110,168,255,0.08)"/>')
-
-    # obstacles — one <path> carrying every wall cell as a subpath. A full map
-    # can hold thousands of wall cells; a <rect> per cell turned into thousands
-    # of DOM nodes that the browser had to keep and re-layout on every pan.
-    wall_d = []
-    for ox, oy in obs:
-        if not (xmin <= ox <= xmax and ymin <= oy <= ymax): continue
-        x, y = to_xy(ox, oy)
-        # Fits one cell with the same inset the old rects used (1.2px each side).
-        wall_d.append(f"M{x + 1.2},{y + 1.2}h{cell - 2.4}v{cell - 2.4}h-{cell - 2.4}z")
-    if wall_d:
-        a(f'<path data-cat="wall" d="{" ".join(wall_d)}" '
-          f'fill="#3a455f" stroke="#7f8eab" stroke-width="1"/>')
-
-    # remembered resources
-    for rx, ry in mem_r - vis_r:
-        if not (xmin <= rx <= xmax and ymin <= ry <= ymax): continue
-        x, y = to_xy(rx, ry)
-        cxr, cyr = x + cell / 2, y + cell / 2
-        a(f'<circle data-cat="ore-mem" cx="{cxr}" cy="{cyr}" r="4.5" fill="#c9a227" opacity="0.55"/>')
-        a(f'<circle data-cat="ore-mem" cx="{cxr}" cy="{cyr}" r="2.2" fill="#ffe08a" opacity="0.85"/>')
-    for rx, ry in vis_r:
-        if not (xmin <= rx <= xmax and ymin <= ry <= ymax): continue
-        x, y = to_xy(rx, ry)
-        cxr, cyr = x + cell / 2, y + cell / 2
-        a(f'<circle data-cat="ore" cx="{cxr}" cy="{cyr}" r="6.5" fill="#ffc857" filter="url(#glow)"/>')
-        a(f'<circle data-cat="ore" cx="{cxr}" cy="{cyr}" r="2.8" fill="#fff3c4"/>')
-
-    # Enemy sightings (remembered, last-known positions).  Each marker carries
-    # the unit type last seen there so an out-of-vision CORE (总部) can be told
-    # from a worker scout without re-scouting.  The dashed ring + dim fill mark
-    # it as last-known (possibly moved).  Live visible enemies are skipped so
-    # the brighter unit marker on top is not duplicated underneath.
-    visible_enemy_positions = {
-        tuple(int(c) for c in (e.get("pos") or []))
-        for e in rec.get("enemies", [])
-        if len(e.get("pos") or []) == 2
-    }
-    for sighting in mm.get("enemy_sightings", []):
-        parsed = _parse_enemy_sighting(sighting)
-        if parsed is None:
-            continue
-        ex, ey = parsed[0]
-        if (ex, ey) in visible_enemy_positions:
-            continue
-        if not (xmin <= ex <= xmax and ymin <= ey <= ymax):
-            continue
-        etype = parsed[1]
-        color = _enemy_type_color(etype)
-        label = _enemy_type_char(etype)
-        x, y = to_xy(ex, ey)
-        cxr, cyr = x + cell / 2, y + cell / 2
-        if etype == "CORE":
-            # Headquarters use a unique diamond + star silhouette. At the
-            # default 16px cell size this reads much faster than another red
-            # circle containing a dense one-character Chinese label.
-            radius = 8.5
-            points = (f"{cxr},{cyr-radius} {cxr+radius},{cyr} "
-                      f"{cxr},{cyr+radius} {cxr-radius},{cyr}")
-            a(f'<circle data-cat="enemy-trace" cx="{cxr}" cy="{cyr}" r="12" '
-              f'fill="{color}" opacity="0.18"/>')
-            a(f'<polygon data-cat="enemy-trace" data-marker="enemy-core-memory" '
-              f'points="{points}" fill="{color}" fill-opacity="0.68" '
-              f'stroke="#ffd5dc" stroke-width="1.6" stroke-dasharray="3 2" '
-              f'filter="url(#glow)"/>')
-            a(f'<text data-cat="enemy-trace" x="{cxr}" y="{cyr + 3.1}" '
-              f'text-anchor="middle" font-size="9.5" '
-              f'font-family="Segoe UI Symbol, Segoe UI, Microsoft YaHei, sans-serif" '
-              f'font-weight="700" fill="#fff4f6">{label}</text>')
-        else:
-            a(f'<circle data-cat="enemy-trace" cx="{cxr}" cy="{cyr}" r="9" fill="{color}" opacity="0.14"/>')
-            a(f'<circle data-cat="enemy-trace" cx="{cxr}" cy="{cyr}" r="6.5" fill="{color}" opacity="0.5"/>')
-            a(f'<circle data-cat="enemy-trace" cx="{cxr}" cy="{cyr}" r="6.5" fill="none" '
-              f'stroke="{color}" stroke-width="1.2" stroke-dasharray="3 3" opacity="0.95"/>')
-            a(f'<text data-cat="enemy-trace" x="{cxr}" y="{cyr + 2.2}" text-anchor="middle" '
-              f'font-size="7.5" font-family="Segoe UI, Microsoft YaHei, sans-serif" '
-              f'font-weight="700" fill="#0b1020" opacity="0.9">{label}</text>')
-
-    # Combat hotspots: pulsing double ring where a fight is on (engaged),
-    # dashed orange ring where one just happened (recent). Drawn below
-    # routes/units so the markers stay readable on top. Sighted-only enemies
-    # already have their unit markers, no extra ring.
-    for s in (hotspots or []):
-        if s.get("level") == "sighted":
-            continue
-        hx, hy = s["x"], s["y"]
-        if not (xmin <= hx <= xmax and ymin <= hy <= ymax):
-            continue
-        x, y = to_xy(hx, hy)
-        hcx, hcy = x + cell / 2, y + cell / 2
-        if s["level"] == "engaged":
-            a(f'<circle data-cat="combat" cx="{hcx}" cy="{hcy}" r="17" fill="none" '
-              f'stroke="#ff4964" stroke-width="1.3" opacity="0.65"/>')
-            a(f'<circle data-cat="combat" class="hotspot-ring engaged" cx="{hcx}" cy="{hcy}" r="12" '
-              f'fill="rgba(255,73,100,0.15)" stroke="#ff4964" stroke-width="2"/>')
-        else:
-            a(f'<circle data-cat="combat" cx="{hcx}" cy="{hcy}" r="12" fill="none" '
-              f'stroke="#ff8c42" stroke-width="1.6" stroke-dasharray="4 3" opacity="0.85"/>')
-
-    # Worker routes and targets are generated by the same planner that moves them.
-    route_colors = (
-        "#63d8ff", "#57d6a3", "#ffc857", "#ff7aa9",
-        "#b38cff", "#ff8a65", "#8fd14f", "#78a9ff",
-    )
-
-    def _draw_route(unit_data, name, color, css_class=""):
-        # Unit names ultimately come from the game server (enemy names are
-        # opponent-controlled), so escape before interpolating into attributes.
-        safe_name = html.escape(str(name), quote=True)
-        # Trim the already-walked segment: the planner logs the full A* polyline
-        # every tick while a unit advances along it, so without this the map
-        # keeps showing ground the unit has already crossed.
-        path = _remaining_path(unit_data)
-        target = unit_data.get("target") or []
-        if len(path) > 1:
-            route_points = []
-            for px, py in path:
-                x, y = to_xy(int(px), int(py))
-                route_points.append(f"{x + cell / 2:.1f},{y + cell / 2:.1f}")
-            points_attr = " ".join(route_points)
-            dash = "" if unit_data.get("path_complete") else ' stroke-dasharray="5 4"'
-            a(f'<polyline class="{css_class}" data-cat="route" data-unit="{safe_name}" '
-              f'points="{points_attr}" fill="none" stroke="{color}" '
-              f'stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" '
-              f'opacity="0.82"{dash}/>')
-        if len(target) == 2:
-            tx, ty = int(target[0]), int(target[1])
-            if xmin <= tx <= xmax and ymin <= ty <= ymax:
-                x, y = to_xy(tx, ty)
-                cx, cy = x + cell / 2, y + cell / 2
-                a(f'<circle class="{css_class}-target" data-cat="target" data-unit="{safe_name}" cx="{cx}" cy="{cy}" '
-                  f'r="8" fill="none" stroke="{color}" stroke-width="1.8" opacity="0.9"/>')
-                a(f'<circle data-cat="target" cx="{cx}" cy="{cy}" r="2" fill="{color}"/>')
-
-    for index, worker in enumerate(rec.get("workers", []) or []):
-        _draw_route(worker, worker.get("name") or f"W{index + 1}",
-                     route_colors[index % len(route_colors)], "worker-route")
-
-    # Vanguard routes (orange)
-    for index, v in enumerate(rec.get("vanguards", []) or []):
-        _draw_route(v, v.get("name") or f"V{index + 1}", "#ff8c42", "vanguard-route")
-
-    # Ranger routes (teal)
-    for index, r in enumerate(rec.get("rangers", []) or []):
-        _draw_route(r, r.get("name") or f"R{index + 1}", "#6ea8ff", "ranger-route")
-
-    def unit(pos, color, label, glow=False, ring=None, cat="unit", unit_name=None,
-             anim_key=None):
-        if not pos or len(pos) != 2: return
-        px, py = int(pos[0]), int(pos[1])
-        if not (xmin <= px <= xmax and ymin <= py <= ymax): return
-        x, y = to_xy(px, py)
-        ux, uy = x + cell / 2, y + cell / 2
-        # data-unit lets the waypoint panel pick a unit by clicking its marker.
-        du = f' data-unit="{html.escape(str(unit_name), quote=True)}"' if unit_name else ""
-        # data-anim + world coords give the dashboard a stable identity per
-        # marker so it can FLIP-animate units between tick positions instead
-        # of teleporting them on every SVG swap. Names are server/opponent
-        # controlled — escape before embedding.
-        if anim_key:
-            a(f'<g data-anim="{html.escape(str(anim_key), quote=True)}" '
-              f'data-wx="{px}" data-wy="{py}">')
-        if glow: a(f'<circle data-cat="{cat}"{du} cx="{ux}" cy="{uy}" r="11" fill="{color}" opacity="0.18"/>')
-        if ring: a(f'<circle data-cat="{cat}"{du} cx="{ux}" cy="{uy}" r="8.5" fill="none" stroke="{ring}" stroke-width="2"/>')
-        unit_radius = 7.5 if len(str(label)) > 2 else 7
-        font_size = 6 if len(str(label)) > 2 else 7
-        a(f'<circle data-cat="{cat}"{du} cx="{ux}" cy="{uy}" r="{unit_radius}" fill="{color}" filter="url(#glow)" '
-          f'stroke="rgba(255,255,255,0.65)" stroke-width="1.2"/>')
-        # Enemy labels are opponent-controlled: escape before embedding as text.
-        a(f'<text data-cat="{cat}"{du} x="{ux}" y="{uy+2.5}" text-anchor="middle" font-size="{font_size}" '
-          f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#0b1020">'
-          f'{html.escape(str(label))}</text>')
-        if anim_key:
-            a('</g>')
-
-    def enemy_core(pos, label):
-        """Draw a live enemy HQ with a silhouette unlike any mobile unit."""
-        if not pos or len(pos) != 2:
-            return
-        px, py = int(pos[0]), int(pos[1])
-        if not (xmin <= px <= xmax and ymin <= py <= ymax):
-            return
-        x, y = to_xy(px, py)
-        ux, uy = x + cell / 2, y + cell / 2
-        # Same FLIP identity as mobile units (see unit() above).
-        a(f'<g data-anim="E:{html.escape(str(label), quote=True)}" '
-          f'data-wx="{px}" data-wy="{py}">')
-        radius = 9.5
-        points = (f"{ux},{uy-radius} {ux+radius},{uy} "
-                  f"{ux},{uy+radius} {ux-radius},{uy}")
-        a(f'<circle data-cat="enemy-core" cx="{ux}" cy="{uy}" r="14" '
-          f'fill="#ff4964" opacity="0.22"/>')
-        a(f'<polygon data-cat="enemy-core" data-marker="enemy-core-live" '
-          f'points="{points}" fill="#ff4964" stroke="#ffe0e5" '
-          f'stroke-width="1.8" filter="url(#glow)"/>')
-        a(f'<text data-cat="enemy-core" x="{ux}" y="{uy+2.5}" text-anchor="middle" '
-          f'font-size="7" font-family="Segoe UI, Microsoft YaHei, sans-serif" '
-          f'font-weight="800" fill="#2b0710">{html.escape(str(label))}</text>')
-        a('</g>')
-
-    for index, w in enumerate(rec.get("workers", [])):
-        c = bool(w.get("cargo"))
-        name = w.get("name") or f"W{index + 1}"
-        unit(w.get("pos"), "#57d6a3" if c else "#8aa4ff", name, glow=c, ring="#9ef0c8" if c else None, cat="worker", unit_name=name, anim_key=name)
-    for index, v in enumerate(rec.get("vanguards", [])):
-        name = v.get("name") or f"V{index + 1}"
-        unit(v.get("pos"), "#ff8c42", name, glow=True, cat="vanguard", unit_name=name, anim_key=name)
-    for index, r in enumerate(rec.get("rangers", [])):
-        name = r.get("name") or f"R{index + 1}"
-        unit(r.get("pos"), "#b38cff", name, glow=True, cat="ranger", unit_name=name, anim_key=name)
-    # Visible enemies are filtered per type (WORKER / VANGUARD / RANGER / CORE)
-    # so the legend can show/hide each class independently.  Enemies without a
-    # typed unit_type land in the generic ENEMY category.  Several enemies can
-    # share one cell — the enemy CORE has its spawned workers standing on the
-    # HQ square — so per cell only the highest-priority unit is drawn; otherwise
-    # a blue worker marker would cover the red enemy-HQ marker at the same spot.
-    _ENEMY_PRIORITY = {"ENEMY": 0, "WORKER": 1, "VANGUARD": 2, "RANGER": 2, "CORE": 3}
-
-    def _enemy_rank(e):
-        return _ENEMY_PRIORITY.get(str(e.get("type") or "ENEMY").upper(), 0)
-
-    drawn_enemy_cells: set[tuple[int, int]] = set()
-    fallback = 1
-    for enemy in sorted(rec.get("enemies", []) or [], key=_enemy_rank, reverse=True):
-        epos = enemy.get("pos") or []
-        if len(epos) != 2:
-            continue
-        ekey = (int(epos[0]), int(epos[1]))
-        if ekey in drawn_enemy_cells:
-            continue
-        drawn_enemy_cells.add(ekey)
-        etype = str(enemy.get("type") or "ENEMY").upper()
-        name = enemy.get("name") or f"E{fallback}"
-        fallback += 1
-        if etype == "CORE":
-            enemy_core(epos, name)
-            continue
-        if etype == "WORKER":
-            cat, color, ring = "enemy-worker", "#8aa4ff", None
-        elif etype == "VANGUARD":
-            cat, color, ring = "enemy-vanguard", "#ff8c42", None
-        elif etype == "RANGER":
-            cat, color, ring = "enemy-ranger", "#b38cff", None
-        else:
-            cat, color, ring = "enemy", "#ff6464", "#ff9b9b"
-        # E: prefix keeps enemy FLIP identities disjoint from own-unit names.
-        unit(epos, color, name, glow=True, ring=ring, cat=cat, anim_key="E:" + name)
-
-    if core_cx is not None:
-        # Wrapped like the unit markers so core migration glides too.
-        a(f'<g data-anim="__core__" data-wx="{int(core[0])}" data-wy="{int(core[1])}">')
-        a(f'<circle data-cat="core" cx="{core_cx}" cy="{core_cy}" r="15" fill="url(#coreGlow)"/>')
-        a(f'<rect data-cat="core" x="{core_cx-6.5}" y="{core_cy-6.5}" width="13" height="13" rx="3" '
-          f'transform="rotate(45 {core_cx} {core_cy})" fill="#6ea8ff" stroke="#d7e8ff" '
-          f'stroke-width="1.4" filter="url(#glow)"/>')
-        a(f'<text data-cat="core" x="{core_cx}" y="{core_cy+3}" text-anchor="middle" font-size="8" '
-          f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#081018">'
-          f'{html.escape(str(rec.get("core_name") or "C1"))}</text>')
-        a('</g>')
-
-    # Beacon
-    bp = rec.get("beacon_pos")
-    if bp and len(bp) == 2:
-        bx, by = to_xy(int(bp[0]), int(bp[1]))
-        bcx, bcy = bx + cell / 2, by + cell / 2
-        # Glow
-        a(f'<circle data-cat="beacon" cx="{bcx}" cy="{bcy}" r="14" fill="#ffc857" opacity="0.18"/>')
-        # Diamond shape
-        r = 7.5
-        a(f'<polygon data-cat="beacon" points="{bcx},{bcy-r} {bcx+r},{bcy} {bcx},{bcy+r} {bcx-r},{bcy}" '
-          f'fill="#ffc857" stroke="#ffe08a" stroke-width="1.5" filter="url(#glow)"/>')
-        # Inner star
-        a(f'<text data-cat="beacon" x="{bcx}" y="{bcy+3.5}" text-anchor="middle" font-size="9" '
-          f'font-family="Segoe UI, Microsoft YaHei, sans-serif" font-weight="700" fill="#5c4300">★</text>')
-
-    # Configured strategy points — the same coordinates the map-pick buttons
-    # fill. Drawing them makes the map double as a coordinate reference.
-    def _config_marker(x, y, color, prefix, cat):
-        if not (xmin <= x <= xmax and ymin <= y <= ymax):
-            return
-        px, py = to_xy(x, y)
-        cx, cy = px + cell / 2, py + cell / 2
-        label = f"{prefix}({x},{y})"
-        w = 6.5 * len(label) + 12
-        a(f'<circle data-cat="{cat}" cx="{cx}" cy="{cy}" r="9" fill="none" stroke="{color}" '
-          f'stroke-width="1.6" stroke-dasharray="4 3" opacity="0.9"/>')
-        a(f'<circle data-cat="{cat}" cx="{cx}" cy="{cy}" r="2.4" fill="{color}"/>')
-        a(f'<rect data-cat="{cat}" x="{cx + 8}" y="{cy - 12}" width="{w:.0f}" height="16" rx="8" '
-          f'fill="#0b1222" stroke="{color}" stroke-opacity="0.55" stroke-width="1"/>')
-        a(f'<text data-cat="{cat}" x="{cx + 8 + w / 2:.0f}" y="{cy + 0.5}" text-anchor="middle" '
-          f'font-size="10" fill="{color}" font-family="Consolas, monospace">{label}</text>')
-
-    if str(config.get("attack_mode", "coords")) == "coords":
-        _config_marker(int(config.get("attack_target_x", 0)),
-                       int(config.get("attack_target_y", 0)), "#ff8c42", "攻", "attack-target")
-    if str(config.get("kite_mode", "coords")) == "coords":
-        _config_marker(int(config.get("kite_target_x", 0)),
-                       int(config.get("kite_target_y", 0)), "#3dd6c9", "筝", "kite-target")
-    if bool(config.get("core_target_enabled", False)):
-        _config_marker(int(config.get("core_target_x", 0)),
-                       int(config.get("core_target_y", 0)), "#6ea8ff", "核", "core-target")
-
-    # Manual per-unit target queues (dashboard ⌖). One marker per queued point.
-    for name, raw in sorted(waypoints.items()):
-        entry = _normalize_wp_entry(raw)
-        if entry is None:
-            continue
-        for x, y in entry["queue"]:
-            if not (xmin <= x <= xmax and ymin <= y <= ymax):
-                continue
-            px, py = to_xy(x, y)
-            cx, cy = px + cell / 2, py + cell / 2
-            label = html.escape(f"{name}→({x},{y})")
-            w = 6.5 * len(label) + 12
-            a(f'<circle data-cat="wp" cx="{cx}" cy="{cy}" r="9" fill="none" stroke="#3dd6c9" '
-              f'stroke-width="1.6" stroke-dasharray="4 3" opacity="0.9"/>')
-            a(f'<circle data-cat="wp" cx="{cx}" cy="{cy}" r="2.4" fill="#3dd6c9"/>')
-            a(f'<rect data-cat="wp" x="{cx + 8}" y="{cy - 12}" width="{w:.0f}" height="16" rx="8" '
-              f'fill="#0b1222" stroke="#3dd6c9" stroke-opacity="0.55" stroke-width="1"/>')
-            a(f'<text data-cat="wp" x="{cx + 8 + w / 2:.0f}" y="{cy + 0.5}" text-anchor="middle" '
-              f'font-size="10" fill="#3dd6c9" font-family="Consolas, monospace">{label}</text>')
-
-    for x in range(xmin, xmax + 1):
-        if x % step == 0:
-            px, _ = to_xy(x, ymin)
-            a(f'<text x="{px+cell/2}" y="{H-6}" text-anchor="middle" fill="#7f8eab" font-size="9" '
-              f'font-family="Consolas, monospace">{x}</text>')
-    for y in range(ymin, ymax + 1):
-        if y % step == 0:
-            _, py = to_xy(xmin, y)
-            a(f'<text x="10" y="{py+cell/2+3}" text-anchor="middle" fill="#7f8eab" font-size="9" '
-              f'font-family="Consolas, monospace">{y}</text>')
-    a(f'<text x="{pad}" y="16" fill="#93a0bf" font-size="11" '
-      f'font-family="Segoe UI, Microsoft YaHei, sans-serif">'
-      f'map {xmin},{ymin} ~ {xmax},{ymax} · {cols}x{rows}</text>')
-    a('</svg>')
-    return "".join(out)
-
-
-def build_parts(log_limit: int = 200):
-    """Build all dashboard fragments + map for page and /api/state."""
-    history = read_history(40)
-    rec = history[0] if history else None
+    Returns ``{unit_id: full_path}`` for every unit whose newest entry carries
+    ``path: null`` with a non-zero ``path_len``. The scan is newest-first and
+    bounded; a unit with no recoverable route inside the window is simply left
+    out (callers render its target marker instead).
+    """
+    missing: set[str] = set()
+    for group, _etype in _UNIT_ROUTE_GROUPS:
+        for raw in rec.get(group) or ():
+            if (
+                isinstance(raw, dict)
+                and raw.get("path") is None
+                and raw.get("path_len")
+            ):
+                missing.add(str(raw.get("id") or ""))
+    if not missing:
+        return {}
+    found: dict[str, list] = {}
+    records = 0
     try:
-        mtime = os.path.getmtime(LOG_FILE)
+        for line in _iter_log_lines_reverse(LOG_FILE):
+            try:
+                older = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(older, dict) or "workers" not in older:
+                continue
+            records += 1
+            for group, _etype in _UNIT_ROUTE_GROUPS:
+                for raw in older.get(group) or ():
+                    if not isinstance(raw, dict):
+                        continue
+                    uid = str(raw.get("id") or "")
+                    if uid in missing and raw.get("path"):
+                        found[uid] = raw["path"]
+                        missing.discard(uid)
+            if not missing or records >= _ROUTE_LOOKBACK_RECORDS:
+                break
     except OSError:
-        mtime = time.time()
-    issues = check_stuck(history)
-    age = time.time() - mtime if mtime else 0
-    if not rec:
-        return None
-
-    workers = rec.get("workers", [])
-    vgs = rec.get("vanguards", [])
-    rgs = rec.get("rangers", [])
-    actions = rec.get("plan_unit_actions", {})
-    resources = rec.get("resources", 0)
-    cap = rec.get("resource_capacity", 50)
-    pct = min(100, int(resources * 100 / cap)) if cap else 0
-    enemies = rec.get("visible_enemies", 0)
-    rcells = rec.get("resource_cells", [])
-    mm = load_map_memory()
-    waypoints = load_waypoints()
-    # Held (驻守) unit names — the per-unit cards render a 驻守 toggle for them.
-    holds = load_holds()
-    # Combat hotspots drive both the alert strip above the map and the pulse
-    # rings on it — compute once, reuse for both.
-    hotspots = _combat_hotspots(rec)
-    hotspots_html = _hotspots_html(hotspots)
-    # render_svg redraws every known obstacle/resource/route on each poll. The
-    # output only changes with the newest tick record, the map file, the
-    # waypoints file, or the few config markers drawn on the map — so cache it
-    # by those signatures and skip the 4ms re-render when nothing moved.
-    svg = _render_svg_cached(rec, mm, waypoints, hotspots)
-    running = age < 30
-    status_cls = "ok" if running else "down"
-    status_text = "运行中" if running else "已停止"
-
-    stats = defaultdict(int)
-    for w in workers:
-        wid = short_id(w.get("id", ""))
-        act = actions.get(wid) or actions.get(w.get("id", ""), "")
-        stats[action_kind(act, w.get("cargo", 0))] += 1
-
-    # Battle-report statistics (economy / combat / production + per-unit).
-    game_stat = game_stats.load()
-    derived = game_stats.derive(game_stat, alive_workers=len(workers))
-    per_worker = game_stat.get("per_worker", {}) or {}
-    per_combat = game_stat.get("per_combat", {}) or {}
-
-    def wcard(w):
-        wid = w.get("id", "")
-        sid = short_id(wid)
-        name = w.get("name") or f"W{workers.index(w) + 1}"
-        act = actions.get(sid) or actions.get(wid, "")
-        cargo = w.get("cargo", 0)
-        kind = action_kind(act, cargo)
-        badge = action_label(act, cargo)
-        path = _remaining_path(w)
-        target = w.get("target")
-        steps = max(0, len(path) - 1)
-        route_text = f"{steps}步" if w.get("path_complete") else f"规划{steps}步"
-        vitals = f"矿 {cargo}" if cargo else f'HP {w.get("hp","?")}'
-        pw = per_worker.get(sid)
-        history_text = ""
-        if pw is not None and (pw.get("harvested", 0) or pw.get("deposited", 0)):
-            history_text = (
-                f'<span class="unit-fact" title="累计采矿 / 卸货">'
-                f'采{pw.get("harvested", 0)}·卸{pw.get("deposited", 0)}</span>'
-            )
-        safe_name = html.escape(str(name))
-        safe_sid = html.escape(str(sid))
-        safe_act = html.escape(str(act or "暂无指令"))
-        # The card carries the unit's live world position so a click can jump
-        # the map view to it (see focusWorld in the JS).
-        wpos = w.get("pos") or []
-        focus_attr = (
-            f' data-focus-wx="{int(wpos[0])}" data-focus-wy="{int(wpos[1])}"'
-            if len(wpos) == 2 else ""
-        )
-        held = str(name).upper() in holds
-        hold_label = "解除驻守" if held else "驻守"
-        return (
-            f'<div class="unit {kind}{" hold" if held else ""}" title="{safe_act}"{focus_attr}><div class="unit-top">'
-            f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
-            f'<span class="unit-actions"><span class="badge {kind}">{html.escape(str(badge))}</span>'
-            f'<button type="button" class="hold-btn{" on" if held else ""}" data-hold-unit="{safe_name}" '
-            f'aria-label="{hold_label} {safe_name}" title="{hold_label}（原地驻守，进入射程自动攻击）">{hold_label}</button>'
-            f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '
-            f'aria-label="自裁 {safe_name}" title="自裁">自裁</button></span></div>'
-            f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(w.get("pos"))}'
-            f'<span class="arrow">→</span>{fmt_pos(target)}</span>'
-            f'<span class="unit-fact">{vitals}</span><span class="unit-fact">{route_text}</span>{history_text}</div></div>'
-        )
-
-    def team_label(act: str) -> str:
-        if "[home]" in act:
-            return "守家"
-        if "[attack]" in act:
-            return "进攻"
-        if "[guerrilla]" in act:
-            return "游击"
-        if "[unassigned]" in act:
-            return "未编队"
-        return "作战"
-
-    def combat_stat_line(sid: str) -> str:
-        """Compact per-combat-unit shots / hits, or death summary."""
-        rec = per_combat.get(sid)
-        if not rec:
-            return ""
-        shots = int(rec.get("shots", 0) or 0)
-        hits = int(rec.get("hits", 0) or 0)
-        rate = (hits * 100 / shots) if shots else 0.0
-        alive = rec.get("died_tick") is None
-        if alive:
-            return f'<span class="unit-fact" title="攻击 / 命中 / 命中率">攻{shots}·中{hits}·{rate:.0f}%</span>'
-        return f'<span class="unit-fact" title="生前攻击 / 命中">阵亡·{shots}/{hits}</span>'
-
-    def ucard(u, color_cls):
-        uid = u.get("id", "")
-        sid = short_id(uid)
-        name = u.get("name") or sid
-        act = actions.get(sid) or actions.get(uid, "")
-        label = team_label(act)
-        stat_line = combat_stat_line(sid)
-        safe_name = html.escape(str(name))
-        safe_sid = html.escape(str(sid))
-        safe_act = html.escape(str(act or "暂无指令"))
-        # Same focus attribute as worker cards: click → map jumps to the unit.
-        upos = u.get("pos") or []
-        focus_attr = (
-            f' data-focus-wx="{int(upos[0])}" data-focus-wy="{int(upos[1])}"'
-            if len(upos) == 2 else ""
-        )
-        held = str(name).upper() in holds
-        hold_label = "解除驻守" if held else "驻守"
-        return (
-            f'<div class="unit {color_cls}{" hold" if held else ""}" title="{safe_act}"{focus_attr}><div class="unit-top">'
-            f'<div class="unit-id">{safe_name}<span class="count">{safe_sid}</span></div>'
-            f'<span class="unit-actions"><span class="badge {color_cls}">{label}</span>'
-            f'<button type="button" class="hold-btn{" on" if held else ""}" data-hold-unit="{safe_name}" '
-            f'aria-label="{hold_label} {safe_name}" title="{hold_label}（原地驻守，进入射程自动攻击）">{hold_label}</button>'
-            f'<button type="button" class="sd-btn" data-sd-unit="{safe_name}" '
-            f'aria-label="自裁 {safe_name}" title="自裁">自裁</button></span></div>'
-            f'<div class="unit-facts"><span class="unit-locator">{fmt_pos(u.get("pos"))}</span>'
-            f'<span class="unit-fact">HP {u.get("hp","?")}</span>{stat_line}</div></div>'
-        )
-
-    w_html = "".join(wcard(w) for w in workers) or '<div class="empty">暂无工人</div>'
-    vg_html = "".join(ucard(v, "combat") for v in vgs) or '<div class="empty">暂无先锋</div>'
-    rg_html = "".join(ucard(r, "combat") for r in rgs) or '<div class="empty">暂无游侠</div>'
-    combat_units = collect_combat_units(rec, load_config(CONFIG_PATH))
-    wp_workers = [w.get("name") for w in workers if w.get("name")]
-    wp_vgs = [v.get("name") for v in vgs if v.get("name")]
-    wp_rgs = [r.get("name") for r in rgs if r.get("name")]
-    waypoint_html = render_waypoints_panel(waypoints, wp_workers, wp_vgs, wp_rgs)
-
-    if issues:
-        items = "".join(
-            f'<div class="issue {i["level"]}"><strong>{i["title"]}</strong>'
-            f'<span>{i["detail"]}</span></div>'
-            for i in issues
-        )
-        issues_html = (
-            '<section class="panel" style="margin-bottom:14px">'
-            f'<div class="panel-title">异常告警</div><div class="issues">{items}</div></section>'
-        )
-    else:
-        issues_html = ""
-
-    def _res_chip(p, removable: bool, manual: bool = False):
-        x, y = int(p[0]), int(p[1])
-        x_btn = (
-            f'<button type="button" class="chip-x" data-remove-x="{x}" data-remove-y="{y}" '
-            f'aria-label="删除 ({x},{y})" title="删除">×</button>' if removable else ""
-        )
-        base_cls = "chip removable"
-        if manual:
-            cls = base_cls + " mem manual"
-        elif removable:
-            cls = base_cls + " mem"
-        else:
-            cls = "chip"
-        return f'<span class="{cls}">{fmt_pos(p)}{x_btn}</span>'
-
-    vis_chips_html = "".join(_res_chip(p, False) for p in rcells)
-    if not vis_chips_html:
-        vis_chips_html = '<div class="muted">当前无可见矿点</div>'
-    mem_resources = list(mm.get("resources", []) or [])
-    manual_set = {tuple(p) for p in (mm.get("manual_resources") or [])}
-    mem_auto = [p for p in mem_resources if tuple(p) not in manual_set]
-    mem_manual = [p for p in mem_resources if tuple(p) in manual_set]
-    auto_chips = "".join(_res_chip(p, True, manual=False) for p in mem_auto)
-    manual_chips = "".join(_res_chip(p, True, manual=True) for p in mem_manual)
-
-    res_html = '<div class="res-section">'
-    res_html += '<h4>可见矿点</h4><div class="chip-row">' + vis_chips_html + '</div>'
-    if mem_auto:
-        res_html += f'<h4>记忆矿点 {len(mem_auto)}</h4><div class="chip-row">{auto_chips}</div>'
-    if mem_manual:
-        res_html += f'<h4>手动录入 <span class="manual-tag">{len(mem_manual)}</span></h4><div class="chip-row">{manual_chips}</div>'
-    if not mem_resources:
-        res_html += '<h4>记忆矿点</h4><div class="muted">暂无记忆矿点</div>'
-    if mem_resources:
-        res_html += (
-            '<div class="actions" style="margin-top:4px">'
-            '<button type="button" id="clearResourceBtn" class="enemy-clear-btn">清除记忆矿点</button>'
-            '</div>'
-        )
-    res_html += (
-        '<div class="res-add-form" id="resAddForm">'
-        '<div class="row">'
-        '<label>X<input id="oreX" name="x" type="number" step="1" placeholder="-30" required></label>'
-        '<label>Y<input id="oreY" name="y" type="number" step="1" placeholder="65" required></label>'
-        '<button type="button" class="pick-btn ore-pick-btn" id="pickOreBtn" '
-        'title="点击地图选择矿点坐标（X 与 Y 一起填入）">⌖ 地图点选</button>'
-        '</div>'
-        '<div class="actions">'
-        '<button type="button" id="oreAddBtn">加入记忆</button>'
-        '<button type="button" class="secondary" id="oreCancelBtn">取消</button>'
-        '</div>'
-        '<div class="msg" id="oreMsg">输入坐标后点加入</div>'
-        '</div>'
-        '</div>'
-    )
-
-    # Enemy sightings — separate card below ore panel
-    ex_sightings = mm.get("enemy_sightings", [])
-    if ex_sightings:
-        ex_chips = "".join(
-            f'<span class="chip enemy-chip" title="{html.escape(str(s.get("type") or "ENEMY"))}">'
-            f'{_enemy_type_char(s.get("type"))}{fmt_pos(s.get("pos"))}</span>'
-            for s in ex_sightings[:30]
-        )
-        enemy_html = f'<div class="res-section"><h4>敌人踪迹</h4><div class="chip-row">{ex_chips}</div></div>'
-    else:
-        enemy_html = '<div class="muted">暂无敌人踪迹</div>'
-
-    brand = (
-        f"Tick {rec.get('tick')} · 延迟 {rec.get('latency_ms',0):.0f} ms · "
-        f"核心 {fmt_pos(rec.get('core_pos'))}"
-    )
-    status_html = (
-        f'<span class="dot"></span><span>{status_text}</span>'
-        f'<span style="color:var(--muted)">日志 {age:.0f}s 前</span>'
-    )
-    hero_html = (
-        f'<div class="card"><div class="kicker">核心状态</div>'
-        f'<div class="big">{fmt_pos(rec.get("core_pos"))}</div>'
-        f'<div class="sub">动作 {rec.get("core_action") or "—"} · 状态 {rec.get("core_state") or "—"} · '
-        f'HP {rec.get("core_hp","?")} / Shield {rec.get("core_shield","?")}</div>'
-        f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">'
-        f'<span class="pill">人口 {rec.get("population",0)}</span>'
-        f'<span class="pill">信标 {fmt_pos(rec.get("beacon_pos"))}</span></div></div>'
-        f'<div class="card"><div class="kicker">资源</div>'
-        f'<div class="big">{resources}<span style="font-size:18px;color:var(--muted)"> / {cap}</span></div>'
-        f'<div class="bar"><span style="width:{pct}%"></span></div>'
-        f'<div class="sub">进度 {pct}% · 可见矿点 {len(rcells)}</div></div>'
-        f'<div class="card"><div class="kicker">战场</div>'
-        f'<div class="big">{enemies}</div>'
-        f'<div class="sub">可见敌人 · 工人 {len(workers)} · 先锋 {len(vgs)} · 游侠 {len(rgs)}</div>'
-        f'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px">'
-        f'<span class="pill">回矿 {stats["cargo"]+stats["deposit"]}</span>'
-        f'<span class="pill">探索 {stats["explore"]}</span>'
-        f'<span class="pill">等待 {stats["wait"]}</span>'
-        f'<span class="pill">挖矿 {stats["harvest"]}</span></div></div>'
-    )
-    metrics_html = (
-        f'<div class="metric"><div class="label">墙记忆</div>'
-        f'<div class="value">{mm.get("obstacle_count",0)}</div></div>'
-        f'<div class="metric"><div class="label">可见障碍</div>'
-        f'<div class="value">{rec.get("obstacle_cells_visible",0)}</div></div>'
-        f'<div class="metric"><div class="label">记忆矿点</div>'
-        f'<div class="value">{mm.get("resource_count",0)}</div></div>'
-        f'<div class="metric"><div class="label">异常告警</div>'
-        f'<div class="value">{len(issues)}</div></div>'
-    )
-    map_title = (
-        f"墙 {mm.get('obstacle_count',0)} · 记忆矿 {mm.get('resource_count',0)} · "
-        f"可见矿 {len(rcells)}"
-    )
-    footer_html = (
-        f'<div>软刷新 · 不重置视角 · 不抢焦点</div>'
-        f'<div>更新于 {time.strftime("%H:%M:%S")} · Tick {rec.get("tick")}</div>'
-    )
-
-    log_html, log_count = _battle_log_html(log_limit)
-
-
-    left_core = _core_rail_html(rec)
-    left_res = (
-        f'<div class="rail-focus"><div class="rail-focus-main" style="flex:1"><span class="rail-eyebrow">资源库存</span>'
-        f'<strong class="rail-value">{resources}<small>/ {cap}</small></strong>'
-        f'<div class="rail-progress"><span style="width:{pct}%"></span></div></div>'
-        f'<span class="rail-focus-meta">{pct}%</span></div>'
-        f'<div class="rail-metric-grid"><div class="rail-metric"><span>可见矿点</span><b>{len(rcells)}</b></div>'
-        f'<div class="rail-metric"><span>记忆矿点</span><b>{mm.get("resource_count",0)}</b></div>'
-        f'<div class="rail-metric"><span>墙体记忆</span><b>{mm.get("obstacle_count",0)}</b></div>'
-        f'<div class="rail-metric"><span>可见墙体</span><b>{rec.get("obstacle_cells_visible",0)}</b></div></div>'
-    )
-    left_fight = (
-        f'<div class="rail-focus"><div class="rail-focus-main"><span class="rail-eyebrow">可见敌人</span>'
-        f'<strong class="rail-value">{enemies}</strong></div>'
-        f'<span class="rail-focus-meta">我方 {len(workers)+len(vgs)+len(rgs)}</span></div>'
-        f'<div class="rail-metric-grid"><div class="rail-metric"><span>工人</span><b>{len(workers)}</b></div>'
-        f'<div class="rail-metric"><span>先锋 / 游侠</span><b>{len(vgs)} / {len(rgs)}</b></div></div>'
-        f'<div class="rail-activity"><span>回矿 {stats["cargo"]+stats["deposit"]}</span>'
-        f'<span>探索 {stats["explore"]}</span><span>等待 {stats["wait"]}</span>'
-        f'<span>挖矿 {stats["harvest"]}</span></div>'
-    )
-    if issues:
-        left_issues = "".join(
-            f'<div class="issue {i["level"]}"><strong>{i["title"]}</strong><span>{i["detail"]}</span></div>'
-            for i in issues[:8]
-        )
-    else:
-        left_issues = '<div class="muted">暂无异常</div>'
-
-    # ── Battle-report panel ─────────────────────────────────────────────
-    def _bar(rate: float) -> str:
-        pct = min(100, int(rate))
-        return (
-            f'<div class="mini-bar"><span style="width:{pct}%"></span></div>'
-            f'<div class="mini-label">{rate:.0f}%</div>'
-        )
-
-    eco = game_stat.get("economy", {}) or {}
-    prod = game_stat.get("production", {}) or {}
-    comb = game_stat.get("combat", {}) or {}
-    prediction = game_stat.get("shot_prediction", {}) or {}
-    death = game_stat.get("deaths", {}) or {}
-    spawned = prod.get("spawned", {}) or {}
-    self_destructed = prod.get("self_destructed", {}) or {}
-    label = {"WORKER": "工人", "VANGUARD": "先锋", "RANGER": "游侠"}
-
-    def unit_counts_map(counter: dict) -> str:
-        return " · ".join(
-            f"{label[t]} {int(counter.get(t, 0) or 0)}" for t in ("WORKER", "VANGUARD", "RANGER")
-        )
-
-    def kv_row(k: str, v: str) -> str:
-        return f'<div class="kv"><span>{k}</span><b>{v}</b></div>'
-
-    def prediction_group_count(group: str, name: str) -> int:
-        groups = prediction.get(group, {}) or {}
-        bucket = groups.get(name, {}) or {}
-        return int(bucket.get("candidates", 0) or 0)
-
-    vg_rate = derived["vanguard_hit_rate"]
-    rg_rate = derived["ranger_hit_rate"]
-    report_html = (
-        '<section class="panel left-rail-panel report-panel"><div class="panel-title">'
-        '<span class="rail-title"><i class="rail-mark">▥</i>战报统计</span>'
-        f'<span class="count">累计 {derived["ticks"]} tick</span></div>'
-        '<div class="kv"><span>总采集</span>'
-        f'<b>{eco.get("harvested_total", 0)} <small>({eco.get("harvest_count", 0)} 次)</small></b></div>'
-        '<div class="kv"><span>总卸货</span>'
-        f'<b>{eco.get("deposited_total", 0)} <small>({eco.get("deposit_count", 0)} 次)</small></b></div>'
-        f'<div class="kv"><span>采集效率</span><b>{derived["harvest_per_tick"]}/tick · 每工人 {derived["harvest_per_worker"]}</b></div>'
-        f'<div class="kv"><span>近窗效率</span><b>{derived["window_harvest_per_tick"]}/tick</b></div>'
-        f'<div class="kv"><span>采集失败</span><b>{eco.get("harvest_failed", 0)}</b></div>'
-        '<div class="stat-chips" style="margin-top:8px">'
-        f'<span class="pill">生产 {unit_counts_map(spawned)}</span>'
-        f'<span class="pill">自裁 {unit_counts_map(self_destructed)}</span>'
-        f'<span class="pill">阵亡 {unit_counts_map(death)}</span>'
-        f'<span class="pill">生产失败 {int(prod.get("spawn_failed", 0) or 0)}</span></div>'
-        '<div style="margin-top:8px"><div class="kv"><span>先锋</span>'
-        f'<b>{comb.get("vanguard_shots", 0)} 攻 / {comb.get("vanguard_hits", 0)} 中</b></div>{_bar(vg_rate)}</div>'
-        '<div style="margin-top:8px"><div class="kv"><span>游侠</span>'
-        f'<b>{comb.get("ranger_shots", 0)} 攻 / {comb.get("ranger_hits", 0)} 中</b></div>{_bar(rg_rate)}</div>'
-        '<div class="stat-chips" style="margin-top:8px">'
-        f'<span class="pill">参与击杀 {int(comb.get("kill_participations", 0) or 0)}</span>'
-        f'<span class="pill">承伤 {int(comb.get("damage_taken", 0) or 0)}</span>'
-        f'<span class="pill">扫描 {int(comb.get("sweeps_resolved", 0) or 0)}</span></div>'
-        '<div class="kv" style="margin-top:8px"><span>预判候选</span>'
-        f'<b>候选 {int(prediction.get("eligible_candidates", 0) or 0)} / '
-        f'{int(prediction.get("candidates", 0) or 0)}</b></div>'
-        '<div class="stat-chips">'
-        f'<span class="pill">正确 {int(prediction.get("predicted_correct", 0) or 0)}</span>'
-        f'<span class="pill">错误 {int(prediction.get("predicted_wrong", 0) or 0)}</span>'
-        f'<span class="pill">未知 {int(prediction.get("unknown", 0) or 0)}</span>'
-        f'<span class="pill">理论 +{int(prediction.get("improvements", 0) or 0)} '
-        f'/ -{int(prediction.get("harms", 0) or 0)}</span></div>'
-        '<div class="kv" style="margin-top:8px"><span>真实预判</span>'
-        f'<b>{int(prediction.get("lead_fire_attempts", 0) or 0)} 攻 / '
-        f'{int(prediction.get("lead_fire_hits", 0) or 0)} 中</b></div>'
-        '<div class="stat-chips">'
-        f'<span class="pill">未中 {int(prediction.get("lead_fire_misses", 0) or 0)}</span>'
-        f'<span class="pill">未知 {int(prediction.get("lead_fire_unknown", 0) or 0)}</span>'
-        f'<span class="pill">实际 +{int(prediction.get("lead_fire_improvements", 0) or 0)} '
-        f'/ -{int(prediction.get("lead_fire_harms", 0) or 0)}</span></div>'
-        '<div class="stat-chips" style="margin-top:8px">'
-        f'<span class="pill">静止 {prediction_group_count("by_motion_state", "stationary")}</span>'
-        f'<span class="pill">移动观察 '
-        f'{prediction_group_count("by_motion_state", "moving_unstable")}</span>'
-        f'<span class="pill">稳定移动 '
-        f'{prediction_group_count("by_motion_state", "moving_stable")}</span>'
-        f'<span class="pill">状态不足 '
-        f'{prediction_group_count("by_motion_state", "uncertain") + prediction_group_count("by_motion_state", "insufficient")}</span>'
-        f'<span class="pill">旧样本 '
-        f'{prediction_group_count("by_motion_state", "legacy")}</span></div>'
-        '<div class="kv" style="margin-top:8px"><span>移动</span>'
-        f'<b>成功 {eco.get("moves_succeeded", 0)} · 失败 {eco.get("moves_failed", 0)}</b></div>'
-        '</section>'
-    )
-
-    left_html = (
-        f'<section class="panel left-rail-panel core-summary"><div class="panel-title">'
-        f'<span class="rail-title"><i class="rail-mark">◆</i>核心 · {html.escape(str(rec.get("core_name") or "C1"))}</span>'
-        f'<span class="count">{rec.get("core_state") or "—"}</span></div>{left_core}</section>'
-        f'<section class="panel left-rail-panel resource-summary"><div class="panel-title">'
-        f'<span class="rail-title"><i class="rail-mark">⬡</i>资源</span><span class="count">采集态势</span></div>{left_res}</section>'
-        f'<section class="panel left-rail-panel battle-summary"><div class="panel-title">'
-        f'<span class="rail-title"><i class="rail-mark">◎</i>战场</span><span class="count">实时兵力</span></div>{left_fight}</section>'
-        f'<section class="panel left-rail-panel issue-summary"><div class="panel-title">'
-        f'<span class="rail-title"><i class="rail-mark">!</i>异常</span><span class="count">{len(issues)}</span></div>'
-        f'<div class="compact-list">{left_issues}</div></section>'
-        + report_html
-        + f'<section class="panel left-rail-panel enemy-panel" id="leftEnemyPanel"><div class="panel-title">'
-        f'<span class="rail-title"><i class="rail-mark">⌁</i>敌人踪迹</span>'
-        f'<span class="count" id="enemyCount">{len(ex_sightings)} 处</span>'
-        f'<button type="button" id="clearEnemyBtn" class="enemy-clear-btn">清除</button></div>'
-        f'<div id="enemySection">{enemy_html}</div></section>'
-    )
-
-    return {
-        "tick": rec.get("tick"),
-        "leftHtml": left_html,
-        "brand": brand,
-        "statusHtml": status_html,
-        "statusClass": status_cls,
-        "heroHtml": hero_html,
-        "metricsHtml": metrics_html,
-        "issuesHtml": issues_html,
-        "workersHtml": w_html,
-        "vgHtml": vg_html,
-        "rgHtml": rg_html,
-        "resHtml": res_html,
-        "enemyHtml": enemy_html,
-        "waypointHtml": waypoint_html,
-        "mapSvg": svg,
-        "mapTitle": map_title,
-        "hotspotsHtml": hotspots_html,
-        "footerHtml": footer_html,
-        "workersCount": len(workers),
-        "vgCount": len(vgs),
-        "rgCount": len(rgs),
-        "resCount": len(rcells),
-        "enemyCount": f"{len(ex_sightings)} 处",
-        "waypointCount": len(waypoints),
-        "combatUnits": combat_units,
-        "logHtml": log_html,
-        "logCount": log_count,
-    }
-
+        pass
+    return found
 
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2854,6 +1695,18 @@ class Handler(BaseHTTPRequestHandler):
     # readline() pin a worker thread forever. Long-lived upgrades (WebSocket)
     # restore blocking mode explicitly before they take over the socket.
     timeout = 30
+    # Keep-alive (HTTP/1.1) is safe here because every response path either
+    # sends an exact Content-Length (_send/_redirect) or takes over the socket
+    # (WebSocket) / closes the connection explicitly. It saves a TCP handshake
+    # per poll for the SPA's 8-per-tick fetch fan-out.
+    protocol_version = "HTTP/1.1"
+    # Do not advertise the interpreter: "arena" instead of
+    # "BaseHTTP/0.6 Python/3.x" (version fingerprinting for scanners).
+    server_version = "arena"
+    sys_version = ""
+
+    def version_string(self) -> str:
+        return self.server_version
 
     # ---- token auth -------------------------------------------------------
 
@@ -2887,28 +1740,100 @@ class Handler(BaseHTTPRequestHandler):
         values = qs.get("token")
         return values[0] if values else ""
 
-    def _authed(self) -> bool:
-        return self._is_loopback() or self._token_ok(self._client_token())
+    def _is_liveness_probe(self) -> bool:
+        """True only for the two unauthenticated GET probes on loopback.
 
-    def _send(self, code: int, body: bytes, content_type: str, extra_headers=None, cache_control: str = "no-store"):
+        The container healthcheck and the deploy smoke test call the dashboard
+        from the host with no token, so loopback keeps exactly ``GET
+        /api/health`` and ``GET /api/state``. Any other method or path from
+        loopback needs DASHBOARD_TOKEN: a local process (or anything sharing the
+        operator's machine / the container network) must not be able to drive
+        the bot just because it can reach 127.0.0.1.
+        """
+        if str(getattr(self, "command", "") or "").upper() != "GET":
+            return False
+        return urlparse(self.path).path in ("/api/health", "/api/state")
+
+    def _authed(self) -> bool:
+        if self._is_loopback() and self._is_liveness_probe():
+            return True
+        return self._token_ok(self._client_token())
+
+    # ---- CSRF / Origin gate ------------------------------------------------
+
+    def _origin_ok(self) -> bool:
+        """Reject cross-site state changes that a browser would happily send.
+
+        No CORS preflight guards a simple POST or a WebSocket upgrade, and the
+        server-side game API key is attached to proxied requests, so the only
+        trustworthy signal is Origin.
+
+        Rules:
+        * no Origin header -> allowed (curl, healthchecks, server-to-server,
+          the deploy smoke test); not reachable from a browser page;
+        * Origin host:port == Host header host:port -> same-origin, allowed;
+        * Origin listed in DASHBOARD_ALLOWED_ORIGINS -> allowed (explicit
+          operator opt-in for a separate console origin).
+        """
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return True
+        origin = (headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        request_host = _origin_host(headers.get("Host") or "")
+        if request_host and _origin_host(origin) == request_host:
+            return True
+        return _origin_key(origin) in DASHBOARD_ALLOWED_ORIGINS
+
+    def _origin_reject(self) -> bool:
+        """Answer 403 + JSON when the Origin is not acceptable; True if rejected."""
+        if self._origin_ok():
+            return False
+        # The body was not read (the gate runs first), so the socket must not be
+        # reused for another request: an unread body would be parsed as one.
+        self.close_connection = True
+        self._send_json(403, {"ok": False, "error": "origin rejected"})
+        return True
+
+    def _send(self, code: int, body: bytes, content_type: str, extra_headers=None,
+              cache_control: str = "no-store", csp: str | None = _CSP,
+              gzip_body: bytes | None = None):
         try:
             # Text payloads (SPA bundles, JSON) compress ~3x; skip small bodies
-            # and already-compressed formats (png/webp/woff2).
+            # and already-compressed formats (png/webp/woff2). ``gzip_body`` is
+            # a pre-built *.gz sibling of the static asset being served (built
+            # by the frontend pipeline); it is only used when the client asks.
             accept = self.headers.get("Accept-Encoding", "") if getattr(self, "headers", None) else ""
             base_type = content_type.split(";", 1)[0].strip()
-            gzip_ok = base_type in _GZIP_TYPES
-            compressed = gzip_ok and len(body) > 1024 and "gzip" in accept
-            if compressed:
+            gzip_ok = base_type in _GZIP_TYPES and len(body) > 1024 and _accepts_gzip(accept)
+            compressed = False
+            if gzip_ok and gzip_body is not None:
+                body = gzip_body
+                compressed = True
+            elif gzip_ok:
                 body = gzip.compress(body, compresslevel=6)
+                compressed = True
             self.send_response(code)
             self.send_header("Content-Type", content_type)
             self.send_header("Cache-Control", cache_control)
-            if gzip_ok:
+            if base_type in _GZIP_TYPES:
                 self.send_header("Vary", "Accept-Encoding")
             if compressed:
                 self.send_header("Content-Encoding", "gzip")
             for name, value in extra_headers or ():
                 self.send_header(name, value)
+            for name, value in _SECURITY_HEADERS:
+                self.send_header(name, value)
+            if csp:
+                self.send_header("Content-Security-Policy", csp)
+            # getattr: BaseHTTPRequestHandler.setup() always sets this, but unit
+            # harnesses build the handler with __new__ and never run setup().
+            if getattr(self, "close_connection", True):
+                # The socket is about to be closed (rejected request, oversized
+                # body, WS takeover); say so instead of letting a keep-alive
+                # client send another request into a dying connection.
+                self.send_header("Connection", "close")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -2917,17 +1842,53 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
-        # Silence per-request noise; errors still print via handle_one_request.
-        return
+        """Minimal access log: 1xx/4xx/5xx only, one line to stderr.
+
+        BaseHTTPRequestHandler calls this from send_response() with
+        (requestline, code, size) for every response. Healthy 2xx/3xx traffic
+        stays silent (the SPA polls several endpoints per tick), while auth
+        failures, CSRF/Origin rejections, unsupported media types and server
+        errors remain visible for ops.
+        """
+        code = 0
+        if len(args) >= 2:
+            try:
+                code = int(args[1])
+            except (TypeError, ValueError):
+                code = 0
+        if 200 <= code < 400:
+            return
+        try:
+            print(f"[access] {format % args}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
     def _read_raw_body(self) -> bytes:
+        """Read the declared request body (bounded), never desynchronizing.
+
+        With keep-alive on, a body that is only partially consumed would be
+        parsed as the next request line, so an oversized / truncated / unknown
+        framing marks the connection for closing after the reply.
+        """
         try:
             length = int(self.headers.get("Content-Length", "0") or 0)
         except (ValueError, TypeError):
             # Malformed Content-Length (scanners / broken clients): treat as an
-            # empty body rather than letting ValueError print a full traceback.
+            # empty body rather than letting ValueError print a full traceback,
+            # but do not reuse a socket whose framing we cannot trust.
+            self.close_connection = True
             return b""
-        return self.rfile.read(min(length, 1_048_576)) if length > 0 else b""
+        if length <= 0:
+            return b""
+        if length > _MAX_BODY_BYTES:
+            # No endpoint here accepts a body this large; the unread remainder
+            # would land in the next request, so read what we can and close.
+            self.close_connection = True
+            return self.rfile.read(_MAX_BODY_BYTES)
+        data = self.rfile.read(length)
+        if len(data) < length:
+            self.close_connection = True
+        return data
 
     @staticmethod
     def _parse_body(raw: bytes) -> dict:
@@ -2937,15 +1898,41 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
+    def _read_json_body(self, raw: bytes | None = None) -> tuple[int, dict]:
+        """Read the POST body as JSON; (200, payload) or (415, {}) for a bad type.
+
+        A body that is present must be declared ``application/json``; otherwise
+        a cross-site ``text/plain`` POST (a CORS "simple request" the browser
+        sends without preflight) could still be parsed as JSON. An empty body
+        needs no Content-Type at all (``/api/config/reset`` sends none).
+
+        ``raw`` lets a dispatcher that already consumed the request stream (the
+        proxy paths forward the bytes untouched) reuse them: the stream can only
+        be read once.
+        """
+        if raw is None:
+            raw = self._read_raw_body()
+        if raw:
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                return 415, {}
+        return 200, self._parse_body(raw)
+
     def _send_json(self, code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self._send(code, body, "application/json; charset=utf-8")
 
     def _redirect(self, location: str) -> None:
-        self.send_response(302)
-        self.send_header("Location", location)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        try:
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            for name, value in _SECURITY_HEADERS:
+                self.send_header(name, value)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            pass
 
     # ---- arena SPA static hosting (/arena) ---------------------------------
 
@@ -2975,7 +1962,18 @@ class Handler(BaseHTTPRequestHandler):
         mime = _ARENA_MIME.get(target.suffix.lower(), "application/octet-stream")
         served_rel = target.relative_to(dist_root).as_posix()
         cache_control = "public, max-age=31536000, immutable" if _ARENA_HASHED_ASSET.match(served_rel) else "no-cache"
-        self._send(200, body, mime, cache_control=cache_control)
+        # A *.gz sibling ships with the build (pre-compressed asset); reusing it
+        # avoids re-gzipping the same multi-hundred-KB bundle on every request.
+        # Only trust it when it is at least as new as the file it compresses, so
+        # a stale sidecar from an older build can never be served.
+        gz_body = None
+        gz_path = Path(str(target) + ".gz")
+        try:
+            if gz_path.is_file() and gz_path.stat().st_mtime >= target.stat().st_mtime:
+                gz_body = gz_path.read_bytes()
+        except OSError:
+            gz_body = None
+        self._send(200, body, mime, cache_control=cache_control, gzip_body=gz_body)
 
     # ---- reverse proxy to the game API (injects the server-side key) -------
 
@@ -3044,7 +2042,15 @@ class Handler(BaseHTTPRequestHandler):
                 payload = exc.read()
             except Exception:
                 payload = b""
-            return exc.code, list((exc.headers or {}).items()), payload
+            error_headers = list((exc.headers or {}).items())
+            try:
+                # HTTPError wraps the live response socket: without an explicit
+                # close every upstream 4xx/5xx keeps one fd until the GC runs
+                # (CPython 3.14 also warns about the implicit cleanup).
+                exc.close()
+            except Exception:
+                pass
+            return exc.code, error_headers, payload
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             return 502, [], json.dumps({"error": f"上游不可达: {exc}"}, ensure_ascii=False).encode("utf-8")
 
@@ -3108,6 +2114,12 @@ class Handler(BaseHTTPRequestHandler):
                 exc.read()
             except Exception:
                 pass
+            try:
+                # Same fd discipline as _arena_upstream: a rejected validation
+                # must not park the upstream socket until the GC runs.
+                exc.close()
+            except Exception:
+                pass
             self._send_json(401, {"ok": False, "error": "SESSION_IMPORT_EXPIRED"})
             return
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -3144,11 +2156,14 @@ class Handler(BaseHTTPRequestHandler):
     def _log_proxy(self, method: str, path: str, status: int, body: bytes) -> None:
         # Diagnostic trail for manual-control issues: the upstream error code
         # (CSRF_INVALID, TICK_MISMATCH, ...) tells exactly why a plan failed.
+        # Successful forwards stay silent (one line per failed command only).
+        if status < 400:
+            return
         try:
             snippet = body[:240].decode("utf-8", "replace")
         except Exception:
             snippet = ""
-        print(f"[arena-proxy] {method} {path} -> {status} {snippet}", flush=True)
+        print(f"[arena-proxy] {method} {path} -> {status} {snippet}", file=sys.stderr, flush=True)
 
     def _proxy_arena_get(self, path: str):
         status, headers, body = self._arena_upstream("GET", path)
@@ -3173,8 +2188,6 @@ class Handler(BaseHTTPRequestHandler):
             csrf = self.headers.get("X-CSRF-Token")
             if csrf:
                 extra["X-CSRF-Token"] = csrf
-        print(f"[arena-proxy] POST {path} arrived (session={'yes' if cookies else 'no'}, "
-              f"csrf={'yes' if 'X-CSRF-Token' in extra else 'no'}, {len(raw)}B)", flush=True)
         status, headers, body = self._arena_upstream("POST", path, body=raw, extra_headers=extra)
         self._log_proxy("POST", path, status, body)
         self._forward_upstream_response(status, headers, body)
@@ -3184,6 +2197,11 @@ class Handler(BaseHTTPRequestHandler):
     def _proxy_game_ws(self):
         """Pipe browser <-> game API. The upstream socket carries the API key;
         frames move byte-for-byte in both directions without being parsed."""
+        # Browsers never preflight a WebSocket upgrade, so an Origin check is
+        # the only thing standing between a hostile page and a pipe that
+        # carries the server-side game key.
+        if self._origin_reject():
+            return
         key = self.headers.get("Sec-WebSocket-Key", "")
         protocol = self.headers.get("Sec-WebSocket-Protocol")
         if not key:
@@ -3195,16 +2213,16 @@ class Handler(BaseHTTPRequestHandler):
         try:
             upstream, leftover, upstream_err = self._ws_upstream_handshake(protocol)
         except OSError as exc:
+            print(f"[arena-proxy] WS handshake failed: {exc}", file=sys.stderr, flush=True)
             self._send(502, json.dumps({"error": f"上游不可达: {exc}"}, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
             return
         if upstream is None:
             # Non-101 upstream reply (401/409/429 ...): surface its body.
             status, body, ctype = upstream_err
             print(f"[arena-proxy] WS handshake rejected upstream -> {status} "
-                  f"{body[:160].decode('utf-8', 'replace')}", flush=True)
+                  f"{body[:160].decode('utf-8', 'replace')}", file=sys.stderr, flush=True)
             self._send(status, body, ctype)
             return
-        print("[arena-proxy] WS open", flush=True)
         # Finish the browser-side handshake with raw bytes, then take over the
         # socket: send_response() would add server log noise on the wire.
         accept = base64.b64encode(hashlib.sha1((key + _WS_ACCEPT_GUID).encode()).digest()).decode()
@@ -3314,52 +2332,57 @@ class Handler(BaseHTTPRequestHandler):
         self._pipe(browser_sock, upstream_sock)
         helper.join(timeout=5)
 
-    def _stream_events(self):
-        """Server-Sent Events: push the moment the data files change.
-
-        Replaces the old 2 s client poll — a new tick (or map-memory / battle
-        log update) shows up on the dashboard as soon as the tactic writes it.
-        The client keeps a slow fallback poll in case the stream is blocked.
-        """
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache, no-store")
-            # Some reverse proxies buffer SSE bodies by default.
-            self.send_header("X-Accel-Buffering", "no")
-            self.end_headers()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            return
-        self.close_connection = True
-        try:
-            self.wfile.write(b"retry: 2000\n: connected\n\n")
-            self.wfile.flush()
-            last = _stream_signature_cached()
-            idle = 0.0
-            while True:
-                time.sleep(0.25)
-                sig = _stream_signature_cached()
-                if sig != last:
-                    last = sig
-                    self.wfile.write(b"event: tick\ndata: 1\n\n")
-                    idle = 0.0
-                else:
-                    idle += 0.25
-                    if idle >= 15.0:
-                        # Keep-alive comment: stops proxies from dropping the
-                        # idle connection and surfaces dead peers promptly.
-                        self.wfile.write(b": ping\n\n")
-                        idle = 0.0
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            # Client disconnected; nothing to clean up (daemon thread).
-            return
+    # ---- request dispatchers -----------------------------------------------
 
     def do_GET(self):
+        try:
+            self._handle_get()
+        except Exception:
+            self._internal_error()
+
+    def do_POST(self):
+        try:
+            self._handle_post()
+        except Exception:
+            self._internal_error()
+
+    def _internal_error(self) -> None:
+        """Turn an unexpected handler exception into a 500 instead of a drop.
+
+        BaseHTTPRequestHandler already closes the connection on an uncaught
+        exception, but the client (SPA fetch / Docker healthcheck) then sees a
+        transport error rather than a diagnosable response. Log the traceback
+        and answer with a small JSON error.
+        """
+        traceback.print_exc(file=sys.stderr)
+        try:
+            self._send_json(500, {"ok": False, "error": "internal"})
+        except Exception:
+            pass
+
+    def _body_framing_rejected(self) -> bool:
+        """411 for a chunked request body we cannot delimit.
+
+        With keep-alive on, an unread chunked body would be parsed as the next
+        request; refuse it and close instead of desynchronizing the socket.
+        """
+        if not (self.headers.get("Transfer-Encoding") or "").strip():
+            return False
+        self.close_connection = True
+        self._send_json(411, {"ok": False, "error": "transfer-encoding unsupported"})
+        return True
+
+    def _handle_get(self):
+        if self._body_framing_rejected():
+            return
+        # A GET carrying a body is unusual, but leaving its bytes in the socket
+        # would desynchronize the next request on a keep-alive connection.
+        self._read_raw_body()
         path = urlparse(self.path).path
         if not self._authed():
             if path == "/" or path == "/arena" or path.startswith("/arena/"):
-                self._send(401, LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                self._send(401, LOGIN_HTML.encode("utf-8"), "text/html; charset=utf-8",
+                           csp=_CSP_LOGIN)
             else:
                 self._send_json(401, {"ok": False, "error": "未授权：缺少或错误的 DASHBOARD_TOKEN"})
             return
@@ -3378,51 +2401,28 @@ class Handler(BaseHTTPRequestHandler):
         if path in _ARENA_GET_PATHS:
             self._proxy_arena_get(path)
             return
-        if path == "/api/stream":
-            self._stream_events()
-            return
         if path == "/api/health":
-            # Liveness probe that costs milliseconds, for the container
-            # healthcheck and the deploy smoke test. The heavy /api/state
-            # payload (every remembered wall rendered into one SVG) is now
-            # behind /api/state?full=1 and is never a routine probe target.
+            # Liveness probe for the container healthcheck, the deploy smoke
+            # test and the watchdog: cheap (one stat + one log tail) but it also
+            # reports tick freshness, so a container whose tactic died is no
+            # longer "healthy". 503 + ok:false once the newest tick is stale.
+            health = _tick_health()
+            self._send_json(200 if health["ok"] else 503, health)
+            return
+        if path == "/api/state":
+            # Compact probe only: the old ?full=1 server-rendered payload (a
+            # single SVG of every remembered wall, ~20 MB / seconds of CPU) is
+            # gone. The query param is still accepted and ignored so external
+            # scripts and old deploy helpers that pass it keep working.
             history = read_history(1)
             self._send_json(200, {
                 "ok": True,
                 "tick": history[0].get("tick") if history else None,
+                "compact": True,
             })
             return
-        if path == "/api/state":
-            query = parse_qs(urlsplit(self.path).query)
-            full = str(query.get("full", [""])[0]).lower() in {"1", "true", "yes"}
-            if not full:
-                # Routine probes only need liveness + tick. The full payload
-                # renders every remembered wall into one SVG (~39 MB, seconds);
-                # keep it behind ?full=1 for manual inspection.
-                history = read_history(1)
-                self._send_json(200, {
-                    "ok": True,
-                    "tick": history[0].get("tick") if history else None,
-                    "compact": True,
-                })
-                return
-            parts = build_parts(log_limit=_clamp_log_limit(self))
-            if not parts:
-                body = json.dumps({"tick": None, "error": "no data"}, ensure_ascii=False).encode("utf-8")
-            else:
-                body = json.dumps(parts, ensure_ascii=False).encode("utf-8")
-            self._send(200, body, "application/json; charset=utf-8")
-            return
-        if path == "/api/log":
-            # Standalone battle-log rows for the current time window, so a
-            # window change can fetch more rows immediately without waiting for
-            # the next tick (softRefresh skips re-renders while tick is idle).
-            log_html, log_count = _battle_log_html(_clamp_log_limit(self))
-            self._send_json(200, {"ok": True, "html": log_html, "count": log_count})
-            return
         if path == "/api/battle-log":
-            # JSON rows for the arena SPA's battle-log panel (the HTML
-            # /api/log endpoint stays with the server-rendered dashboard).
+            # JSON rows for the arena SPA's battle-log panel.
             self._send_json(200, {"ok": True, "entries": battle_log_json_entries(_clamp_log_limit(self))})
             return
         if path == "/api/config":
@@ -3438,22 +2438,6 @@ class Handler(BaseHTTPRequestHandler):
                 "combat_units": collect_combat_units(rec, config),
             })
             return
-        if path == "/api/trends":
-            query = parse_qs(urlsplit(self.path).query)
-            raw = query.get("seconds", query.get("ticks", ["600"]))[0]
-            try:
-                window = int(raw)
-            except (TypeError, ValueError):
-                window = 600
-            window = max(60, min(21600, window))
-            points = _trends_points(window)
-            self._send_json(200, {
-                "ok": True,
-                "window": window,
-                "lastTs": points[-1]["t"] if points else None,
-                "points": points,
-            })
-            return
         if path == "/api/waypoints":
             self._send_json(200, {"ok": True, "waypoints": load_waypoints()})
             return
@@ -3466,12 +2450,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/enemy-memory":
             # Remembered enemies (last-known positions) from the shared
-            # map_memory.json — the same data this dashboard draws as its
-            # enemy-trace layer. Enemies currently visible in the latest
-            # tick are skipped so the arena page never duplicates markers.
-            # Ranked by last-seen tick and capped per type so each filter
-            # combination on the arena page can fill its own 21 slots.
-            memory = load_map_memory()
+            # map_memory.json. Enemies currently visible in the latest tick are
+            # skipped so the arena page never duplicates markers. Ranked by
+            # last-seen tick and capped per type so each filter combination on
+            # the arena page can fill its own 21 slots.
+            memory = load_enemy_sightings_memory()
             history = read_history(1)
             rec = history[0] if history else {}
             visible = set()
@@ -3510,16 +2493,20 @@ class Handler(BaseHTTPRequestHandler):
             # cells) plus the current target cell from the newest tick.
             history = read_history(1)
             rec = history[0] if history else {}
+            # Routes unchanged since the previous tick are logged as
+            # ``path: null`` (tactic.py keeps a 53 KB record down to ~8 KB);
+            # recover the coordinates from an older record in the log tail.
+            recovered = _resolve_unit_paths(rec)
             units = []
-            for group, etype in (("workers", "WORKER"),
-                                 ("vanguards", "VANGUARD"),
-                                 ("rangers", "RANGER")):
+            for group, etype in _UNIT_ROUTE_GROUPS:
                 for index, raw in enumerate(rec.get(group) or []):
                     if not isinstance(raw, dict):
                         continue
                     pos = raw.get("pos") or []
                     target = raw.get("target") or []
-                    path = _remaining_path(raw)
+                    path = _remaining_path(
+                        raw, recovered.get(str(raw.get("id") or "")),
+                    )
                     if len(target) != 2 and not path:
                         continue
                     units.append({
@@ -3558,29 +2545,48 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
-    def do_POST(self):
+    def _handle_post(self):
+        if self._body_framing_rejected():
+            return
         path = urlparse(self.path).path
+        # Every POST either mutates shared state or proxies a game command, so
+        # the Origin gate runs before anything is read or parsed.
+        if self._origin_reject():
+            return
         raw = self._read_raw_body()
         if path == "/api/login":
             # Login is the one endpoint that must work without auth.
-            data = self._parse_body(raw)
+            status, data = self._read_json_body(raw)
+            if status != 200:
+                self._send_json(415, _JSON_ONLY_ERROR)
+                return
             token = str(data.get("token", "")).strip()
             if self._token_ok(token):
-                self.send_response(200)
-                self.send_header("Set-Cookie", f"arena_token={token}; Path=/; HttpOnly; SameSite=Lax")
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(b'{"ok":true}')))
-                self.end_headers()
-                self.wfile.write(b'{"ok":true}')
+                self._send(200, b'{"ok":true}', "application/json; charset=utf-8",
+                           extra_headers=((
+                               "Set-Cookie",
+                               f"arena_token={token}; Path=/; HttpOnly; SameSite=Lax",
+                           ),))
             else:
                 self._send_json(401, {"ok": False, "error": "token 错误"})
+            return
+        if path == "/api/logout":
+            # Clearing the cookie needs no auth (it only forgets a credential
+            # the caller already holds) and no state: the token itself stays
+            # valid, so this cannot lock an operator out.
+            self._send(200, b'{"ok":true}', "application/json; charset=utf-8",
+                       extra_headers=((
+                           "Set-Cookie",
+                           "arena_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+                       ),))
             return
         if not self._authed():
             if path.startswith("/api/v1/"):
                 # A browser POST to the game API that never reaches the
                 # proxy shows up as the generic frontend error; log it so the
                 # missing-dashboard-token case is visible server-side.
-                print(f"[arena-proxy] POST {path} blocked: dashboard auth failed", flush=True)
+                print(f"[arena-proxy] POST {path} blocked: dashboard auth failed",
+                      file=sys.stderr, flush=True)
             self._send_json(401, {"ok": False, "error": "未授权：缺少或错误的 DASHBOARD_TOKEN"})
             return
         if path == "/api/v1/session/import":
@@ -3589,6 +2595,10 @@ class Handler(BaseHTTPRequestHandler):
             # official site. The operator copies their session cookie there
             # and imports it; we validate it upstream, then rebind it to
             # this origin so later requests flow through the MANUAL slot.
+            status, _ = self._read_json_body(raw)
+            if status != 200:
+                self._send_json(415, _JSON_ONLY_ERROR)
+                return
             self._import_session(raw)
             return
         if path == "/api/session/draft":
@@ -3596,7 +2606,10 @@ class Handler(BaseHTTPRequestHandler):
             # explicit save. Format-check only: the upstream validation
             # happens on the actual import.
             global _SESSION_DRAFT
-            data = self._parse_body(raw)
+            status, data = self._read_json_body(raw)
+            if status != 200:
+                self._send_json(415, _JSON_ONLY_ERROR)
+                return
             cookies = str(data.get("cookies", "")).strip()
             csrf = str(data.get("csrf", "")).strip()
             if not cookies or not csrf or len(cookies) > 8192 or len(csrf) > 512:
@@ -3615,8 +2628,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         # The proxy paths above forward the raw body untouched; only the
         # config/management endpoints below need it parsed, so the high-volume
-        # game commands skip a full JSON parse of every request body.
-        data = self._parse_body(raw)
+        # game commands skip a full JSON parse of every request body. A wrong
+        # Content-Type is answered here, before any handler runs, so a 415 can
+        # never leave a half-applied change behind.
+        status, data = self._read_json_body(raw)
+        if status != 200:
+            self._send_json(415, _JSON_ONLY_ERROR)
+            return
         if path in {"/api/config", "/api/config/reset"}:
             try:
                 is_reset = path.endswith("/reset")
@@ -3828,15 +2846,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class _QuietHTTPServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer that does not spam tracebacks for dropped peers.
+    """ThreadingHTTPServer tuned for a bursty polling SPA + public port.
 
     The dashboard port is public, so internet scanners connect and reset
     constantly; each one used to print a full ConnectionResetError traceback
-    via socketserver.handle_error. Swallow the benign disconnect/timeout
-    errors and keep real failures visible.
+    via socketserver.handle_error. Swallow the benign disconnect/timeout errors
+    and keep real failures visible.
+
+    request_queue_size 64 (instead of 5) absorbs the SPA's per-tick fetch fan-out
+    plus healthcheck curls without TCP refusals, and daemon_threads keeps a
+    shutdown from waiting on hijacked WebSocket pipes.
     """
 
     daemon_threads = True
+    request_queue_size = 64
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -3848,8 +2871,14 @@ class _QuietHTTPServer(ThreadingHTTPServer):
 
 def main():
     srv = _QuietHTTPServer((HOST, PORT), Handler)
-    print(f"[dashboard] http://localhost:{PORT}")
-    print("[dashboard] soft refresh /api/state · Ctrl+C 停止")
+    print(f"[dashboard] http://localhost:{PORT}", flush=True)
+    if DASHBOARD_TOKEN:
+        print("[dashboard] DASHBOARD_TOKEN set: loopback also needs the token "
+              "(cookie / Bearer / ?token=) except GET /api/health and GET /api/state",
+              flush=True)
+    else:
+        print("[dashboard] DASHBOARD_TOKEN unset: auth disabled (local dev mode)", flush=True)
+    print("[dashboard] soft refresh /api/state · Ctrl+C 停止", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

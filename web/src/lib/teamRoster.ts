@@ -2,6 +2,7 @@
 // arena sidebar uses it to show the same 守家/进攻/风筝 squads the dashboard
 // manages, keyed by the dashboard display names (V1/R2...).
 import type { TeamConfig } from './teamSettings'
+import { dashboardRequest } from './dashboardRequest'
 
 export type TeamKey = 'home' | 'attack' | 'kite' | 'guerrilla' | 'unassigned'
 
@@ -16,28 +17,24 @@ export interface TeamData {
   config: TeamConfig
 }
 
-export async function loadTeamRoster(): Promise<TeamData> {
-  try {
-    const response = await fetch('/api/teams', { credentials: 'same-origin' })
-    if (!response.ok) return { roster: {}, config: {} }
-    const data = await response.json() as { ok?: boolean; combat_units?: unknown; config?: unknown }
-    if (!data || data.ok !== true || !Array.isArray(data.combat_units)) return { roster: {}, config: {} }
-    const roster: TeamRoster = {}
-    for (const unit of data.combat_units as Array<Record<string, unknown>>) {
-      const name = typeof unit.name === 'string' ? unit.name : ''
-      const team = typeof unit.team === 'string' ? unit.team : ''
-      if (!name) continue
-      roster[name] = (TEAM_KEYS as string[]).includes(team) ? (team as TeamKey) : 'unassigned'
-    }
-    const config = data.config && typeof data.config === 'object' && !Array.isArray(data.config)
-      ? data.config as TeamConfig
-      : {}
-    return { roster, config }
-  } catch {
-    // Outside the deployed dashboard (dev server / demo) the endpoint does
-    // not exist — the squads tab simply stays empty.
-    return { roster: {}, config: {} }
+export async function loadTeamRoster(signal?: AbortSignal): Promise<TeamData> {
+  const result = await dashboardRequest<{ ok?: boolean; combat_units?: unknown; config?: unknown }>('/api/teams', { signal })
+  // Outside the deployed dashboard (dev server / demo) the endpoint does not
+  // exist — the squads tab simply stays empty.
+  if (!result.ok) return { roster: {}, config: {} }
+  const data = result.data
+  if (!data || data.ok !== true || !Array.isArray(data.combat_units)) return { roster: {}, config: {} }
+  const roster: TeamRoster = {}
+  for (const unit of data.combat_units as Array<Record<string, unknown>>) {
+    const name = typeof unit.name === 'string' ? unit.name : ''
+    const team = typeof unit.team === 'string' ? unit.team : ''
+    if (!name) continue
+    roster[name] = (TEAM_KEYS as string[]).includes(team) ? (team as TeamKey) : 'unassigned'
   }
+  const config = data.config && typeof data.config === 'object' && !Array.isArray(data.config)
+    ? data.config as TeamConfig
+    : {}
+  return { roster, config }
 }
 
 // Dashboard display name -> squad key, with unknown units landing in the
@@ -89,33 +86,11 @@ export async function saveTeamSettings(patch: TeamConfig): Promise<boolean> {
 // Worker strategy (and other non-combat fields) lives in the strategy
 // config, saved through /api/config with the same partial-merge semantics.
 export async function saveStrategyConfig(patch: TeamConfig): Promise<boolean> {
-  try {
-    const response = await fetch('/api/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify(patch),
-    })
-    if (!response.ok) return false
-    const data = await response.json() as { ok?: boolean }
-    return data?.ok === true
-  } catch {
-    return false
-  }
+  const result = await dashboardRequest<{ ok?: boolean }>('/api/config', { method: 'POST', body: patch })
+  return result.ok && result.data?.ok === true
 }
 
 async function postTeams(payload: Record<string, unknown>): Promise<boolean> {
-  try {
-    const response = await fetch('/api/teams', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify(payload),
-    })
-    if (!response.ok) return false
-    const data = await response.json() as { ok?: boolean }
-    return data?.ok === true
-  } catch {
-    return false
-  }
+  const result = await dashboardRequest<{ ok?: boolean }>('/api/teams', { method: 'POST', body: payload })
+  return result.ok && result.data?.ok === true
 }

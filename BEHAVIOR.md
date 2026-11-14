@@ -444,10 +444,9 @@ b558d97 feat: add direct-play wrapper with BFS pathfinding, enemy avoidance, aut
 tactic.py          # 主战术脚本（核心逻辑）
 tactic_config.py   # 策略配置定义、校验与热加载
 tactic_config.json # 仪表盘生成的运行时配置（Git 忽略）
-direct_wrapper.py  # 直接控制桥接器（备用，BFS 寻路）
-dashboard.py       # Web 战术仪表盘
+dashboard.py       # HTTP 服务：/api/* + web/dist 的 arena 控制台 + 游戏 API/WS 代理
 status.py          # 命令行状态查看器
-requirements.txt   # 依赖：arena-hero>=0.2.4,<0.3
+requirements.txt   # 依赖：arena-hero>=0.2.9,<0.3
 BEHAVIOR.md        # 本文件，行为逻辑说明
 tactic_log.jsonl   # 运行日志（JSONL 格式，可分析）
 tactic_play.log    # 控制台输出记录
