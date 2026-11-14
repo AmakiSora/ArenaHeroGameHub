@@ -2960,8 +2960,12 @@ class Handler(BaseHTTPRequestHandler):
         rel = path[len("/arena/"):].split("?", 1)[0].lstrip("/")
         target = (dist_root / rel).resolve() if rel else dist_root / "index.html"
         # Unknown subpaths fall back to index.html (React Router owns them);
-        # the parent check also blocks ../ traversal attempts.
+        # the parent check also blocks ../ traversal attempts. Asset paths
+        # never fall back: a stale hash must 404, not cache HTML as immutable JS.
         if target != dist_root / "index.html" and not (target.is_file() and dist_root in target.parents):
+            if rel.startswith("assets/"):
+                self._send(404, b"not found", "text/plain; charset=utf-8")
+                return
             target = dist_root / "index.html"
         try:
             body = target.read_bytes()
@@ -2969,7 +2973,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
         mime = _ARENA_MIME.get(target.suffix.lower(), "application/octet-stream")
-        cache_control = "public, max-age=31536000, immutable" if _ARENA_HASHED_ASSET.match(rel) else "no-cache"
+        served_rel = target.relative_to(dist_root).as_posix()
+        cache_control = "public, max-age=31536000, immutable" if _ARENA_HASHED_ASSET.match(served_rel) else "no-cache"
         self._send(200, body, mime, cache_control=cache_control)
 
     # ---- reverse proxy to the game API (injects the server-side key) -------
