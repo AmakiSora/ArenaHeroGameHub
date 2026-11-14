@@ -1,5 +1,5 @@
 import { Bot, ChevronDown, ListChecks, UserRound } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { CommandReceipts } from '../../lib/commandPlans'
 import type {
@@ -36,7 +36,7 @@ interface Section {
 // `{}` literal per render would invalidate the memo and loop the effect).
 const EMPTY_UNIT_NAMES: UnitNameMap = {}
 
-export function PendingCommands({ tick, state, receipts, unitNames = EMPTY_UNIT_NAMES }: Props) {
+export const PendingCommands = memo(function PendingCommands({ tick, state, receipts, unitNames = EMPTY_UNIT_NAMES }: Props) {
   const { t, i18n } = useTranslation()
   const [expanded, setExpanded] = useState(true)
   const sections = useMemo(() => (['AGENT', 'MANUAL'] as CommandSource[])
@@ -109,7 +109,7 @@ export function PendingCommands({ tick, state, receipts, unitNames = EMPTY_UNIT_
       </p>}
     </div>}
   </section>
-}
+})
 
 function commandRows(
   plan: CommandPlan,

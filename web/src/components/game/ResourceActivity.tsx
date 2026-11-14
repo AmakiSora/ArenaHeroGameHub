@@ -1,12 +1,12 @@
 import { CircleAlert, Coins, HeartPulse, PackageOpen, Pickaxe, Trash2 } from 'lucide-react'
-import { useMemo } from 'react'
+import { memo, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import { resourceActivityFromEvents } from '../../lib/resourceActivity'
 import type { GameEvent } from '../../lib/types'
 
 const visibleItemLimit = 3
 
-export function ResourceActivity({ events }: { events: GameEvent[] }) {
+export const ResourceActivity = memo(function ResourceActivity({ events }: { events: GameEvent[] }) {
   const { t } = useTranslation()
   const items = useMemo(() => resourceActivityFromEvents(events), [events])
   if (!items.length) return null
@@ -96,4 +96,4 @@ export function ResourceActivity({ events }: { events: GameEvent[] }) {
       {t('game.moreResourceEvents', { count: hiddenCount })}
     </p>}
   </section>
-}
+})

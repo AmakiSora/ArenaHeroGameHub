@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { loadEnemyMemory, type EnemySighting } from '../lib/enemyMemory'
+import { sameJSON } from '../lib/stableState'
 
 // Remembered enemies from the tactic bot's map memory; refreshed on every new
 // tick so a confirmed kill or re-scout retires its stale marker promptly.
@@ -14,7 +15,7 @@ export function useEnemyMemory(tick: number | null, enabled = true): EnemySighti
   useEffect(() => {
     if (!enabled) { setSightings(DEMO_SIGHTINGS); return }
     let cancelled = false
-    void loadEnemyMemory().then((next) => { if (!cancelled) setSightings(next) })
+    void loadEnemyMemory().then((next) => { if (!cancelled) setSightings((current) => sameJSON(current, next) ? current : next) })
     return () => { cancelled = true }
   }, [tick, enabled])
   return sightings

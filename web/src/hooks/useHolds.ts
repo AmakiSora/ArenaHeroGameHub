@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { loadHolds } from '../lib/holds'
+import { sameSet } from '../lib/stableState'
 
 // Manual per-unit hold position (驻守) from the tactic dashboard (/api/holds).
 // Refreshed on every new Tick and on demand right after a mutation so the
@@ -10,7 +11,7 @@ export function useHolds(tick: number | null, enabled = true) {
   useEffect(() => {
     if (!enabled) { setHolds(new Set()); return }
     let cancelled = false
-    void loadHolds().then((next) => { if (!cancelled) setHolds(next) })
+    void loadHolds().then((next) => { if (!cancelled) setHolds((current) => sameSet(current, next) ? current : next) })
     return () => { cancelled = true }
   }, [tick, epoch, enabled])
   const refresh = useCallback(() => setEpoch((value) => value + 1), [])

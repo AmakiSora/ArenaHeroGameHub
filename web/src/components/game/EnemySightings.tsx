@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { memo, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { EnemySighting } from '../../lib/enemyMemory'
 import { maximumHealth } from '../../lib/gameRules'
@@ -9,7 +9,7 @@ import { UnitArtIcon } from './UnitArtIcon'
 // only its sprite and a segmented HP bar, followed by dimmed last-known
 // (remembered) enemies from the tactic's map memory. Clicking any chip jumps
 // the camera there so the operator can order units into combat.
-export function EnemySightings({ state, onJump, sightings = [], onJumpTo }: { state: PlayerState; onJump: (enemy: WorldObject) => void; sightings?: EnemySighting[]; onJumpTo?: (position: Position) => void }) {
+export const EnemySightings = memo(function EnemySightings({ state, onJump, sightings = [], onJumpTo }: { state: PlayerState; onJump: (enemy: WorldObject) => void; sightings?: EnemySighting[]; onJumpTo?: (position: Position) => void }) {
   const { t } = useTranslation()
   const enemies = useMemo(() => {
     const home = state.objects.find((object) => object.kind === 'CORE' && object.controlled)?.position
@@ -23,7 +23,7 @@ export function EnemySightings({ state, onJump, sightings = [], onJumpTo }: { st
   }, [state.objects])
   if (!enemies.length && !sightings.length) return null
 
-  return <section aria-label={t('game.enemySightings')} className="absolute left-3 top-16 z-20 flex max-w-[min(20rem,calc(100%-1.5rem))] flex-wrap gap-1 lg:top-5">
+  return <section aria-label={t('game.enemySightings')} className="pointer-events-auto flex max-w-full flex-wrap gap-1 lg:absolute lg:left-3 lg:top-5 lg:z-20 lg:max-w-[min(20rem,calc(100%-1.5rem))]">
     {enemies.map((enemy) => {
       const artType = enemy.kind === 'CORE' ? 'CORE' : enemy.unit_type ?? 'WORKER'
       const name = enemy.kind === 'CORE' ? t('game.units.CORE') : t(`game.units.${enemy.unit_type}`)
@@ -62,4 +62,4 @@ export function EnemySightings({ state, onJump, sightings = [], onJumpTo }: { st
       </button>
     })}
   </section>
-}
+})

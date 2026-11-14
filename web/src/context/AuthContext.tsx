@@ -29,7 +29,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
   useEffect(() => { if (!demo) void refresh() }, [demo, refresh])
   const login = useCallback(async (email: string, password: string) => { await api.login(email, password); await refresh() }, [refresh])
-  const logout = useCallback(async () => { try { await api.logout() } finally { clearCSRF(); clearImportDraft(); setUser(null) } }, [])
+  const logout = useCallback(async () => { try { await api.logout() } finally { clearCSRF(); void clearImportDraft(); setUser(null) } }, [])
   const value = useMemo(() => ({ user, loading, refresh, login, logout }), [user, loading, refresh, login, logout])
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { loadUnitNames, type UnitNameMap } from '../lib/unitNames'
+import { sameRecord } from '../lib/stableState'
 
 // The tactic assigns the dashboard display names (W1/V2/R3) once per Tick and
 // writes them into the tick record, so refresh on every new Tick — this also
@@ -9,7 +10,7 @@ export function useUnitNames(tick: number | null, enabled = true) {
   useEffect(() => {
     if (!enabled) return
     let cancelled = false
-    void loadUnitNames().then((next) => { if (!cancelled) setNames(next) })
+    void loadUnitNames().then((next) => { if (!cancelled) setNames((current) => sameRecord(current, next) ? current : next) })
     return () => { cancelled = true }
   }, [tick, enabled])
   return names

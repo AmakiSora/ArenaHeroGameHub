@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { loadSquadTargets, type SquadTargetMap } from '../lib/squadTargets'
+import { sameJSON } from '../lib/stableState'
 
 // Attack/kite squad target queues (/api/squad-targets). Refreshed on every new
 // Tick — the bot pops a head once the squad arrives and clears it — and on
@@ -10,7 +11,7 @@ export function useSquadTargets(tick: number | null, enabled = true) {
   useEffect(() => {
     if (!enabled) { setSquadTargets({}); return }
     let cancelled = false
-    void loadSquadTargets().then((next) => { if (!cancelled) setSquadTargets(next) })
+    void loadSquadTargets().then((next) => { if (!cancelled) setSquadTargets((current) => sameJSON(current, next) ? current : next) })
     return () => { cancelled = true }
   }, [tick, epoch, enabled])
   const refresh = useCallback(() => setEpoch((value) => value + 1), [])

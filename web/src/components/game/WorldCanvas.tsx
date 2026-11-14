@@ -1,5 +1,5 @@
 import { BowArrow } from 'lucide-react'
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { BEACON_SPRITE_PATH, beaconSpriteRect } from '../../lib/beaconArt'
 import { resolvedShotMarkers, resolvedSweepMarkers, type ResolvedShotMarker } from '../../lib/combatAnimation'
 import type { ShotMarker, SweepMarker } from '../../lib/combatPreview'
@@ -21,7 +21,6 @@ import { BeaconDirectionIndicator } from './BeaconDirectionIndicator'
 import { CoreDirectionIndicator } from './CoreDirectionIndicator'
 import { MapFeatureInfo } from './MapFeatureInfo'
 import type { MapAnchor } from './UnitActionDialog'
-import { UnitArtIcon } from './UnitArtIcon'
 
 interface Props {
   state: PlayerState
@@ -59,8 +58,8 @@ interface Props {
   // dashed markers (they may have moved), unlike live visible units.
   memoryEnemies?: EnemySighting[]
   // Tactic bot's per-unit destinations + remaining paths; the path cells get
-  // a light tint of the unit's own color baked into the terrain layer (below
-  // obstacles/units), and a target ring marks the destination.
+  // a light tint of the unit's own color painted over the terrain layer, and
+  // a target ring marks the destination.
   unitRoutes?: UnitRoute[]
   // Obstacle sprites are the heaviest terrain layer (shadowed images on every
   // explored cell); hiding them is the performance escape hatch once the
@@ -89,35 +88,42 @@ const RESOURCE_GREEN = '#76b889'
 const RESOURCE_GREEN_LIGHT = '#b2d2ba'
 const BEACON_GOLD = '#d9a62e'
 const BEACON_GOLD_LIGHT = '#ffe29a'
+const SPRITE_VARIANT_LIMIT = 96
 interface CachedUnitSprite { canvas: HTMLCanvasElement; width: number; height: number; padding: number }
 interface CachedBeaconSprite { canvas: HTMLCanvasElement; size: number }
+// Static terrain identity: sprite sheets and the obstacle toggle. Explored
+// cells are tracked separately through per-chunk signatures so a tick that
+// discovers a few new cells only rebuilds the chunks those cells land in —
+// the shadowed obstacle sprites everywhere else stay cached.
 interface TerrainScene {
-  explored: Map<string, ExploredCell>
-  visible: Set<string>
-  visibleObstacleCells: Set<string>
-  visibleResourceCells: Set<string>
   obstacleSprites: HTMLImageElement[]
   resourceSprites: HTMLImageElement[]
-  // Obstacle layer toggle: flipping it retires the tile cache through the
-  // scene identity check, so tiles re-render once without the obstacle art.
   obstaclesVisible: boolean
-  // Unit-route cell tints baked into the terrain tiles so they sit below
-  // obstacles, resources and units; routes change every tick, which retires
-  // the tile cache through the scene identity check.
-  unitRouteTints: Map<string, string>
 }
-interface CachedTerrainTile { canvas: HTMLCanvasElement; pixels: number; cell: number }
+interface CachedTerrainTile { canvas: HTMLCanvasElement; pixels: number; cell: number; signature: string }
 interface TerrainTileCache {
   scene: TerrainScene
+  explored: Map<string, ExploredCell>
+  signatures: Map<string, string>
   cell: number
   ratio: number
   pixels: number
   tiles: Map<string, CachedTerrainTile>
 }
+type UnitFaction = 'friendly' | 'hostile' | 'selected'
 const unitSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedUnitSprite>>()
 const beaconSpriteCache = new WeakMap<HTMLImageElement, Map<string, CachedBeaconSprite>>()
 
-export function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onCenterCore = () => {}, beaconIndicatorVisible = true, coreIndicatorVisible = true, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], memoryEnemies = [], unitRoutes = [], obstaclesVisible = true, preferredSelectionId }: Props) {
+function rememberSpriteVariant<V>(variants: Map<string, V>, key: string, value: V): V {
+  variants.set(key, value)
+  if (variants.size > SPRITE_VARIANT_LIMIT) {
+    const oldest = variants.keys().next().value
+    if (oldest !== undefined) variants.delete(oldest)
+  }
+  return value
+}
+
+export const WorldCanvas = memo(function WorldCanvas({ state, explored, selectedId, targeting, destinationSelecting, attackPositions = [], targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, centerPosition, centerRequest, zoomRequest, onSelect, onTarget, onAttackPosition, onMoveDestination, onCenterBeacon, onCenterCore = () => {}, beaconIndicatorVisible = true, coreIndicatorVisible = true, onAnchorChange, coordPicking = false, onCoordPick, highlightPositions = [], memoryEnemies = [], unitRoutes = [], obstaclesVisible = true, preferredSelectionId }: Props) {
   const backgroundCanvasRef = useRef<HTMLCanvasElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -131,12 +137,15 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
   const [inspectedFeature, setInspectedFeature] = useState<MapFeatureView | null>(null)
   const [zooming, setZooming] = useState(false)
   const drag = useRef<{ x: number; y: number; cameraX: number; cameraY: number; moved: boolean } | null>(null)
+  const pointers = useRef(new Map<number, { x: number; y: number }>())
+  const pinch = useRef<{ dist: number; cell: number; midX: number; midY: number; cameraX: number; cameraY: number } | null>(null)
   const previousPositionsRef = useRef<Map<string, Position>>(new Map())
   const activeMovementRef = useRef<EntityMotionAnimation | null>(null)
   const activeSweepRef = useRef<{ markers: SweepMarker[]; startedAt: number } | null>(null)
   const activeShotRef = useRef<{ markers: ResolvedShotMarker[]; startedAt: number } | null>(null)
   const selectionRippleRef = useRef<{ objectId: string; startedAt: number } | null>(null)
   const previousSelectedIdRef = useRef<string | null>(null)
+  const lastAnchorRef = useRef<MapAnchor | null>(null)
   const seenEventIdsRef = useRef<Set<string>>(new Set())
   const animationFrameRef = useRef<number | null>(null)
   const cameraFrameRef = useRef<number | null>(null)
@@ -149,12 +158,6 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
   const entities = useMemo(() => state.objects.filter((object) => object.position), [state])
   const homeCore = useMemo(() => entities.find((object) => object.kind === 'CORE' && object.controlled) ?? null, [entities])
   const entityGroupsByPosition = useMemo(() => groupEntitiesByPosition(state.objects), [state.objects])
-  const visibleObstacleCells = useMemo(() => collectTerrainObjectPositions(state.objects, 'OBSTACLE'), [state.objects])
-  const visibleResourceCells = useMemo(() => collectTerrainObjectPositions(state.objects, 'RESOURCE'), [state.objects])
-  const routeDestinationsByPosition = useMemo(() => groupRouteDestinations(routeDestinations), [routeDestinations])
-  const moveArrowsByPosition = useMemo(() => groupMarkersByOrigin(moveArrows), [moveArrows])
-  const sweepMarkersByPosition = useMemo(() => groupMarkersByOrigin(sweepMarkers), [sweepMarkers])
-  const shotMarkersByPosition = useMemo(() => groupMarkersByOrigin(shotMarkers), [shotMarkers])
   const attackPositionKeys = useMemo(() => new Set(attackPositions.map(positionKey)), [attackPositions])
   const unitRouteTints = useMemo(() => {
     const tints = new Map<string, string>()
@@ -167,15 +170,10 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
     return tints
   }, [unitRoutes])
   const terrainScene = useMemo<TerrainScene>(() => ({
-    explored,
-    visible,
-    visibleObstacleCells,
-    visibleResourceCells,
     obstacleSprites,
     resourceSprites,
     obstaclesVisible,
-    unitRouteTints,
-  }), [explored, obstacleSprites, obstaclesVisible, resourceSprites, unitRouteTints, visible, visibleObstacleCells, visibleResourceCells])
+  }), [obstacleSprites, obstaclesVisible, resourceSprites])
   const visibleShotMarkers = useMemo(() => shotMarkers.filter((marker) => positionInViewport(marker.from, camera, size, 1) || positionInViewport(marker.to, camera, size, 1)), [camera, shotMarkers, size])
   const inspectedFeatureView = useMemo(() => inspectedFeature ? mapFeaturesAt(inspectedFeature.position, state, explored).find((feature) => feature.kind === inspectedFeature.kind) ?? null : null, [explored, inspectedFeature, state])
 
@@ -220,9 +218,25 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
   useEffect(() => {
     const element = containerRef.current
     if (!element) return
-    const observer = new ResizeObserver(([entry]) => setSize({ width: entry.contentRect.width, height: entry.contentRect.height }))
+    const observer = new ResizeObserver(([entry]) => {
+      const { width, height } = entry.contentRect
+      setSize((current) => current.width === width && current.height === height ? current : { width, height })
+    })
     observer.observe(element); return () => observer.disconnect()
   }, [])
+  // React registers root-level wheel listeners as passive, so preventDefault
+  // inside onWheel is ignored (Ctrl+wheel / trackpad pinch would zoom the
+  // whole page). A native non-passive listener owns map zoom instead.
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    const onWheel = (event: WheelEvent) => {
+      event.preventDefault()
+      scheduleZoom((current) => wheelZoomCell(current, event.deltaY, event.deltaMode, size.height))
+    }
+    canvas.addEventListener('wheel', onWheel, { passive: false })
+    return () => canvas.removeEventListener('wheel', onWheel)
+  }, [scheduleZoom, size])
   useEffect(() => { if (selectedId) setInspectedFeature(null) }, [selectedId])
   useEffect(() => { if (inspectedFeature && !inspectedFeatureView) setInspectedFeature(null) }, [inspectedFeature, inspectedFeatureView])
   useLayoutEffect(() => { cameraRef.current = camera }, [camera])
@@ -299,8 +313,9 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
     if (canvas.height !== pixelHeight) canvas.height = pixelHeight
     const context = canvas.getContext('2d'); if (!context) return
     context.setTransform(ratio, 0, 0, ratio, 0, 0)
-    drawTiledWorldTerrain(backgroundContext, size, camera, ratio, terrainScene, terrainCacheRef, zooming)
-    drawWorldPlanMarkers(backgroundContext, size, camera, routeDestinationsByPosition, moveArrowsByPosition, sweepMarkersByPosition, shotMarkersByPosition)
+    drawTiledWorldTerrain(backgroundContext, size, camera, ratio, terrainScene, explored, terrainCacheRef, zooming)
+    drawFogAndRouteTints(backgroundContext, size, camera, explored, visible, unitRouteTints)
+    drawWorldPlanMarkers(backgroundContext, size, camera, routeDestinations, moveArrows, sweepMarkers, shotMarkers)
     const nextPositions = collectEntityPositions(state)
     const reduceMotion = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches
     const animationStart = performance.now()
@@ -331,7 +346,7 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
       const shotProgress = activeShot ? Math.min(1, (now - activeShot.startedAt) / SHOT_ANIMATION_MS) : 1
       const selectionProgress = selectionRipple?.objectId === selectedId ? Math.min(1, (now - selectionRipple.startedAt) / SELECTION_RIPPLE_MS) : 1
       const easedProgress = linearProgress * linearProgress * (3 - 2 * linearProgress)
-      try { drawWorldEntities(context, size, camera, state, unitSprites, beaconSprite, visibleEntityGroups, selectedId, targetableIds, activeMovement?.motions ?? new Map(), easedProgress, activeSweep?.markers ?? [], sweepProgress, activeShot?.markers ?? [], shotProgress, selectionProgress) }
+      try { drawWorldEntities(context, size, camera, state, unitSprites, beaconSprite, visibleEntityGroups, selectedId, targetableIds, activeMovement?.motions ?? new Map(), easedProgress, activeSweep?.markers ?? [], sweepProgress, activeShot?.markers ?? [], shotProgress, selectionProgress, memoryEnemies) }
       catch (error) { console.error('WORLD_RENDER_FAILED', error); return }
       if ((activeMovement && linearProgress < 1) || (activeSweep && sweepProgress < 1) || (activeShot && shotProgress < 1) || (selectionRipple && selectionProgress < 1)) animationFrameRef.current = requestAnimationFrame(renderFrame)
       else {
@@ -343,25 +358,39 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
     }
     renderFrame(performance.now())
     return () => { if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current); animationFrameRef.current = null }
-  }, [size, camera, state, terrainScene, unitSprites, beaconSprite, entityGroupsByPosition, selectedId, targetableIds, routeDestinationsByPosition, moveArrowsByPosition, sweepMarkersByPosition, shotMarkersByPosition, zooming])
+  }, [size, camera, state, terrainScene, explored, visible, unitRouteTints, unitSprites, beaconSprite, entityGroupsByPosition, selectedId, targetableIds, routeDestinations, moveArrows, sweepMarkers, shotMarkers, zooming, memoryEnemies])
   useEffect(() => {
     const selected = entities.find((object) => object.id === selectedId)
-    if (!selected?.position) { onAnchorChange(null); return }
+    if (!selected?.position) {
+      if (lastAnchorRef.current !== null) { lastAnchorRef.current = null; onAnchorChange(null) }
+      return
+    }
     const pointX = size.width / 2 + (selected.position[0] - camera.x) * camera.cell
     const pointY = size.height / 2 + (selected.position[1] - camera.y) * camera.cell
     const dialogWidth = Math.min(288, size.width - 24), gap = camera.cell * .65 + 12
     const selectedArrow = moveArrows.find((arrow) => arrow.objectId === selectedId)
     const horizontalSides: ('left' | 'right')[] = selectedArrow && selectedArrow.to[0] > selectedArrow.from[0] ? ['left', 'right'] : ['right', 'left']
+    let anchor: MapAnchor | null = null
     for (const side of horizontalSides) {
       if (side === 'right' && pointX + gap + dialogWidth <= size.width - 12) {
-        onAnchorChange({ x: pointX + gap, y: Math.min(size.height - 190, Math.max(190, pointY)), side }); return
+        anchor = { x: pointX + gap, y: Math.min(size.height - 190, Math.max(190, pointY)), side }; break
       }
       if (side === 'left' && pointX - gap - dialogWidth >= 12) {
-        onAnchorChange({ x: pointX - gap, y: Math.min(size.height - 190, Math.max(190, pointY)), side }); return
+        anchor = { x: pointX - gap, y: Math.min(size.height - 190, Math.max(190, pointY)), side }; break
       }
     }
-    const x = Math.min(size.width - dialogWidth - 12, Math.max(12, pointX - dialogWidth / 2))
-    onAnchorChange(pointY > size.height / 2 ? { x, y: pointY - gap, side: 'top' } : { x, y: pointY + gap, side: 'bottom' })
+    if (!anchor) {
+      const x = Math.min(size.width - dialogWidth - 12, Math.max(12, pointX - dialogWidth / 2))
+      anchor = pointY > size.height / 2 ? { x, y: pointY - gap, side: 'top' } : { x, y: pointY + gap, side: 'bottom' }
+    }
+    // Quantize to whole pixels and bail on no-op: during a pan this effect
+    // runs every camera frame, and identical anchors must not re-render the
+    // page that owns the dialog.
+    anchor = { ...anchor, x: Math.round(anchor.x), y: Math.round(anchor.y) }
+    const previous = lastAnchorRef.current
+    if (previous && previous.x === anchor.x && previous.y === anchor.y && previous.side === anchor.side) return
+    lastAnchorRef.current = anchor
+    onAnchorChange(anchor)
   }, [camera, entities, moveArrows, onAnchorChange, selectedId, size])
 
   const screenToWorld = (clientX: number, clientY: number): Position => {
@@ -393,16 +422,68 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
   return <div ref={containerRef} style={{ backgroundImage: `url(${WORLD_BACKGROUND_PATH})`, backgroundPosition: 'center', backgroundSize: 'cover' }} className={`relative h-full min-h-[420px] w-full overflow-hidden bg-space-950 ${targeting || destinationSelecting || coordPicking ? 'cursor-crosshair' : 'cursor-grab active:cursor-grabbing'}`}>
     <canvas ref={backgroundCanvasRef} className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden="true" />
     <canvas
-      ref={canvasRef} className="absolute inset-0 h-full w-full touch-none" aria-label="Tactical world map"
-      onWheel={(event) => {
-        event.preventDefault()
-        const { deltaY, deltaMode } = event
-        scheduleZoom((current) => wheelZoomCell(current, deltaY, deltaMode, size.height))
+      ref={canvasRef} className="absolute inset-0 h-full w-full touch-none focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-signal/55" tabIndex={0} aria-label="Tactical world map"
+      onKeyDown={(event) => {
+        const step = event.shiftKey ? 5 : 1
+        if (event.key === 'ArrowUp') { event.preventDefault(); scheduleCamera((current) => ({ ...current, y: current.y - step })) }
+        else if (event.key === 'ArrowDown') { event.preventDefault(); scheduleCamera((current) => ({ ...current, y: current.y + step })) }
+        else if (event.key === 'ArrowLeft') { event.preventDefault(); scheduleCamera((current) => ({ ...current, x: current.x - step })) }
+        else if (event.key === 'ArrowRight') { event.preventDefault(); scheduleCamera((current) => ({ ...current, x: current.x + step })) }
+        else if (event.key === '+' || event.key === '=') { event.preventDefault(); scheduleZoom((current) => Math.min(MAX_WORLD_CELL_SIZE, current + 6)) }
+        else if (event.key === '-' || event.key === '_') { event.preventDefault(); scheduleZoom((current) => Math.max(MIN_WORLD_CELL_SIZE, current - 6)) }
       }}
-      onPointerDown={(event) => { event.currentTarget.setPointerCapture(event.pointerId); const current = cameraRef.current; drag.current = { x: event.clientX, y: event.clientY, cameraX: current.x, cameraY: current.y, moved: false } }}
-      onPointerMove={(event) => { const activeDrag = drag.current; if (!activeDrag) return; const dx = event.clientX - activeDrag.x, dy = event.clientY - activeDrag.y; if (Math.abs(dx) + Math.abs(dy) > 5) activeDrag.moved = true; const cameraX = activeDrag.cameraX, cameraY = activeDrag.cameraY; scheduleCamera((current) => ({ ...current, x: cameraX - dx / current.cell, y: cameraY - dy / current.cell })) }}
-      onPointerUp={(event) => { if (drag.current && !drag.current.moved) choose(screenToWorld(event.clientX, event.clientY)); drag.current = null }}
-      onPointerCancel={() => { drag.current = null }}
+      onPointerDown={(event) => {
+        event.currentTarget.setPointerCapture(event.pointerId)
+        pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+        if (pointers.current.size === 2) {
+          const [first, second] = [...pointers.current.values()]
+          const current = cameraRef.current
+          pinch.current = { dist: Math.hypot(second.x - first.x, second.y - first.y), cell: current.cell, midX: (first.x + second.x) / 2, midY: (first.y + second.y) / 2, cameraX: current.x, cameraY: current.y }
+          drag.current = null
+          return
+        }
+        const current = cameraRef.current
+        drag.current = { x: event.clientX, y: event.clientY, cameraX: current.x, cameraY: current.y, moved: false }
+      }}
+      onPointerMove={(event) => {
+        if (!pointers.current.has(event.pointerId)) return
+        pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+        const activePinch = pinch.current
+        if (activePinch && pointers.current.size >= 2) {
+          const [first, second] = [...pointers.current.values()]
+          const dist = Math.hypot(second.x - first.x, second.y - first.y)
+          const midX = (first.x + second.x) / 2, midY = (first.y + second.y) / 2
+          if (activePinch.dist > 0 && dist > 0) {
+            scheduleCamera((current) => ({
+              ...current,
+              cell: Math.min(MAX_WORLD_CELL_SIZE, Math.max(MIN_WORLD_CELL_SIZE, activePinch.cell * dist / activePinch.dist)),
+              x: activePinch.cameraX - (midX - activePinch.midX) / current.cell,
+              y: activePinch.cameraY - (midY - activePinch.midY) / current.cell,
+            }))
+          }
+          return
+        }
+        const activeDrag = drag.current
+        if (!activeDrag) return
+        const dx = event.clientX - activeDrag.x, dy = event.clientY - activeDrag.y
+        if (Math.abs(dx) + Math.abs(dy) > 5) activeDrag.moved = true
+        const cameraX = activeDrag.cameraX, cameraY = activeDrag.cameraY
+        scheduleCamera((current) => ({ ...current, x: cameraX - dx / current.cell, y: cameraY - dy / current.cell }))
+      }}
+      onPointerUp={(event) => {
+        const wasPinching = pinch.current !== null
+        pointers.current.delete(event.pointerId)
+        if (pointers.current.size < 2) pinch.current = null
+        if (pointers.current.size === 1) {
+          const [remaining] = [...pointers.current.values()]
+          const current = cameraRef.current
+          drag.current = { x: remaining.x, y: remaining.y, cameraX: current.x, cameraY: current.y, moved: true }
+          return
+        }
+        if (!wasPinching && drag.current && !drag.current.moved) choose(screenToWorld(event.clientX, event.clientY))
+        drag.current = null
+      }}
+      onPointerCancel={(event) => { pointers.current.delete(event.pointerId); if (pointers.current.size < 2) pinch.current = null; drag.current = null }}
     />
     {unitRoutes.length > 0 && <svg aria-hidden="true" className="pointer-events-none absolute inset-0 z-10" width={size.width} height={size.height}>
       {(() => {
@@ -430,20 +511,6 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
         style={{ left: point.left, top: point.top, width: diameter, height: diameter, transform: 'translate(-50%, -50%)' }}
       />
     })}
-    {memoryEnemies.map((sighting) => {
-      const point = worldToScreen(sighting.position)
-      const diameter = Math.max(24, camera.cell * .7)
-      return <span
-        key={`memory:${positionKey(sighting.position)}`}
-        aria-hidden="true"
-        className="pointer-events-none absolute z-10 grid place-items-center rounded-full border border-dashed border-coral-hostile/45 bg-coral-hostile/[.08]"
-        style={{ left: point.left, top: point.top, width: diameter, height: diameter, transform: 'translate(-50%, -50%)' }}
-      >
-        {sighting.type === 'ENEMY'
-          ? <span className="size-[26%] rounded-full bg-coral-hostile/55" />
-          : <UnitArtIcon type={sighting.type} className="h-[68%] w-[68%] opacity-55 grayscale-[.35]" />}
-      </span>
-    })}
     {visibleShotMarkers.map((marker) => {
       const from = worldToScreen(marker.from), to = worldToScreen(marker.to), dx = to.left - from.left, dy = to.top - from.top, length = Math.hypot(dx, dy)
       const ux = dx / length, uy = dy / length, px = -uy, py = ux, side = dx > 0 ? -1 : dx < 0 ? 1 : dy > 0 ? -1 : 1
@@ -454,7 +521,7 @@ export function WorldCanvas({ state, explored, selectedId, targeting, destinatio
     {coreIndicatorVisible && homeCore?.position && <CoreDirectionIndicator corePosition={homeCore.position} camera={camera} viewport={size} onCenter={onCenterCore} />}
     {inspectedFeatureView && featureAnchor && <MapFeatureInfo feature={inspectedFeatureView} anchor={featureAnchor} onClose={() => setInspectedFeature(null)} />}
   </div>
-}
+})
 
 function mapFeatureAnchor(position: Position, camera: Camera, size: { width: number; height: number }): MapAnchor {
   const pointX = size.width / 2 + (position[0] - camera.x) * camera.cell
@@ -467,20 +534,40 @@ function mapFeatureAnchor(position: Position, camera: Camera, size: { width: num
   return pointY > size.height / 2 ? { x, y: pointY - gap, side: 'top' } : { x, y: pointY + gap, side: 'bottom' }
 }
 
+// Chunk signature over the explored kinds inside one chunk: comparing it
+// against the baked tile tells whether newly discovered cells dirtied this
+// chunk, without diffing the whole explored map every tick.
+function chunkSignature(explored: Map<string, ExploredCell>, chunkX: number, chunkY: number): string {
+  const firstX = chunkX * TERRAIN_CHUNK_CELLS, firstY = chunkY * TERRAIN_CHUNK_CELLS
+  let signature = ''
+  for (let y = firstY; y < firstY + TERRAIN_CHUNK_CELLS; y++) {
+    for (let x = firstX; x < firstX + TERRAIN_CHUNK_CELLS; x++) {
+      const kind = explored.get(`${x},${y}`)?.kind
+      signature += kind === 'OBSTACLE' ? 'O' : kind === 'RESOURCE' ? 'R' : kind ? '.' : ' '
+    }
+  }
+  return signature
+}
+
 function drawTiledWorldTerrain(
   ctx: CanvasRenderingContext2D,
   size: { width: number; height: number },
   camera: Camera,
   ratio: number,
   scene: TerrainScene,
+  explored: Map<string, ExploredCell>,
   cacheRef: { current: TerrainTileCache | null },
   allowScaledCache: boolean,
 ) {
   let cache = cacheRef.current
   if (!cache || cache.scene !== scene || (!allowScaledCache && cache.cell !== camera.cell) || cache.ratio !== ratio) {
     if (cache) releaseTerrainTiles(cache)
-    cache = { scene, cell: camera.cell, ratio, pixels: 0, tiles: new Map() }
+    cache = { scene, explored, signatures: new Map(), cell: camera.cell, ratio, pixels: 0, tiles: new Map() }
     cacheRef.current = cache
+  } else if (cache.explored !== explored) {
+    // New discovery: keep every baked tile, drop only the stale signatures.
+    cache.explored = explored
+    cache.signatures.clear()
   }
 
   ctx.clearRect(0, 0, size.width, size.height)
@@ -492,9 +579,15 @@ function drawTiledWorldTerrain(
     for (let chunkX = bounds.minX; chunkX <= bounds.maxX; chunkX++) {
       const key = `${chunkX},${chunkY}`
       visibleKeys.add(key)
+      let signature = cache.signatures.get(key)
+      if (signature === undefined) {
+        signature = chunkSignature(explored, chunkX, chunkY)
+        cache.signatures.set(key, signature)
+      }
       let tile = cache.tiles.get(key)
-      if (!tile) {
-        tile = createTerrainTile(chunkX, chunkY, allowScaledCache ? camera.cell : cache.cell, ratio, scene)
+      if (!tile || tile.signature !== signature) {
+        if (tile) { cache.pixels -= tile.pixels; tile.canvas.width = 1; tile.canvas.height = 1 }
+        tile = createTerrainTile(chunkX, chunkY, allowScaledCache ? camera.cell : cache.cell, ratio, scene, explored, signature)
         cache.tiles.set(key, tile)
         cache.pixels += tile.pixels
       } else {
@@ -514,14 +607,14 @@ function drawTiledWorldTerrain(
   evictTerrainTiles(cache, visibleKeys)
 }
 
-function createTerrainTile(chunkX: number, chunkY: number, cell: number, ratio: number, scene: TerrainScene): CachedTerrainTile {
+function createTerrainTile(chunkX: number, chunkY: number, cell: number, ratio: number, scene: TerrainScene, explored: Map<string, ExploredCell>, signature: string): CachedTerrainTile {
   const paddedCells = TERRAIN_CHUNK_CELLS + TERRAIN_CHUNK_PADDING_CELLS * 2
   const cssSize = paddedCells * cell
   const canvas = document.createElement('canvas')
   canvas.width = Math.max(1, Math.ceil(cssSize * ratio))
   canvas.height = Math.max(1, Math.ceil(cssSize * ratio))
   const context = canvas.getContext('2d')
-  if (!context) return { canvas, pixels: canvas.width * canvas.height, cell }
+  if (!context) return { canvas, pixels: canvas.width * canvas.height, cell, signature }
   context.setTransform(ratio, 0, 0, ratio, 0, 0)
   const firstX = chunkX * TERRAIN_CHUNK_CELLS
   const firstY = chunkY * TERRAIN_CHUNK_CELLS
@@ -530,8 +623,8 @@ function createTerrainTile(chunkX: number, chunkY: number, cell: number, ratio: 
     y: firstY + (TERRAIN_CHUNK_CELLS - 1) / 2,
     cell,
   }
-  drawWorldTerrain(context, { width: cssSize, height: cssSize }, tileCamera, scene)
-  return { canvas, pixels: canvas.width * canvas.height, cell }
+  drawWorldTerrain(context, { width: cssSize, height: cssSize }, tileCamera, scene, explored)
+  return { canvas, pixels: canvas.width * canvas.height, cell, signature }
 }
 
 function evictTerrainTiles(cache: TerrainTileCache, visibleKeys: Set<string>) {
@@ -555,72 +648,98 @@ function releaseTerrainTiles(cache: TerrainTileCache) {
   cache.pixels = 0
 }
 
-function drawWorldTerrain(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, scene: TerrainScene) {
-  const { explored, visible, visibleObstacleCells, visibleResourceCells, obstacleSprites, resourceSprites, obstaclesVisible } = scene
+// Static bake: every explored cell at full brightness with its obstacle /
+// resource art. The fog pass below dims the cells that are out of sight this
+// tick, so unit movement never invalidates the expensive sprite work.
+function drawWorldTerrain(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, scene: TerrainScene, explored: Map<string, ExploredCell>) {
+  const { obstacleSprites, resourceSprites, obstaclesVisible } = scene
   ctx.clearRect(0, 0, size.width, size.height); ctx.fillStyle = 'rgba(0,0,0,.18)'; ctx.fillRect(0, 0, size.width, size.height)
   const toScreen = ([x, y]: Position) => [size.width / 2 + (x - camera.x) * camera.cell, size.height / 2 + (y - camera.y) * camera.cell] as const
   const minX = Math.floor(camera.x - size.width / camera.cell / 2) - 1, maxX = Math.ceil(camera.x + size.width / camera.cell / 2) + 1
   const minY = Math.floor(camera.y - size.height / camera.cell / 2) - 1, maxY = Math.ceil(camera.y + size.height / camera.cell / 2) + 1
   for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
-    const key = `${x},${y}`, isVisible = visible.has(key), memory = explored.get(key)
-    if (!isVisible && !memory) continue
+    if (!explored.has(`${x},${y}`)) continue
     const [sx, sy] = toScreen([x, y]); const half = camera.cell / 2
-    ctx.fillStyle = isVisible ? 'rgba(13,13,15,.82)' : 'rgba(5,5,5,.9)'; ctx.fillRect(sx - half, sy - half, camera.cell, camera.cell)
-    ctx.strokeStyle = isVisible ? 'rgba(255,255,255,.12)' : 'rgba(255,255,255,.05)'; ctx.lineWidth = 1; ctx.strokeRect(sx - half + .5, sy - half + .5, camera.cell - 1, camera.cell - 1)
-  }
-  // Unit-route cell tints: painted right on the road so obstacle sprites,
-  // resources and (on the canvas above) units all stay visible on top.
-  for (const [key, color] of scene.unitRouteTints) {
-    const [x, y] = key.split(',').map(Number)
-    if (x < minX || x > maxX || y < minY || y > maxY) continue
-    if (!visible.has(key) && !explored.has(key)) continue
-    const [sx, sy] = toScreen([x, y]); const half = camera.cell / 2
-    const inset = camera.cell * .08
-    ctx.globalAlpha = .28; ctx.fillStyle = color
-    ctx.fillRect(sx - half + inset, sy - half + inset, camera.cell - inset * 2, camera.cell - inset * 2)
-    ctx.globalAlpha = 1
+    ctx.fillStyle = 'rgba(13,13,15,.82)'; ctx.fillRect(sx - half, sy - half, camera.cell, camera.cell)
+    ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 1; ctx.strokeRect(sx - half + .5, sy - half + .5, camera.cell - 1, camera.cell - 1)
   }
   const renderedObstacles: ObstacleRenderCell[] = []
-  const renderedResources: { position: Position; x: number; y: number; visible: boolean }[] = []
+  const renderedResources: { position: Position; x: number; y: number }[] = []
   const obstacleCells = new Set<string>()
   // Layer toggle: with obstacles hidden the cell scan and the shadowed
   // sprite draws are skipped entirely (the perf win the toggle exists for).
   if (obstaclesVisible) {
     for (let y = minY - 1; y <= maxY + 1; y++) for (let x = minX - 1; x <= maxX + 1; x++) {
       const key = `${x},${y}`
-      if (visibleObstacleCells.has(key) || explored.get(key)?.kind === 'OBSTACLE') obstacleCells.add(key)
+      if (explored.get(key)?.kind === 'OBSTACLE') obstacleCells.add(key)
     }
   }
   for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
-    const key = positionKey([x, y]), memory = explored.get(key), isVisible = visible.has(key)
-    if (obstacleCells.has(key) && (isVisible || memory)) {
+    const key = positionKey([x, y]), memory = explored.get(key)
+    if (!memory) continue
+    if (obstacleCells.has(key)) {
       const [screenX, screenY] = toScreen([x, y])
-      renderedObstacles.push({ position: [x, y], x: screenX, y: screenY, visible: isVisible, shape: obstacleCellShape([x, y], obstacleCells) })
-    } else if (visibleResourceCells.has(key) || (!isVisible && memory?.kind === 'RESOURCE')) {
+      renderedObstacles.push({ position: [x, y], x: screenX, y: screenY, shape: obstacleCellShape([x, y], obstacleCells) })
+    } else if (memory.kind === 'RESOURCE') {
       const [screenX, screenY] = toScreen([x, y])
-      renderedResources.push({ position: [x, y], x: screenX, y: screenY, visible: isVisible })
+      renderedResources.push({ position: [x, y], x: screenX, y: screenY })
     }
   }
   drawObstacleTerrain(ctx, renderedObstacles, camera.cell, obstacleSprites)
-  for (const resource of renderedResources) drawResource(ctx, resource.position, resource.x, resource.y, camera.cell, resource.visible, resourceSprites)
+  for (const resource of renderedResources) drawResource(ctx, resource.position, resource.x, resource.y, camera.cell, resourceSprites)
 }
 
-function drawWorldPlanMarkers(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, routeDestinations: Map<string, RouteDestination[]>, moveArrows: Map<string, MoveArrow[]>, sweepMarkers: Map<string, SweepMarker[]>, shotMarkers: Map<string, ShotMarker[]>) {
-  const toScreen = ([x, y]: Position) => [size.width / 2 + (x - camera.x) * camera.cell, size.height / 2 + (y - camera.y) * camera.cell] as const
+// Dynamic pass: fog of war over explored-but-unseen cells plus the tactic
+// route tints. Both are cheap fills keyed by the live visibility set, kept
+// out of the baked tiles so they never trigger sprite re-rendering.
+function drawFogAndRouteTints(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, explored: Map<string, ExploredCell>, visible: Set<string>, unitRouteTints: Map<string, string>) {
   const minX = Math.floor(camera.x - size.width / camera.cell / 2) - 1, maxX = Math.ceil(camera.x + size.width / camera.cell / 2) + 1
   const minY = Math.floor(camera.y - size.height / camera.cell / 2) - 1, maxY = Math.ceil(camera.y + size.height / camera.cell / 2) + 1
-  // Ranger previews span up to three cells, so include a small marker margin
-  // without scanning every planned marker on each camera frame.
-  for (let y = minY - 3; y <= maxY + 3; y++) for (let x = minX - 3; x <= maxX + 3; x++) {
+  const half = camera.cell / 2
+  ctx.fillStyle = 'rgba(2,2,4,.62)'
+  for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
     const key = `${x},${y}`
-    for (const destination of routeDestinations.get(key) ?? []) drawRouteDestination(ctx, toScreen(destination.position), camera.cell, destination.blocked, destination.selectable === true, destination.immediate === true, destination.hostile === true)
-    for (const arrow of moveArrows.get(key) ?? []) drawMoveArrow(ctx, toScreen(arrow.from), toScreen(arrow.to), camera.cell, arrow.hostile ? HOSTILE_CORAL : arrow.source === 'AGENT' ? AGENT_VIOLET : PRIMARY_BLUE, arrow.dashed === true)
-    for (const marker of sweepMarkers.get(key) ?? []) drawSweepSword(ctx, toScreen(marker.from), toScreen(marker.to), camera.cell, marker.source === 'AGENT' ? AGENT_VIOLET : PRIMARY_BLUE)
-    for (const marker of shotMarkers.get(key) ?? []) drawShotArc(ctx, toScreen(marker.from), toScreen(marker.to), camera.cell, marker.source === 'AGENT' ? AGENT_VIOLET : PRIMARY_BLUE)
+    if (visible.has(key) || !explored.has(key)) continue
+    const sx = size.width / 2 + (x - camera.x) * camera.cell, sy = size.height / 2 + (y - camera.y) * camera.cell
+    ctx.fillRect(sx - half, sy - half, camera.cell, camera.cell)
+  }
+  if (!unitRouteTints.size) return
+  ctx.globalAlpha = .28
+  const inset = camera.cell * .08
+  for (const [key, color] of unitRouteTints) {
+    const comma = key.indexOf(',')
+    const x = Number(key.slice(0, comma)), y = Number(key.slice(comma + 1))
+    if (x < minX || x > maxX || y < minY || y > maxY) continue
+    if (!visible.has(key) && !explored.has(key)) continue
+    const sx = size.width / 2 + (x - camera.x) * camera.cell, sy = size.height / 2 + (y - camera.y) * camera.cell
+    ctx.fillStyle = color
+    ctx.fillRect(sx - half + inset, sy - half + inset, camera.cell - inset * 2, camera.cell - inset * 2)
+  }
+  ctx.globalAlpha = 1
+}
+
+// Markers are few (one plan per unit); iterate them directly and cull by
+// viewport instead of scanning every viewport cell, which at minimum zoom
+// meant hundreds of thousands of Map lookups per camera frame.
+function drawWorldPlanMarkers(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, routeDestinations: RouteDestination[], moveArrows: MoveArrow[], sweepMarkers: SweepMarker[], shotMarkers: ShotMarker[]) {
+  const toScreen = ([x, y]: Position) => [size.width / 2 + (x - camera.x) * camera.cell, size.height / 2 + (y - camera.y) * camera.cell] as const
+  // Ranger previews span up to three cells, so markers get a small margin.
+  const inView = (position: Position) => positionInViewport(position, camera, size, 3)
+  for (const destination of routeDestinations) {
+    if (inView(destination.position)) drawRouteDestination(ctx, toScreen(destination.position), camera.cell, destination.blocked, destination.selectable === true, destination.immediate === true, destination.hostile === true)
+  }
+  for (const arrow of moveArrows) {
+    if (inView(arrow.from) || inView(arrow.to)) drawMoveArrow(ctx, toScreen(arrow.from), toScreen(arrow.to), camera.cell, arrow.hostile ? HOSTILE_CORAL : arrow.source === 'AGENT' ? AGENT_VIOLET : PRIMARY_BLUE, arrow.dashed === true)
+  }
+  for (const marker of sweepMarkers) {
+    if (inView(marker.from) || inView(marker.to)) drawSweepSword(ctx, toScreen(marker.from), toScreen(marker.to), camera.cell, marker.source === 'AGENT' ? AGENT_VIOLET : PRIMARY_BLUE)
+  }
+  for (const marker of shotMarkers) {
+    if (inView(marker.from) || inView(marker.to)) drawShotArc(ctx, toScreen(marker.from), toScreen(marker.to), camera.cell, marker.source === 'AGENT' ? AGENT_VIOLET : PRIMARY_BLUE)
   }
 }
 
-function drawWorldEntities(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, state: PlayerState, unitSprites: Partial<Record<UnitArtType, HTMLImageElement>>, beaconSprite: HTMLImageElement | null, entityGroups: WorldObject[][], selectedId: string | null, targetableIds: Set<string>, motions: Map<string, EntityMotion>, movementProgress: number, resolvedSweeps: SweepMarker[], sweepProgress: number, resolvedShots: ResolvedShotMarker[], shotProgress: number, selectionProgress: number) {
+function drawWorldEntities(ctx: CanvasRenderingContext2D, size: { width: number; height: number }, camera: Camera, state: PlayerState, unitSprites: Partial<Record<UnitArtType, HTMLImageElement>>, beaconSprite: HTMLImageElement | null, entityGroups: WorldObject[][], selectedId: string | null, targetableIds: Set<string>, motions: Map<string, EntityMotion>, movementProgress: number, resolvedSweeps: SweepMarker[], sweepProgress: number, resolvedShots: ResolvedShotMarker[], shotProgress: number, selectionProgress: number, memoryEnemies: EnemySighting[]) {
   ctx.clearRect(0, 0, size.width, size.height)
   const toScreen = ([x, y]: Position) => [size.width / 2 + (x - camera.x) * camera.cell, size.height / 2 + (y - camera.y) * camera.cell] as const
   let beaconPoint = toScreen(state.champion_beacon.position)
@@ -677,14 +796,38 @@ function drawWorldEntities(ctx: CanvasRenderingContext2D, size: { width: number;
     }
   }
   if (beaconCarried && !carriedBeaconDrawn) drawChampionBeacon(ctx, beaconPoint, camera.cell, state.champion_beacon.status, false, beaconSprite)
+  drawMemoryEnemies(ctx, toScreen, size, camera, memoryEnemies, unitSprites)
   for (const marker of resolvedSweeps) drawResolvedSweep(ctx, toScreen(marker.from), toScreen(marker.to), camera.cell, sweepProgress)
   for (const marker of resolvedShots) drawResolvedShot(ctx, toScreen(marker.from), toScreen(marker.to), camera.cell, shotProgress, marker.hit)
 }
 
-function collectTerrainObjectPositions(objects: WorldObject[], kind: 'OBSTACLE' | 'RESOURCE') {
-  const cells = new Set<string>()
-  for (const object of objects) if (object.kind === kind) for (const position of object.positions ?? []) cells.add(positionKey(position))
-  return cells
+// Last-known enemy positions: dashed dim markers on the entity canvas,
+// viewport-culled. Hundreds of DOM spans here used to reconcile on every
+// camera frame; canvas draws cost a fraction of that.
+function drawMemoryEnemies(ctx: CanvasRenderingContext2D, toScreen: (position: Position) => readonly [number, number], size: { width: number; height: number }, camera: Camera, sightings: EnemySighting[], sprites: Partial<Record<UnitArtType, HTMLImageElement>>) {
+  if (!sightings.length) return
+  const radius = Math.max(12, camera.cell * .35)
+  for (const sighting of sightings) {
+    if (!positionInViewport(sighting.position, camera, size, 2)) continue
+    const [x, y] = toScreen(sighting.position)
+    ctx.save()
+    ctx.setLineDash([Math.max(3, camera.cell * .08), Math.max(2, camera.cell * .06)])
+    ctx.strokeStyle = 'rgba(198,99,112,.45)'; ctx.fillStyle = 'rgba(198,99,112,.08)'; ctx.lineWidth = 1
+    ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
+    ctx.setLineDash([])
+    const artType = sighting.type === 'ENEMY' ? null : sighting.type
+    const image = artType ? sprites[artType] : undefined
+    if (artType && image?.complete && image.naturalWidth > 0) {
+      const rect = unitSpriteRect(x, y, camera.cell * .8, artType, image.naturalWidth / image.naturalHeight)
+      const cached = cachedUnitSprite(image, rect, camera.cell * .8, 'hostile')
+      ctx.globalAlpha = .55
+      ctx.drawImage(cached.canvas, rect.left - cached.padding, rect.top - cached.padding, cached.width, cached.height)
+    } else {
+      ctx.fillStyle = 'rgba(198,99,112,.55)'
+      ctx.beginPath(); ctx.arc(x, y, Math.max(2, radius * .26), 0, Math.PI * 2); ctx.fill()
+    }
+    ctx.restore()
+  }
 }
 
 function groupEntitiesByPosition(objects: WorldObject[]) {
@@ -699,42 +842,29 @@ function groupEntitiesByPosition(objects: WorldObject[]) {
   return grouped
 }
 
-function groupRouteDestinations(destinations: RouteDestination[]) {
-  const grouped = new Map<string, RouteDestination[]>()
-  for (const destination of destinations) appendGrouped(grouped, positionKey(destination.position), destination)
-  return grouped
-}
-
-function groupMarkersByOrigin<T extends { from: Position }>(markers: T[]) {
-  const grouped = new Map<string, T[]>()
-  for (const marker of markers) appendGrouped(grouped, positionKey(marker.from), marker)
-  return grouped
-}
-
-function appendGrouped<T>(grouped: Map<string, T[]>, key: string, value: T) {
-  const entries = grouped.get(key)
-  if (entries) entries.push(value)
-  else grouped.set(key, [value])
-}
-
 function positionInViewport(position: Position, camera: Camera, size: { width: number; height: number }, margin: number) {
   const halfWidth = size.width / camera.cell / 2 + margin
   const halfHeight = size.height / camera.cell / 2 + margin
   return Math.abs(position[0] - camera.x) <= halfWidth && Math.abs(position[1] - camera.y) <= halfHeight
 }
 
+// Entities are far fewer than viewport cells: walk the group map and keep
+// the groups inside the camera bounds, preserving row-major draw order.
 function collectVisibleEntityGroups(grouped: Map<string, WorldObject[]>, camera: Camera, size: { width: number; height: number }) {
   const margin = 2
   const minX = Math.floor(camera.x - size.width / camera.cell / 2) - margin
   const maxX = Math.ceil(camera.x + size.width / camera.cell / 2) + margin
   const minY = Math.floor(camera.y - size.height / camera.cell / 2) - margin
   const maxY = Math.ceil(camera.y + size.height / camera.cell / 2) + margin
-  const visible: WorldObject[][] = []
-  for (let y = minY; y <= maxY; y++) for (let x = minX; x <= maxX; x++) {
-    const group = grouped.get(`${x},${y}`)
-    if (group) visible.push(group)
+  const visible: { x: number; y: number; group: WorldObject[] }[] = []
+  for (const [key, group] of grouped) {
+    const comma = key.indexOf(',')
+    const x = Number(key.slice(0, comma)), y = Number(key.slice(comma + 1))
+    if (x < minX || x > maxX || y < minY || y > maxY) continue
+    visible.push({ x, y, group })
   }
-  return visible
+  visible.sort((left, right) => left.y - right.y || left.x - right.x)
+  return visible.map((entry) => entry.group)
 }
 
 function shotCurve([fromX, fromY]: readonly [number, number], [toX, toY]: readonly [number, number], cell: number) {
@@ -868,7 +998,7 @@ function drawRouteDestination(ctx: CanvasRenderingContext2D, [x, y]: readonly [n
   ctx.fillStyle = color; ctx.beginPath(); ctx.arc(x, y, Math.max(1.5, cell * .035), 0, Math.PI * 2); ctx.fill(); ctx.restore()
 }
 
-interface ObstacleRenderCell { position: Position; x: number; y: number; visible: boolean; shape: ObstacleCellShape }
+interface ObstacleRenderCell { position: Position; x: number; y: number; shape: ObstacleCellShape }
 
 function drawObstacleTerrain(ctx: CanvasRenderingContext2D, cells: ObstacleRenderCell[], cellSize: number, sprites: HTMLImageElement[]) {
   if (!cells.length) return
@@ -882,12 +1012,12 @@ function drawObstacleConnections(ctx: CanvasRenderingContext2D, cells: ObstacleR
     const [worldX, worldY] = obstacle.position
     const east = byPosition.get(positionKey([worldX + 1, worldY]))
     const south = byPosition.get(positionKey([worldX, worldY + 1]))
-    if (east) drawObstacleConnection(ctx, obstacle.x + cell / 2, obstacle.y, cell, obstacle.position, obstacle.visible && east.visible, sprites, true)
-    if (south) drawObstacleConnection(ctx, obstacle.x, obstacle.y + cell / 2, cell, obstacle.position, obstacle.visible && south.visible, sprites, false)
+    if (east) drawObstacleConnection(ctx, obstacle.x + cell / 2, obstacle.y, cell, obstacle.position, sprites, true)
+    if (south) drawObstacleConnection(ctx, obstacle.x, obstacle.y + cell / 2, cell, obstacle.position, sprites, false)
   }
 }
 
-function drawObstacleConnection(ctx: CanvasRenderingContext2D, x: number, y: number, cell: number, position: Position, visible: boolean, sprites: HTMLImageElement[], horizontal: boolean) {
+function drawObstacleConnection(ctx: CanvasRenderingContext2D, x: number, y: number, cell: number, position: Position, sprites: HTMLImageElement[], horizontal: boolean) {
   const image = sprites[obstacleSpriteIndex(position, sprites.length)]
   if (!image?.complete || image.naturalWidth <= 0) return
 
@@ -899,13 +1029,13 @@ function drawObstacleConnection(ctx: CanvasRenderingContext2D, x: number, y: num
   if (horizontal) ctx.rect(x - cell, y - cell / 2, cell * 2, cell)
   else ctx.rect(x - cell / 2, y - cell, cell, cell * 2)
   ctx.clip()
-  ctx.globalAlpha = visible ? .94 : .3; ctx.shadowColor = 'rgba(0,0,0,.84)'; ctx.shadowBlur = Math.max(2, Math.round(cell * .065)); ctx.shadowOffsetY = Math.round(cell * .025)
+  ctx.globalAlpha = .94; ctx.shadowColor = 'rgba(0,0,0,.84)'; ctx.shadowBlur = Math.max(2, Math.round(cell * .065)); ctx.shadowOffsetY = Math.round(cell * .025)
   ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; ctx.drawImage(image, left, top, size, size); ctx.restore()
 }
 
 function drawObstacleSprite(ctx: CanvasRenderingContext2D, obstacle: ObstacleRenderCell, cell: number, sprites: HTMLImageElement[]) {
   const image = sprites[obstacleSpriteIndex(obstacle.position, sprites.length)]
-  ctx.save(); ctx.globalAlpha = obstacle.visible ? 1 : .35; ctx.shadowColor = 'rgba(0,0,0,.9)'; ctx.shadowBlur = Math.max(3, Math.round(cell * .1)); ctx.shadowOffsetY = Math.round(cell * .045)
+  ctx.save(); ctx.shadowColor = 'rgba(0,0,0,.9)'; ctx.shadowBlur = Math.max(3, Math.round(cell * .1)); ctx.shadowOffsetY = Math.round(cell * .045)
   if (image?.complete && image.naturalWidth > 0) {
     const { size, left, top } = obstacleSpriteRect(obstacle.x, obstacle.y, cell)
     ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; ctx.drawImage(image, left, top, size, size)
@@ -916,14 +1046,14 @@ function drawObstacleSprite(ctx: CanvasRenderingContext2D, obstacle: ObstacleRen
   }
   ctx.restore()
 }
-function drawResource(ctx: CanvasRenderingContext2D, position: Position, x: number, y: number, cell: number, visible: boolean, sprites: HTMLImageElement[]) {
+function drawResource(ctx: CanvasRenderingContext2D, position: Position, x: number, y: number, cell: number, sprites: HTMLImageElement[]) {
   const image = sprites[resourceSpriteIndex(position, sprites.length)]
   const { left, top, size } = resourceSpriteRect(x, y, cell)
-  ctx.save(); ctx.globalAlpha = visible ? 1 : .3; ctx.shadowColor = 'rgba(118,184,137,.42)'; ctx.shadowBlur = visible ? Math.max(2, Math.round(cell * .055)) : 0; ctx.shadowOffsetY = Math.round(cell * .025)
+  ctx.save(); ctx.shadowColor = 'rgba(118,184,137,.42)'; ctx.shadowBlur = Math.max(2, Math.round(cell * .055)); ctx.shadowOffsetY = Math.round(cell * .025)
   if (image?.complete && image.naturalWidth > 0) {
     ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; ctx.drawImage(image, left, top, size, size)
   } else {
-    const radius = size * .3; ctx.fillStyle = visible ? RESOURCE_GREEN : '#24372b'; ctx.beginPath(); ctx.moveTo(x, y - radius); ctx.lineTo(x + radius * .72, y); ctx.lineTo(x, y + radius); ctx.lineTo(x - radius * .72, y); ctx.closePath(); ctx.fill()
+    const radius = size * .3; ctx.fillStyle = RESOURCE_GREEN; ctx.beginPath(); ctx.moveTo(x, y - radius); ctx.lineTo(x + radius * .72, y); ctx.lineTo(x, y + radius); ctx.lineTo(x - radius * .72, y); ctx.closePath(); ctx.fill()
   }
   ctx.restore()
 }
@@ -949,7 +1079,7 @@ function drawChampionBeacon(ctx: CanvasRenderingContext2D, [x, y]: readonly [num
 function cachedChampionBeacon(image: HTMLImageElement, cell: number, attached: boolean): CachedBeaconSprite {
   const ratio = Math.min(2, Math.max(1, typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1))
   const size = Math.max(1, Math.ceil(cell * (attached ? .9 : 1.5)))
-  const key = `${attached ? 'carried' : 'ground'}:${cell}:${ratio}`
+  const key = `${attached ? 'carried' : 'ground'}:${Math.round(cell * 2)}:${ratio}`
   let variants = beaconSpriteCache.get(image)
   if (!variants) { variants = new Map(); beaconSpriteCache.set(image, variants) }
   const existing = variants.get(key)
@@ -968,7 +1098,8 @@ function cachedChampionBeacon(image: HTMLImageElement, cell: number, attached: b
   const rect = beaconSpriteRect(center, center, cell, attached, image.naturalWidth / image.naturalHeight)
   context.shadowColor = BEACON_GOLD_LIGHT; context.shadowBlur = cell * (attached ? .1 : .22); context.imageSmoothingEnabled = true; context.imageSmoothingQuality = 'high'
   context.drawImage(image, rect.left, rect.top, rect.width, rect.height)
-  const cached = { canvas, size }; variants.set(key, cached); return cached
+  const cached = { canvas, size }
+  return rememberSpriteVariant(variants, key, cached)
 }
 
 function drawEntity(ctx: CanvasRenderingContext2D, x: number, y: number, cell: number, object: WorldObject, selected: boolean, target: boolean, selectionProgress: number, sprites: Partial<Record<UnitArtType, HTMLImageElement>>) {
@@ -977,18 +1108,15 @@ function drawEntity(ctx: CanvasRenderingContext2D, x: number, y: number, cell: n
   const image = artType ? sprites[artType] : undefined
   if (artType && image?.complete && image.naturalWidth > 0) {
     const rect = unitSpriteRect(x, y, cell, artType, image.naturalWidth / image.naturalHeight)
-    if (selected) drawSpriteSelectionRipple(ctx, image, rect, selectionProgress)
+    // The gold selection tint is baked once per sprite variant instead of
+    // running a canvas filter on every animation frame.
+    const cached = cachedUnitSprite(image, rect, cell, selected ? 'selected' : friendly ? 'friendly' : 'hostile')
+    if (selected) drawSpriteSelectionRipple(ctx, cached, rect, selectionProgress)
     else if (target) {
       ctx.save(); ctx.strokeStyle = HOSTILE_CORAL; ctx.lineWidth = cell * .034; ctx.setLineDash([cell * .07, cell * .07])
       ctx.beginPath(); ctx.arc(x, y, Math.max(rect.width, rect.height) * .64, 0, Math.PI * 2); ctx.stroke(); ctx.restore()
     }
-    if (selected) {
-      ctx.save(); ctx.shadowColor = color; ctx.shadowBlur = cell * .24; ctx.filter = 'sepia(1) saturate(2.6) hue-rotate(350deg) brightness(1.12)'
-      ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high'; ctx.drawImage(image, rect.left, rect.top, rect.width, rect.height); ctx.restore()
-    } else {
-      const cached = cachedUnitSprite(image, rect, cell, friendly)
-      ctx.drawImage(cached.canvas, rect.left - cached.padding, rect.top - cached.padding, cached.width, cached.height)
-    }
+    ctx.drawImage(cached.canvas, rect.left - cached.padding, rect.top - cached.padding, cached.width, cached.height)
     return
   }
   if (selected) {
@@ -1003,11 +1131,11 @@ function drawEntity(ctx: CanvasRenderingContext2D, x: number, y: number, cell: n
   traceEntityShape(ctx, x, y, size, object); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0
 }
 
-function cachedUnitSprite(image: HTMLImageElement, rect: { width: number; height: number }, cell: number, friendly: boolean): CachedUnitSprite {
+function cachedUnitSprite(image: HTMLImageElement, rect: { width: number; height: number }, cell: number, faction: UnitFaction): CachedUnitSprite {
   const ratio = Math.min(2, Math.max(1, typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1))
-  const blur = cell * (friendly ? .15 : .12), padding = Math.max(2, Math.ceil(blur * 1.8))
+  const blur = cell * (faction === 'friendly' ? .15 : faction === 'selected' ? .24 : .12), padding = Math.max(2, Math.ceil(blur * 1.8))
   const width = rect.width + padding * 2, height = rect.height + padding * 2
-  const key = `${friendly ? 'friendly' : 'hostile'}:${rect.width}x${rect.height}:${Math.round(blur * 10)}:${ratio}`
+  const key = `${faction}:${rect.width}x${rect.height}:${Math.round(blur * 10)}:${ratio}`
   let variants = unitSpriteCache.get(image)
   if (!variants) { variants = new Map(); unitSpriteCache.set(image, variants) }
   const existing = variants.get(key)
@@ -1015,23 +1143,24 @@ function cachedUnitSprite(image: HTMLImageElement, rect: { width: number; height
 
   const canvas = document.createElement('canvas'); canvas.width = Math.ceil(width * ratio); canvas.height = Math.ceil(height * ratio)
   const context = canvas.getContext('2d')!; context.setTransform(ratio, 0, 0, ratio, 0, 0); context.imageSmoothingEnabled = true; context.imageSmoothingQuality = 'high'
-  context.shadowColor = friendly ? PRIMARY_BLUE : HOSTILE_CORAL; context.shadowBlur = blur
-  context.filter = friendly ? 'none' : 'hue-rotate(145deg) saturate(.85) brightness(.92)'
+  context.shadowColor = faction === 'selected' ? SELECTED_GOLD : faction === 'friendly' ? PRIMARY_BLUE : HOSTILE_CORAL; context.shadowBlur = blur
+  context.filter = faction === 'selected' ? 'sepia(1) saturate(2.6) hue-rotate(350deg) brightness(1.12)' : faction === 'friendly' ? 'none' : 'hue-rotate(145deg) saturate(.85) brightness(.92)'
   context.drawImage(image, padding, padding, rect.width, rect.height)
-  const cached = { canvas, width, height, padding }; variants.set(key, cached); return cached
+  const cached = { canvas, width, height, padding }
+  return rememberSpriteVariant(variants, key, cached)
 }
 
-function drawSpriteSelectionRipple(ctx: CanvasRenderingContext2D, image: HTMLImageElement, rect: { left: number; top: number; width: number; height: number }, progress: number) {
+function drawSpriteSelectionRipple(ctx: CanvasRenderingContext2D, cached: CachedUnitSprite, rect: { left: number; top: number; width: number; height: number }, progress: number) {
   if (progress >= 1) return
   const centerX = rect.left + rect.width / 2, centerY = rect.top + rect.height / 2
-  ctx.save(); ctx.filter = 'sepia(1) saturate(2.6) hue-rotate(350deg) brightness(1.12)'; ctx.shadowColor = SELECTED_GOLD
+  ctx.save()
   for (let wave = 0; wave < 2; wave++) {
     const delay = wave * .18
     if (progress < delay) continue
     const waveProgress = Math.min(1, (progress - delay) / (1 - delay)), eased = 1 - (1 - waveProgress) ** 3, scale = 1.04 + eased * .24
-    const width = Math.round(rect.width * scale), height = Math.round(rect.height * scale)
-    ctx.globalAlpha = (1 - waveProgress) * (.34 - wave * .08); ctx.shadowBlur = Math.max(3, Math.round(Math.max(rect.width, rect.height) * (.12 + eased * .12)))
-    ctx.drawImage(image, Math.round(centerX - width / 2), Math.round(centerY - height / 2), width, height)
+    const width = cached.width * scale, height = cached.height * scale
+    ctx.globalAlpha = (1 - waveProgress) * (.34 - wave * .08)
+    ctx.drawImage(cached.canvas, centerX - width / 2, centerY - height / 2, width, height)
   }
   ctx.restore()
 }

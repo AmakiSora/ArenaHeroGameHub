@@ -1,5 +1,5 @@
 import { ChevronDown, Crosshair, Settings, X } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { memo, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { maximumHealth } from '../../lib/gameRules'
 import type { SquadKey, SquadTargetMap } from '../../lib/squadTargets'
@@ -126,7 +126,7 @@ function SquadSettingsPanel({ spec, config, onUpdateConfig, onPickCoords, pickin
   </div>
 }
 
-export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {}, onAssignTeam, teamConfig = {}, onUpdateConfig, onPickCoords, pickingCoordsField = null, squadTargets = {}, onPickSquadTarget, onRemoveSquadTarget, onClearSquadTargets, pickingSquadTarget = null }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster; onAssignTeam?: (name: string, team: TeamKey) => void; teamConfig?: TeamConfig; onUpdateConfig?: (field: string, value: number | boolean | string) => void; onPickCoords?: (xField: string, yField: string) => void; pickingCoordsField?: string | null; squadTargets?: SquadTargetMap; onPickSquadTarget?: (squad: SquadKey) => void; onRemoveSquadTarget?: (squad: SquadKey, index: number) => void; onClearSquadTargets?: (squad: SquadKey) => void; pickingSquadTarget?: SquadKey | null }) {
+export const AssetList = memo(function AssetList({ state, objects, selectedId, onSelect, unitNames = {}, teamRoster = {}, onAssignTeam, teamConfig = {}, onUpdateConfig, onPickCoords, pickingCoordsField = null, squadTargets = {}, onPickSquadTarget, onRemoveSquadTarget, onClearSquadTargets, pickingSquadTarget = null, drawer = false, onCloseDrawer }: { state: PlayerState; objects: WorldObject[]; selectedId: string | null; onSelect: (object: WorldObject) => void; unitNames?: UnitNameMap; teamRoster?: TeamRoster; onAssignTeam?: (name: string, team: TeamKey) => void; teamConfig?: TeamConfig; onUpdateConfig?: (field: string, value: number | boolean | string) => void; onPickCoords?: (xField: string, yField: string) => void; pickingCoordsField?: string | null; squadTargets?: SquadTargetMap; onPickSquadTarget?: (squad: SquadKey) => void; onRemoveSquadTarget?: (squad: SquadKey, index: number) => void; onClearSquadTargets?: (squad: SquadKey) => void; pickingSquadTarget?: SquadKey | null; drawer?: boolean; onCloseDrawer?: () => void }) {
   const { t } = useTranslation(); const controlled = useMemo(() => objects.filter((object) => object.controlled), [objects])
   const groups = useMemo(() => UNIT_GROUP_KEYS.map((key) => ({ key, members: controlled.filter((object) => groupKeyOf(object) === key) })), [controlled])
   // Production demand (生产需求): live current/target per unit type, fed by
@@ -198,7 +198,7 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
       <span className={`shrink-0 font-mono text-[9px] ${producing ? 'text-emerald-400' : 'text-blue-soft'}`}>{current}/{target}</span>
     </div>
   }
-  return <aside className="panel-strong hidden h-full min-h-0 flex-col border-y-0 border-l-0 lg:flex">
+  return <aside className={`panel-strong h-full min-h-0 flex-col border-y-0 border-l-0 ${drawer ? 'flex' : 'hidden lg:flex'}`}>
     <div className="border-b border-white/[.07]">
       <div className="px-5 py-4"><Logo /><GameStats state={state} className="mt-4" /></div>
       <div className="flex min-h-10 items-center justify-between gap-3 border-t border-white/[.07] px-4 py-2">
@@ -208,6 +208,7 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
           <span className="truncate font-display text-xs font-medium text-zinc-400">{t('game.objects')}</span>
         </h2>
         <span className="rounded-gold-sm bg-white/[.04] px-2 py-1 font-mono text-[9px] text-zinc-500">{controlled.length}</span>
+        {onCloseDrawer && <button type="button" onClick={onCloseDrawer} aria-label={t('common.close')} className="focus-ring grid size-8 shrink-0 place-items-center rounded-gold-sm text-zinc-400 transition-colors hover:bg-white/[.06] hover:text-zinc-100"><X aria-hidden="true" size={15} /></button>}
       </div>
       <div role="tablist" aria-label={t('game.fleetTabs.label')} className="flex gap-1.5 border-t border-white/[.07] px-3 py-2">
         {FLEET_VIEWS.map((key) => <button key={key} type="button" role="tab" aria-selected={view === key} onClick={() => switchView(key)} className={`focus-ring flex-1 rounded-gold px-2 py-1.5 text-xs font-medium transition-colors ${view === key ? 'bg-indigo-deep/55 text-blue-soft' : 'text-zinc-500 hover:bg-white/[.04] hover:text-zinc-200'}`}>{t(`game.fleetTabs.${key}`)}</button>)}
@@ -231,4 +232,4 @@ export function AssetList({ state, objects, selectedId, onSelect, unitNames = {}
       </section> })}
     </div>
   </aside>
-}
+})

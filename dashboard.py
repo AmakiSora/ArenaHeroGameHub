@@ -4,6 +4,7 @@ Run: python dashboard.py  -> http://localhost:4399
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import hmac
 import html
@@ -81,6 +82,12 @@ _ARENA_MIME = {
     ".map": "application/json; charset=utf-8",
 }
 
+# Vite emits content-hashed bundles (assets/<name>-<hash>.js/css/woff2); only
+# those may be cached forever. Unhashed files (index.html, assets/game art)
+# must revalidate so a deploy or sprite swap takes effect on the next load.
+_ARENA_HASHED_ASSET = re.compile(r"^assets/(?!game/).+-[A-Za-z0-9_-]{8}\.(?:js|css|woff2?)$")
+_GZIP_TYPES = {"text/html", "text/css", "text/javascript", "application/javascript", "application/json", "image/svg+xml", "text/plain"}
+
 # Upstream endpoints the browser may reach through the dashboard proxy.
 _ARENA_GET_PATHS = {"/api/v1/leaderboard", "/api/v1/me", "/api/v1/me/stats"}
 _ARENA_POST_PATHS = {"/api/v1/game/commands", "/api/v1/auth/login", "/api/v1/auth/logout"}
@@ -89,6 +96,11 @@ _ARENA_POST_PATHS = {"/api/v1/game/commands", "/api/v1/auth/login", "/api/v1/aut
 _ARENA_CSRF_COOKIE = "arena_csrf"
 _ARENA_WS_PATH = "/api/v1/game/ws"
 _WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+# Remembered session-import draft (raw upstream cookies + CSRF). Kept in the
+# dashboard process behind DASHBOARD_TOKEN instead of browser localStorage,
+# where any XSS could read it. In-memory only: a restart asks the operator to
+# paste once more, which is acceptable for a credential this sensitive.
+_SESSION_DRAFT: dict[str, str] | None = None
 
 
 # ---------- data loading --------------------------------------------------
@@ -2878,11 +2890,23 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self) -> bool:
         return self._is_loopback() or self._token_ok(self._client_token())
 
-    def _send(self, code: int, body: bytes, content_type: str, extra_headers=None):
+    def _send(self, code: int, body: bytes, content_type: str, extra_headers=None, cache_control: str = "no-store"):
         try:
+            # Text payloads (SPA bundles, JSON) compress ~3x; skip small bodies
+            # and already-compressed formats (png/webp/woff2).
+            accept = self.headers.get("Accept-Encoding", "") if getattr(self, "headers", None) else ""
+            base_type = content_type.split(";", 1)[0].strip()
+            gzip_ok = base_type in _GZIP_TYPES
+            compressed = gzip_ok and len(body) > 1024 and "gzip" in accept
+            if compressed:
+                body = gzip.compress(body, compresslevel=6)
             self.send_response(code)
             self.send_header("Content-Type", content_type)
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache_control)
+            if gzip_ok:
+                self.send_header("Vary", "Accept-Encoding")
+            if compressed:
+                self.send_header("Content-Encoding", "gzip")
             for name, value in extra_headers or ():
                 self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
@@ -2945,7 +2969,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
         mime = _ARENA_MIME.get(target.suffix.lower(), "application/octet-stream")
-        self._send(200, body, mime)
+        cache_control = "public, max-age=31536000, immutable" if _ARENA_HASHED_ASSET.match(rel) else "no-cache"
+        self._send(200, body, mime, cache_control=cache_control)
 
     # ---- reverse proxy to the game API (injects the server-side key) -------
 
@@ -3095,6 +3120,8 @@ class Handler(BaseHTTPRequestHandler):
             user = {}
         print(f"[arena-proxy] session import ok for {user.get('username', '?')} "
               f"({len(pairs)} cookie(s), csrf={'yes' if csrf else 'no'})", flush=True)
+        global _SESSION_DRAFT
+        _SESSION_DRAFT = {"cookies": cookie_header, "csrf": csrf}
         self._send(200, json.dumps({"ok": True, "user": user, "csrf_token": csrf}, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8", extra_headers=set_cookies)
 
@@ -3340,6 +3367,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/arena" or path.startswith("/arena/"):
             self._serve_arena_spa(path)
             return
+        if path == "/api/session/draft":
+            self._send_json(200, {"ok": True, "draft": _SESSION_DRAFT})
+            return
         if path in _ARENA_GET_PATHS:
             self._proxy_arena_get(path)
             return
@@ -3555,6 +3585,24 @@ class Handler(BaseHTTPRequestHandler):
             # and imports it; we validate it upstream, then rebind it to
             # this origin so later requests flow through the MANUAL slot.
             self._import_session(raw)
+            return
+        if path == "/api/session/draft":
+            # One-time migration of a legacy browser-stored draft, or an
+            # explicit save. Format-check only: the upstream validation
+            # happens on the actual import.
+            global _SESSION_DRAFT
+            data = self._parse_body(raw)
+            cookies = str(data.get("cookies", "")).strip()
+            csrf = str(data.get("csrf", "")).strip()
+            if not cookies or not csrf or len(cookies) > 8192 or len(csrf) > 512:
+                self._send_json(400, {"ok": False, "error": "SESSION_IMPORT_INVALID"})
+                return
+            _SESSION_DRAFT = {"cookies": cookies, "csrf": csrf}
+            self._send_json(200, {"ok": True})
+            return
+        if path == "/api/session/draft/clear":
+            _SESSION_DRAFT = None
+            self._send_json(200, {"ok": True})
             return
         if path in _ARENA_POST_PATHS:
             # Game command plan: forward upstream with the server-side key.

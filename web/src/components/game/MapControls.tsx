@@ -1,4 +1,5 @@
 import { Eye, EyeOff, Focus, Minus, Plus } from 'lucide-react'
+import { memo } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { EnemySightingType } from '../../lib/enemyMemory'
 import { UnitArtIcon } from './UnitArtIcon'
@@ -7,7 +8,7 @@ import { UnitArtIcon } from './UnitArtIcon'
 // the master toggle only.
 export const ENEMY_FILTER_TYPES = ['WORKER', 'VANGUARD', 'RANGER', 'CORE'] as const
 
-export function MapControls({ onCenter, onZoom, beaconIndicatorVisible = true, onToggleBeaconIndicator, coreIndicatorVisible = true, onToggleCoreIndicator, memoryVisible = false, onToggleMemory, routesVisible = false, onToggleRoutes, obstaclesVisible = true, onToggleObstacles, memoryFilters, onToggleMemoryFilter }: { onCenter: () => void; onZoom: (direction: number) => void; beaconIndicatorVisible?: boolean; onToggleBeaconIndicator?: () => void; coreIndicatorVisible?: boolean; onToggleCoreIndicator?: () => void; memoryVisible?: boolean; onToggleMemory?: () => void; routesVisible?: boolean; onToggleRoutes?: () => void; obstaclesVisible?: boolean; onToggleObstacles?: () => void; memoryFilters?: ReadonlySet<EnemySightingType>; onToggleMemoryFilter?: (type: EnemySightingType) => void }) {
+export const MapControls = memo(function MapControls({ onCenter, onZoom, beaconIndicatorVisible = true, onToggleBeaconIndicator, coreIndicatorVisible = true, onToggleCoreIndicator, memoryVisible = false, onToggleMemory, routesVisible = false, onToggleRoutes, obstaclesVisible = true, onToggleObstacles, memoryFilters, onToggleMemoryFilter }: { onCenter: () => void; onZoom: (direction: number) => void; beaconIndicatorVisible?: boolean; onToggleBeaconIndicator?: () => void; coreIndicatorVisible?: boolean; onToggleCoreIndicator?: () => void; memoryVisible?: boolean; onToggleMemory?: () => void; routesVisible?: boolean; onToggleRoutes?: () => void; obstaclesVisible?: boolean; onToggleObstacles?: () => void; memoryFilters?: ReadonlySet<EnemySightingType>; onToggleMemoryFilter?: (type: EnemySightingType) => void }) {
   const { t } = useTranslation(); const buttons = [
     { label: t('game.center'), icon: Focus, action: onCenter },
     { label: t('game.zoomIn'), icon: Plus, action: () => onZoom(1) },
@@ -18,7 +19,7 @@ export function MapControls({ onCenter, onZoom, beaconIndicatorVisible = true, o
   const memoryLabel = memoryVisible ? t('game.hideEnemyMemory') : t('game.showEnemyMemory')
   const routesLabel = routesVisible ? t('game.hideUnitRoutes') : t('game.showUnitRoutes')
   const obstaclesLabel = obstaclesVisible ? t('game.hideObstacles') : t('game.showObstacles')
-  return <div className="panel absolute bottom-4 left-4 z-20 flex items-center rounded-gold p-1">
+  return <div className="panel absolute bottom-4 left-16 z-20 flex max-w-[calc(100%-12rem)] items-center overflow-x-auto rounded-gold p-1 lg:left-4 lg:max-w-[calc(100%-2rem)] [&>button]:shrink-0">
     {buttons.map(({ label, icon: Icon, action }) => <button key={label} onClick={action} aria-label={label} title={label} className="focus-ring grid size-11 place-items-center rounded-gold-sm text-zinc-400 transition-colors hover:bg-white/[.06] hover:text-zinc-100"><Icon size={18} /></button>)}
     {onToggleBeaconIndicator && <button onClick={onToggleBeaconIndicator} aria-label={beaconIndicatorLabel} aria-pressed={beaconIndicatorVisible} title={beaconIndicatorLabel} className={`focus-ring grid size-11 place-items-center rounded-gold-sm transition-colors ${beaconIndicatorVisible ? 'bg-[#d9a62e]/[.14] text-[#e1b64e]' : 'text-zinc-400 hover:bg-white/[.06] hover:text-zinc-100'}`}>{beaconIndicatorVisible ? <Eye size={18} /> : <EyeOff size={18} />}</button>}
     {onToggleCoreIndicator && <button onClick={onToggleCoreIndicator} aria-label={coreIndicatorLabel} aria-pressed={coreIndicatorVisible} title={coreIndicatorLabel} className={`focus-ring grid size-11 place-items-center rounded-gold-sm transition-colors ${coreIndicatorVisible ? 'bg-cyan-signal/[.14] text-cyan-signal' : 'text-zinc-400 hover:bg-white/[.06] hover:text-zinc-100'}`}>{coreIndicatorVisible ? <Eye size={18} /> : <EyeOff size={18} />}</button>}
@@ -41,4 +42,4 @@ export function MapControls({ onCenter, onZoom, beaconIndicatorVisible = true, o
       </button>
     })}
   </div>
-}
+})

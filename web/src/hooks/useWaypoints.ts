@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { loadWaypoints, type WaypointMap } from '../lib/waypoints'
+import { sameJSON } from '../lib/stableState'
 
 // Manual per-unit target queues from the tactic dashboard (/api/waypoints).
 // Refreshed on every new Tick — the bot clears targets as units arrive — and
@@ -10,7 +11,7 @@ export function useWaypoints(tick: number | null, enabled = true) {
   useEffect(() => {
     if (!enabled) { setWaypoints({}); return }
     let cancelled = false
-    void loadWaypoints().then((next) => { if (!cancelled) setWaypoints(next) })
+    void loadWaypoints().then((next) => { if (!cancelled) setWaypoints((current) => sameJSON(current, next) ? current : next) })
     return () => { cancelled = true }
   }, [tick, epoch, enabled])
   const refresh = useCallback(() => setEpoch((value) => value + 1), [])

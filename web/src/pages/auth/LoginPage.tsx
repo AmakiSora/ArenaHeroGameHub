@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router'
 import { AuthCard, FormError, FormField } from '../../components/auth/AuthCard'
 import { useAuth } from '../../context/AuthContext'
-import { api, getImportDraft } from '../../lib/api'
+import { api, fetchImportDraft } from '../../lib/api'
 import { getErrorMessage } from '../../lib/errorMessage'
 
 type LoginMode = 'import' | 'password'
@@ -28,23 +28,26 @@ export function LoginPage() {
   // also expired, the prefilled fields stay — only the changed values need
   // replacing before clicking "Import session" again.
   useEffect(() => {
-    const draft = getImportDraft()
-    if (!draft) return
-    setCookies(draft.cookies); setCsrf(draft.csrf)
-    if (loading || user || autoImportTried.current) return
-    autoImportTried.current = true
-    setRestoring(true)
-    void (async () => {
-      try {
-        await api.importSession(draft.cookies, draft.csrf)
-        if (await refresh()) navigate('/', { replace: true })
-        else setError('SESSION_IMPORT_EXPIRED')
-      } catch (cause) {
-        setError(getErrorMessage(cause))
-      } finally {
-        setRestoring(false)
-      }
-    })()
+    let cancelled = false
+    void fetchImportDraft().then((draft) => {
+      if (cancelled || !draft) return
+      setCookies(draft.cookies); setCsrf(draft.csrf)
+      if (loading || user || autoImportTried.current) return
+      autoImportTried.current = true
+      setRestoring(true)
+      void (async () => {
+        try {
+          await api.importSession(draft.cookies, draft.csrf)
+          if (await refresh()) navigate('/', { replace: true })
+          else setError('SESSION_IMPORT_EXPIRED')
+        } catch (cause) {
+          setError(getErrorMessage(cause))
+        } finally {
+          setRestoring(false)
+        }
+      })()
+    })
+    return () => { cancelled = true }
   }, [loading, user, refresh, navigate])
   const switchMode = (next: LoginMode) => { setMode(next); setError('') }
   const submit = async (event: FormEvent) => { event.preventDefault(); setBusy(true); setError(''); try { await login(email, password); navigate('/') } catch (cause) { setError(getErrorMessage(cause)) } finally { setBusy(false) } }

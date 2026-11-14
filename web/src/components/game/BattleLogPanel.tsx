@@ -1,5 +1,5 @@
 import { ChevronDown, ScrollText } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   BATTLE_LOG_CATEGORIES,
@@ -79,7 +79,7 @@ function loadWindow(): number | 'all' {
   return raw !== null && Number.isFinite(value) && value >= 1 ? value : 'all'
 }
 
-export function BattleLogPanel({ tick, enabled, onJump }: Props) {
+export const BattleLogPanel = memo(function BattleLogPanel({ tick, enabled, onJump }: Props) {
   const { t, i18n } = useTranslation()
   const [expanded, setExpanded] = useState(true)
   const [entries, setEntries] = useState<BattleLogEntry[]>(() => enabled ? [] : demoEntries())
@@ -104,9 +104,17 @@ export function BattleLogPanel({ tick, enabled, onJump }: Props) {
     new Intl.DateTimeFormat(i18n.language, { hour: '2-digit', minute: '2-digit', second: '2-digit' }), [i18n.language])
   // Rows older than the selected time window are hidden; 'all' disables it.
   const cutoff = logWindow === 'all' ? null : now / 1000 - logWindow
-  const visible = entries.filter((entry) =>
+  // Coordinate segments are parsed once per fetch, not on every render, and
+  // each row keeps the key of its position in the fetched batch so toggling
+  // a filter never remounts the surviving rows.
+  const parsed = useMemo(() => entries.map((entry, index) => ({
+    entry,
+    key: `${entry.ts ?? 'x'}-${entry.tick ?? 'x'}-${index}`,
+    segments: splitLogMessage(entry.msg),
+  })), [entries])
+  const visible = useMemo(() => parsed.filter(({ entry }) =>
     filters[entry.cat] !== false
-    && (cutoff === null || (entry.ts !== null && entry.ts >= cutoff)))
+    && (cutoff === null || (entry.ts !== null && entry.ts >= cutoff))), [cutoff, filters, parsed])
   const toggleFilter = (category: BattleLogCategory) => setFilters((current) => {
     const next = { ...current, [category]: current[category] === false }
     try { localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(next)) } catch { /* storage full is non-fatal */ }
@@ -161,13 +169,13 @@ export function BattleLogPanel({ tick, enabled, onJump }: Props) {
     </div>}
     {expanded && <div className="max-h-[min(30dvh,16rem)] overflow-y-auto border-t border-white/[.07]">
       {visible.length ? <ul className="px-3.5 py-2">
-        {visible.slice(0, ROW_RENDER_CAP).map((entry, index) => <li key={`${entry.ts ?? ''}-${entry.tick ?? ''}-${index}`} className="flex gap-2 py-1">
+        {visible.slice(0, ROW_RENDER_CAP).map(({ entry, key, segments }) => <li key={key} className="flex gap-2 py-1">
           <span className="w-16 shrink-0 pt-px text-right font-mono text-[9px] leading-4 text-zinc-600">
             {entry.ts !== null ? timeFormat.format(new Date(entry.ts * 1000)) : ''}
             {entry.tick !== null ? ` ·t${entry.tick}` : ''}
           </span>
           <span className={`min-w-0 flex-1 break-words text-[10px] leading-4 ${CATEGORY_TONES[entry.cat] ?? 'text-zinc-300'}`}>
-            {splitLogMessage(entry.msg).map((segment, segmentIndex) => segment.kind === 'coord'
+            {segments.map((segment, segmentIndex) => segment.kind === 'coord'
               ? <button
                 key={segmentIndex}
                 type="button"
@@ -182,4 +190,4 @@ export function BattleLogPanel({ tick, enabled, onJump }: Props) {
       </ul> : <p className="px-3.5 py-3 text-[11px] text-zinc-500">{t('game.battleLogEmpty')}</p>}
     </div>}
   </section>
-}
+})

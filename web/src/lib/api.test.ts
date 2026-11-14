@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api, apiURL, getImportDraft, setCSRF } from './api'
+import { api, apiURL, fetchImportDraft, setCSRF } from './api'
 
 describe('API URL', () => {
   it('keeps dashboard-proxied requests relative', () => {
@@ -85,34 +85,53 @@ describe('manual command API', () => {
     expect(localStorage.getItem('arena-hero.csrf')).toBe('csrf-imported')
   })
 
-  it('remembers imported credentials so the next login can reuse them', async () => {
+  it('keeps imported credentials out of browser storage', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true, user: { username: 'operator' }, csrf_token: 'csrf-imported' }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
 
     await api.importSession('arena_session=abc; other=1', 'csrf-imported')
 
-    expect(getImportDraft()).toEqual({ cookies: 'arena_session=abc; other=1', csrf: 'csrf-imported' })
+    expect(localStorage.getItem('arena-hero.import-draft')).toBeNull()
   })
 
-  it('does not remember a failed import and ignores corrupt drafts', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: false, error: 'SESSION_IMPORT_EXPIRED' }), { status: 401, headers: { 'Content-Type': 'application/json' } }))
+  it('reads the remembered draft from the dashboard server', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true, draft: { cookies: 'arena_session=abc; other=1', csrf: 'csrf-imported' } }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
 
+    await expect(fetchImportDraft()).resolves.toEqual({ cookies: 'arena_session=abc; other=1', csrf: 'csrf-imported' })
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/session/draft')
+  })
+
+  it('migrates a legacy localStorage draft to the server once', async () => {
+    localStorage.setItem('arena-hero.import-draft', JSON.stringify({ cookies: 'arena_session=abc', csrf: 'csrf-x' }))
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+
+    await expect(fetchImportDraft()).resolves.toEqual({ cookies: 'arena_session=abc', csrf: 'csrf-x' })
+    const [path, init] = fetchMock.mock.calls[0]
+    expect(path).toBe('/api/session/draft')
+    expect(init?.method).toBe('POST')
+    expect(localStorage.getItem('arena-hero.import-draft')).toBeNull()
+  })
+
+  it('ignores corrupt drafts and unreachable draft endpoints', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: false, error: 'SESSION_IMPORT_EXPIRED' }), { status: 401, headers: { 'Content-Type': 'application/json' } }))
     await expect(api.importSession('arena_session=stale', 'csrf-old')).rejects.toThrow('SESSION_IMPORT_EXPIRED')
-    expect(getImportDraft()).toBeNull()
 
     localStorage.setItem('arena-hero.import-draft', '{not json')
-    expect(getImportDraft()).toBeNull()
-    localStorage.setItem('arena-hero.import-draft', JSON.stringify({ cookies: '  ', csrf: 'x' }))
-    expect(getImportDraft()).toBeNull()
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true, draft: { cookies: '  ', csrf: 'x' } }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await expect(fetchImportDraft()).resolves.toBeNull()
+
+    vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('Failed to fetch'))
+    await expect(fetchImportDraft()).resolves.toBeNull()
   })
 
   it('drops the remembered credentials on logout', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }))
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(null, { status: 204 }))
     setCSRF('csrf-x')
     localStorage.setItem('arena-hero.import-draft', JSON.stringify({ cookies: 'arena_session=abc', csrf: 'csrf-x' }))
 
     await api.logout()
 
     expect(localStorage.getItem('arena-hero.csrf')).toBeNull()
-    expect(getImportDraft()).toBeNull()
+    expect(localStorage.getItem('arena-hero.import-draft')).toBeNull()
+    expect(fetchMock.mock.calls.some(([path]) => path === '/api/session/draft/clear')).toBe(true)
   })
 })

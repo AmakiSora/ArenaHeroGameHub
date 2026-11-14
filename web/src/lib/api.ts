@@ -24,26 +24,59 @@ export const setCSRF = (token: string) => localStorage.setItem(csrfKey, token)
 export const clearCSRF = () => localStorage.removeItem(csrfKey)
 
 // The pasted official-site credentials stay valid upstream until that session
-// expires, and re-importing them is idempotent — so a successful import
-// remembers both values; the login page prefills them and silently retries
-// the import instead of asking the operator to copy from DevTools again.
-const importDraftKey = 'arena-hero.import-draft'
+// expires, and re-importing them is idempotent. The draft lives on the
+// dashboard server (behind DASHBOARD_TOKEN), never in browser storage where
+// any XSS could read raw session cookies. A pre-existing localStorage draft
+// is migrated server-side once, then deleted locally.
+const legacyImportDraftKey = 'arena-hero.import-draft'
 
 export interface ImportDraft { cookies: string; csrf: string }
 
-export function getImportDraft(): ImportDraft | null {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(importDraftKey) ?? 'null') as Partial<ImportDraft> | null
-    if (parsed && typeof parsed.cookies === 'string' && typeof parsed.csrf === 'string' && parsed.cookies.trim() && parsed.csrf.trim()) {
-      return { cookies: parsed.cookies, csrf: parsed.csrf }
-    }
-  } catch {
-    // Corrupt draft: treat as absent, it gets replaced on the next import.
+function parseDraft(value: unknown): ImportDraft | null {
+  if (!value || typeof value !== 'object') return null
+  const parsed = value as Partial<ImportDraft>
+  if (typeof parsed.cookies === 'string' && typeof parsed.csrf === 'string' && parsed.cookies.trim() && parsed.csrf.trim()) {
+    return { cookies: parsed.cookies, csrf: parsed.csrf }
   }
   return null
 }
-export const setImportDraft = (cookies: string, csrf: string) => localStorage.setItem(importDraftKey, JSON.stringify({ cookies, csrf }))
-export const clearImportDraft = () => localStorage.removeItem(importDraftKey)
+
+function readLegacyDraft(): ImportDraft | null {
+  try {
+    return parseDraft(JSON.parse(localStorage.getItem(legacyImportDraftKey) ?? 'null'))
+  } catch {
+    return null
+  }
+}
+
+export async function fetchImportDraft(): Promise<ImportDraft | null> {
+  const legacy = readLegacyDraft()
+  if (legacy) {
+    try {
+      await request<{ ok: boolean }>('/api/session/draft', { method: 'POST', body: JSON.stringify(legacy) })
+      localStorage.removeItem(legacyImportDraftKey)
+    } catch {
+      // Dashboard unreachable (dev/demo): keep the legacy draft for prefill
+      // and retry the migration on the next visit.
+    }
+    return legacy
+  }
+  try {
+    const data = await request<{ ok: boolean; draft: unknown }>('/api/session/draft')
+    return parseDraft(data.draft)
+  } catch {
+    return null
+  }
+}
+
+export async function clearImportDraft(): Promise<void> {
+  localStorage.removeItem(legacyImportDraftKey)
+  try {
+    await request('/api/session/draft/clear', { method: 'POST' })
+  } catch {
+    // Best effort: the server draft is also replaced by the next import.
+  }
+}
 
 // crypto.randomUUID() exists only in secure contexts (https / localhost).
 // The dashboard is served over plain http, where it is undefined and every
@@ -59,16 +92,20 @@ export function apiURL(path: string, baseURL = import.meta.env.VITE_API_BASE_URL
   return `${baseURL.trim().replace(/\/+$/, '')}${path}`
 }
 
+// A hung request must never wedge the serial command-submit queue: every
+// call gets a hard deadline and rejects with REQUEST_FAILED on timeout.
+const REQUEST_TIMEOUT_MS = 15_000
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   if (init.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
   let response: Response
   try {
-    response = await fetch(apiURL(path), { ...init, headers, credentials: 'include' })
+    response = await fetch(apiURL(path), { ...init, headers, credentials: 'include', signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
   } catch (cause) {
     // fetch itself threw: the request never reached the dashboard. Surface
-    // the browser's reason (mixed content, https upgrade, net failure) — it
-    // is the decisive clue, far more than a bare REQUEST_FAILED code.
+    // the browser's reason (mixed content, https upgrade, net failure,
+    // timeout) — it is the decisive clue, far more than a bare code.
     const detail = cause instanceof Error && cause.message ? ` ${cause.message}` : ''
     throw new APIError(`REQUEST_FAILED${detail}`, 0)
   }
@@ -94,20 +131,20 @@ export const api = {
     clearCSRF()
     // Logout invalidates the session upstream, so the remembered credentials
     // would only fail on the next silent re-import — drop them too.
-    clearImportDraft()
+    await clearImportDraft()
   },
   // Dashboard-local: OAuth-only accounts (LINUX DO / GitHub) cannot log in
   // through the proxy, so their official-site session cookie is imported,
   // validated upstream and rebound to this origin. The CSRF token (copied
   // from the official site's localStorage) is mandatory for the session
-  // credential's MANUAL command POSTs and is stored here for later requests.
+  // credential's MANUAL command POSTs; the dashboard keeps it in a
+  // proxy-owned cookie and remembers the import draft server-side.
   importSession: async (cookies: string, csrf: string) => {
     const result = await request<{ ok: boolean; user: User; csrf_token: string }>('/api/v1/session/import', {
       method: 'POST',
       body: JSON.stringify({ cookies, csrf }),
     })
     if (result.csrf_token) setCSRF(result.csrf_token)
-    setImportDraft(cookies, csrf)
     return result
   },
   submitCommands: (plan: CommandPlan) => request<Receipt>('/api/v1/game/commands', {

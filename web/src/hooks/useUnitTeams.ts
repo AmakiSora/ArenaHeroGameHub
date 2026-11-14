@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { loadTeamRoster, moveUnitInRoster, saveStrategyConfig, saveTeamRoster, saveTeamSettings, type TeamKey, type TeamRoster } from '../lib/teamRoster'
 import { TEAM_SETTING_FIELDS, type TeamConfig } from '../lib/teamSettings'
+import { sameRecord } from '../lib/stableState'
 
 // Combat-squad rosters (守家/进攻/风筝/游击) and squad settings come from the
 // tactic dashboard's /api/teams endpoint; refresh on every new tick so roster
@@ -15,7 +16,7 @@ export function useUnitTeams(tick: number | null, enabled = true) {
   useEffect(() => {
     if (!enabled) return
     let cancelled = false
-    void loadTeamRoster().then((next) => { if (!cancelled) { setRoster(next.roster); setConfig(next.config) } })
+    void loadTeamRoster().then((next) => { if (!cancelled) { setRoster((current) => sameRecord(current, next.roster) ? current : next.roster); setConfig((current) => sameRecord(current, next.config) ? current : next.config) } })
     return () => { cancelled = true }
   }, [tick, enabled])
   // Drag & drop assignment: the chip moves instantly (optimistic), the save
