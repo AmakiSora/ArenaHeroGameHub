@@ -1512,6 +1512,49 @@ class WorkerEnemyEvasionTests(unittest.TestCase):
         self.assertEqual(action, "HARVEST")
         self.assertTrue(worker.harvested)
 
+    def test_diagonal_ranger_outside_manhattan_radius_flees(self) -> None:
+        # A Ranger at (2,2) relative to the worker is Chebyshev 2 — a legal
+        # diagonal shot — but Manhattan 4, outside the radius-3 trigger. The
+        # old radius-only test let workers harvest calmly and die at camped
+        # mines; the real attack geometry must force evasion.
+        worker = self.Worker((5, 0))
+        config = default_config()
+        try:
+            action, detail = tactic._plan_worker(
+                worker,
+                self.Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset(),
+                depleted=set(),
+                config=config,
+                enemies=(self.Enemy((7, 2), unit_type="RANGER"),),
+            )
+        finally:
+            self._clear_worker_state()
+        self.assertEqual(action, "MOVE")
+        self.assertIn("flee", detail)
+        self.assertFalse(worker.harvested)
+
+    def test_diagonal_ranger_blocked_by_wall_does_not_flee(self) -> None:
+        # Same diagonal offset, but a wall on the shot line means the Ranger
+        # cannot actually hit the worker → no evasion (geometry, not radius).
+        worker = self.Worker((5, 0))
+        config = default_config()
+        try:
+            action, _ = tactic._plan_worker(
+                worker,
+                self.Core(),
+                resource_cells=frozenset({(5, 0)}),
+                obstacle_cells=frozenset({(6, 1)}),
+                depleted=set(),
+                config=config,
+                enemies=(self.Enemy((7, 2), unit_type="RANGER"),),
+            )
+        finally:
+            self._clear_worker_state()
+        self.assertEqual(action, "HARVEST")
+        self.assertTrue(worker.harvested)
+
     def test_evasion_disabled_by_radius_zero(self) -> None:
         worker = self.Worker((5, 0))
         config = default_config()
@@ -10807,17 +10850,22 @@ class WorkerContestedBackoffTests(unittest.TestCase):
         rejection at all, so the tally is kept per origin instead of rebuilt.
         """
         seen: list = []
+        events = [self._contested_event()]
         for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 3):
-            details = self._run(tick=tick, events=[self._contested_event()])
+            details = self._run(tick=tick, events=events)
             seen.append((
                 tick,
                 details["worker-1"],
                 tactic._worker_contest_blocked.get("worker-1", (None, None))[0],
                 tactic._worker_planned_step.get("worker-1", (None, None))[1],
             ))
+            # The claimant holds only (4,0); a step routed around it lands and is
+            # not refused, so the park must not learn it as a second boxed cell.
+            dest = tactic._worker_planned_step.get("worker-1", (None, None))[1]
+            events = [self._contested_event()] if dest == (4, 0) else []
 
-        blocked_cell, until = tactic._worker_contest_blocked["worker-1"]
-        self.assertEqual(blocked_cell, (4, 0))
+        blocked_cells, until = tactic._worker_contest_blocked["worker-1"]
+        self.assertEqual(blocked_cells, frozenset({(4, 0)}))
         self.assertGreater(until, tactic.turn_context.tick)
         # (4,0) is the straight line to the Core at (0,0): with it parked the
         # plan must step somewhere else rather than re-issuing the refused move.
@@ -10832,7 +10880,10 @@ class WorkerContestedBackoffTests(unittest.TestCase):
         parked = [(tick, plan, blocked, dest) for tick, plan, blocked, dest in seen
                   if blocked is not None]
         self.assertTrue(parked, seen)
-        self.assertEqual({blocked for _t, _p, blocked, _d in parked}, {(4, 0)}, seen)
+        self.assertEqual(
+            {blocked for _t, _p, blocked, _d in parked},
+            {frozenset({(4, 0)})}, seen,
+        )
         for _tick, plan, _blocked, dest in parked:
             self.assertNotEqual(dest, (4, 0), seen)
             self.assertTrue(plan.startswith("MOVE"), seen)
@@ -10969,11 +11020,17 @@ class AttackContestAvoidanceTests(unittest.TestCase):
 
     def test_repeated_refusals_park_the_cell_and_route_around_it(self) -> None:
         details = {}
+        events = [self._refusal()]
         for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 2):
-            details = self._run(tick=tick, events=[self._refusal()])
+            details = self._run(tick=tick, events=events)
+            # Only the (4,0) claimant is real: once the march routes around it the
+            # alternative step lands, so it is not refused (a fresh refusal is
+            # what lets the park learn an additional boxed-in neighbour).
+            dest = tactic._worker_planned_step.get("ranger-5", (None, None))[1]
+            events = [self._refusal()] if dest == (4, 0) else []
         blocked = tactic._worker_contest_blocked.get("ranger-5")
         self.assertIsNotNone(blocked, "combat repeats must park the refused cell")
-        self.assertEqual(blocked[0], (4, 0))
+        self.assertEqual(blocked[0], frozenset({(4, 0)}))
         self.assertTrue(details["ranger-5"].startswith("MOVE"), details)
         self.assertIn("contest-avoid=(4, 0)", details["ranger-5"], details)
         self.assertNotEqual(
@@ -11002,17 +11059,38 @@ class AttackContestAvoidanceTests(unittest.TestCase):
         self.assertEqual(origin, (0, 0), first)
 
         details = {}
+        events = [self._refusal((0, 0))]
         for tick in range(2, tactic._WORKER_CONTEST_BLOCK_AFTER + 3):
             details = self._run(
-                tick=tick, events=[self._refusal((0, 0))], pos=(0, 0), team="home",
+                tick=tick, events=events, pos=(0, 0), team="home",
             )
+            # The claimant holds only ``dest``; a step routed around it lands.
+            last = tactic._worker_planned_step.get("ranger-5", (None, None))[1]
+            events = [self._refusal((0, 0))] if last == dest else []
         blocked = tactic._worker_contest_blocked.get("ranger-5")
         self.assertIsNotNone(blocked, "home repeats must park the refused cell")
-        self.assertEqual(blocked[0], dest, details)
+        self.assertEqual(blocked[0], frozenset({dest}), details)
         self.assertTrue(details["ranger-5"].startswith("MOVE"), details)
         self.assertIn(f"contest-avoid={dest}", details["ranger-5"], details)
         self.assertNotEqual(
             tactic._worker_planned_step["ranger-5"][1], dest, details,
+        )
+
+    def test_boxed_unit_parks_every_refused_neighbour(self) -> None:
+        """V27 logged 3456 MOVE_CONTESTED re-issuing the one non-parked direction.
+
+        When several neighbours are genuinely contested (a fresh refusal fires
+        for each attempted step), the park must learn them all instead of staying
+        pinned to the first refusal while the unit hammers the alternative.
+        """
+        for tick in range(1, tactic._WORKER_CONTEST_BLOCK_AFTER + 3):
+            self._run(tick=tick, events=[self._refusal()])
+        blocked = tactic._worker_contest_blocked.get("ranger-5")
+        self.assertIsNotNone(blocked)
+        self.assertIn((4, 0), blocked[0])
+        self.assertGreaterEqual(
+            len(blocked[0]), 2,
+            "a unit refused on multiple steps must park more than the first cell",
         )
 
 
@@ -14035,6 +14113,160 @@ class OrbitBreakAndSweepFuseConfigTests(unittest.TestCase):
             self.assertFalse(tactic_config.validate_config({key: False})[key])
             with self.assertRaises(tactic_config.ConfigValidationError):
                 tactic_config.validate_config({key: "yes"})
+
+
+class ReviewImprovementTests(unittest.TestCase):
+    """Regressions for the log-review fixes: danger-aware mining geometry,
+    hit-prospect target selection, dead-unit naming and the core A* negative
+    cache."""
+
+    class Enemy:
+        def __init__(self, position, unit_type="RANGER", eid=None) -> None:
+            self.id = eid or f"e-{position[0]}-{position[1]}"
+            self.position = position
+            self.unit_type = unit_type
+
+    class Ranger:
+        def __init__(self, position) -> None:
+            self.id = "r-test"
+            self.position = position
+            self.shot_target = None
+            self.expected_cell = None
+
+        def shoot(self, target, *, expected_cell=None) -> None:
+            self.shot_target = target
+            self.expected_cell = expected_cell
+
+    def setUp(self) -> None:
+        self._tracks = {
+            k: list(v) for k, v in tactic._enemy_motion_tracks.items()
+        }
+        tactic._enemy_motion_tracks.clear()
+        tactic._object_names[("R", "r-test")] = "R99"
+
+    def tearDown(self) -> None:
+        tactic._enemy_motion_tracks.clear()
+        tactic._enemy_motion_tracks.update(self._tracks)
+        tactic._object_names.pop(("R", "r-test"), None)
+
+    def test_enemy_danger_cells_covers_diagonal_ranger(self) -> None:
+        danger = tactic._enemy_danger_cells(
+            (self.Enemy((0, 0), "RANGER"),), frozenset(), 3,
+        )
+        # Diagonal (2,2) is a legal Ranger shot (Chebyshev 2) even though its
+        # Manhattan distance is 4 — the mine there must be flagged unsafe.
+        self.assertIn((2, 2), danger)
+        self.assertIn((3, 3), danger)
+        self.assertIn((3, 0), danger)
+        # Off-line cells are not shot lines.
+        self.assertNotIn((2, 1), danger)
+        # A wall on the diagonal blocks the shot line.
+        blocked = tactic._enemy_danger_cells(
+            (self.Enemy((0, 0), "RANGER"),), frozenset({(1, 1)}), 3,
+        )
+        self.assertNotIn((2, 2), blocked)
+
+    def test_ranger_prefers_stationary_over_nearer_mover(self) -> None:
+        ranger = self.Ranger((0, 0))
+        mover = self.Enemy((1, 0), "VANGUARD", eid="mover")
+        still = self.Enemy((3, 0), "VANGUARD", eid="still")
+        # mover steps every tick; still holds position.
+        for tick in range(4):
+            tactic._update_enemy_motion_tracks((mover,), tick)
+            mover.position = (1 + tick, 0)
+        tactic._update_enemy_motion_tracks((still,), 0)
+        tactic._update_enemy_motion_tracks((still,), 1)
+        tactic._update_enemy_motion_tracks((still,), 2)
+        mover.position = (1, 0)
+        tactic.turn_context.shot_predictions = []
+        action, _ = tactic._ranger_best_shot(
+            ranger, (0, 0), (mover, still), frozenset(), 3,
+        )
+        self.assertEqual(action, "SHOOT")
+        # The farther stationary target outranks the adjacent mover (~96% vs ~3%
+        # current-cell hit rate).
+        self.assertIs(ranger.shot_target, still)
+
+    def test_dead_unit_name_preserved(self) -> None:
+        turn = SimpleNamespace(units=(), visible_enemies=(), core=None)
+        tactic.turn_context.dead_unit_names = {"w-dead": "W7"}
+        try:
+            name = tactic._battle_actor_name(turn, "w-dead")
+        finally:
+            tactic.turn_context.dead_unit_names = {}
+        self.assertEqual(name, "W7")
+
+    def test_enemy_kill_is_not_logged_as_defeat(self) -> None:
+        turn = SimpleNamespace(units=(), visible_enemies=(), core=None)
+        event = SimpleNamespace(
+            event_type="UNIT_DAMAGED", reason_code=None,
+            actor_id="r-1", target_id="e-1", position=(2, 0),
+            values={"damage": 2, "hp": 0},
+        )
+        tactic.turn_context.dead_unit_names = {"e-1": "E3"}
+        try:
+            cat, msg = tactic._classify_battle_event(turn, event, {})
+        finally:
+            tactic.turn_context.dead_unit_names = {}
+        self.assertEqual(cat, "kill")
+        self.assertIn("E3", msg)
+
+    def test_core_unreachable_target_caches_failure(self) -> None:
+        core = SimpleNamespace(
+            id="core", position=(0, 0), hp=5, shield=10,
+            view=SimpleNamespace(state=CoreState.NORMAL),
+            spawn=lambda unit_type: None, heal=lambda: None,
+            repair_shield=lambda: None, pickup_beacon=lambda: None,
+            start_move=lambda direction: None, wait=lambda: None,
+        )
+        # (1,0) walls the primary heading; the target (5,0) is sealed on all
+        # four sides so A* can never reach it within budget.
+        walls = frozenset({(1, 0), (4, 0), (6, 0), (5, 1), (5, -1)})
+        config = default_config()
+        config["core_movement_enabled"] = True
+        config["core_target_enabled"] = True
+        config["core_target_x"] = 5
+        config["core_target_y"] = 0
+        config["target_workers"] = 0
+        config["target_vanguards"] = 0
+        config["target_rangers"] = 0
+        config["cargo_wait_distance"] = 0
+        calls = {"n": 0}
+        real_bfs = tactic._bfs_path
+
+        def counting_bfs(*args, **kwargs):
+            calls["n"] += 1
+            return real_bfs(*args, **kwargs)
+
+        tactic._core_target_path_cache.clear()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            with patch.object(tactic, "load_config", return_value=config), \
+                 patch.object(tactic, "_bfs_path", counting_bfs), \
+                 patch.object(tactic, "MAP_MEMORY_PATH", temp / "map_memory.json"), \
+                 patch.object(tactic, "WAYPOINTS_PATH", temp / "waypoints.json"), \
+                 patch.object(tactic, "HOLDS_PATH", temp / "holds.json"), \
+                 patch.object(tactic, "SELF_DESTRUCT_PATH", temp / "self_destruct.json"), \
+                 patch.object(tactic, "BATTLE_LOG_PATH", temp / "battle_log.jsonl"), \
+                 patch.object(tactic, "CONFIG_PATH", temp / "tactic_config.json"):
+                for tick in (1, 2, 3):
+                    turn = SimpleNamespace(
+                        tick=tick, units=(), workers=(), vanguards=(), rangers=(),
+                        visible_enemies=(), core=core, resources=50,
+                        resource_cells=frozenset(), resource_space=3,
+                        beacon=SimpleNamespace(
+                            position=None, status=SimpleNamespace(name="GROUND"),
+                        ),
+                        state=SimpleNamespace(population=1), events=(),
+                        obstacle_cells=walls,
+                    )
+                    tactic._map_dirty = False
+                    tactic.choose_actions(turn)
+        # The failing search runs once, then the negative cache suppresses it on
+        # the following Ticks (it used to re-burn the budget every Tick).
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(tactic._core_target_path_cache.get("fail_goal"), (5, 0))
+        tactic._core_target_path_cache.clear()
 
 
 if __name__ == "__main__":

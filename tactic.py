@@ -1815,6 +1815,68 @@ def _combat_threats(enemies: tuple | list) -> tuple:
     return tuple(e for e in enemies if _is_combat_threat(e))
 
 
+def _enemy_danger_cells(
+    enemies: tuple | list,
+    obstacle_cells: frozenset[tuple[int, int]],
+    ranger_range: int = 3,
+) -> set[tuple[int, int]]:
+    """Cells a visible enemy combat unit could attack this Tick.
+
+    Uses the real attack geometry — Ranger 8-way Chebyshev shots up to
+    ``ranger_range`` with line-of-sight, Vanguard cardinal melee — instead of a
+    Manhattan radius, so a diagonal shooter at (2,2) covers the cells it can
+    actually hit. Mines falling in this set are unsafe to work even when the
+    enemy is several Manhattan cells away.
+    """
+    danger: set[tuple[int, int]] = set()
+    for enemy in _combat_threats(enemies):
+        origin = tuple(enemy.position)
+        if _enemy_unit_type_name(enemy) == "RANGER":
+            for dx in range(-ranger_range, ranger_range + 1):
+                for dy in range(-ranger_range, ranger_range + 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    if max(abs(dx), abs(dy)) > ranger_range:
+                        continue
+                    if not (dx == 0 or dy == 0 or abs(dx) == abs(dy)):
+                        continue
+                    cell = (origin[0] + dx, origin[1] + dy)
+                    if not _line_blocked(origin, cell, obstacle_cells):
+                        danger.add(cell)
+        else:
+            danger.update(_neighbor_cells(origin))
+    return danger
+
+
+def _nearest_worker_threat(
+    pos: tuple[int, int],
+    combat_enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    threat_radius: int,
+    ranger_range: int = 3,
+) -> Any | None:
+    """Nearest enemy that actually threatens a worker at ``pos``, or None.
+
+    A worker must flee when an enemy can shoot it, not merely when one is close
+    by Manhattan distance. The old radius-only test missed diagonal Rangers: an
+    enemy at (2,2) is Chebyshev 2 (a legal shot) but Manhattan 4, outside the
+    radius-3 flee trigger, so workers harvested calmly and were shot dead at the
+    same camped mine. Threaten on the radius OR the real attack geometry.
+    """
+    nearest = None
+    best = 1 << 30
+    for enemy in combat_enemies:
+        epos = tuple(enemy.position)
+        dist = _manhattan(pos, epos)
+        if dist <= threat_radius or _kite_enemy_can_hit(
+            pos, enemy, obstacle_cells, ranger_range,
+        ):
+            if dist < best:
+                best = dist
+                nearest = enemy
+    return nearest
+
+
 def _attack_retreat_decision(
     enemies: tuple,
     squad_pos: tuple[int, int] | None,
@@ -2042,10 +2104,11 @@ def _plan_waypoint(
             threat_radius = int(config.get("enemy_threat_radius", 3))
             combat_enemies = _combat_threats(enemies)
             if combat_enemies and threat_radius > 0:
-                nearest = min(
-                    combat_enemies, key=lambda e: _manhattan(pos, tuple(e.position))
+                nearest = _nearest_worker_threat(
+                    pos, combat_enemies, obstacle_cells, threat_radius,
+                    int(config.get("ranger_attack_range", 3)),
                 )
-                if _manhattan(pos, tuple(nearest.position)) <= threat_radius:
+                if nearest is not None:
                     _waypoint_stuck.pop(uid, None)
                     flee_blocked = blocked | {tuple(e.position) for e in enemies}
                     return _worker_flee(
@@ -2568,10 +2631,11 @@ def _plan_worker(
     # oscillation next to a harmless unit.
     combat_enemies = _combat_threats(enemies)
     if combat_enemies and threat_radius > 0:
-        nearest_enemy = min(
-            combat_enemies, key=lambda e: _manhattan(pos, tuple(e.position))
+        nearest_enemy = _nearest_worker_threat(
+            pos, combat_enemies, obstacle_cells, threat_radius,
+            int(config.get("ranger_attack_range", 3)),
         )
-        if _manhattan(pos, tuple(nearest_enemy.position)) <= threat_radius:
+        if nearest_enemy is not None:
             # `others` already carries the enemy cells in production (occupied
             # includes them); union them again so a fleeing worker can never
             # step onto an enemy even if `occupied` was not passed. Block all
@@ -4682,6 +4746,26 @@ def _commit_shadow_predictions(accepted: bool) -> None:
     game_stats.record_prediction_candidates(_game_stats, committed)
 
 
+def _enemy_motion_tier(enemy: Any) -> int:
+    """Hit-prospect tier for a shot at the enemy's CURRENT cell.
+
+    Live fire control showed stationary targets hit ~96% while moving ones hit
+    ~3% (a moving unit is barely hittable at its current cell). Rank still
+    targets first (0), unknown history next (1), clearly moving last (2), so a
+    Ranger spends its shot on something it can actually hit instead of the
+    nearest mover.
+    """
+    history = _enemy_motion_tracks.get(str(getattr(enemy, "id", id(enemy))), [])
+    velocity, _ = _motion_streak(history)
+    if velocity is None:
+        return 1
+    if velocity == (0, 0):
+        return 0
+    if abs(velocity[0]) + abs(velocity[1]) == 1:
+        return 2
+    return 1
+
+
 def _ranger_best_shot(
     ranger: Any,
     pos: tuple[int, int],
@@ -4691,12 +4775,15 @@ def _ranger_best_shot(
     *,
     lead_fire_enabled: bool = False,
 ) -> tuple[str, str] | None:
-    """Pick the closest enemy in legal 8-way range (rules v0.8/v0.13).
+    """Pick the best enemy in legal 8-way range (rules v0.8/v0.13).
 
     Distance is Chebyshev — horizontal, vertical, or exact-diagonal offsets
     where max(|dx|, |dy|) is within 1..attack_range. Diagonal shots are legal
-    and only intermediate crossed cells can block the line.
+    and only intermediate crossed cells can block the line. Among legal targets
+    a still one outranks a mover (current-cell hits on movers are ~3%), with
+    distance breaking ties inside the same motion tier.
     """
+    best_key = (1 << 30, 1 << 30)
     best_dist = 10_000
     best_target = None
     for enemy in enemies:
@@ -4707,7 +4794,9 @@ def _ranger_best_shot(
             continue
         if _line_blocked(pos, tuple(enemy.position), obstacle_cells):
             continue
-        if dist < best_dist:
+        key = (_enemy_motion_tier(enemy), dist)
+        if key < best_key:
+            best_key = key
             best_dist = dist
             best_target = enemy
     if best_target is None:
@@ -4930,6 +5019,17 @@ def _plan_home_combat(
     # Initialized before every branch so no path hits an unbound name.
     engage_radius = max(int(config.get("home_engage_radius", 10) or 0), return_radius)
 
+    # Prolonged delivery-ring freeze escape: a defender stuck on the same ring
+    # cell for _HOME_CHUTE_WAIT_ESCAPE Ticks stops yielding to carriers and
+    # pathfinds out to its patrol slot (see _home_chute_wait). The counter resets
+    # as soon as the defender stands somewhere else.
+    _uid = str(unit.id)
+    _cw = _home_chute_wait.get(_uid)
+    if _cw is not None and _cw[0] != pos:
+        _home_chute_wait.pop(_uid, None)
+        _cw = None
+    _chute_escape = _cw is not None and _cw[1] >= _HOME_CHUTE_WAIT_ESCAPE
+
     if unit_kind == "vanguard":
         sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
         if sweep is not None:
@@ -4959,6 +5059,17 @@ def _plan_home_combat(
             enemy for enemy in enemies
             if _manhattan(core_pos, enemy.position) <= engage_radius + 1
         ]
+    # Economic defence: campers threatening a mine or a recent death cell get
+    # intercepted even far outside the patrol ring. The home squad used to idle
+    # on the delivery ring while workers were killed at a mine 60+ cells away
+    # (engage_radius only measured from the Core). resource_assign caps these
+    # targets to the mining radius so defenders do not chase across the map.
+    defense = getattr(turn_context, "defense_targets", ())
+    if defense:
+        _seen = {id(enemy) for enemy in local_enemies}
+        local_enemies.extend(
+            enemy for enemy in defense if id(enemy) not in _seen
+        )
     if local_enemies:
         # A fresh visible threat supersedes any remembered chase target.
         _home_engage_target.pop(str(unit.id), None)
@@ -5136,21 +5247,29 @@ def _plan_home_combat(
             return ("MOVE", f"{d.name} chute-clear")
         # Every outward cell is at capacity: waiting one tick is better than
         # re-issuing the same blocked move and logging another CELL_UNIT_LIMIT.
-        unit.wait()
-        return ("WAIT", "packed-outward-wait")
+        # After a prolonged freeze, fall through to patrol instead of yielding
+        # forever (the ring stays packed with a large worker fleet).
+        _home_chute_wait[_uid] = (pos, (_cw[1] + 1) if _cw is not None else 1)
+        if not _chute_escape:
+            unit.wait()
+            return ("WAIT", "packed-outward-wait")
 
     # Already on/near the assigned slot: hold instead of micro-stepping.
-    if _manhattan(pos, goal) <= 1 and dist_home <= return_radius:
+    if _manhattan(pos, goal) <= 1 and dist_home <= return_radius and not _chute_escape:
         unit.wait()
         _set_unit_route(unit, goal, [pos], complete=True)
         return ("WAIT", f"home-hold {goal}")
-    if _chute_in_demand and dist_home > 1 and _manhattan(goal, core_pos) <= 1:
+    if (
+        _chute_in_demand and dist_home > 1 and _manhattan(goal, core_pos) <= 1
+        and not _chute_escape
+    ):
         # Chute hysteresis: chute-clear above pushed this defender outward to
         # keep the unloading ring free, so it must not walk straight back onto
         # it while carriers are still queued. Without this the two rules take
         # turns every Tick (observed V8/V3: ``LEFT home-patrol`` / ``RIGHT
         # chute-clear`` on 100% of Ticks, and the re-entry was itself rejected
         # often enough to log 967 CELL_UNIT_LIMIT warns per 3000 Ticks).
+        _home_chute_wait[_uid] = (pos, (_cw[1] + 1) if _cw is not None else 1)
         unit.wait()
         _set_unit_route(unit, goal, [pos], complete=False)
         return ("WAIT", f"home-chute-hold {goal}")
@@ -6714,6 +6833,12 @@ def _plan_kite_combat(
 
     if target is not None and unit_kind == "ranger":
         motion = _kite_motion_info(target, pos)
+        # Lead fire on a mover beats a current-cell shot even at streak 1: a
+        # moving target is ~3% hittable at its current cell but ~8% at its
+        # predicted next cell, so gating low-streak leads back to current-cell
+        # would LOWER hits. Stationary targets already fall through to a
+        # current-cell shot (~96%) via the state gate below; the oscillating
+        # bounce model aims at the cell the target just left.
         expected = (
             motion.get("predicted")
             if motion["state"] in {"advance", "retreat"} or motion.get("oscillating")
@@ -7149,14 +7274,17 @@ _worker_contest_streak: dict[str, tuple[tuple[int, int], tuple[int, int], int]] 
 # can. Kept so a repeat offender can blacklist the destination instead of
 # re-issuing the same refused step forever.
 _worker_planned_step: dict[str, tuple[tuple[int, int], tuple[int, int]]] = {}
-# Destination refused this many consecutive Ticks gets parked for the carrier,
+# Destinations refused this many consecutive Ticks get parked for the carrier,
 # and for how long. Observed: W5 (49797bf4) fired the same MOVE:RIGHT out of
 # (279,-424) for 118 straight Ticks, 57 of the last 60 warn rows in
 # battle_log — an invisible claimant holds that cell and the carrier has no way
-# to learn that from a rejection that names only its own cell.
+# to learn that from a rejection that names only its own cell. The park is a SET
+# of refused cells: a unit boxed in on several sides (V27 logged 3456
+# MOVE_CONTESTED re-issuing the one non-parked direction) must learn every
+# refused neighbour, not just the first.
 _WORKER_CONTEST_BLOCK_AFTER = 4
 _WORKER_CONTEST_BLOCK_TICKS = 60
-_worker_contest_blocked: dict[str, tuple[tuple[int, int], int]] = {}
+_worker_contest_blocked: dict[str, tuple[frozenset[tuple[int, int]], int]] = {}
 # Rejections counted per origin cell: ``full unit id -> (origin, count)``. Kept
 # across the waiting Tick (which emits no rejection) so a worker that keeps
 # losing the same fight actually reaches the block threshold.
@@ -7172,6 +7300,32 @@ _attack_regroup_ids: set[str] = set()
 # while the Core stays on it; recomputed when the target changes, the Core
 # leaves the path, or a newly learned wall blocks the next step.
 _core_target_path_cache: dict[str, Any] = {}
+# A manual-target A* that exhausts its budget without a path used to re-run the
+# identical failing search every Tick (~1s/Tick at an 84,900-expansion budget,
+# 82% of live Ticks — the source of COMMAND_WINDOW_CLOSED rejections). Walls only
+# ever grow, so a failed search stays failed; cache the negative result and retry
+# only after this backoff (a target change clears it immediately).
+_CORE_PATH_FAIL_BACKOFF = 60
+# Recent ally-death heat: cell -> Tick a friendly unit died there. A mine near
+# a death stays banned after the campers slip out of vision, so workers are not
+# sent straight back into the same ambush (observed: ~20 workers killed at one
+# camped mine cluster while the distance-only assignment kept refilling it).
+_death_heat: dict[tuple[int, int], int] = {}
+_DEATH_HEAT_TTL = 150
+# Hysteresis ban on dangerous mines: cell -> Tick the ban lifts. Refreshed every
+# Tick a mine is covered by enemy fire or sits by a recent death; once the
+# threat leaves, the ban persists a while so assignments stop flickering as
+# campers mill in and out of the old "enemy within 1 cell" filter.
+_mine_danger_ban: dict[tuple[int, int], int] = {}
+_MINE_DANGER_BAN_TICKS = 60
+# Throttle for the economic-defence situation row in battle_log so the review
+# can track the ban/heat/sortie state over time without flooding the 2MB budget.
+_last_defense_log_tick = -(1 << 30)
+_DEFENSE_LOG_EVERY = 100
+# Previous Tick's unit snapshot (full uid -> (stable name, position)) used to
+# detect deaths for the heat map and to keep a dead unit's name for the battle
+# log (the name registry is pruned before events are classified).
+_prev_unit_snapshot: dict[str, tuple[str, tuple[int, int]]] = {}
 # Signature of the last dashboard map edits we absorbed (avoid re-applying every tick).
 _last_dashboard_map_sig: tuple | None = None
 # Track each worker's previous position to avoid backtracking
@@ -7453,20 +7607,20 @@ def _cell_limit_block_cell(uid: str, tick: int) -> tuple[int, int] | None:
     return block[0]
 
 
-def _attack_contest_cell(uid: str, tick: int) -> tuple[int, int] | None:
-    """The neighbour ``uid`` keeps being refused entry to, or None.
+def _attack_contest_cells(uid: str, tick: int) -> frozenset[tuple[int, int]]:
+    """The neighbours ``uid`` keeps being refused entry to, or an empty set.
 
     The invisible-claimant case: a visible blocker already reaches the planners
     through ``adjacent_enemies``, but a claimant outside vision only shows up as
     a MOVE_CONTESTED rejection naming the unit's own cell. Parking the refused
-    destination (the worker backoff's mechanism) makes the march route around it
-    instead of re-issuing the doomed step forever. Only the teams in
+    destinations (the worker backoff's mechanism) makes the march route around
+    them instead of re-issuing the doomed step forever. Only the teams in
     ``_CONTEST_PARK_TEAMS`` consume it; kite/guerrilla aim at the claimant's cell
     through ``_kite_collision_streak`` instead.
     """
     block = _worker_contest_blocked.get(uid)
     if block is None or block[1] <= tick:
-        return None
+        return frozenset()
     return block[0]
 
 
@@ -7492,9 +7646,13 @@ def _record_combat_planned_step(unit: Any, detail: str) -> None:
     )
 
 
-def _attack_contest_note(cell: tuple[int, int] | None) -> str:
-    """Suffix marking that this step was planned around a parked refusal."""
-    return f" contest-avoid={cell}" if cell is not None else ""
+def _attack_contest_note(cells: frozenset[tuple[int, int]]) -> str:
+    """Suffix marking that this step was planned around parked refusals."""
+    if not cells:
+        return ""
+    return " contest-avoid=" + ",".join(
+        f"({x}, {y})" for x, y in sorted(cells)
+    )
 
 
 # Cache of per-name home-team patrol slot indices. Keyed by (radius, sorted
@@ -7502,6 +7660,14 @@ def _attack_contest_note(cell: tuple[int, int] | None) -> str:
 # Prevents multiple home defenders from hashing onto the same patrol slot and
 # hammering each other with CELL_UNIT_LIMIT moves (observed with R5/R6).
 _home_patrol_slot_cache: dict[tuple[int, tuple[str, ...]], dict[str, int]] = {}
+# Consecutive Ticks a home defender has spent frozen on the delivery ring
+# (packed-outward-wait / home-chute-hold): uid -> (cell, count). With a large
+# worker fleet the ring is permanently packed, so the courtesy wait used to
+# freeze defenders for 99% of Ticks while the economy was raided. After
+# _HOME_CHUTE_WAIT_ESCAPE Ticks stuck on the same cell the defender stops
+# yielding and pathfinds out to its patrol slot instead.
+_home_chute_wait: dict[str, tuple[tuple[int, int], int]] = {}
+_HOME_CHUTE_WAIT_ESCAPE = 6
 # Lease holder frozen this many ticks (rejected moves count as no progress)
 # before the lease rotates to the next carrier.
 _DELIVERY_STUCK_LIMIT = 4
@@ -8928,6 +9094,17 @@ def _battle_actor_name(turn: Any, object_id: Any) -> str:
     core = getattr(turn, "core", None)
     if core is not None and str(core.id) == key:
         return _object_name(object_id, "C")
+    # A unit killed this Tick has already left the snapshot and its name was
+    # pruned from the registry; recover the stable name captured in bookkeeping
+    # so kill/defeat rows keep the unit's identity instead of minting a fresh
+    # U### that reads as a different object.
+    dead_name = getattr(turn_context, "dead_unit_names", {}).get(key)
+    if dead_name is not None:
+        return dead_name
+    for prefix in ("W", "V", "R", "C", "E"):
+        name = _object_names.get((prefix, key))
+        if name is not None:
+            return name
     return _object_name(object_id, "U")
 
 
@@ -9014,6 +9191,10 @@ def _classify_battle_event(
         hp = values.get("hp")
         dmg = values.get("damage")
         if hp == 0:
+            # An enemy reduced to 0 HP is our kill, not a defeat; only friendly
+            # (W/V/R/C) names belong in the defeat category.
+            if target.startswith("E"):
+                return row("kill", f"{actor} 击败 {target}")
             return row("defeat", f"{target} 被击败")
         return row("combat", f"{target} 受 {dmg} 伤害（HP {hp}）")
     if et == "UNIT_SELF_DESTRUCTED":
@@ -9116,6 +9297,10 @@ turn_context = type(
         "kite_collision_snapshot": None,
         "kite_ranger_range": 3,
         "kite_obstacles": frozenset(),
+        "dead_unit_names": {},
+        "recent_death_cells": frozenset(),
+        "mine_danger_cells": frozenset(),
+        "defense_targets": (),
         "shot_predictions": [],
         "shot_prediction_results": [],
         # Per-Tick planning profiler output (filled by choose_actions, read by
@@ -9227,6 +9412,7 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _combat_path_cache, _home_engage_target, _guerrilla_core_target,
         _guerrilla_unit_target, _worker_stuck_ticks, _worker_stuck_pos,
         _waypoint_stuck, _kite_collision_streak, _kite_stall_pos,
+        _home_chute_wait,
         _kite_stall_ticks, _kite_prev_pos, _kite_shuttle_ticks,
         _kite_prev_prev_pos, _kite_friendly_split, _roam_pos_history,
         _roam_escape_left, _roam_stall_cells, _roam_stall_origin,
@@ -9402,6 +9588,29 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         alive_ids.add(str(v.id))
     for r in getattr(turn, "rangers", ()) or ():
         alive_ids.add(str(r.id))
+    # Detect this Tick's deaths before the name registry is pruned: keep the
+    # dead unit's stable name for the battle log and mark its cell in the death
+    # heat map so mine assignment and home defence react to the ambush.
+    global _prev_unit_snapshot, _death_heat
+    _tick_now = turn_context.tick
+    _snapshot: dict[str, tuple[str, tuple[int, int]]] = {}
+    for u in turn.units:
+        _snapshot[str(u.id)] = (
+            _object_name(u.id, _UNIT_NAME_PREFIX.get(u.unit_type, "U")),
+            tuple(u.position),
+        )
+    dead_names: dict[str, str] = {}
+    for uid, (name, pos) in _prev_unit_snapshot.items():
+        if uid not in _snapshot:
+            dead_names[uid] = name
+            _death_heat[pos] = _tick_now
+    _prev_unit_snapshot = _snapshot
+    _death_heat = {
+        cell: tick for cell, tick in _death_heat.items()
+        if _tick_now - tick <= _DEATH_HEAT_TTL
+    }
+    turn_context.dead_unit_names = dead_names
+    turn_context.recent_death_cells = frozenset(_death_heat)
     _prune_dead_unit_bookkeeping(alive_ids)
     # Ally position view for the same-cell friendly-split ranking (read-only).
     turn_context.units_view = tuple(turn.units)
@@ -9594,6 +9803,8 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     # Defined in both branches below: the core-movement heuristic reads it even
     # in full-explore mode, so it must never be left undefined.
     all_resources: list = []
+    turn_context.mine_danger_cells = frozenset()
+    turn_context.defense_targets = ()
     if gold_full_explore:
         _resource_assignments.clear()
     else:
@@ -9620,18 +9831,72 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 if _manhattan(tuple(r), core_pos) <= mine_max_distance
             ]
 
-        # A mine adjacent to a visible enemy is a contested cell: both sides
-        # race for it every tick, lose to MOVE_CONTESTED, and the worker
-        # freezes in a forever head-on (observed: 25+ ticks wedged). Skip
-        # those deposits while the enemy stands there.
+        # Dangerous mines: covered by enemy fire (real attack geometry, so a
+        # diagonal Ranger at (2,2) bans the mine it can actually shoot), adjacent
+        # to any visible enemy (a contested cell both sides race for), or near a
+        # recent ally death. Ban them with hysteresis: the old instantaneous
+        # "enemy within 1 cell" filter flickered as campers milled about, flipping
+        # sticky assignments every few Ticks, and it never saw the diagonal shot
+        # that kept killing workers at the same mine. The ban persists after the
+        # threat leaves so routes stabilise and workers are not fed back into the
+        # ambush the moment a camper steps out of vision.
+        global _mine_danger_ban
+        danger_cells = _enemy_danger_cells(
+            enemies, obstacle_cells, int(config.get("ranger_attack_range", 3)),
+        )
+        turn_context.mine_danger_cells = frozenset(danger_cells)
         enemy_cells = {tuple(e.position) for e in enemies}
-        if enemy_cells:
-            all_resources = [
-                r for r in all_resources
-                if not any(
-                    _manhattan(tuple(r), ec) <= 1 for ec in enemy_cells
+        death_cells = turn_context.recent_death_cells
+        for res in all_resources:
+            rt = tuple(res)
+            if (
+                rt in danger_cells
+                or any(_manhattan(rt, ec) <= 1 for ec in enemy_cells)
+                or any(_manhattan(rt, dc) <= 1 for dc in death_cells)
+            ):
+                _mine_danger_ban[rt] = _tick_now + _MINE_DANGER_BAN_TICKS
+        _mine_danger_ban = {
+            cell: until for cell, until in _mine_danger_ban.items()
+            if until > _tick_now
+        }
+        all_resources = [
+            r for r in all_resources
+            if _mine_danger_ban.get(tuple(r), 0) <= _tick_now
+        ]
+        # Home-defence sortie targets: visible combat units lurking by a recent
+        # death or a banned mine, within the mining radius. Home defenders chase
+        # these even far outside the core patrol ring (see _plan_home_combat),
+        # so the squad clears the camp instead of idling on the delivery ring.
+        turn_context.defense_targets = tuple(
+            e for e in _combat_threats(enemies)
+            if (mine_max_distance <= 0
+                or _manhattan(tuple(e.position), core_pos) <= mine_max_distance)
+            and (
+                any(_chebyshev(tuple(e.position), dc) <= 4 for dc in death_cells)
+                or any(
+                    _chebyshev(tuple(e.position), cell) <= 4
+                    for cell in _mine_danger_ban
                 )
-            ]
+            )
+        )
+        # Periodic situation row so a later log review can quantify whether the
+        # danger ban / death heat / home sortie are engaging the camp.
+        global _last_defense_log_tick
+        if _tick_now - _last_defense_log_tick >= _DEFENSE_LOG_EVERY:
+            _last_defense_log_tick = _tick_now
+            try:
+                append_jsonl(BATTLE_LOG_PATH, [{
+                    "tick": _tick_now,
+                    "ts": time.time(),
+                    "cat": "combat",
+                    "msg": (
+                        f"经济防卫：禁采矿 {len(_mine_danger_ban)} 个，"
+                        f"阵亡热点 {len(death_cells)} 处，"
+                        f"出击目标 {len(turn_context.defense_targets)} 个"
+                    ),
+                }])
+            except OSError:
+                pass
 
         # A mine under the Core is not mineable: an empty worker must vacate the
         # chute before HARVEST, so assigning it produces a vacate/return A-B-A
@@ -9905,6 +10170,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 and tuple(core_pos) in (_core_target_path_cache.get("path") or ())
             )
             _core_astep = None
+            _core_hold = False
             if (
                 core_target_enabled
                 and dirs
@@ -9921,37 +10187,74 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             ):
                 cpos = tuple(core_pos)
                 nxt = None
-                if _core_target_path_cache.get("goal") == tuple(target):
-                    cpath = _core_target_path_cache.get("path") or []
+                _cache = _core_target_path_cache
+                _goal = tuple(target)
+                if _cache.get("goal") == _goal:
+                    cpath = _cache.get("path") or []
                     if cpos in cpath:
                         cidx = cpath.index(cpos)
                         if (
                             0 <= cidx < len(cpath) - 1
                             and cpath[cidx + 1] not in obstacle_cells
-                            and core_cell_counts.get(cpath[cidx + 1], 0)
-                            < _CELL_UNIT_LIMIT
                         ):
-                            nxt = cpath[cidx + 1]
-                if nxt is None:
-                    budget = min(
-                        1_500_000,
-                        max(50_000, _manhattan(cpos, tuple(target)) * 60),
+                            ncell = cpath[cidx + 1]
+                            if core_cell_counts.get(ncell, 0) < _CELL_UNIT_LIMIT:
+                                nxt = ncell
+                            else:
+                                # A friendly unit is squatting on the route's next
+                                # cell. The cached path is still valid (occupancy is
+                                # transient, not a wall), so hold without re-searching
+                                # — a fresh A* over the same walls returns the same
+                                # blocked step and used to burn the budget every Tick.
+                                _core_hold = True
+                if nxt is None and not _core_hold:
+                    _fail_active = (
+                        _cache.get("fail_goal") == _goal
+                        and turn_context.tick < _cache.get("fail_until", 0)
                     )
-                    cpath = _bfs_path(
-                        cpos, tuple(target), obstacle_cells, max_steps=budget
-                    )
-                    if cpath and len(cpath) > 1:
-                        _core_target_path_cache.update(
-                            {"goal": tuple(target), "path": cpath}
+                    if not _fail_active:
+                        budget = min(
+                            1_500_000,
+                            max(50_000, _manhattan(cpos, _goal) * 60),
                         )
-                        nxt = cpath[1]
-                if nxt is not None and (
-                    core_cell_counts.get(nxt, 0) >= _CELL_UNIT_LIMIT
-                ):
-                    # Our own units are squatting on the route's next cell: hold
-                    # this Tick (the cached path stays valid, they will move)
-                    # rather than burning a rejected start_move.
-                    nxt = None
+                        cpath = _bfs_path(
+                            cpos, _goal, obstacle_cells, max_steps=budget
+                        )
+                        if cpath and len(cpath) > 1:
+                            _cache.update({
+                                "goal": _goal, "path": cpath,
+                                "fail_goal": None, "fail_until": 0,
+                                "fail_warned": False,
+                            })
+                            ncell = cpath[1]
+                            if core_cell_counts.get(ncell, 0) < _CELL_UNIT_LIMIT:
+                                nxt = ncell
+                            else:
+                                _core_hold = True
+                        else:
+                            # Unreachable within budget: remember the failure so
+                            # the next Ticks skip the search instead of repeating
+                            # it. Warn once per episode so an unreachable manual
+                            # target is visible rather than silently burning CPU.
+                            _cache.update({
+                                "goal": _goal, "path": [],
+                                "fail_goal": _goal,
+                                "fail_until": turn_context.tick + _CORE_PATH_FAIL_BACKOFF,
+                            })
+                            if not _cache.get("fail_warned"):
+                                _cache["fail_warned"] = True
+                                try:
+                                    append_jsonl(BATTLE_LOG_PATH, [{
+                                        "tick": turn_context.tick,
+                                        "ts": time.time(),
+                                        "cat": "warn",
+                                        "msg": (
+                                            f"核心目标 {_fmt_cell(_goal)} 在寻路预算内不可达，"
+                                            f"暂停重试 {_CORE_PATH_FAIL_BACKOFF} tick"
+                                        ),
+                                    }])
+                                except OSError:
+                                    pass
                 if nxt is not None:
                     _core_astep = (nxt[0] - core_pos[0], nxt[1] - core_pos[1])
             if _core_astep is not None:
@@ -9963,8 +10266,9 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                         core_done = True
                         break
             # Try each direction (obstacle + dead-end aware). Skipped when the
-            # A* detour already issued this Tick's core move.
-            for d in (dirs if _core_astep is None else []):
+            # A* detour already issued this Tick's core move, or when the core is
+            # holding for a friendly squatter on the cached route's next cell.
+            for d in (dirs if _core_astep is None and not _core_hold else []):
                 nx, ny = core_pos[0] + d.delta[0], core_pos[1] + d.delta[1]
                 if (nx, ny) in obstacle_cells or (nx, ny) in core_blocked_now:
                     continue
@@ -10098,36 +10402,46 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         },
         **_repeat_now,
     }
-    # Once the same origin keeps losing the same fight, park the destination it
-    # keeps aiming at so the march routes around the claimant instead of
+    # Once the same origin keeps losing the same fight, park the destinations it
+    # keeps aiming at so the march routes around the claimants instead of
     # re-issuing the refused step forever. The rejection event names only the
     # worker's own cell, so the destination comes from what we planned last Tick.
-    _blocked_now: dict[str, tuple[tuple[int, int], int]] = {}
+    _blocked_now: dict[str, tuple[frozenset[tuple[int, int]], int]] = {}
     _core_cell = tuple(core_pos)
     for _key, (_cell, _repeat) in _worker_contest_repeat.items():
         if _repeat < _WORKER_CONTEST_BLOCK_AFTER:
             continue
+        _planned = _worker_planned_step.get(_key)
+        # The newest refused destination (None if the unit moved since that plan,
+        # or if it aimed at the chute — parking the Core cell starves the vault).
+        _new_dest = (
+            _planned[1]
+            if _planned is not None
+            and _planned[0] == _cell
+            and _planned[1] != _core_cell
+            else None
+        )
         _live = _worker_contest_blocked.get(_key)
         if _live is not None and _live[1] > turn_context.tick:
-            # Sticky while the carrier stands its ground: the tally keeps
-            # growing every Tick, and re-pointing the block at the newest plan
-            # destination would un-park the very cell that escape just stepped
-            # onto, flipping the ban LEFT/UP every Tick instead of routing
-            # around the claimant.
+            # Sticky while the carrier stands its ground: keep every parked cell
+            # and ADD the newly refused one — but only when a MOVE_CONTESTED
+            # actually fired this Tick. The per-origin tally persists across
+            # refusal-free Ticks, so adding the latest plan unconditionally would
+            # park cells the unit successfully stepped onto. A set grows only
+            # with genuinely refused neighbours, so a unit boxed in on several
+            # sides learns them all instead of re-issuing the one non-parked
+            # direction forever (V27: 3456 MOVE_CONTESTED on the alternative).
+            _cells = _live[0]
+            if _new_dest is not None and _key in _contested_now:
+                _cells = _cells | {_new_dest}
             _blocked_now[_key] = (
-                _live[0], turn_context.tick + _WORKER_CONTEST_BLOCK_TICKS,
+                _cells, turn_context.tick + _WORKER_CONTEST_BLOCK_TICKS,
             )
             continue
-        _planned = _worker_planned_step.get(_key)
-        if _planned is None or _planned[0] != _cell:
-            continue  # the worker moved since that plan: nothing to learn
-        if _planned[1] == _core_cell:
-            # Never park the chute: a carrier refused on the Core cell is the
-            # deposit path itself, and parking it starves the vault for the
-            # whole TTL instead of routing around a neighbour.
+        if _new_dest is None:
             continue
         _blocked_now[_key] = (
-            _planned[1],
+            frozenset({_new_dest}),
             turn_context.tick + _WORKER_CONTEST_BLOCK_TICKS,
         )
     _worker_contest_blocked = {
@@ -10518,9 +10832,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 lease_uid=delivery_lease,
                 next_uid=_delivery_next_uid,
                 cell_counts=friendly_cell_counts,
-                contest_blocked=(
-                    frozenset({_blocked[0]}) if _blocking else frozenset()
-                ),
+                contest_blocked=(_blocked[0] if _blocking else frozenset()),
             )
             unit_phase_ms["worker"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = f"{action}:{detail}"
@@ -10544,18 +10856,20 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         elif unit.unit_type == UnitType.VANGUARD:
             team = _combat_team_for(name, config)
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
-            _contest_cell = (
-                _attack_contest_cell(str(unit.id), turn.tick)
+            _contest_cells = (
+                _attack_contest_cells(str(unit.id), turn.tick)
                 if team in _CONTEST_PARK_TEAMS
-                else None
+                else frozenset()
             )
-            # Thread the 1-2 refusal cells through the transient channel instead
+            # Thread the refusal cells through the transient channel instead
             # of copying the whole wall set: `obstacle_cells | _extra_block`
             # broke the persistent dead-end structure's identity cache, so every
             # unit in the congestion episode paid a from-scratch 4.2 s batch
             # (report #8). The overlay keeps the planner's obstacle argument a
             # complete blocked set (identical membership) without the copy.
-            _extra_block = {c for c in (_blocked_cell, _contest_cell) if c is not None}
+            _extra_block = set(_contest_cells)
+            if _blocked_cell is not None:
+                _extra_block.add(_blocked_cell)
             _unit_obstacles = (
                 _ObstacleOverlay(obstacle_cells, frozenset(_extra_block))
                 if _extra_block
@@ -10574,20 +10888,22 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             unit_phase_ms["vanguard"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = (
                 f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
-                + _attack_contest_note(_contest_cell)
+                + _attack_contest_note(_contest_cells)
             )
             if action == "MOVE" and team in _CONTEST_PARK_TEAMS:
                 _record_combat_planned_step(unit, detail)
         elif unit.unit_type == UnitType.RANGER:
             team = _combat_team_for(name, config)
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
-            _contest_cell = (
-                _attack_contest_cell(str(unit.id), turn.tick)
+            _contest_cells = (
+                _attack_contest_cells(str(unit.id), turn.tick)
                 if team in _CONTEST_PARK_TEAMS
-                else None
+                else frozenset()
             )
             # Same transient-channel treatment as the Vanguard branch above.
-            _extra_block = {c for c in (_blocked_cell, _contest_cell) if c is not None}
+            _extra_block = set(_contest_cells)
+            if _blocked_cell is not None:
+                _extra_block.add(_blocked_cell)
             _unit_obstacles = (
                 _ObstacleOverlay(obstacle_cells, frozenset(_extra_block))
                 if _extra_block
@@ -10606,7 +10922,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             unit_phase_ms["ranger"] += time.monotonic() - _ut0
             unit_actions_detail[uid] = (
                 f"{action}:{detail}[{team}]{_sweep_fuse_note(unit)}"
-                + _attack_contest_note(_contest_cell)
+                + _attack_contest_note(_contest_cells)
             )
             if action == "MOVE" and team in _CONTEST_PARK_TEAMS:
                 _record_combat_planned_step(unit, detail)

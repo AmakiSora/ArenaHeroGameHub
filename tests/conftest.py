@@ -57,3 +57,25 @@ def arena_data_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
         yield path
     finally:
         os.environ.pop(ENV_KEY, None)
+
+
+@pytest.fixture(autouse=True)
+def _reset_danger_state():
+    """Isolate the cross-Tick danger/defence state between tests.
+
+    The death heat map, mine ban hysteresis and previous-unit snapshot persist
+    across Ticks in production; without a reset a unit id from one test would
+    register as a "death" in the next and ban mines near its old cell. Cleared
+    before each test only — multi-Tick persistence within a test is untouched.
+    """
+    import tactic
+
+    tactic._death_heat.clear()
+    tactic._mine_danger_ban.clear()
+    tactic._prev_unit_snapshot.clear()
+    tactic._home_chute_wait.clear()
+    tactic.turn_context.dead_unit_names = {}
+    tactic.turn_context.recent_death_cells = frozenset()
+    tactic.turn_context.mine_danger_cells = frozenset()
+    tactic.turn_context.defense_targets = ()
+    yield
