@@ -2140,11 +2140,15 @@ def _attack_retreat_decision(
     """
     forbidden: frozenset[tuple[int, int]] = frozenset()
     reach = 0 if radius <= 0 else max(int(threat_radius or 0), int(radius), 0)
+    # Sum the squad before the early return: an idle Tick (no visible enemies)
+    # must still report the squad's real HP, otherwise the decision log says
+    # friend_hp=0 and a replay reads it as a wiped squad.
+    friend_hp = sum(int(getattr(unit, "hp", 0) or 0) for unit in squad_units)
     detail = {
         "retreat": False,
         "reach": reach,
         "squad_size": int(squad_size),
-        "friend_hp": 0,
+        "friend_hp": friend_hp,
         "enemy_hp": 0,
         "enemy_count": 0,
         "outnumbered": False,
@@ -2160,7 +2164,6 @@ def _attack_retreat_decision(
     nearby = [
         e for e in threats if _chebyshev(tuple(e.position), squad_pos) <= reach
     ]
-    friend_hp = sum(int(getattr(unit, "hp", 0) or 0) for unit in squad_units)
     enemy_hp = sum(int(getattr(enemy, "hp", 0) or 0) for enemy in nearby)
     outnumbered = len(nearby) >= squad_size
     hp_outmatched = friend_hp > 0 and enemy_hp >= friend_hp

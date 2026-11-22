@@ -237,6 +237,19 @@ class RetreatDetailTests(unittest.TestCase):
         self.assertFalse(detail["out_hp"])
         self.assertEqual(detail["reach"], 10)
 
+    def test_detail_reports_friend_hp_with_no_visible_enemies(self) -> None:
+        squad = (SimpleNamespace(hp=4), SimpleNamespace(hp=2), SimpleNamespace(hp=2))
+        detail: dict = {}
+        retreat, count, _centroid, _forbidden = tactic._attack_retreat_decision(
+            (), (0, 0), 3, 4, set(),
+            squad_units=squad, threat_radius=10, detail_out=detail,
+        )
+        self.assertFalse(retreat)
+        self.assertEqual(count, 0)
+        self.assertEqual(detail["friend_hp"], 8)
+        self.assertEqual(detail["enemy_hp"], 0)
+        self.assertEqual(detail["enemy_count"], 0)
+
 
 class AutoTargetRowsTests(unittest.TestCase):
     def setUp(self) -> None:
