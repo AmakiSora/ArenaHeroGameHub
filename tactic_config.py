@@ -147,6 +147,10 @@ CONFIG_FIELDS = (
     ),
     ConfigField("home_patrol_radius", "守家巡逻半径", "combat", "integer", 5, 1, 30, 1),
     ConfigField("home_engage_radius", "守家迎击半径(0=关)", "combat", "integer", 10, 0, 30, 1),
+    # Leash for the economic-defence chase (defense_targets: campers at a mine
+    # or a recent death cell). Without it the home squad walked 45+ cells to a
+    # death hotspot (t646408). 0 keeps the old unlimited chase.
+    ConfigField("home_defense_leash", "守家跨区追击上限(0=不限)", "combat", "integer", 12, 0, 50, 1),
     ConfigField(
         "home_engage_memory_ticks",
         "守家迎击目标记忆 Tick(0=关)",

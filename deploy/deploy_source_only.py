@@ -78,6 +78,7 @@ FILES = (
     "state_io.py",
     "watchdog.py",
     "status.py",
+    "replay.py",
     "docker-entrypoint.py",
     "BEHAVIOR.md",
 )

@@ -88,6 +88,7 @@ ArenaGame/
 ├── game_stats.py          # 累计战报统计聚合与持久化
 ├── state_io.py            # 跨进程文件锁、原子写、JSONL 追加与裁剪
 ├── status.py              # 命令行实时状态查看器
+├── replay.py              # 离线逐拍复盘：状态/动作/事件/决策/ASCII 棋盘
 ├── watchdog.py            # 卡死检测：update_stall_tracking 产出 stall_alert
 ├── docker-entrypoint.py   # 容器入口：启动 tactic + dashboard，负责退避重启/崩溃熔断/卡死看门狗/日志轮转
 ├── diagnose.py            # 诊断辅助脚本（本地用，git 忽略）
@@ -180,7 +181,7 @@ python status.py
 |----|----------|------|
 | **工人与寻路** | `worker_bfs_enabled`, `bfs_max_steps`, `avoid_backtracking`, `backtrack_penalty`, `enemy_threat_radius`, `worker_mine_max_distance` | A* 寻路开关、节点上限、回头规避、遇敌回避半径 |
 | **核心** | `core_movement_enabled`, `cargo_wait_distance`, `repair_enabled`, `heal_enabled`, `peace_shield_target`, `combat_shield_target`, `resource_reserve` | 核心移动、修盾目标、生产保留金币 |
-| **战斗分队** | `home_team`, `attack_team`, `kite_team`, `guerrilla_team`, `home_patrol_radius`, `home_engage_memory_ticks`, `attack_target_x/y`, `attack_mode`, `kite_target_x/y`, `kite_mode`, `guerrilla_engage_radius`, `ranger_attack_range`, `ranger_lead_fire_enabled` | 四队名单（V1/R2 等）、守家/进攻/风筝/游击策略、游侠射程与预判 |
+| **战斗分队** | `home_team`, `attack_team`, `kite_team`, `guerrilla_team`, `home_patrol_radius`, `home_engage_radius`, `home_engage_memory_ticks`, `home_defense_leash`, `attack_target_x/y`, `attack_mode`, `attack_retreat_radius`, `attack_march_engage_radius`, `kite_target_x/y`, `kite_mode`, `guerrilla_engage_radius`, `ranger_attack_range`, `ranger_lead_fire_enabled` | 四队名单（V1/R2 等）、守家/进攻/风筝/游击策略、守家跨区追击上限（`home_defense_leash`，默认 12，0=不限）、自动进攻撤退与行军接敌半径、游侠射程与预判 |
 | **运行** | `map_save_interval_ticks` | 地图记忆落盘节奏 |
 | **生产** | `target_workers`, `target_vanguards`, `target_rangers` | 各兵种目标数量（0–100） |
 
@@ -298,10 +299,14 @@ tick=35060 core=MOVE_RIGHT res=9/45 pop=9 workers=7 enemies=0 resources_visible=
 ```
 
 ### JSONL 日志 `tactic_log.jsonl`
-每 Tick 完整状态：Tick、时间戳、Core 状态、资源/容量/人口/生产单价、所有单位位置货物 HP、动作指令、目标与规划路径、可见敌人、矿点、上 Tick 解析事件、决策与提交耗时。文件超 `ARENA_LOG_MAX_MB`（默认 20）自动轮转，最多保留 3 个备份。
+每 Tick 完整状态：Tick、时间戳、Core 状态（含移动方向/进度/目的地）、资源/容量/人口、所有单位位置货物 HP、动作指令、目标与规划路径、可见敌人（敌方 Core 含盾/状态/移动字段）、矿点、上 Tick 解析事件、决策与提交耗时。
+
+日志格式版本 4，事件保留 `target`/`target_name`、`values`（damage/hp/targets_hit/amount 等，超 512B 截断）、`resolved_tick`；每拍另有 `decisions`（进攻撤退判定输入/输出、守家追击 leash、sweep-fuse、waypoint-stuck）、`config_rev`/`config_changed`/`config_delta`、`auto_target_candidates`/`kite_target_candidates` 和 `guerrilla_decisions`。文件超 `ARENA_LOG_MAX_MB`（默认 20）自动轮转，最多保留 3 个备份。
+
+离线复盘：`python replay.py --from 646385 --to 646436 --file _review/tactic_log.jsonl`；加 `--board` 画逐拍棋盘，`--unit V12` 只看单个单位，`--json` 输出原始记录。
 
 ### 战斗日志 `battle_log.jsonl`
-分类事件，由 tactic（发现/解析事件，以及提交成功后的风筝接敌 Tick 汇总）与 dashboard（配置/分队改动）并发写入，用 `file_lock` 串行化，超 2 MB 自动裁剪保留最新 500 条。风筝队完整逐单位候选和敌情保存在 `tactic_log.jsonl`，避免行军 Tick 挤占战斗日志。
+分类事件，由 tactic（发现/解析事件，以及提交成功后的风筝接敌 Tick 汇总）与 dashboard（配置/分队改动）并发写入，用 `file_lock` 串行化，超 2 MB 自动裁剪保留最新 500 条。事件行除 `msg` 外还带 `event`/`resolved_tick`/`actor`/`target`/`pos`/`values` 结构化列，面板仍只读 `tick/ts/cat/msg`；精确复盘以 `tactic_log.jsonl` 为准。
 
 ### 战报统计 `game_stats.json`
 每 Tick 从解析事件聚合累计：经济、生产、战斗命中率、移动、游侠预判准确度，跨重启保留，面板渲染。每单位明细按稳定名跟踪（阵亡后显示「已阵亡 · 生前攻 N 中 N」）。
@@ -369,10 +374,11 @@ python -m pytest
 ```
 
 - `tests/test_tactic_config.py`：配置字段、校验、迁移、热加载
+- `tests/test_log_schema_v4.py`：日志 v4 事件字段、决策快照、配置版本、battle_log 结构化列、replay 兼容性
 - `tests/test_regressions.py`：行为回归，**610 个用例方法 / 约 1.3 万行**，覆盖寻路、死胡同、采集、卸货、回避、分队等
 - `tests/conftest.py`：autouse 的 session 级 fixture，把 `ARENA_DATA_DIR` 指到临时目录，套件不再往仓库根写 `tactic_log.jsonl` / `game_stats.json` / `*.lock`
 
-完整套件约 850 个用例，本地约 15 秒跑完。CI（`.github/workflows/ci.yml`）在 Python 3.12 上依次跑 `ruff check .` 与 `python -m pytest`，另有独立的 `web` job（`npm ci` → lint → test → build）。ruff 规则集与已知技术债见 `pyproject.toml`。
+完整套件约 880 个用例，本地约 15 秒跑完。CI（`.github/workflows/ci.yml`）在 Python 3.12 上依次跑 `ruff check .` 与 `python -m pytest`，另有独立的 `web` job（`npm ci` → lint → test → build）。ruff 规则集与已知技术债见 `pyproject.toml`。
 
 ---
 

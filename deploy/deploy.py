@@ -191,6 +191,7 @@ MANIFEST_FILES = (
     "game_stats.py",
     "watchdog.py",
     "status.py",
+    "replay.py",
     "tactic.py",
     "dashboard.py",
     # The container entrypoint.  deploy_source_only.py forgot it, so a

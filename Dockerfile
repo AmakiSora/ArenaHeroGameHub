@@ -33,6 +33,7 @@ COPY dashboard.py \
      tactic_config.py \
      map_codec.py \
      status.py \
+     replay.py \
      watchdog.py \
      docker-entrypoint.py \
      ./

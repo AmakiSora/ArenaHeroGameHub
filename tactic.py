@@ -1246,9 +1246,23 @@ class TickRecord:
     beacon_pos: list[int] | None = None
     beacon_status: str | None = None
     events: list[dict] = field(default_factory=list)
+    # Resolution events are produced while resolving the *previous* Tick. The
+    # record-level value is set when every event agrees; each event also carries
+    # its own `resolved_tick` (v4) for mixed/older producers.
+    events_tick: int | None = None
+    core_move: dict | None = None
     shot_predictions: list[dict] = field(default_factory=list)
     shot_prediction_results: list[dict] = field(default_factory=list)
     kite_decisions: list[dict] = field(default_factory=list)
+    guerrilla_decisions: list[dict] = field(default_factory=list)
+    # Auto-mode target candidate ranking (top 3) for attack/kite squads.
+    auto_target_candidates: list[dict] = field(default_factory=list)
+    kite_target_candidates: list[dict] = field(default_factory=list)
+    # Squad/defence verdict inputs and fuse counters that drove this Tick.
+    decisions: dict = field(default_factory=dict)
+    config_rev: str = ""
+    config_changed: list[str] = field(default_factory=list)
+    config_delta: dict = field(default_factory=dict)
     plan_unit_actions: dict[str, str] = field(default_factory=dict)
     plan_core_action: str | None = None
     accepted: bool = False
@@ -1261,6 +1275,124 @@ class TickRecord:
     pathfind_ms: float = 0.0
     dead_end_runs: int = 0
     dead_end_ms: float = 0.0
+
+
+_EVENT_VALUE_KEYS = frozenset({
+    "damage", "hp", "targets_hit", "amount", "unit_type", "cost",
+    "required", "source", "direction", "progress", "required_ticks",
+    "destination", "shield", "resource_amount", "target_id",
+})
+_EVENT_VALUES_MAX_BYTES = 512
+
+
+def _event_values(event: Any) -> dict | None:
+    """Keep a compact, size-capped copy of a ResolutionEvent's values.
+
+    The wire carries damage/hp/targets_hit and a few economy fields inside
+    ``values``; the old Tick log dropped the whole dict, which made combat
+    attribution impossible without the Chinese battle-log text. Unknown keys
+    are preserved while they fit the cap so a new protocol field is not lost
+    silently; oversized payloads fall back to the known combat/economy keys.
+    """
+    values = getattr(event, "values", None)
+    if not isinstance(values, Mapping) or not values:
+        return None
+    candidate = {str(key): value for key, value in values.items()}
+    encoded = json.dumps(candidate, ensure_ascii=False, default=str)
+    if len(encoded) <= _EVENT_VALUES_MAX_BYTES:
+        return json.loads(encoded)
+    trimmed = {key: value for key, value in candidate.items() if key in _EVENT_VALUE_KEYS}
+    encoded = json.dumps(trimmed, ensure_ascii=False, default=str)
+    if len(encoded) <= _EVENT_VALUES_MAX_BYTES:
+        return json.loads(encoded)
+    return {"_truncated": True, "_keys": sorted(candidate)[:12]}
+
+
+def _direction_name(direction: Any) -> str | None:
+    """Direction enum/string → the four-letter name used elsewhere in the log."""
+    if direction is None:
+        return None
+    return str(getattr(direction, "name", direction))
+
+
+def _core_move_fields(view: Any) -> dict:
+    """Movement fields available on CoreView (own or enemy), Nones omitted."""
+    fields = {
+        "direction": _direction_name(getattr(view, "move_direction", None)),
+        "progress": getattr(view, "move_progress", None),
+        "required_ticks": getattr(view, "move_required_ticks", None),
+        "destination": (
+            list(view.destination)
+            if getattr(view, "destination", None) is not None
+            else None
+        ),
+    }
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def _sweep_fuse_snapshot() -> dict:
+    """Active sweep-fuse debts, keyed by the 8-char id used across the log."""
+    tick = int(getattr(turn_context, "tick", 0) or 0)
+    out: dict[str, dict] = {}
+    for uid, until in _sweep_fuse_until.items():
+        if until > tick:
+            out[str(uid)[:8]] = {"remaining": until - tick}
+    for uid, streak in _sweep_miss_streak.items():
+        if streak <= 0:
+            continue
+        key = str(uid)[:8]
+        out.setdefault(key, {})["miss_streak"] = streak
+    return out
+
+
+def _waypoint_stuck_snapshot() -> dict:
+    """Units currently burning their waypoint retry budget."""
+    out: dict[str, dict] = {}
+    for uid, value in _waypoint_stuck.items():
+        try:
+            ticks, target = value
+        except (TypeError, ValueError):
+            continue
+        if ticks > 0:
+            out[str(uid)[:8]] = {"ticks": ticks, "target": list(target)}
+    return out
+
+
+def _config_revision(config: Mapping) -> tuple[str, list[str]]:
+    """Stable revision + changed keys since the previous Tick.
+
+    Replays need to know which config a row was planned under. The revision is
+    a short hash of the whole config; the changed-key list makes a hot change
+    visible without diffing two full snapshots.
+    """
+    payload = json.dumps(config, sort_keys=True, ensure_ascii=False, default=str)
+    revision = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    previous = getattr(turn_context, "config_values", None)
+    changed: list[str] = []
+    if isinstance(previous, Mapping):
+        changed = [
+            key for key in sorted(set(previous) | set(config))
+            if previous.get(key) != config.get(key)
+        ]
+    turn_context.config_values = dict(config)
+    return revision, changed
+
+
+def _rows_for_tick(rows: Iterable[Any], tick: int) -> list:
+    """Drop planner rows left over from an earlier Tick.
+
+    Decision stores live on the process-global ``turn_context``; a test or a
+    crashed planning pass can leave a previous Tick's rows behind. Logging them
+    under the current Tick would silently mis-attribute a decision, so rows that
+    carry a different ``tick`` are discarded. Rows without a tick key are kept
+    for backward compatibility with older producers.
+    """
+    out = []
+    for row in rows or ():
+        if isinstance(row, Mapping) and row.get("tick") not in (None, tick):
+            continue
+        out.append(row)
+    return out
 
 
 class TacticLogger:
@@ -1297,7 +1429,7 @@ class TacticLogger:
         header = {
             "_meta": "arena-hero-tactic-log",
             "_started_at": datetime.now(timezone.utc).isoformat(),
-            "_version": 3,
+            "_version": 4,
         }
         self._file.write(json.dumps(header, ensure_ascii=False) + "\n")
         self._file.flush()
@@ -1399,7 +1531,46 @@ class TacticLogger:
             for item in turn_context.shot_predictions
         ]
         rec.shot_prediction_results = list(turn_context.shot_prediction_results)
-        rec.kite_decisions = list(getattr(turn_context, "kite_decisions", []) or [])
+        rec.kite_decisions = _rows_for_tick(
+            getattr(turn_context, "kite_decisions", []) or [], turn.tick,
+        )
+        rec.guerrilla_decisions = _rows_for_tick(
+            getattr(turn_context, "guerrilla_decisions", []) or [], turn.tick,
+        )
+        rec.auto_target_candidates = _rows_for_tick(
+            getattr(turn_context, "attack_target_candidates", []) or [], turn.tick,
+        )
+        rec.kite_target_candidates = _rows_for_tick(
+            getattr(turn_context, "kite_target_candidates", []) or [], turn.tick,
+        )
+        decisions: dict[str, Any] = {}
+        attack_decision = getattr(turn_context, "attack_decision", None)
+        if isinstance(attack_decision, Mapping):
+            if attack_decision.get("tick") in (None, turn.tick):
+                decisions["attack"] = dict(attack_decision)
+        home_defense = getattr(turn_context, "home_defense_decisions", None)
+        if isinstance(home_defense, Mapping):
+            home_rows = [
+                row for row in home_defense.values()
+                if isinstance(row, Mapping) and row.get("tick") in (None, turn.tick)
+            ]
+            if home_rows:
+                decisions["home_defense"] = home_rows
+        home_leash = getattr(turn_context, "home_defense_leash", None)
+        if home_leash is not None:
+            decisions["home_defense_leash"] = int(home_leash)
+        sweep_fuse = _sweep_fuse_snapshot()
+        if sweep_fuse:
+            decisions["sweep_fuse"] = sweep_fuse
+        waypoint_stuck = _waypoint_stuck_snapshot()
+        if waypoint_stuck:
+            decisions["waypoint_stuck"] = waypoint_stuck
+        rec.decisions = decisions
+        rec.config_rev = str(getattr(turn_context, "config_rev", "") or "")
+        rec.config_changed = list(
+            getattr(turn_context, "config_changed", []) or []
+        )
+        rec.config_delta = dict(getattr(turn_context, "config_delta", {}) or {})
         rec.accepted = accepted
         rec.latency_ms = round(latency_ms, 1)
         if phase_ms:
@@ -1416,6 +1587,9 @@ class TacticLogger:
             rec.core_hp = core.hp
             rec.core_shield = core.shield
             rec.core_state = core.view.state.value if hasattr(core.view.state, "value") else str(core.view.state)
+            move_fields = _core_move_fields(core.view)
+            if move_fields:
+                rec.core_move = move_fields
 
         logged_uids: set[str] = set()
         for w in turn.workers:
@@ -1465,22 +1639,66 @@ class TacticLogger:
             }
 
         for enemy in turn.visible_enemies:
-            rec.enemies.append({
+            enemy_type = _enemy_unit_type_name(enemy) or "ENEMY"
+            entry = {
                 "id": str(enemy.id)[:8],
                 "name": _object_name(enemy.id, "E"),
                 "pos": list(enemy.position),
                 "hp": getattr(enemy, "hp", None),
-                "type": _enemy_unit_type_name(enemy) or "ENEMY",
-            })
+                "type": enemy_type,
+            }
+            if enemy_type == "CORE":
+                # Enemy CoreView carries the same movement/defence fields as
+                # our own core; the old log kept only position/HP.
+                entry["shield"] = getattr(enemy, "shield", None)
+                state = getattr(enemy, "state", None)
+                entry["state"] = (
+                    state.value if hasattr(state, "value") else str(state)
+                ) if state is not None else None
+                core_move = _core_move_fields(enemy)
+                if core_move:
+                    entry["move"] = core_move
+            elif enemy_type == "WORKER":
+                cargo = getattr(enemy, "cargo", None)
+                if cargo is not None:
+                    entry["cargo"] = cargo
+            rec.enemies.append(entry)
 
+        event_ticks: set[int] = set()
         for event in turn.events:
-            rec.events.append({
+            actor_id = getattr(event, "actor_id", None)
+            target_id = getattr(event, "target_id", None)
+            target_name = _battle_actor_name(turn, target_id) if target_id else None
+            resolved_tick = getattr(event, "tick", None)
+            try:
+                event_tick = int(resolved_tick) if resolved_tick is not None else 0
+            except (TypeError, ValueError):
+                event_tick = 0
+            if event_tick > 0:
+                event_ticks.add(event_tick)
+            actor_name = _battle_actor_name(turn, actor_id) if actor_id else None
+            event_row = {
                 "type": event.event_type,
                 "reason": event.reason_code,
-                "actor": str(event.actor_id)[:8] if event.actor_id else None,
+                "actor": str(actor_id)[:8] if actor_id else None,
                 "pos": list(event.position) if event.position else None,
-                "amount": event.resource_amount,
-            })
+                "amount": getattr(event, "resource_amount", None),
+            }
+            # Omit empty/null columns: movement events dominate the log (~45 per
+            # Tick) and doubling their width would cost more than the new detail.
+            if actor_name and actor_name != "—":
+                event_row["actor_name"] = actor_name
+            if target_id:
+                event_row["target"] = str(target_id)[:8]
+            if target_name and target_name != "—":
+                event_row["target_name"] = target_name
+            values = _event_values(event)
+            if values:
+                event_row["values"] = values
+            if event_tick:
+                event_row["resolved_tick"] = event_tick
+            rec.events.append(event_row)
+        rec.events_tick = next(iter(event_ticks)) if len(event_ticks) == 1 else None
 
         self._maybe_rotate()
         if self._file and not self._file.closed:
@@ -1883,37 +2101,98 @@ def _attack_retreat_decision(
     squad_size: int,
     radius: int,
     enemy_memory: set[tuple[int, int]],
+    *,
+    squad_units: Iterable[Any] = (),
+    threat_radius: int = 0,
+    detail_out: dict | None = None,
 ) -> tuple[bool, int, tuple[int, int] | None, frozenset[tuple[int, int]]]:
     """Decide whether the attack squad is outmatched and should disengage.
 
-    Auto-attack engagement policy: if the enemy combat units within ``radius``
-    (Chebyshev) of the squad centroid are at least as numerous as the squad
-    itself, the squad retreats away from that cluster and re-targets. ``radius``
-    of 0 disables the check. Returns a ``(retreat, enemy_count, cluster_centroid,
-    forbidden_targets)`` tuple; ``forbidden_targets`` covers enemy-memory sightings
-    inside the cluster's footprint so the auto target scorer skips the cluster
-    and marches on the next-best sighting instead.
+    Auto-attack engagement policy: the squad disengages when the enemy
+    combat units near it outmatch it. Two signals, either one is enough:
+
+      * numbers -- enemies within ``threat_radius`` (Chebyshev, measured from
+        the squad centroid) are at least as numerous as the squad;
+      * hit points -- the same enemy group out-HPs the whole squad, because
+        ``squad_units`` is every living squad member regardless of where it
+        stands. Measuring only the members inside ``threat_radius`` made the
+        comparison asymmetric: at t646406 R6 stood 12 cells out, so the squad
+        counted 8 HP against the enemies' 8 and retreated while actually
+        holding 10 HP. The far straggler is still part of the fight it will
+        reinforce, so its HP counts.
+
+    ``threat_radius`` defaults to ``radius``. It exists because `radius` is
+    also the old numbers-only gate: with ``attack_retreat_radius = 4`` the
+    squad never even *saw* the enemies it was trading with at 7-10 cells
+    (observed t646406: centroid (-652,-106), enemies at (-660,-107)..(-662,-108),
+    so `nearby` was empty and the 5-unit squad fought on to 7 losses). Pass the
+    real engagement leash here.
+
+    A single enemy never triggers a squad-wide retreat on its own; ties on HP
+    do, because a tie means the squad trades 1:1 or worse against a group it
+    could out-manoeuvre instead.
+
+    ``radius <= 0`` disables the whole check. Returns a
+    ``(retreat, enemy_count, cluster_centroid, forbidden_targets)`` tuple;
+    ``forbidden_targets`` covers enemy-memory sightings inside the cluster's
+    footprint so the auto target scorer skips the cluster and marches on the
+    next-best sighting instead.
     """
     forbidden: frozenset[tuple[int, int]] = frozenset()
+    reach = 0 if radius <= 0 else max(int(threat_radius or 0), int(radius), 0)
+    detail = {
+        "retreat": False,
+        "reach": reach,
+        "squad_size": int(squad_size),
+        "friend_hp": 0,
+        "enemy_hp": 0,
+        "enemy_count": 0,
+        "outnumbered": False,
+        "hp_outmatched": False,
+        "out_hp": False,
+    }
     if radius <= 0 or squad_pos is None or squad_size <= 0 or not enemies:
+        if detail_out is not None:
+            detail_out.update(detail)
         return False, 0, None, forbidden
 
     threats = [e for e in enemies if _is_combat_threat(e)]
     nearby = [
-        e for e in threats if _chebyshev(tuple(e.position), squad_pos) <= radius
+        e for e in threats if _chebyshev(tuple(e.position), squad_pos) <= reach
     ]
-    if len(nearby) < squad_size:
+    friend_hp = sum(int(getattr(unit, "hp", 0) or 0) for unit in squad_units)
+    enemy_hp = sum(int(getattr(enemy, "hp", 0) or 0) for enemy in nearby)
+    outnumbered = len(nearby) >= squad_size
+    hp_outmatched = friend_hp > 0 and enemy_hp >= friend_hp
+    out_hp = hp_outmatched and len(nearby) >= 2
+    detail.update({
+        "friend_hp": friend_hp,
+        "enemy_hp": enemy_hp,
+        "enemy_count": len(nearby),
+        "outnumbered": outnumbered,
+        "hp_outmatched": hp_outmatched,
+        "out_hp": out_hp,
+        "retreat": bool(outnumbered or out_hp),
+    })
+    if detail_out is not None:
+        detail_out.update(detail)
+    if not nearby:
+        return False, 0, None, forbidden
+    if not outnumbered and not out_hp:
         return False, len(nearby), None, forbidden
 
-    # outnumbered (or tied): disengage and re-target.
+    # outmatched: disengage and re-target.
     cluster_cells = [tuple(e.position) for e in nearby]
     cx = round(sum(x for x, _ in cluster_cells) / len(cluster_cells))
     cy = round(sum(y for _, y in cluster_cells) / len(cluster_cells))
     forbidden = frozenset(
         p
         for p in enemy_memory
-        if any(_chebyshev(p, c) <= radius for c in cluster_cells)
+        if any(_chebyshev(p, c) <= reach for c in cluster_cells)
     )
+    if detail_out is not None:
+        detail_out["retreat"] = True
+        detail_out["forbidden"] = len(forbidden)
     return True, len(nearby), (cx, cy), forbidden
 
 
@@ -2124,10 +2403,20 @@ def _plan_waypoint(
         else:
             # 攻击模式：前进道路上遇到的敌人一律接战，打完继续行军。
             if unit.unit_type == UnitType.VANGUARD:
+                # Sweep first: an adjacent enemy is free damage this Tick.
+                # Approach only when no cardinal target exists, because the
+                # approach MOVE would otherwise steal the Tick from a legal
+                # sweep (t646406: E247 cardinal above V12, E249 diagonal).
                 sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
                 if sweep is not None:
                     _waypoint_stuck.pop(uid, None)
                     return sweep
+                approach = _vanguard_approach_for_sweep(
+                    unit, pos, enemies, obstacle_cells, cell_counts,
+                )
+                if approach is not None:
+                    _waypoint_stuck.pop(uid, None)
+                    return approach
             else:
                 shot = _ranger_best_shot(
                     unit,
@@ -3343,6 +3632,44 @@ def _auto_target_rank(
     return score
 
 
+def _auto_target_rows(
+    candidates: Iterable[tuple[int, int]],
+    core_pos: tuple[int, int] | None,
+    squad_pos: tuple[int, int],
+    *,
+    limit: int = 3,
+    priority: str | None = None,
+) -> list[dict]:
+    """Top-N auto target candidates with the score components that ranked them.
+
+    The chosen cell and the reason string in ``plan_unit_actions`` show *what*
+    the squad marched on; this list shows what it rejected. Candidates are the
+    same set every squad member sees (memory + the shared centroid), so the
+    list is stable across the Tick.
+    """
+    tick = int(getattr(turn_context, "tick", 0) or 0)
+    rows = []
+    for cell in candidates:
+        seen = int(_enemy_memory_ticks.get(cell, 0) or 0)
+        age = tick - seen if seen > 0 and tick > 0 else None
+        row = {
+            "cell": list(cell),
+            "score": _auto_target_rank(cell, core_pos, squad_pos),
+            "distance_squad": _manhattan(cell, squad_pos),
+            "distance_core": (
+                _manhattan(cell, core_pos) if core_pos is not None else None
+            ),
+            "age": age,
+            "type": _enemy_memory_types.get(cell),
+        }
+        if priority is not None:
+            row["priority"] = priority
+        row["tick"] = tick
+        rows.append(row)
+    rows.sort(key=lambda row: row["score"])
+    return rows[: max(int(limit), 1)]
+
+
 def _guerrilla_roam_goal(unit: Any, pos: tuple[int, int]) -> tuple[int, int]:
     """Return a far, per-unit bearing goal for solo guerrilla movement.
 
@@ -4533,6 +4860,60 @@ def _sweep_fuse_note(unit: Any) -> str:
     return " sweep-fuse" if _sweep_fused(unit) else ""
 
 
+def _vanguard_approach_for_sweep(
+    unit: Any,
+    pos: tuple[int, int],
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    cell_counts: Mapping | None = None,
+) -> tuple[str, str] | None:
+    """Step beside a diagonally-adjacent enemy so the sweep can land.
+
+    `_vanguard_adjacent_sweep` only sweeps the four cardinal neighbours. A
+    Vanguard that ends its move on a diagonal cell therefore sweeps empty air
+    every Tick while the enemy sits safely on the corner. Observed
+    t646403-t646407, V12 swept 0 targets three Ticks running: the target left
+    the swept cell first each time (battle log), and a diagonal enemy cannot be
+    swept at all until this step puts the Vanguard on a cardinal neighbour.
+
+    Returns a one-step MOVE onto a free cardinal neighbour of the closest
+    diagonal enemy, or None when no such enemy or no free slot exists. Enemy
+    cells are hard-blocked: stepping onto one is rejected as MOVE_CONTESTED,
+    so the approach must never aim at a cell another enemy occupies.
+    """
+    diagonal = [
+        enemy
+        for enemy in enemies
+        if _chebyshev(pos, tuple(enemy.position)) == 1
+        and _manhattan(pos, tuple(enemy.position)) != 1
+    ]
+    if not diagonal:
+        return None
+    target = min(diagonal, key=lambda e: _chebyshev(pos, tuple(e.position)))
+    tx, ty = target.position
+    # Same membership rule as _choose_actions (`enemy_cells`): enemies are not
+    # in obstacle_cells, so they must be blocked explicitly.
+    blocked = frozenset(obstacle_cells) | frozenset(
+        tuple(enemy.position) for enemy in enemies
+    )
+    steps = (Direction.UP, Direction.DOWN, Direction.LEFT, Direction.RIGHT)
+    for around in steps:
+        cell = (tx + around.delta[0], ty + around.delta[1])
+        if cell == pos or cell in blocked:
+            continue
+        if cell_counts is not None and cell_counts.get(cell, 0) >= _CELL_UNIT_LIMIT:
+            continue
+        delta = (cell[0] - pos[0], cell[1] - pos[1])
+        for step in steps:
+            if step.delta == delta:
+                unit.move(step)
+                return (
+                    "MOVE",
+                    f"{step.name} sweep-approach -> {target.position}",
+                )
+    return None
+
+
 def _vanguard_adjacent_sweep(
     vanguard: Any,
     pos: tuple[int, int],
@@ -4849,6 +5230,49 @@ def _ranger_best_shot(
     return ("SHOOT", f"current enemy at {best_target.position} dist={best_dist}")
 
 
+def _ranger_low_hp_kite(
+    ranger: Any,
+    pos: tuple[int, int],
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    cell_counts: Mapping | None = None,
+) -> tuple[str, str] | None:
+    """Make a 1-HP Ranger inside knife range move instead of trading shots.
+
+    Game rule (player-confirmed, see `_worker_flee`): a moving unit is never
+    hit; only a stationary target takes damage. A Ranger at 1 HP that fires
+    from inside Chebyshev 2 is therefore a free kill -- it stands still for a
+    full Tick next to an enemy that kills it. Observed t646411-t646423: R18
+    held (-660,-107) at hp1 and fired seven Ticks in a row, then died.
+
+    Returns a MOVE away from the nearest close threat, or None when the Ranger
+    is not in danger (no combat enemy within Chebyshev 2) or every escape cell
+    is blocked. Workers and enemy Cores cannot hurt it, so they never trigger
+    the kite: at t646421 R18 at 1 HP fled from E250, a WORKER two cells away.
+    """
+    if getattr(ranger, "unit_type", None) != UnitType.RANGER:
+        return None
+    hp = getattr(ranger, "hp", None)
+    if hp is None or int(hp) > 1:
+        return None
+    threats = [
+        enemy for enemy in enemies
+        if _is_combat_threat(enemy)
+        and _chebyshev(pos, tuple(enemy.position)) <= 2
+    ]
+    if not threats:
+        return None
+    nearest = min(threats, key=lambda e: _chebyshev(pos, tuple(e.position)))
+    blocked = frozenset(tuple(enemy.position) for enemy in enemies)
+    step = _retreat_from(
+        pos, tuple(nearest.position), obstacle_cells, blocked, cell_counts,
+    )
+    if step is None:
+        return None
+    ranger.move(step)
+    return ("MOVE", f"{step.name} low-hp-kite hp={hp}")
+
+
 def _scout_cardinal(
     unit: Any,
     pos: tuple[int, int],
@@ -5031,10 +5455,20 @@ def _plan_home_combat(
     _chute_escape = _cw is not None and _cw[1] >= _HOME_CHUTE_WAIT_ESCAPE
 
     if unit_kind == "vanguard":
+        # Sweep first: an adjacent enemy is free damage this Tick. Approach
+        # only when no cardinal target exists (see _plan_waypoint).
         sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
         if sweep is not None:
             return sweep
+        approach = _vanguard_approach_for_sweep(
+            unit, pos, enemies, obstacle_cells, cell_counts,
+        )
+        if approach is not None:
+            return approach
     else:
+        kite = _ranger_low_hp_kite(unit, pos, enemies, obstacle_cells, cell_counts)
+        if kite is not None:
+            return kite
         shot = _ranger_best_shot(
             unit,
             pos,
@@ -5066,10 +5500,38 @@ def _plan_home_combat(
     # targets to the mining radius so defenders do not chase across the map.
     defense = getattr(turn_context, "defense_targets", ())
     if defense:
+        # Leash the far-away economic-defence chase. `defense_targets` exists
+        # so campers threatening a mine are answered at the mine, but it used
+        # to ignore distance entirely: defenders walked 45+ cells to a death
+        # hotspot and the fight was decided before they arrived (observed
+        # t646408: V1 at (-636,-86) ordered to (-660,-107), 45 Manhattan,
+        # while the last death landed 5 Ticks later at t646433). 0 disables.
+        leash = max(int(config.get("home_defense_leash", 12) or 0), 0)
         _seen = {id(enemy) for enemy in local_enemies}
-        local_enemies.extend(
-            enemy for enemy in defense if id(enemy) not in _seen
-        )
+        kept_defense = []
+        dropped_defense = []
+        for enemy in defense:
+            if id(enemy) in _seen:
+                continue
+            if leash <= 0 or _manhattan(pos, enemy.position) <= leash:
+                kept_defense.append(enemy)
+            else:
+                dropped_defense.append(enemy)
+        local_enemies.extend(kept_defense)
+        store = getattr(turn_context, "home_defense_decisions", None)
+        if store is not None and (kept_defense or dropped_defense):
+            store[str(unit.id)] = {
+                "tick": int(getattr(turn_context, "tick", 0) or 0),
+                "unit": _object_name(
+                    unit.id, "V" if unit_kind == "vanguard" else "R",
+                ),
+                "leash": leash,
+                "kept": len(kept_defense),
+                "dropped": len(dropped_defense),
+                "target": (
+                    list(kept_defense[0].position) if kept_defense else None
+                ),
+            }
     if local_enemies:
         # A fresh visible threat supersedes any remembered chase target.
         _home_engage_target.pop(str(unit.id), None)
@@ -5417,6 +5879,10 @@ def _plan_attack_combat(
             # instead of charging back into the losing fight.
             target = (int(config["attack_target_x"]), int(config["attack_target_y"]))
         else:
+            turn_context.attack_target_candidates = _auto_target_rows(
+                candidates, core_pos, squad_pos,
+                priority="core" if core_targets else None,
+            )
             target = min(
                 candidates, key=lambda p: _auto_target_rank(p, core_pos, squad_pos)
             )
@@ -5455,10 +5921,20 @@ def _plan_attack_combat(
         return ("WAIT", f"attack-retreat-blocked n={len(enemies)}")
 
     if unit_kind == "vanguard":
+        # Sweep first: an adjacent enemy is free damage this Tick. Approach
+        # only when no cardinal target exists (see _plan_waypoint).
         sweep = _vanguard_adjacent_sweep(unit, pos, enemies)
         if sweep is not None:
             return sweep
+        approach = _vanguard_approach_for_sweep(
+            unit, pos, enemies, obstacle_cells, cell_counts,
+        )
+        if approach is not None:
+            return approach
     else:
+        kite = _ranger_low_hp_kite(unit, pos, enemies, obstacle_cells, cell_counts)
+        if kite is not None:
+            return kite
         shot = _ranger_best_shot(
             unit,
             pos,
@@ -5974,6 +6450,10 @@ def _kite_mode_target(
         if core_targets:
             candidates = core_targets
         if candidates:
+            turn_context.kite_target_candidates = _auto_target_rows(
+                candidates, core_pos, squad_pos,
+                priority="core" if core_targets else None,
+            )
             return mode, min(
                 candidates, key=lambda p: _auto_target_rank(p, core_pos, squad_pos)
             )
@@ -9243,6 +9723,26 @@ def _classify_battle_event(
     return None, None
 
 
+def _battle_event_fields(turn: Any, event: Any) -> dict[str, Any]:
+    """Structured columns that back a battle-log row.
+
+    The panel still renders ``msg``; these fields let a replay or an offline
+    query answer "who hit whom, for how much" without parsing Chinese text.
+    The SPA endpoint deliberately still exposes only tick/ts/cat/msg.
+    """
+    actor_id = getattr(event, "actor_id", None)
+    target_id = getattr(event, "target_id", None)
+    pos = getattr(event, "position", None)
+    return {
+        "event": getattr(event, "event_type", None),
+        "resolved_tick": getattr(event, "tick", None),
+        "actor": str(actor_id)[:8] if actor_id else None,
+        "target": str(target_id)[:8] if target_id else None,
+        "pos": list(pos) if pos is not None else None,
+        "values": _event_values(event),
+    }
+
+
 def _battle_log_entries(
     turn: Any,
     *,
@@ -9268,7 +9768,9 @@ def _battle_log_entries(
     for event in getattr(turn, "events", ()) or ():
         cat, msg = _classify_battle_event(turn, event, positions)
         if cat and msg:
-            entries.append({"tick": tick, "ts": ts, "cat": cat, "msg": msg})
+            entry = {"tick": tick, "ts": ts, "cat": cat, "msg": msg}
+            entry.update(_battle_event_fields(turn, event))
+            entries.append(entry)
     return entries
 
 
@@ -9288,10 +9790,13 @@ turn_context = type(
         "attack_retreat": False,
         "attack_retreat_from": None,
         "attack_forbidden_targets": frozenset(),
+        "attack_decision": None,
+        "attack_target_candidates": [],
         "attack_queue_target": None,
         "kite_squad_pos": None,
         "kite_directives": {},
         "kite_decisions": [],
+        "kite_target_candidates": [],
         "kite_queue_target": None,
         "guerrilla_decisions": [],
         "kite_collision_snapshot": None,
@@ -9301,6 +9806,12 @@ turn_context = type(
         "recent_death_cells": frozenset(),
         "mine_danger_cells": frozenset(),
         "defense_targets": (),
+        "home_defense_leash": 12,
+        "home_defense_decisions": {},
+        "config_values": None,
+        "config_rev": "",
+        "config_changed": [],
+        "config_delta": {},
         "shot_predictions": [],
         "shot_prediction_results": [],
         # Per-Tick planning profiler output (filled by choose_actions, read by
@@ -9543,6 +10054,15 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     unit_actions_detail: dict[str, str] = {}
     core_action_name = "WAIT"
     config = load_config()
+    # Per-Tick decision telemetry: reset before planning so a stale verdict or
+    # candidate list from the previous Tick can never be logged as this one's.
+    turn_context.attack_decision = None
+    turn_context.attack_target_candidates = []
+    turn_context.kite_target_candidates = []
+    turn_context.home_defense_decisions = {}
+    turn_context.home_defense_leash = max(
+        int(config.get("home_defense_leash", 12) or 0), 0,
+    )
     turn_context.worker_routes = {}
     turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
@@ -9665,11 +10185,19 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     # ── Lifecycle guard ─────────────────────────────────────────────────
     if turn.core is None:
         _publish_plan_profile(_phase)
+        turn_context.config_rev, turn_context.config_changed = _config_revision(config)
+        turn_context.config_delta = {
+            key: config.get(key) for key in turn_context.config_changed
+        }
         return ("RESPAWN", {})
 
     _phase.start("core_setup")
     # Newly produced (or previously unassigned) combat units join 守家队.
     config = _auto_enlist_new_combat_units(turn, config)
+    turn_context.config_rev, turn_context.config_changed = _config_revision(config)
+    turn_context.config_delta = {
+        key: config.get(key) for key in turn_context.config_changed
+    }
 
     core = turn.core
     core_pos = core.position
@@ -9754,20 +10282,53 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             pass
 
     # Squad-wide auto-attack retreat decision (computed once per Tick so every
-    # attack-team member acts on the same verdict). In auto mode, when the
-    # enemy combat units within attack_retreat_radius are at least as numerous
-    # as the squad, the whole team disengages and re-targets (see
-    # _plan_attack_combat). radius == 0 disables the policy.
+    # attack-team member acts on the same verdict). The squad disengages when
+    # it is outnumbered or out-HP'd by the enemies inside its engagement leash;
+    # the view is widened to attack_march_engage_radius because the squad trades
+    # across distances attack_retreat_radius alone never looked at. radius == 0
+    # disables the policy (see _attack_retreat_decision).
     retreat_radius = int(config.get("attack_retreat_radius", 5))
     squad_size = len(squad_cells)
     turn_context.attack_squad_size = squad_size
+    # The squad fights at the march engagement leash, so the retreat verdict
+    # must look at least that far instead of stopping at attack_retreat_radius
+    # (4 by default), which is shorter than the gap it actually trades across.
+    retreat_view = max(
+        retreat_radius,
+        int(config.get("attack_march_engage_radius", 0) or 0),
+    )
+    squad_units = tuple(
+        unit
+        for unit in turn.units
+        if _object_name(unit.id, _UNIT_NAME_PREFIX.get(unit.unit_type, "U"))
+        .upper() in attack_squad_names
+    )
+    attack_detail: dict[str, Any] = {}
     retreat, enemy_count, cluster_centroid, forbidden = _attack_retreat_decision(
         enemies,
         turn_context.attack_squad_pos,
         squad_size,
         retreat_radius,
         _enemy_memory,
+        squad_units=squad_units,
+        threat_radius=retreat_view,
+        detail_out=attack_detail,
     )
+    attack_detail.update({
+        "tick": int(getattr(turn_context, "tick", 0) or 0),
+        "squad_pos": (
+            list(turn_context.attack_squad_pos)
+            if turn_context.attack_squad_pos is not None else None
+        ),
+        "squad_size": squad_size,
+        "centroid": list(cluster_centroid) if cluster_centroid else None,
+        "forbidden": len(forbidden),
+        "mode": str(config.get("attack_mode", "coords")),
+        "radius": retreat_radius,
+        "view": retreat_view,
+        "retreat": bool(retreat),
+    })
+    turn_context.attack_decision = attack_detail
     # Only the auto mode honors the outnumbered-retreat policy; beacon/coords
     # mode march on a fixed destination and don't re-target from memory.
     if retreat and str(config.get("attack_mode", "coords")) == "auto":
