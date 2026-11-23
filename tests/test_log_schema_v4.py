@@ -1,6 +1,7 @@
 """Tick-log v4 fields: structured combat events, decisions, config revision."""
 from __future__ import annotations
 
+import gzip
 import json
 import tempfile
 import unittest
@@ -407,6 +408,14 @@ class ReplayTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("tick 100", text)
         self.assertIn("UNIT_DAMAGED", text)
+
+    def test_loads_a_gzipped_hourly_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tactic_log.jsonl.2026-11-23_0008.gz"
+            with gzip.open(path, "wt", encoding="utf-8") as handle:
+                handle.write(json.dumps(self._record(100)) + "\n")
+            records = replay.load_records([path])
+        self.assertEqual([rec["tick"] for rec in records], [100])
 
 
 class EventValuesAndConfigRevisionTests(unittest.TestCase):

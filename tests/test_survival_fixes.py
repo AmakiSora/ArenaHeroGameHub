@@ -319,10 +319,12 @@ class CoreSurvivalTests(unittest.TestCase):
         self.assertEqual(
             tactic._core_respawn_suppress.get("target"), (500, 0),
         )
-        # The manual target is invalidated, so the Core follows the auto
-        # heuristic (worker mass at (0, 500)) instead of marching east.
-        self.assertEqual(moves, [Direction.DOWN])
-        self.assertEqual(action, "MOVE_DOWN")
+        # The manual target is invalidated, and the fresh Core also holds still
+        # for the economy-rebuild window (deposits are refused while it is
+        # MOVING). Either way it must not march east at the stale target.
+        self.assertEqual(moves, [])
+        self.assertNotEqual(action, "MOVE_RIGHT")
+        self.assertTrue(tactic._core_recovery)
 
     def test_manual_target_without_respawn_still_moves_toward_it(self) -> None:
         action, moves = self._run(worker_pos=(0, 500), tick=5)

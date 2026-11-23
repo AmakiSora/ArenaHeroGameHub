@@ -1548,6 +1548,9 @@ class TacticLogger:
         if isinstance(attack_decision, Mapping):
             if attack_decision.get("tick") in (None, turn.tick):
                 decisions["attack"] = dict(attack_decision)
+        attack_local = getattr(turn_context, "attack_local_decisions", None)
+        if isinstance(attack_local, Mapping) and attack_local:
+            decisions["attack_local"] = list(attack_local.values())
         home_defense = getattr(turn_context, "home_defense_decisions", None)
         if isinstance(home_defense, Mapping):
             home_rows = [
@@ -1819,6 +1822,7 @@ def _retreat_from(
     cell_counts: Mapping | None = None,
     *,
     force: bool = False,
+    prefer_empty: bool = False,
 ) -> Direction | None:
     """Pick a direction that moves away from core_pos, if any is free.
 
@@ -1837,25 +1841,33 @@ def _retreat_from(
 
     ``force`` skips dead-end avoidance: the last-resort evacuation of a unit
     squatting on the chute must not fail on style grounds.
+
+    ``prefer_empty`` ranks an empty neighbour above a squeezable one before
+    distance. A 1-HP Ranger escaping a shot should not pick a cell another
+    friendly is about to enter just because it is one step farther; that is
+    how a kite lands on MOVE_CONTESTED.
     """
     best: Direction | None = None
-    best_dist = -1
+    best_key: tuple[int, int] | None = None
     for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
         npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
         if npos in obstacle_cells:
             continue
+        occupants = 0
         if cell_counts is not None:
             if npos in others:
                 continue
-            if cell_counts.get(npos, 0) >= _CELL_UNIT_LIMIT:
+            occupants = int(cell_counts.get(npos, 0) or 0)
+            if occupants >= _CELL_UNIT_LIMIT:
                 continue
         elif npos in others:
             continue
         if not force and _is_dead_end_step(npos, obstacle_cells):
             continue
         dist = _manhattan(npos, core_pos)
-        if dist > best_dist:
-            best_dist = dist
+        key = ((0 if occupants == 0 else 1) if prefer_empty else 0, -dist)
+        if best_key is None or key < best_key:
+            best_key = key
             best = d
     return best
 
@@ -2115,6 +2127,92 @@ def _nearest_worker_threat(
                 best = dist
                 nearest = enemy
     return nearest
+
+
+# A worker that just saw a combat enemy keeps fleeing for this many Ticks after
+# it leaves vision. The instantaneous trigger flipped W1 from flee-enemy back to
+# its normal route the moment the shooter stepped out of sight; the shot still
+# resolved and killed it. Three Ticks covers the resolution delay without
+# keeping a worker dancing for long after the danger is gone.
+_WORKER_THREAT_MEMORY_TICKS = 3
+_worker_threat_memory: dict[str, tuple[int, tuple[int, int]]] = {}
+
+
+def _remember_worker_threat(uid: str, enemy_pos: tuple[int, int]) -> None:
+    _worker_threat_memory[str(uid)] = (
+        int(getattr(turn_context, "tick", 0) or 0),
+        (int(enemy_pos[0]), int(enemy_pos[1])),
+    )
+
+
+def _recalled_worker_threat(uid: str) -> tuple[int, int] | None:
+    entry = _worker_threat_memory.get(str(uid))
+    if entry is None:
+        return None
+    tick, pos = entry
+    now = int(getattr(turn_context, "tick", 0) or 0)
+    # Tick 0 is the unit-test / pre-loop state: no clock, so no memory rather
+    # than a never-expiring entry shared by every test worker with one id.
+    if now <= 0:
+        return None
+    if now - tick <= _WORKER_THREAT_MEMORY_TICKS:
+        return pos
+    _worker_threat_memory.pop(str(uid), None)
+    return None
+
+
+def _prune_worker_threat_memory(turn: Any) -> None:
+    alive = {str(w.id) for w in getattr(turn, "workers", ()) or ()}
+    for uid in list(_worker_threat_memory):
+        if uid not in alive:
+            _worker_threat_memory.pop(uid, None)
+
+
+def _worker_evasion_target(
+    uid: str,
+    pos: tuple[int, int],
+    combat_enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    threat_radius: int,
+    ranger_range: int,
+) -> tuple[int, int] | None:
+    """Current visible threat, else the last one remembered for a few Ticks."""
+    nearest = _nearest_worker_threat(
+        pos, combat_enemies, obstacle_cells, threat_radius, ranger_range,
+    )
+    if nearest is not None:
+        _remember_worker_threat(uid, tuple(nearest.position))
+        return tuple(nearest.position)
+    return _recalled_worker_threat(uid)
+
+
+def _mark_worker_damage_sites(turn: Any) -> None:
+    """Ban the cell where a worker was just damaged, even if it is not a known mine.
+
+    The normal mine ban only iterates ``all_resources``; a worker killed on a
+    depleted/forgotten cell left no mark, so the next worker was fed back into
+    the same ambush. The damage event carries the worker's cell; ban it for the
+    same hysteresis window as a visible camper.
+    """
+    tick = int(getattr(turn_context, "tick", 0) or 0)
+    workers = {str(w.id) for w in getattr(turn, "workers", ()) or ()}
+    if not workers:
+        return
+    for event in getattr(turn, "events", ()) or ():
+        if getattr(event, "event_type", "") != "UNIT_DAMAGED":
+            continue
+        target = getattr(event, "target_id", None)
+        if target is None or str(target) not in workers:
+            continue
+        pos = getattr(event, "position", None)
+        if pos is None or len(pos) != 2:
+            continue
+        core = getattr(turn, "core", None)
+        if core is not None and tuple(pos) == tuple(core.position):
+            continue  # a hit at the chute is not a mine to ban
+        _mine_danger_ban[(int(pos[0]), int(pos[1]))] = (
+            tick + _MINE_DANGER_BAN_TICKS
+        )
 
 
 def _attack_retreat_decision(
@@ -2419,19 +2517,19 @@ def _plan_waypoint(
             # the stuck counter. (rush mode deliberately disables this.)
             threat_radius = int(config.get("enemy_threat_radius", 3))
             combat_enemies = _combat_threats(enemies)
-            if combat_enemies and threat_radius > 0:
-                nearest = _nearest_worker_threat(
-                    pos, combat_enemies, obstacle_cells, threat_radius,
+            if threat_radius > 0:
+                target = _worker_evasion_target(
+                    uid, pos, combat_enemies, obstacle_cells, threat_radius,
                     int(config.get("ranger_attack_range", 3)),
                 )
-                if nearest is not None:
+                if target is not None:
                     _waypoint_stuck.pop(uid, None)
                     flee_blocked = blocked | {tuple(e.position) for e in enemies}
                     return _worker_flee(
                         unit,
                         uid,
                         pos,
-                        tuple(nearest.position),
+                        target,
                         tuple(core_pos),
                         obstacle_cells,
                         flee_blocked,
@@ -2960,12 +3058,12 @@ def _plan_worker(
     # so dancing away from them only wastes cargo trips and creates LEFT/RIGHT
     # oscillation next to a harmless unit.
     combat_enemies = _combat_threats(enemies)
-    if combat_enemies and threat_radius > 0:
-        nearest_enemy = _nearest_worker_threat(
-            pos, combat_enemies, obstacle_cells, threat_radius,
+    if threat_radius > 0:
+        target = _worker_evasion_target(
+            uid, pos, combat_enemies, obstacle_cells, threat_radius,
             int(config.get("ranger_attack_range", 3)),
         )
-        if nearest_enemy is not None:
+        if target is not None:
             # `others` already carries the enemy cells in production (occupied
             # includes them); union them again so a fleeing worker can never
             # step onto an enemy even if `occupied` was not passed. Block all
@@ -2975,7 +3073,7 @@ def _plan_worker(
                 worker,
                 uid,
                 pos,
-                tuple(nearest_enemy.position),
+                target,
                 core_pos,
                 obstacle_cells,
                 flee_blocked,
@@ -5279,29 +5377,44 @@ def _ranger_low_hp_kite(
     enemies: tuple,
     obstacle_cells: frozenset[tuple[int, int]],
     cell_counts: Mapping | None = None,
+    *,
+    ranger_range: int = 3,
 ) -> tuple[str, str] | None:
-    """Make a 1-HP Ranger inside knife range move instead of trading shots.
+    """Make a 1-HP Ranger move when an enemy can actually shoot it.
 
     Game rule (player-confirmed, see `_worker_flee`): a moving unit is never
-    hit; only a stationary target takes damage. A Ranger at 1 HP that fires
-    from inside Chebyshev 2 is therefore a free kill -- it stands still for a
-    full Tick next to an enemy that kills it. Observed t646411-t646423: R18
-    held (-660,-107) at hp1 and fired seven Ticks in a row, then died.
+    hit; only a stationary target takes damage. A 1-HP Ranger that fires while
+    an enemy can hit its cell is a free kill -- it stands still for a full Tick.
 
-    Returns a MOVE away from the nearest close threat, or None when the Ranger
-    is not in danger (no combat enemy within Chebyshev 2) or every escape cell
-    is blocked. Workers and enemy Cores cannot hurt it, so they never trigger
-    the kite: at t646421 R18 at 1 HP fled from E250, a WORKER two cells away.
+    The trigger uses the real attack geometry, not a fixed Chebyshev 2: an
+    enemy Ranger shoots at range 3, so R1 at t647229 (hp1, E8/E12 at distance 3)
+    stood and fired and died. Vanguards still only threaten adjacent cells;
+    Workers and Cores never trigger the kite.
+
+    Returns a MOVE away from the nearest threat, or None when no enemy can hit
+    the Ranger or every escape cell is blocked. Empty escape cells are preferred
+    over squeezable ones so a kite does not land on MOVE_CONTESTED.
     """
     if getattr(ranger, "unit_type", None) != UnitType.RANGER:
         return None
     hp = getattr(ranger, "hp", None)
     if hp is None or int(hp) > 1:
         return None
+    threat_range = int(ranger_range or 3)
     threats = [
         enemy for enemy in enemies
         if _is_combat_threat(enemy)
-        and _chebyshev(pos, tuple(enemy.position)) <= 2
+        and (
+            _kite_enemy_can_hit(pos, enemy, obstacle_cells, threat_range)
+            # A Ranger inside its 3-cell range can step into a legal line and
+            # shoot next Tick. At 1 HP, respect the range even when the current
+            # diagonal is blocked: t647294 E7 at (-545,-96) was Chebyshev 3 from
+            # R2 (-547,-99) but not on a legal line now; it killed R2 next Tick.
+            or (
+                _enemy_unit_type_name(enemy) == "RANGER"
+                and _chebyshev(pos, tuple(enemy.position)) <= threat_range
+            )
+        )
     ]
     if not threats:
         return None
@@ -5309,6 +5422,7 @@ def _ranger_low_hp_kite(
     blocked = frozenset(tuple(enemy.position) for enemy in enemies)
     step = _retreat_from(
         pos, tuple(nearest.position), obstacle_cells, blocked, cell_counts,
+        prefer_empty=True,
     )
     if step is None:
         return None
@@ -5559,7 +5673,10 @@ def _plan_home_combat(
         if approach is not None:
             return approach
     else:
-        kite = _ranger_low_hp_kite(unit, pos, enemies, obstacle_cells, cell_counts)
+        kite = _ranger_low_hp_kite(
+            unit, pos, enemies, obstacle_cells, cell_counts,
+            ranger_range=int(config.get("ranger_attack_range", 3)),
+        )
         if kite is not None:
             return kite
         shot = _ranger_best_shot(
@@ -5872,6 +5989,102 @@ def _plan_home_combat(
     )
 
 
+def _attack_local_snapshot(
+    unit: Any,
+    pos: tuple[int, int],
+    enemies: tuple,
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Local threat picture for a detached attack member.
+
+    The squad verdict is centroid-based; this snapshot is per-unit and is logged
+    even when the unit is not retreating, so a replay can see ``local_enemies``
+    instead of only the squad-wide ``enemy_count=0``.
+    """
+    squad_pos = getattr(turn_context, "attack_squad_pos", None)
+    squad_size = int(getattr(turn_context, "attack_squad_size", 0) or 0)
+    if squad_pos is None or squad_size <= 1:
+        return None
+    engage_radius = max(int(config.get("attack_march_engage_radius", 10) or 0), 1)
+    detached = _manhattan(pos, squad_pos)
+    if detached <= engage_radius:
+        return None
+    threats = [
+        enemy for enemy in enemies
+        if _is_combat_threat(enemy)
+        and _manhattan(pos, tuple(enemy.position)) <= engage_radius
+    ]
+    if not threats:
+        return None
+    unit_hp = int(getattr(unit, "hp", 0) or 0)
+    return {
+        "tick": int(getattr(turn_context, "tick", 0) or 0),
+        "unit": _object_name(
+            unit.id, _UNIT_NAME_PREFIX.get(getattr(unit, "unit_type", None), "U"),
+        ),
+        "pos": list(pos),
+        "squad_pos": list(squad_pos),
+        "detached": detached,
+        "local_enemies": len(threats),
+        "local_enemy_hp": sum(int(getattr(e, "hp", 0) or 0) for e in threats),
+        "local_hp": unit_hp,
+    }
+
+
+def _attack_local_outlier_step(
+    unit: Any,
+    pos: tuple[int, int],
+    enemies: tuple,
+    config: dict[str, Any],
+    obstacle_cells: frozenset[tuple[int, int]],
+    cell_counts: Mapping | None = None,
+    *,
+    snapshot: dict[str, Any] | None = None,
+) -> tuple[str, str] | None:
+    """Fallback local retreat for a detached attack member that is outmatched.
+
+    Runs after the normal sweep/shot/kite steps, so a 1-HP Ranger still gets the
+    range-aware kite first. This catches the cases where the kite cannot move
+    and a detached member would otherwise march on or trade into a superior
+    local group.
+    """
+    snapshot = snapshot or _attack_local_snapshot(unit, pos, enemies, config)
+    if snapshot is None:
+        return None
+    local_hp = int(snapshot.get("local_hp", 0) or 0)
+    local_enemies = int(snapshot.get("local_enemies", 0) or 0)
+    local_enemy_hp = int(snapshot.get("local_enemy_hp", 0) or 0)
+    if not (
+        (local_hp <= 1 and local_enemies >= 2)
+        or (local_enemies >= 3 and local_enemy_hp >= local_hp * 2)
+    ):
+        return None
+    threats = [
+        enemy for enemy in enemies
+        if _is_combat_threat(enemy)
+        and _manhattan(pos, tuple(enemy.position))
+        <= max(int(config.get("attack_march_engage_radius", 10) or 0), 1)
+    ]
+    if not threats:
+        return None
+    cx = round(sum(tuple(e.position)[0] for e in threats) / len(threats))
+    cy = round(sum(tuple(e.position)[1] for e in threats) / len(threats))
+    blocked = frozenset(obstacle_cells) | frozenset(
+        tuple(enemy.position) for enemy in enemies
+    )
+    step = _retreat_from(
+        pos, (cx, cy), obstacle_cells, blocked, cell_counts, prefer_empty=True,
+    )
+    if step is None:
+        return None
+    unit.move(step)
+    snapshot["action"] = f"{step.name} attack-local-retreat"
+    return (
+        "MOVE",
+        f"{step.name} attack-local-retreat n={local_enemies} hp={local_hp}",
+    )
+
+
 def _plan_attack_combat(
     unit: Any,
     *,
@@ -5901,6 +6114,11 @@ def _plan_attack_combat(
       （N>0）可再限定只追距本单位 N 格内的顺路敌人；0 = 仅顺路过滤。
     """
     pos = tuple(unit.position)
+    local_snapshot = _attack_local_snapshot(unit, pos, enemies, config)
+    if local_snapshot is not None:
+        store = getattr(turn_context, "attack_local_decisions", None)
+        if isinstance(store, dict):
+            store[str(unit.id)] = local_snapshot
 
     mode = str(config.get("attack_mode", "coords"))
     attack_radius = max(int(config.get("attack_auto_radius", 0) or 0), 0)
@@ -6031,7 +6249,10 @@ def _plan_attack_combat(
         if approach is not None:
             return approach
     else:
-        kite = _ranger_low_hp_kite(unit, pos, enemies, obstacle_cells, cell_counts)
+        kite = _ranger_low_hp_kite(
+            unit, pos, enemies, obstacle_cells, cell_counts,
+            ranger_range=int(config.get("ranger_attack_range", 3)),
+        )
         if kite is not None:
             return kite
         shot = _ranger_best_shot(
@@ -6044,6 +6265,13 @@ def _plan_attack_combat(
         )
         if shot is not None:
             return shot
+
+    local_step = _attack_local_outlier_step(
+        unit, pos, enemies, config, obstacle_cells, cell_counts,
+        snapshot=local_snapshot,
+    )
+    if local_step is not None:
+        return local_step
 
     if enemies:
         engage_pool = enemies
@@ -7834,6 +8062,30 @@ _enemy_clear_seq: int = 0
 # may not drift beyond (see core_max_drift). Persisted to map_memory.json so a
 # restart never re-anchors an already-migrated base.
 _core_anchor: tuple[int, int] | None = None
+# Post-respawn economic recovery. A destroyed Core respawns with one worker and
+# a 5-resource vault, and every Core action is exclusive: a migration step
+# takes 4 Ticks and rejects every worker DEPOSIT while MOVING. The automatic
+# movement heuristic must therefore stand down until the economy can pay for a
+# unit again. Live log 2026-11-23: after C1 died at (-374,-10), C2 respawned at
+# (-197,1501) but kept marching toward the still-configured manual target
+# (-249,-8). In the next 409 Ticks: 101 Core steps (MOVING ~3/4 of Ticks), 825
+# worker steps, 4 harvests, 3 deposits, population frozen at 2. Frozen here,
+# re-anchored at the respawn cell, with miners kept near the new base.
+_CORE_RECOVERY_HEADCOUNT = 4
+# Safety valve: a respawn site with no reachable mine would otherwise keep the
+# Core frozen forever (recovery only ends on rebuilt headcount + banked gold).
+# After this many Ticks fall back to the old movement policy; with the stale
+# manual target clipped to the respawn anchor that still means "stay put" in
+# target mode, and auto mode resumes seeking resources.
+_CORE_RECOVERY_MAX_TICKS = 300
+_CORE_RECOVERY_MINE_RADIUS = 32
+_core_recovery: bool = False
+_core_recovery_tick: int = 0
+# A manual core target configured before the Core died points at the old base.
+# After a respawn it is only trusted inside core_max_drift of the new anchor;
+# farther out it is stale, so the Core stays where it respawned. Any config
+# edit to the three target keys is fresh operator intent and clears this.
+_core_target_stale_after_respawn: bool = False
 # Last core step we issued: (pos, direction, tick). A CORE_DESTINATION_
 # TERRAIN_BLOCKED rejection on the next Tick is attributed to pos+delta so the
 # blocked cell lands in obstacle memory instead of being re-issued forever
@@ -9912,6 +10164,7 @@ turn_context = type(
         "attack_retreat_from": None,
         "attack_forbidden_targets": frozenset(),
         "attack_decision": None,
+        "attack_local_decisions": {},
         "attack_target_candidates": [],
         "attack_queue_target": None,
         "kite_squad_pos": None,
@@ -10157,6 +10410,117 @@ def _unit_should_return_to_heal(
 # stall-alert state of its own.
 
 
+def _enter_core_recovery(turn, core, config, tick) -> bool:
+    """Enter post-respawn recovery when this Tick reports a fresh Core.
+
+    The server announces the replacement as ``CORE_RESPAWNED`` (target = the
+    new Core). Everything scheduled against the dead Core — the manual target,
+    its cached A* route, the pending heading — referred to the old base, so
+    drop it and make the respawn cell the new anchor. Returns True when the
+    event matched.
+    """
+    global _core_recovery, _core_recovery_tick, _core_target_stale_after_respawn
+    global _core_anchor, _core_pending_move, _core_move_hold_until_tick, _map_dirty
+    for event in getattr(turn, "events", ()) or ():
+        if getattr(event, "event_type", "") != "CORE_RESPAWNED":
+            continue
+        target_id = getattr(event, "target_id", None)
+        if target_id is not None and str(target_id) != str(core.id):
+            continue
+        event_pos = getattr(event, "position", None)
+        anchor = (
+            tuple(event_pos) if event_pos is not None else tuple(core.position)
+        )
+        _core_recovery = True
+        _core_recovery_tick = tick
+        _core_target_stale_after_respawn = True
+        _core_anchor = anchor
+        _core_pending_move = None
+        _core_move_hold_until_tick = 0
+        _core_target_path_cache.clear()
+        _resource_assignments.clear()
+        _worker_rally_home.clear()
+        _map_dirty = True
+        detail = (
+            f"核心重生 {_fmt_cell(anchor)}：暂停核心移动，矿点半径收缩到 "
+            f"{_CORE_RECOVERY_MINE_RADIUS}，先恢复经济"
+        )
+        if config.get("core_target_enabled", False):
+            stale_target = (
+                int(config.get("core_target_x", 0)),
+                int(config.get("core_target_y", 0)),
+            )
+            max_drift = max(0, int(config.get("core_max_drift", 200) or 0))
+            if max_drift > 0 and _manhattan(stale_target, anchor) > max_drift:
+                detail += (
+                    f"；旧核心目标 {_fmt_cell(stale_target)} 距此 "
+                    f"{_manhattan(stale_target, anchor)} 格，暂不返航"
+                )
+        try:
+            append_jsonl(BATTLE_LOG_PATH, [{
+                "tick": tick, "ts": time.time(), "cat": "economy",
+                "msg": detail,
+            }])
+        except OSError:
+            pass
+        return True
+    return False
+
+
+def _update_core_recovery(turn, core, config, tick) -> None:
+    """Maintain the post-respawn recovery window for this Tick.
+
+    Recovery ends once the fleet can sustain itself: enough workers to mine
+    and a spawn's worth of resources banked. A respawn event on the entering
+    Tick never exits on that same Tick (the new Core must hold at least once).
+    """
+    global _core_recovery
+    if _enter_core_recovery(turn, core, config, tick):
+        return
+    if not _core_recovery:
+        return
+    if tick - _core_recovery_tick >= _CORE_RECOVERY_MAX_TICKS:
+        # Unreachable economy (no mine at the new site): stop narrowing the
+        # mine radius and let the normal movement policy decide again.
+        _core_recovery = False
+        try:
+            append_jsonl(BATTLE_LOG_PATH, [{
+                "tick": tick, "ts": time.time(), "cat": "economy",
+                "msg": (
+                    f"核心重生恢复窗口超时（{_CORE_RECOVERY_MAX_TICKS} Tick）："
+                    "放开移动与采矿半径"
+                ),
+            }])
+        except OSError:
+            pass
+        return
+    worker_target = int(config.get("target_workers", 10) or 0)
+    headcount = (
+        0 if worker_target <= 0 else min(_CORE_RECOVERY_HEADCOUNT, worker_target)
+    )
+    workers = len(getattr(turn, "workers", ()) or ())
+    resources = int(getattr(turn, "resources", 0) or 0)
+    if workers >= headcount and resources >= UNIT_SPAWN_COSTS["WORKER"]:
+        _core_recovery = False
+
+
+def _effective_mine_radius(config: Mapping) -> int:
+    """Mine-assignment radius for this Tick.
+
+    ``worker_mine_max_distance`` unchanged outside recovery; right after a
+    respawn it shrinks to a short ring around the new Core so the two starting
+    workers probe fresh ground instead of walking to remembered nodes 100+
+    cells away (the live pair spent 400 Ticks on that round trip). 0 still
+    means "no cap" in normal play, but recovery needs a finite ring.
+    """
+    configured = int(config.get("worker_mine_max_distance", 0) or 0)
+    if not _core_recovery:
+        return configured
+    if configured <= 0:
+        return _CORE_RECOVERY_MINE_RADIUS
+    return min(configured, _CORE_RECOVERY_MINE_RADIUS)
+
+
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
     """Plan one Tick, holding every A* search to a shared wall-clock budget."""
     global _plan_pathfind_deadline
@@ -10178,6 +10542,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     # Per-Tick decision telemetry: reset before planning so a stale verdict or
     # candidate list from the previous Tick can never be logged as this one's.
     turn_context.attack_decision = None
+    turn_context.attack_local_decisions = {}
     turn_context.attack_target_candidates = []
     turn_context.kite_target_candidates = []
     turn_context.home_defense_decisions = {}
@@ -10187,6 +10552,8 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     turn_context.worker_routes = {}
     turn_context.unit_routes = {}
     turn_context.tick = int(getattr(turn, "tick", 0) or 0)
+    _prune_worker_threat_memory(turn)
+    _mark_worker_damage_sites(turn)
     _discard_noncollision_move_failures(turn)
     _record_sweep_resolutions(turn, bool(config.get("sweep_miss_fuse", True)))
     turn_context.shot_predictions = []
@@ -10232,7 +10599,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     # Detect this Tick's deaths before the name registry is pruned: keep the
     # dead unit's stable name for the battle log and mark its cell in the death
     # heat map so mine assignment and home defence react to the ambush.
-    global _prev_unit_snapshot, _death_heat
+    global _prev_unit_snapshot, _death_heat, _core_target_stale_after_respawn
     _tick_now = turn_context.tick
     _snapshot: dict[str, tuple[str, tuple[int, int]]] = {}
     for u in turn.units:
@@ -10324,6 +10691,15 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     core_pos = core.position
     resources = turn.resources
     turn_context.resource_space = turn.resource_space
+
+    # A fresh manual target is explicit operator intent — stop treating the
+    # configured coordinate as the dead base's leftover.
+    if _core_target_stale_after_respawn and any(
+        key in ("core_target_enabled", "core_target_x", "core_target_y")
+        for key in turn_context.config_changed
+    ):
+        _core_target_stale_after_respawn = False
+    _update_core_recovery(turn, core, config, turn_context.tick)
 
     resource_cells: frozenset[tuple[int, int]] = turn.resource_cells
     # Use permanent obstacle memory for pathfinding, not just current vision
@@ -10449,6 +10825,39 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         "view": retreat_view,
         "retreat": bool(retreat),
     })
+    # The squad verdict is centroid-based, so a detached member can be under
+    # fire while `enemy_count` stays 0. Surface that local picture separately;
+    # it must not feed the squad-wide retreat decision, or one outlier would
+    # drag the whole team away from its target.
+    local_peers: list[dict[str, Any]] = []
+    if turn_context.attack_squad_pos is not None:
+        for unit in squad_units:
+            if _manhattan(unit.position, turn_context.attack_squad_pos) <= retreat_view:
+                continue
+            local_threats = [
+                enemy for enemy in enemies
+                if _is_combat_threat(enemy)
+                and _manhattan(unit.position, tuple(enemy.position)) <= retreat_view
+            ]
+            if not local_threats:
+                continue
+            local_peers.append({
+                "unit": _object_name(
+                    unit.id, _UNIT_NAME_PREFIX.get(unit.unit_type, "U"),
+                ),
+                "pos": list(unit.position),
+                "enemies": len(local_threats),
+                "enemy_hp": sum(int(getattr(e, "hp", 0) or 0) for e in local_threats),
+                "hp": int(getattr(unit, "hp", 0) or 0),
+            })
+    if local_peers:
+        attack_detail["local"] = local_peers
+        attack_detail["local_enemy_count"] = max(
+            row["enemies"] for row in local_peers
+        )
+        attack_detail["local_enemy_hp"] = max(
+            row["enemy_hp"] for row in local_peers
+        )
     turn_context.attack_decision = attack_detail
     # Only the auto mode honors the outnumbered-retreat policy; beacon/coords
     # mode march on a fixed destination and don't re-target from memory.
@@ -10506,7 +10915,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         # Workers ignore mines farther than this Manhattan distance from the core —
         # a far deposit round-trip wastes more ticks than it earns, and a worker
         # stranded out deep is easy prey. 0 (default) disables the cap.
-        mine_max_distance = int(config.get("worker_mine_max_distance", 0))
+        mine_max_distance = _effective_mine_radius(config)
         if mine_max_distance > 0:
             all_resources = [
                 r for r in all_resources
@@ -10696,7 +11105,10 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             core_done = True
 
     # ── Core movement ────────────────────────────────────────────────────
-    if not core_done and config["core_movement_enabled"]:
+    # A fresh Core holds still until the economy can pay for a unit: moving and
+    # depositing share the Core's action, and a step keeps it MOVING for 3 of
+    # every 4 Ticks, so mining is impossible while it migrates.
+    if not core_done and config["core_movement_enabled"] and not _core_recovery:
         # A Core migration spans several Ticks (state stays MOVING until the
         # step lands). Re-issuing START_MOVE mid-step is rejected as
         # CORE_ALREADY_MOVING and used to flood the battle log with one warn
@@ -10819,6 +11231,21 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                     int(config.get("core_target_x", 0)),
                     int(config.get("core_target_y", 0)),
                 )
+                # A target configured before the Core died points at the old
+                # base. Unless it is close enough to be a real intent for the
+                # new site, treat it as stale and stay anchored at the respawn
+                # cell (the live target sat 1509 cells from C2). Any later
+                # dashboard edit of the target keys clears the guard. Primary
+                # guard is _core_respawn_suppress (turns the target OFF for
+                # 3000 Ticks); this clamp covers the Tick the suppression has
+                # expired but the operator still never saved a new target.
+                if (
+                    _core_target_stale_after_respawn
+                    and _core_anchor is not None
+                    and max_drift > 0
+                    and _manhattan(target, tuple(_core_anchor)) > max_drift
+                ):
+                    target = tuple(_core_anchor)
             else:
                 # Move toward workers + resources center of mass
                 # Compute average worker position
@@ -11355,6 +11782,17 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     # heal_return_limit == 0 (no stagger) keeps heal_return_allowed = None.
     _phase.stop()  # unit_setup
 
+    # Right after a respawn, workers plan against the same short mine radius
+    # the assignment stage used, so the rally fallback (_worker_rally_goal)
+    # turns a wandering miner around at 2x that ring instead of letting it
+    # explore 400 cells away from a Core that is trying to rebuild.
+    worker_config = config
+    if _core_recovery:
+        worker_config = {
+            **config,
+            "worker_mine_max_distance": _effective_mine_radius(config),
+        }
+
     # Per-unit planner wall-clock, broken down by unit type so the summary can
     # attribute a slow tick to "workers" vs "vanguards" vs "rangers". Each is the
     # sum over every unit of that type this Tick.
@@ -11555,7 +11993,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 resource_cells=resource_cells,
                 obstacle_cells=obstacle_cells,
                 depleted=depleted,
-                config=config,
+                config=worker_config,
                 occupied=occupied,
                 enemies=enemies,
                 lease_uid=delivery_lease,

@@ -15,6 +15,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import sys
 from collections.abc import Iterable, Mapping
@@ -52,7 +53,10 @@ def load_records(paths: Iterable[Path]) -> list[dict]:
         if not path.exists():
             continue
         try:
-            handle = path.open("r", encoding="utf-8")
+            if path.name.endswith(".gz"):
+                handle = gzip.open(path, "rt", encoding="utf-8")
+            else:
+                handle = path.open("r", encoding="utf-8")
         except OSError as exc:
             print(f"[replay] cannot read {path}: {exc}", file=sys.stderr)
             continue
