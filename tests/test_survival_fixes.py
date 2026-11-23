@@ -113,6 +113,27 @@ class WorkerFleeFireCoverTests(unittest.TestCase):
         self.assertEqual(moved, [Direction.UP])
         self.assertIn("flee-enemy@(3, 0)", detail)
 
+    def test_real_departure_history_detects_two_cell_oscillation(self) -> None:
+        moved: list = []
+        worker = SimpleNamespace(
+            id="worker-1", position=(0, 0),
+            move=moved.append, wait=lambda: None,
+        )
+        uid = "worker-1"
+        tactic._worker_last_pos[uid] = (0, 1)
+        tactic._worker_recent[uid] = [(0, 0), (0, 1)]
+        enemies = (_enemy((3, 0), UnitType.VANGUARD),)
+
+        action, detail = tactic._worker_flee(
+            worker, uid, (0, 0), (3, 0), (-2, 2),
+            frozenset(), frozenset({(3, 0)}), True,
+            enemies=enemies,
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertEqual(moved, [Direction.LEFT])
+        self.assertIn("flee-enemy@(3, 0)", detail)
+
 
 class HomeSafeApproachTests(unittest.TestCase):
     """`_home_safe_approach` overrides only an exposed direct approach step."""

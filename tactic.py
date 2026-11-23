@@ -2129,19 +2129,29 @@ def _nearest_worker_threat(
     return nearest
 
 
-# A worker that just saw a combat enemy keeps fleeing for this many Ticks after
-# it leaves vision. The instantaneous trigger flipped W1 from flee-enemy back to
-# its normal route the moment the shooter stepped out of sight; the shot still
-# resolved and killed it. Three Ticks covers the resolution delay without
-# keeping a worker dancing for long after the danger is gone.
 _WORKER_THREAT_MEMORY_TICKS = 3
-_worker_threat_memory: dict[str, tuple[int, tuple[int, int]]] = {}
+_WORKER_INJURED_THREAT_MEMORY_TICKS = 16
+_worker_threat_memory: dict[str, tuple[int, tuple[int, int], int]] = {}
+_worker_retreat: dict[str, int] = {}
+_worker_retreat_path_cache: dict[str, dict] = {}
 
 
-def _remember_worker_threat(uid: str, enemy_pos: tuple[int, int]) -> None:
+def _worker_hp(worker: Any) -> int:
+    return int(getattr(worker, "hp", _unit_max_hp(worker)) or 0)
+
+
+def _remember_worker_threat(
+    uid: str, enemy_pos: tuple[int, int], hp: int | None = None,
+) -> None:
+    ttl = (
+        _WORKER_INJURED_THREAT_MEMORY_TICKS
+        if hp is not None and hp < _UNIT_MAX_HP[UnitType.WORKER]
+        else _WORKER_THREAT_MEMORY_TICKS
+    )
     _worker_threat_memory[str(uid)] = (
         int(getattr(turn_context, "tick", 0) or 0),
         (int(enemy_pos[0]), int(enemy_pos[1])),
+        ttl,
     )
 
 
@@ -2149,16 +2159,29 @@ def _recalled_worker_threat(uid: str) -> tuple[int, int] | None:
     entry = _worker_threat_memory.get(str(uid))
     if entry is None:
         return None
-    tick, pos = entry
     now = int(getattr(turn_context, "tick", 0) or 0)
     # Tick 0 is the unit-test / pre-loop state: no clock, so no memory rather
     # than a never-expiring entry shared by every test worker with one id.
     if now <= 0:
         return None
-    if now - tick <= _WORKER_THREAT_MEMORY_TICKS:
+    tick, pos = entry[:2]
+    ttl = entry[2] if len(entry) > 2 else _WORKER_THREAT_MEMORY_TICKS
+    if now - tick <= ttl:
         return pos
     _worker_threat_memory.pop(str(uid), None)
     return None
+
+
+def _worker_should_retreat(worker: Any) -> bool:
+    uid = str(worker.id)
+    if _worker_hp(worker) < _unit_max_hp(worker):
+        _worker_retreat[uid] = int(getattr(turn_context, "tick", 0) or 0)
+        return True
+    if uid in _worker_retreat:
+        _worker_retreat.pop(uid, None)
+        _worker_retreat_path_cache.pop(uid, None)
+        _worker_threat_memory.pop(uid, None)
+    return False
 
 
 def _prune_worker_threat_memory(turn: Any) -> None:
@@ -2175,13 +2198,14 @@ def _worker_evasion_target(
     obstacle_cells: frozenset[tuple[int, int]],
     threat_radius: int,
     ranger_range: int,
+    hp: int | None = None,
 ) -> tuple[int, int] | None:
     """Current visible threat, else the last one remembered for a few Ticks."""
     nearest = _nearest_worker_threat(
         pos, combat_enemies, obstacle_cells, threat_radius, ranger_range,
     )
     if nearest is not None:
-        _remember_worker_threat(uid, tuple(nearest.position))
+        _remember_worker_threat(uid, tuple(nearest.position), hp)
         return tuple(nearest.position)
     return _recalled_worker_threat(uid)
 
@@ -2195,7 +2219,9 @@ def _mark_worker_damage_sites(turn: Any) -> None:
     same hysteresis window as a visible camper.
     """
     tick = int(getattr(turn_context, "tick", 0) or 0)
-    workers = {str(w.id) for w in getattr(turn, "workers", ()) or ()}
+    workers = {
+        str(w.id): w for w in getattr(turn, "workers", ()) or ()
+    }
     if not workers:
         return
     for event in getattr(turn, "events", ()) or ():
@@ -2210,6 +2236,10 @@ def _mark_worker_damage_sites(turn: Any) -> None:
         core = getattr(turn, "core", None)
         if core is not None and tuple(pos) == tuple(core.position):
             continue  # a hit at the chute is not a mine to ban
+        worker = workers[str(target)]
+        hp = _worker_hp(worker)
+        _worker_retreat[str(target)] = tick
+        _remember_worker_threat(str(target), tuple(pos), hp)
         _mine_danger_ban[(int(pos[0]), int(pos[1]))] = (
             tick + _MINE_DANGER_BAN_TICKS
         )
@@ -2350,13 +2380,15 @@ def _worker_flee(
     prev = _worker_last_pos.get(uid)
     recent = _worker_recent.get(uid, [])
     recent_set = set(recent)
-    # Detect 2-cell oscillation: A->B->A. Break it by banning the reverse
-    # step when any other free neighbor exists.
+    # Successful moves record the departure cell, so at A after A->B->A the
+    # history ends [..., A, B]. Keep the old seeded shape for existing callers.
     oscillating = (
         len(recent) >= 2
-        and recent[-1] == pos
-        and prev == recent[-2]
         and prev is not None
+        and (
+            (recent[-1] == prev and recent[-2] == pos)
+            or (recent[-1] == pos and prev == recent[-2])
+        )
     )
     candidates: list[tuple[float, int, Direction, tuple[int, int]]] = []
     for d in (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT):
@@ -2420,6 +2452,147 @@ def _worker_flee(
     worker.wait()
     _set_worker_route(worker, tuple(pos), [tuple(pos)], complete=True)
     return ("WAIT", "flee-boxed")
+
+
+def _worker_retreat_to_core(
+    worker,
+    uid: str,
+    pos: tuple[int, int],
+    core_pos: tuple[int, int],
+    obstacle_cells: frozenset[tuple[int, int]],
+    move_blocked: frozenset[tuple[int, int]],
+    carrying: bool,
+    enemies: tuple,
+    combat_enemies: tuple,
+    threat_radius: int,
+    ranger_range: int,
+    config: dict[str, Any],
+) -> tuple[str, str] | None:
+    """Keep an injured worker on a stable, danger-avoiding route home."""
+    danger = frozenset(
+        _enemy_danger_cells(combat_enemies, obstacle_cells, ranger_range)
+    )
+    threat = _nearest_worker_threat(
+        pos, combat_enemies, obstacle_cells, threat_radius, ranger_range,
+    )
+    if pos == core_pos:
+        if threat is not None:
+            return _worker_flee(
+                worker, uid, pos, tuple(threat.position), core_pos,
+                obstacle_cells, move_blocked | {
+                    tuple(e.position) for e in enemies
+                }, carrying, enemies=combat_enemies,
+                ranger_range=ranger_range,
+            )
+        if carrying:
+            if turn_context.resource_space > 0:
+                worker.deposit()
+                _set_worker_route(worker, core_pos, [pos], complete=True)
+                return ("DEPOSIT", f"retreat-core cargo={worker.cargo}")
+            worker.wait()
+            _set_worker_route(worker, core_pos, [pos], complete=False)
+            return ("WAIT", "retreat-core chute-full")
+        return None
+
+    if core_pos in danger:
+        if threat is not None:
+            return _worker_flee(
+                worker, uid, pos, tuple(threat.position), core_pos,
+                obstacle_cells, move_blocked | {
+                    tuple(e.position) for e in enemies
+                }, carrying, enemies=combat_enemies,
+                ranger_range=ranger_range,
+            )
+        worker.wait()
+        return ("WAIT", "retreat-core threatened")
+
+    obstacles_here = obstacle_cells
+    if core_pos in obstacle_cells:
+        obstacles_here = obstacle_cells - {core_pos}
+    extras_here = frozenset(move_blocked) - {pos}
+    if core_pos in extras_here and _chute_vacating_this_tick:
+        extras_here = extras_here - {core_pos}
+    blocked_key = extras_here
+    cache = _worker_retreat_path_cache.get(uid)
+    if (
+        cache is not None
+        and cache.get("goal") == core_pos
+        and cache.get("blocked") == blocked_key
+        and cache.get("path")
+        and (not cache.get("safe") or cache.get("danger") == danger)
+    ):
+        path = cache["path"]
+        safe = bool(cache.get("safe"))
+        index = int(cache.get("index", 0))
+    else:
+        distance = _manhattan(pos, core_pos)
+        budget = max(
+            int(config.get("bfs_max_steps", 2500)),
+            min(8000, distance * 12 + 200),
+        )
+        path = _bfs_path(
+            pos, core_pos, obstacles_here, max_steps=budget,
+            extras=blocked_key | danger,
+        )
+        safe = path is not None
+        if path is None:
+            path = _bfs_path(
+                pos, core_pos, obstacles_here, max_steps=budget,
+                extras=blocked_key,
+            )
+        if path is None:
+            _worker_retreat_path_cache.pop(uid, None)
+            target = _worker_evasion_target(
+                uid, pos, combat_enemies, obstacle_cells, threat_radius,
+                ranger_range, _worker_hp(worker),
+            )
+            if target is not None:
+                return _worker_flee(
+                    worker, uid, pos, target, core_pos, obstacle_cells,
+                    blocked_key | {tuple(e.position) for e in enemies},
+                    carrying, enemies=combat_enemies,
+                    ranger_range=ranger_range,
+                )
+            worker.wait()
+            return ("WAIT", "retreat-no-path")
+        index = 0
+        cache = {
+            "goal": core_pos,
+            "blocked": blocked_key,
+            "danger": danger,
+            "safe": safe,
+            "path": path,
+            "index": index,
+        }
+        _worker_retreat_path_cache[uid] = cache
+
+    path_index = _path_index(path, pos, index)
+    if path_index < 0 or path_index + 1 >= len(path):
+        _worker_retreat_path_cache.pop(uid, None)
+        worker.wait()
+        return ("WAIT", "retreat-replan")
+    npos = path[path_index + 1]
+    if npos in obstacle_cells or npos in blocked_key or (safe and npos in danger):
+        _worker_retreat_path_cache.pop(uid, None)
+        worker.wait()
+        return ("WAIT", "retreat-replan")
+    direction = _direction_for_step(pos, npos)
+    if direction is None:
+        _worker_retreat_path_cache.pop(uid, None)
+        worker.wait()
+        return ("WAIT", "retreat-replan")
+    worker.move(direction)
+    _worker_last_pos[uid] = pos
+    recent = _worker_recent.get(uid, [])
+    recent.append(pos)
+    if len(recent) > 6:
+        recent.pop(0)
+    _worker_recent[uid] = recent
+    _waypoint_stuck.pop(uid, None)
+    cache["index"] = path_index + 1
+    _set_worker_route(worker, core_pos, path, complete=True)
+    mode = "safe" if safe else "fallback"
+    return ("MOVE", f"{direction.name} retreat-core {mode}")
 
 
 def _plan_waypoint(
@@ -2502,6 +2675,23 @@ def _plan_waypoint(
         cell_counts,
         tuple(core_pos),
     )
+    threat_radius = int(config.get("enemy_threat_radius", 3))
+    if is_worker and threat_radius > 0 and _worker_should_retreat(unit):
+        _waypoint_stuck.pop(uid, None)
+        retreat_action = _worker_retreat_to_core(
+            unit, uid, pos, tuple(core_pos), obstacle_cells,
+            frozenset(blocked) - {pos},
+            getattr(unit, "cargo", 0) > 0, enemies,
+            _combat_threats(enemies), threat_radius,
+            int(config.get("ranger_attack_range", 3)), config,
+        )
+        if retreat_action is not None:
+            return retreat_action
+        unit.wait()
+        return ("WAIT", "retreat-core")
+    if is_worker and threat_radius <= 0:
+        _worker_retreat.pop(uid, None)
+        _worker_retreat_path_cache.pop(uid, None)
 
     def _count_stuck() -> bool:
         """Return True when the unit should skip the current target."""
@@ -2521,6 +2711,7 @@ def _plan_waypoint(
                 target = _worker_evasion_target(
                     uid, pos, combat_enemies, obstacle_cells, threat_radius,
                     int(config.get("ranger_attack_range", 3)),
+                    _worker_hp(unit),
                 )
                 if target is not None:
                     _waypoint_stuck.pop(uid, None)
@@ -3058,10 +3249,23 @@ def _plan_worker(
     # so dancing away from them only wastes cargo trips and creates LEFT/RIGHT
     # oscillation next to a harmless unit.
     combat_enemies = _combat_threats(enemies)
-    if threat_radius > 0:
+    retreating = threat_radius > 0 and _worker_should_retreat(worker)
+    if retreating:
+        retreat_action = _worker_retreat_to_core(
+            worker, uid, pos, core_pos, obstacle_cells, move_blocked,
+            carrying, enemies, combat_enemies, threat_radius,
+            int(config.get("ranger_attack_range", 3)), config,
+        )
+        if retreat_action is not None:
+            return retreat_action
+    elif threat_radius <= 0:
+        _worker_retreat.pop(uid, None)
+        _worker_retreat_path_cache.pop(uid, None)
+        _worker_threat_memory.pop(uid, None)
+    if threat_radius > 0 and not (retreating and pos == core_pos):
         target = _worker_evasion_target(
             uid, pos, combat_enemies, obstacle_cells, threat_radius,
-            int(config.get("ranger_attack_range", 3)),
+            int(config.get("ranger_attack_range", 3)), _worker_hp(worker),
         )
         if target is not None:
             # `others` already carries the enemy cells in production (occupied
@@ -10293,6 +10497,7 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
         _worker_last_pos, _worker_recent, _worker_explore_history,
         _worker_rally_home, _worker_planned_step, _worker_contest_blocked,
         _worker_contest_repeat, _resource_assignments, _worker_path_cache,
+        _worker_retreat, _worker_retreat_path_cache,
         _cargo_route_miss_dist, _march_route_miss, _cell_limit_blocked,
         _combat_path_cache, _home_engage_target, _guerrilla_core_target,
         _guerrilla_unit_target, _worker_stuck_ticks, _worker_stuck_pos,
