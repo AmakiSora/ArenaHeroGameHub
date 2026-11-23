@@ -2066,6 +2066,28 @@ def _enemy_danger_cells(
     return danger
 
 
+def _cell_fire_cover(
+    cell: tuple[int, int],
+    enemies: tuple | list,
+    obstacle_cells: frozenset[tuple[int, int]],
+    ranger_range: int = 3,
+) -> int:
+    """How many visible enemy combat units could hit ``cell`` without moving.
+
+    Production review 2026-11-23 (5h, 5,700 unit-ticks near enemies): a unit
+    whose END cell was on a visible Ranger's fire line was hit 22% of the time
+    even while moving; an end cell outside every fire line was hit 0.1%. The
+    old "keep moving and you are safe" rule is wrong against predictive
+    shooters; the end cell's exposure is what matters. Used to pick escape and
+    approach steps that stay off every visible fire line.
+    """
+    cover = 0
+    for enemy in _combat_threats(enemies):
+        if _kite_enemy_can_hit(cell, enemy, obstacle_cells, ranger_range):
+            cover += 1
+    return cover
+
+
 def _nearest_worker_threat(
     pos: tuple[int, int],
     combat_enemies: tuple,
@@ -2208,15 +2230,21 @@ def _worker_flee(
     obstacle_cells: frozenset[tuple[int, int]],
     others: frozenset[tuple[int, int]],
     carrying: bool,
+    *,
+    enemies: tuple | list = (),
+    ranger_range: int = 3,
 ) -> tuple[str, str]:
     """Move one step away from the enemy.
 
-    Game rule (player-confirmed): a moving unit is never hit — only a
-    stationary one takes damage. A threatened worker must therefore spend every
-    Tick MOVING (never WAIT / HARVEST / DEPOSIT). Pick a free, non-dead-end
-    cell that maximizes distance from the enemy; fall back to any free cell;
-    only WAIT when every neighbor is blocked. `others` includes the enemy cells
-    themselves, so the worker can never step onto an enemy.
+    A threatened worker spends every Tick MOVING (never WAIT / HARVEST /
+    DEPOSIT). Candidate cells are ranked first by how many visible enemies
+    could hit the END cell (``_cell_fire_cover`` over ``enemies``), then by
+    distance from the nearest enemy. Production 2026-11-23: 7 of 14 worker
+    deaths fled away from the nearest Ranger straight onto another Ranger's
+    fire line while a cover-0 neighbour existed (W23 took 8 damage stepping
+    LEFT into six shooters). Fall back to any free cell; only WAIT when every
+    neighbor is blocked. `others` includes the enemy cells themselves, so the
+    worker can never step onto an enemy.
 
     Cargo workers bias hard toward the Core so they do not ping-pong on the
     same two cells next to a stationary attacker while carrying resources home.
@@ -2240,6 +2268,12 @@ def _worker_flee(
             continue
         dist_enemy = _manhattan(npos, enemy_pos)
         score = dist_enemy * 10.0
+        if enemies:
+            # Fire-line exposure dominates every other term: one covering
+            # shooter outweighs the whole distance/backtrack/cargo bias.
+            score -= 100.0 * _cell_fire_cover(
+                npos, enemies, obstacle_cells, ranger_range,
+            )
         if carrying:
             closer_home = _manhattan(pos, core_pos) - _manhattan(npos, core_pos)
             score += closer_home * 8.0
@@ -2402,6 +2436,8 @@ def _plan_waypoint(
                         obstacle_cells,
                         flee_blocked,
                         carrying=(getattr(unit, "cargo", 0) > 0),
+                        enemies=combat_enemies,
+                        ranger_range=int(config.get("ranger_attack_range", 3)),
                     )
         else:
             # 攻击模式：前进道路上遇到的敌人一律接战，打完继续行军。
@@ -2545,6 +2581,8 @@ def _plan_hold(
     for enemy in sorted(
         threats, key=lambda e: _chebyshev(pos, tuple(e.position)),
     ):
+        if _enemy_unit_type_name(enemy) == "RANGER":
+            continue
         predicted = _kite_motion_info(enemy, pos).get("predicted")
         if predicted is None:
             continue
@@ -2942,6 +2980,8 @@ def _plan_worker(
                 obstacle_cells,
                 flee_blocked,
                 carrying,
+                enemies=combat_enemies,
+                ranger_range=int(config.get("ranger_attack_range", 3)),
             )
 
     if pos == core.position and turn_context.resource_space > 0 and carrying:
@@ -5425,6 +5465,56 @@ def _home_patrol_goal(
     return (core_pos[0] + slot[0], core_pos[1] + slot[1])
 
 
+def _home_safe_approach(
+    unit: Any,
+    pos: tuple[int, int],
+    goal: tuple[int, int],
+    enemies: tuple,
+    obstacle_cells: frozenset[tuple[int, int]],
+    ranger_range: int,
+    cell_counts: Mapping | None,
+    prefix: str,
+) -> tuple[str, str] | None:
+    """Fire-aware approach step for a home defender that cannot attack yet.
+
+    Production 2026-11-23: 11 of 32 friendly hits were home/attack units
+    stepping straight down a Ranger's fire line (``home-intercept``) while a
+    neighbour off every fire line existed. Only engages when the direct
+    approach is actually exposed: then pick the free neighbour with the least
+    fire cover, breaking ties by distance to ``goal``. Returns None when the
+    current situation is not exposed (caller keeps its normal march).
+    """
+    threats = _combat_threats(enemies)
+    if not threats:
+        return None
+    if min(_chebyshev(pos, tuple(e.position)) for e in threats) > ranger_range + 2:
+        return None
+    enemy_cells = {tuple(e.position) for e in enemies}
+    options: list[tuple[int, int, int, Direction, tuple[int, int]]] = []
+    for order, d in enumerate(
+        (Direction.UP, Direction.RIGHT, Direction.DOWN, Direction.LEFT)
+    ):
+        npos = (pos[0] + d.delta[0], pos[1] + d.delta[1])
+        if npos in obstacle_cells or npos in enemy_cells:
+            continue
+        if cell_counts is not None and cell_counts.get(npos, 0) >= _CELL_UNIT_LIMIT:
+            continue
+        cover = _cell_fire_cover(npos, threats, obstacle_cells, ranger_range)
+        options.append((cover, _manhattan(npos, goal), order, d, npos))
+    if not options:
+        return None
+    options.sort()
+    best_cover, _dist, _order, best_dir, best_cell = options[0]
+    # Greedy direct step (what _move_towards would usually take) — only
+    # override it when it is exposed and a strictly safer step exists.
+    direct = min(options, key=lambda o: (o[1], o[2]))
+    if direct[0] == 0 or best_cover >= direct[0]:
+        return None
+    unit.move(best_dir)
+    _set_unit_route(unit, goal, [pos, best_cell], complete=False)
+    return ("MOVE", f"{best_dir.name} {prefix}-safe cover={best_cover}/{direct[0]}")
+
+
 def _plan_home_combat(
     unit: Any,
     *,
@@ -5553,6 +5643,12 @@ def _plan_home_combat(
             if _manhattan(core_pos, nearest.position) <= return_radius
             else "home-intercept"
         )
+        safe = _home_safe_approach(
+            unit, pos, tuple(nearest.position), enemies, obstacle_cells,
+            int(config.get("ranger_attack_range", 3)), cell_counts, prefix,
+        )
+        if safe is not None:
+            return safe
         moved = _move_towards(
             unit,
             pos,
@@ -6997,12 +7093,9 @@ def _plan_kite_combat(
     )
     # Predictive attack on a contested cell. If this unit already had two
     # same-tick move attempts toward the same cell cancelled by collision
-    # (same pos, same target cell, the server dropped both moves), the enemy
-    # is reliably still trying to enter that cell next tick. Attack the cell
-    # directly instead of retrying the doomed move: a Vanguard sweep hits the
-    # cell without entering it (no collision possible), and a Ranger can
-    # shoot_cell it. Movement resolves before combat, so the shot lands on
-    # the enemy's post-move cell.
+    # (same pos, same target cell, the server dropped both moves), a Vanguard
+    # can sweep that cell. For a Ranger, only pre-fire it when an enemy's own
+    # motion track predicts that cell; the collision may have been with an ally.
     collision = _kite_collision_streak.get(str(unit.id))
     collision_avoid: tuple[int, int] | None = None
     if (
@@ -7029,18 +7122,28 @@ def _plan_kite_combat(
                 _record_kite_stall(uid, pos)
                 return "SWEEP", detail
         if unit_kind == "ranger":
-            shot = _kite_ranger_fire(
-                unit, pos, target, contested, obstacle_cells, attack_range,
-            )
-            if shot is not None:
-                _kite_collision_streak.pop(str(unit.id), None)
-                action, detail = shot
-                _kite_log_decision(
-                    unit, unit_kind, mode, objective, threats, action, detail,
-                    target=target,
+            # A repeated failed move can be an ally collision; it does not prove
+            # that the currently selected enemy caused it. Only pre-fire when a
+            # visible enemy's own motion track predicts this exact contested cell.
+            contested_enemy = next((
+                enemy for enemy in threats
+                if _enemy_unit_type_name(enemy) != "RANGER"
+                and _kite_motion_info(enemy, pos).get("predicted") == contested
+            ), None)
+            if contested_enemy is not None:
+                shot = _kite_ranger_fire(
+                    unit, pos, contested_enemy, contested,
+                    obstacle_cells, attack_range,
                 )
-                _record_kite_stall(uid, pos)
-                return action, detail
+                if shot is not None:
+                    _kite_collision_streak.pop(str(unit.id), None)
+                    action, detail = shot
+                    _kite_log_decision(
+                        unit, unit_kind, mode, objective, threats, action, detail,
+                        target=contested_enemy,
+                    )
+                    _record_kite_stall(uid, pos)
+                    return action, detail
     elif (
         collision is not None
         and collision[0] == pos
@@ -7316,22 +7419,22 @@ def _plan_kite_combat(
 
     if target is not None and unit_kind == "ranger":
         motion = _kite_motion_info(target, pos)
-        # Lead fire on a mover beats a current-cell shot even at streak 1: a
-        # moving target is ~3% hittable at its current cell but ~8% at its
-        # predicted next cell, so gating low-streak leads back to current-cell
-        # would LOWER hits. Stationary targets already fall through to a
-        # current-cell shot (~96%) via the state gate below; the oscillating
-        # bounce model aims at the cell the target just left.
+        # Production outcomes favor current-cell shots against enemy Rangers
+        # (151 counterfactual harms vs 33 improvements); keep lead fire for
+        # targets whose motion prediction has shown a net benefit.
         expected = (
             motion.get("predicted")
-            if motion["state"] in {"advance", "retreat"} or motion.get("oscillating")
+            if _enemy_unit_type_name(target) != "RANGER"
+            and (motion["state"] in {"advance", "retreat"} or motion.get("oscillating"))
             else None
         )
         shot = _kite_ranger_fire(
             unit, pos, target, expected, obstacle_cells, attack_range,
         )
         if shot is None and (
-            motion["state"] in {"stationary", "unknown"} or motion.get("oscillating")
+            _enemy_unit_type_name(target) == "RANGER"
+            or motion["state"] in {"stationary", "unknown"}
+            or motion.get("oscillating")
         ):
             shot = _kite_ranger_fire(
                 unit, pos, target, None, obstacle_cells, attack_range,
@@ -7745,6 +7848,21 @@ _core_move_hold_until_tick: int = 0
 # beats hammering: each attempt re-enters MOVING and a MOVING Core rejects every
 # worker DEPOSIT, which is how an 11-hour freeze looked in the field.
 _CORE_MOVE_HOLD_TICKS = 4
+# Core danger freeze: a migrating Core cannot repair or heal (CORE_MOVING), and
+# production C1 kept stepping east toward its manual target for 30 Ticks after
+# 4+ Rangers appeared 8 cells away, then was shot from 10 HP+shield to dead in
+# 6 Ticks (t649639-t649645). While a combat enemy is within this Chebyshev
+# radius the Core stops starting new steps; the freeze lingers a while after
+# the last sighting because campers slip in and out of vision.
+_CORE_DANGER_RADIUS = 12
+_CORE_DANGER_LINGER_TICKS = 40
+_core_danger_until: int = 0
+# After a respawn the manual core target still points at the old base (C2
+# respawned 1,500 cells away and spent 74% of 545 Ticks MOVING toward it,
+# depositing 4 resources in total). Suppress the manual target until the
+# operator saves a new one or this many Ticks pass.
+_CORE_RESPAWN_TARGET_SUPPRESS_TICKS = 3000
+_core_respawn_suppress: dict[str, Any] = {}
 # Worker MOVE_CONTESTED repeat tracker: {uid: (pos, contested_cell, count)}.
 # Two workers whose deterministic plans submit the same cell every Tick cancel
 # both moves every Tick (observed 30+ identical rejections); after two
@@ -10416,7 +10534,9 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             if (
                 rt in danger_cells
                 or any(_manhattan(rt, ec) <= 1 for ec in enemy_cells)
-                or any(_manhattan(rt, dc) <= 1 for dc in death_cells)
+                # 2026-11-23: W24/W14/W20 died 2-4 cells from the mine they
+                # were walking to within 60 Ticks; a 1-cell ban never fired.
+                or any(_chebyshev(rt, dc) <= 4 for dc in death_cells)
             ):
                 _mine_danger_ban[rt] = _tick_now + _MINE_DANGER_BAN_TICKS
         _mine_danger_ban = {
@@ -10501,6 +10621,45 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     _phase.start("core_action")
     core_done = False
 
+    # Core danger freeze (see _CORE_DANGER_RADIUS): any visible combat enemy
+    # near the Core refreshes a linger window during which the Core neither
+    # starts a migration step nor gives up shield repair.
+    global _core_danger_until
+    if any(
+        _chebyshev(tuple(e.position), tuple(core_pos)) <= _CORE_DANGER_RADIUS
+        for e in _combat_threats(enemies)
+    ):
+        _core_danger_until = turn_context.tick + _CORE_DANGER_LINGER_TICKS
+    _core_in_danger = turn_context.tick < _core_danger_until
+
+    # Respawn: suppress a stale manual core target (see
+    # _CORE_RESPAWN_TARGET_SUPPRESS_TICKS). Lifted as soon as the operator
+    # saves a different target, or after the timeout.
+    for _ev in getattr(turn, "events", ()) or ():
+        if getattr(_ev, "event_type", "") == "CORE_RESPAWNED":
+            _core_respawn_suppress.update({
+                "target": (
+                    int(config.get("core_target_x", 0)),
+                    int(config.get("core_target_y", 0)),
+                ),
+                "until": turn_context.tick + _CORE_RESPAWN_TARGET_SUPPRESS_TICKS,
+            })
+            _core_danger_until = 0
+            break
+    if _core_respawn_suppress:
+        _cur_target = (
+            int(config.get("core_target_x", 0)),
+            int(config.get("core_target_y", 0)),
+        )
+        if (
+            _cur_target != _core_respawn_suppress.get("target")
+            or turn_context.tick >= int(_core_respawn_suppress.get("until", 0))
+        ):
+            _core_respawn_suppress.clear()
+        elif config.get("core_target_enabled", False):
+            config = dict(config)
+            config["core_target_enabled"] = False
+
     if beacon_on_ground_here:
         core.pickup_beacon()
         core_action_name = "PICKUP_BEACON"
@@ -10525,6 +10684,11 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             if enemies
             else int(config["peace_shield_target"])
         )
+        # Under threat near the Core, top the shield up to its cap instead of
+        # the low combat target: C1 died with 2 spare resources while its
+        # shield sat at the combat target of 3 (t649639-t649645).
+        if _core_in_danger:
+            shield_target = max(shield_target, effective_cap)
         want_repair = core.shield < shield_target and core.shield < effective_cap
         if want_repair:
             core.repair_shield()
@@ -10629,6 +10793,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         if (
             not close_cargo
             and not core_mid_move
+            and not _core_in_danger
             and turn_context.tick >= _core_move_hold_until_tick
         ):
             # Drift leash: the automatic heuristic chases the worker/resource

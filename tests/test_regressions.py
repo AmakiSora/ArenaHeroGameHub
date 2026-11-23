@@ -3778,14 +3778,12 @@ class KiteTeamPlannerTests(unittest.TestCase):
         # The streak is cleared once the predictive attack fires.
         self.assertNotIn(str(vanguard.id), tactic._kite_collision_streak)
 
-    def test_ranger_shoots_contested_cell_after_two_move_collisions(self):
-        # Same collision rule as the Vanguard test, but for a Ranger: after
-        # two cancelled move attempts into the same cell, shoot_cell that cell
-        # instead of retrying the doomed move (movement resolves before combat,
-        # so the shot lands on the enemy's post-move cell).
+    def test_ranger_shoots_predicted_contested_cell_after_two_move_collisions(self):
+        # A Ranger may pre-fire the contested cell only when the enemy's own
+        # motion track predicts that exact post-move position.
         ranger = self.unit("kite-r-collide", (0, 0), UnitType.RANGER)
-        enemy = self.enemy("enemy-v", (0, 1), UnitType.VANGUARD)
-        tactic._enemy_motion_tracks[enemy.id] = [(3, (0, 2)), (4, (0, 1))]
+        enemy = self.enemy("enemy-v", (1, -1), UnitType.VANGUARD)
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (2, -1)), (4, (1, -1))]
         tactic._kite_collision_streak.clear()
         tactic._kite_collision_streak[str(ranger.id)] = ((0, 0), (0, -1), 2)
 
@@ -3798,6 +3796,41 @@ class KiteTeamPlannerTests(unittest.TestCase):
         self.assertIn("kite-lead", detail)
         self.assertEqual(ranger.expected_cell, (0, -1))
         self.assertNotIn(str(ranger.id), tactic._kite_collision_streak)
+
+    def test_ranger_does_not_prefire_stationary_enemy_into_ally_collision_cell(self):
+        # The Ranger and a friendly unit can collide even when the selected
+        # enemy is stationary. That collision is not evidence the enemy will
+        # enter the contested cell, so normal evasion should take over.
+        ranger = self.unit("kite-r-stationary-collide", (0, 0), UnitType.RANGER)
+        enemy = self.enemy("stationary-v", (0, 1), UnitType.VANGUARD)
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (0, 1)), (4, (0, 1))]
+        tactic._kite_collision_streak.clear()
+        tactic._kite_collision_streak[str(ranger.id)] = ((0, 0), (0, -1), 2)
+
+        action, detail = tactic._plan_ranger(
+            ranger, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("kite-evade", detail)
+        self.assertIsNone(ranger.expected_cell)
+
+    def test_ranger_does_not_prefire_moving_enemy_ranger_collision_cell(self):
+        ranger = self.unit("kite-ranger-collide", (0, 0), UnitType.RANGER)
+        enemy = self.enemy("enemy-ranger", (1, -1), UnitType.RANGER)
+        tactic._enemy_motion_tracks[enemy.id] = [(3, (2, -1)), (4, (1, -1))]
+        tactic._kite_collision_streak.clear()
+        tactic._kite_collision_streak[str(ranger.id)] = ((0, 0), (0, -1), 2)
+
+        action, detail = tactic._plan_ranger(
+            ranger, (enemy,), frozenset(), self.config,
+            core_pos=(0, 0), team="kite",
+        )
+
+        self.assertEqual(action, "MOVE")
+        self.assertIn("kite-evade", detail)
+        self.assertIsNone(ranger.expected_cell)
 
     def test_ranger_without_target_avoids_contested_cell_instead_of_shooting(self):
         ranger = self.unit("kite-r-no-target", (0, 0), UnitType.RANGER)
@@ -7435,6 +7468,24 @@ class ManualHoldTests(unittest.TestCase):
         self.assertEqual(action, "SHOOT")
         self.assertEqual(actions["shoots"][0], ((2, 0), (1, 0)))
         self.assertIn("kite-lead", detail)
+
+    def test_ranger_holds_on_current_cell_against_moving_enemy_ranger(self) -> None:
+        # Production lead-fire outcomes against Rangers were net-negative, so
+        # a hold order must use the reliable current cell instead.
+        tactic._enemy_motion_tracks.clear()
+        tactic._enemy_motion_tracks["e1"] = [
+            (100, (0, 4)), (101, (0, 3)), (102, (0, 2)),
+        ]
+        unit, actions = self._hold_unit("r1-current", (0, 0), UnitType.RANGER)
+        enemy = self._enemy("e1", (0, 2), etype="RANGER")
+        try:
+            action, detail = tactic._plan_hold(unit, (enemy,), frozenset(), {})
+        finally:
+            tactic._enemy_motion_tracks.clear()
+
+        self.assertEqual(action, "SHOOT")
+        self.assertEqual(actions["shoots"][0], ((0, 2), None))
+        self.assertIn("current", detail)
 
     def test_ranger_waits_when_enemy_out_of_range(self) -> None:
         unit, actions = self._hold_unit("r1", (0, 0), UnitType.RANGER)
