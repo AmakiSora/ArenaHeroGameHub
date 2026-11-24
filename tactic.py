@@ -8341,6 +8341,12 @@ _core_recovery_tick: int = 0
 # farther out it is stale, so the Core stays where it respawned. Any config
 # edit to the three target keys is fresh operator intent and clears this.
 _core_target_stale_after_respawn: bool = False
+# Manual target the Core has already announced reaching. One battle-log row per
+# arrival episode; reset when the Core leaves the cell or the operator saves a
+# new target, so a later return trip logs again. Kept in memory only: a process
+# restart while parked prints one extra line, which is harmless and confirms
+# where the Core actually is.
+_core_target_arrival_logged: tuple[int, int] | None = None
 # Last core step we issued: (pos, direction, tick). A CORE_DESTINATION_
 # TERRAIN_BLOCKED rejection on the next Tick is attributed to pos+delta so the
 # blocked cell lands in obstacle memory instead of being re-issued forever
@@ -10791,6 +10797,37 @@ def _effective_mine_radius(config: Mapping) -> int:
     return min(configured, _CORE_RECOVERY_MINE_RADIUS)
 
 
+def _manual_core_target(
+    config,
+    *,
+    anchor: tuple[int, int] | None,
+    stale: bool,
+    max_drift: int,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return ``(configured, effective)`` for the manual Core target.
+
+    A target saved before the Core died points at the old base. The post-respawn
+    guard clamps ``effective`` to the new anchor, exactly as the movement code
+    has always done. The primary guard is ``_core_respawn_suppress`` (target off
+    for 3000 Ticks); this clamp covers the Tick it expires before the operator
+    saves a new target. Arrival callers compare against ``effective`` but only
+    announce it when it equals ``configured``: sitting on the clamped anchor is
+    not the operator's target.
+    """
+    configured = (
+        int(config.get("core_target_x", 0)),
+        int(config.get("core_target_y", 0)),
+    )
+    if (
+        stale
+        and anchor is not None
+        and max_drift > 0
+        and _manhattan(configured, tuple(anchor)) > max_drift
+    ):
+        return configured, tuple(anchor)
+    return configured, configured
+
+
 def choose_actions(turn) -> tuple[str, dict[str, str]]:
     """Plan one Tick, holding every A* search to a shared wall-clock budget."""
     global _plan_pathfind_deadline
@@ -10870,6 +10907,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
     # dead unit's stable name for the battle log and mark its cell in the death
     # heat map so mine assignment and home defence react to the ambush.
     global _prev_unit_snapshot, _death_heat, _core_target_stale_after_respawn
+    global _core_target_arrival_logged
     _tick_now = turn_context.tick
     _snapshot: dict[str, tuple[str, tuple[int, int]]] = {}
     for u in turn.units:
@@ -10964,11 +11002,12 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
 
     # A fresh manual target is explicit operator intent — stop treating the
     # configured coordinate as the dead base's leftover.
-    if _core_target_stale_after_respawn and any(
+    if any(
         key in ("core_target_enabled", "core_target_x", "core_target_y")
         for key in turn_context.config_changed
     ):
         _core_target_stale_after_respawn = False
+        _core_target_arrival_logged = None
     _update_core_recovery(turn, core, config, turn_context.tick)
 
     resource_cells: frozenset[tuple[int, int]] = turn.resource_cells
@@ -11487,6 +11526,42 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             for _u in _core_count_list:
                 _p = tuple(_u.position)
                 core_cell_counts[_p] = core_cell_counts.get(_p, 0) + 1
+        max_drift = max(0, int(config.get("core_max_drift", 200)))
+        # Confirm arrival before the movement gate. A parked Core with a loaded
+        # worker inside cargo_wait_distance has close_cargo true, and a step
+        # from last Tick keeps it MOVING; neither means the target was missed.
+        # The same helper the movement branch uses decides the effective cell,
+        # so a target clamped to the respawn anchor cannot be reported as
+        # "arrived" when the operator's coordinate is somewhere else.
+        if config.get("core_target_enabled", False):
+            _manual_target, _effective_target = _manual_core_target(
+                config,
+                anchor=_core_anchor,
+                stale=_core_target_stale_after_respawn,
+                max_drift=max_drift,
+            )
+            if tuple(core_pos) == _effective_target:
+                if (
+                    _effective_target == _manual_target
+                    and _core_target_arrival_logged != _manual_target
+                ):
+                    _core_target_arrival_logged = _manual_target
+                    try:
+                        append_jsonl(BATTLE_LOG_PATH, [{
+                            "tick": turn_context.tick,
+                            "ts": time.time(),
+                            "cat": "config",
+                            "msg": (
+                                f"核心已到达指定目标 "
+                                f"{_fmt_cell(_manual_target)}，停止移动"
+                            ),
+                        }])
+                    except OSError:
+                        pass
+            else:
+                _core_target_arrival_logged = None
+        else:
+            _core_target_arrival_logged = None
         if (
             not close_cargo
             and not core_mid_move
@@ -11499,7 +11574,6 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             # Core — the whole base migrates forever (observed 2800+ cells).
             # Clamp every automatic step to a persisted anchor instead. 0
             # disables the leash; a manual core target bypasses it.
-            max_drift = max(0, int(config.get("core_max_drift", 200)))
             if _core_anchor is None:
                 _core_anchor = tuple(core_pos)
                 _map_dirty = True
@@ -11511,26 +11585,16 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             # Determine movement target
             core_target_enabled = config.get("core_target_enabled", False)
             if core_target_enabled:
-                # Fixed coordinate target (overrides resource/worker heuristics)
-                target = (
-                    int(config.get("core_target_x", 0)),
-                    int(config.get("core_target_y", 0)),
+                # Fixed coordinate target (overrides resource/worker heuristics).
+                # The helper applies the post-respawn stale-target clamp and is
+                # also used by the arrival check above, so both agree on the
+                # effective cell.
+                manual_target, target = _manual_core_target(
+                    config,
+                    anchor=_core_anchor,
+                    stale=_core_target_stale_after_respawn,
+                    max_drift=max_drift,
                 )
-                # A target configured before the Core died points at the old
-                # base. Unless it is close enough to be a real intent for the
-                # new site, treat it as stale and stay anchored at the respawn
-                # cell (the live target sat 1509 cells from C2). Any later
-                # dashboard edit of the target keys clears the guard. Primary
-                # guard is _core_respawn_suppress (turns the target OFF for
-                # 3000 Ticks); this clamp covers the Tick the suppression has
-                # expired but the operator still never saved a new target.
-                if (
-                    _core_target_stale_after_respawn
-                    and _core_anchor is not None
-                    and max_drift > 0
-                    and _manhattan(target, tuple(_core_anchor)) > max_drift
-                ):
-                    target = tuple(_core_anchor)
             else:
                 # Move toward workers + resources center of mass
                 # Compute average worker position

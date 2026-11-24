@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -545,6 +546,98 @@ class MiningEconomyTests(RespawnRecoveryBase):
         self.assertIn("at_core", details[worker.id])
         self.assertEqual(world.deposits, 1)
         self.assertEqual(worker.cargo, 0)
+
+
+class CoreTargetArrivalLogTests(RespawnRecoveryBase):
+    """A manual target must say when the Core actually gets there.
+
+    The operator could previously only infer arrival from the Core stopping;
+    one config row per arrival episode makes it explicit without spamming a
+    row every Tick the Core parks on the target.
+    """
+
+    @staticmethod
+    def _rows(log: Path) -> list[dict]:
+        if not log.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in log.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def test_arrival_is_logged_once_per_target(self) -> None:
+        world = RespawnWorld(core_pos=(-197, 1501), mines=set(), workers=1)
+        self._config = self.config(core_target_x=-197, core_target_y=1501)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log = Path(temp_dir) / "battle_log.jsonl"
+            with self.isolated_tick_env(Path(temp_dir)):
+                world.step()
+                world.step()
+            arrivals = [
+                row for row in self._rows(log)
+                if "到达指定目标" in row.get("msg", "")
+            ]
+        self.assertEqual(len(arrivals), 1)
+        self.assertIn("(-197,1501)", arrivals[0]["msg"])
+        self.assertEqual(arrivals[0]["cat"], "config")
+
+    def test_arrival_logs_only_after_the_core_reaches_the_cell(self) -> None:
+        world = RespawnWorld(core_pos=(-197, 1502), mines=set(), workers=1)
+        self._config = self.config(core_target_x=-197, core_target_y=1501)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log = Path(temp_dir) / "battle_log.jsonl"
+            with self.isolated_tick_env(Path(temp_dir)):
+                world.step()
+                before = [
+                    row for row in self._rows(log)
+                    if "到达指定目标" in row.get("msg", "")
+                ]
+                world.core.position = (-197, 1501)
+                world.step()
+            after = [
+                row for row in self._rows(log)
+                if "到达指定目标" in row.get("msg", "")
+            ]
+        self.assertEqual(before, [])
+        self.assertEqual(len(after), 1)
+
+    def test_arrival_is_logged_even_when_a_loaded_worker_holds_the_core(self) -> None:
+        # close_cargo stops the Core from starting a move, but it must not hide
+        # the arrival: the Core is already parked on the operator's target.
+        world = RespawnWorld(
+            core_pos=(-197, 1501), mines=set(), workers=1, resources=0,
+        )
+        world.world_workers[0].position = (-197, 1502)
+        world.world_workers[0].cargo = 1
+        self._config = self.config(core_target_x=-197, core_target_y=1501)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log = Path(temp_dir) / "battle_log.jsonl"
+            with self.isolated_tick_env(Path(temp_dir)):
+                world.step()
+            arrivals = [
+                row for row in self._rows(log)
+                if "到达指定目标" in row.get("msg", "")
+            ]
+        self.assertEqual(len(arrivals), 1)
+
+    def test_stale_respawn_target_is_not_reported_as_arrived(self) -> None:
+        # The configured target points at the dead base; after a respawn the
+        # Core is clamped to its new anchor. Sitting on the anchor is not the
+        # operator's target, so the arrival row must not claim it.
+        world = RespawnWorld(core_pos=(-197, 1501), mines=set(), workers=1)
+        tactic._core_target_stale_after_respawn = True
+        tactic._core_anchor = (-197, 1501)
+        self._config = self.config(core_target_x=-249, core_target_y=-8)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log = Path(temp_dir) / "battle_log.jsonl"
+            with self.isolated_tick_env(Path(temp_dir)):
+                world.step()
+            arrivals = [
+                row for row in self._rows(log)
+                if "到达指定目标" in row.get("msg", "")
+            ]
+        self.assertEqual(arrivals, [])
 
 
 if __name__ == "__main__":
