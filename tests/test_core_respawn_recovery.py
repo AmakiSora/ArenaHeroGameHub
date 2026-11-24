@@ -449,5 +449,103 @@ class RespawnEconomyRecoveryTests(RespawnRecoveryBase):
         self.assertFalse(tactic._core_recovery)
 
 
+class MiningEconomyTests(RespawnRecoveryBase):
+    """Dead-memory invalidation, sticky revalidation, deposit chute.
+
+    Live window 654574-655274 (``_review`` logs): 65 of 171 mine runs walked
+    to a cell someone had already harvested and 57 arrived to nothing; a
+    remembered cell still held a resource only 27 times in 62 stands (43.5%).
+    ``_review/_respawn_vision.py`` over 628662-655498 (467 harvests): every
+    harvested cell came within vision again and exactly one was ever
+    refilled, 339 Ticks later — the nodes are one-shot, so a dead memory entry
+    costs the whole round trip.
+
+    A failed deposit is the opposite: over all 232 live DEPOSIT_FAILED, the
+    same worker's next DEPOSIT_SUCCEEDED came a median 2 Ticks later (p90 3,
+    max 13), so the MOVING guard is kept for a clean log, not for income.
+    """
+
+    def test_harvest_succeeded_tombstones_the_cell(self) -> None:
+        world = RespawnWorld(core_pos=(-197, 1501), mines=set(), workers=0)
+        world.add_worker((-197, 1503))
+        harvested = (-197, 1491)
+        tactic._resource_memory.add(harvested)
+        tactic._resource_tombstones.discard(harvested)
+
+        tactic._update_resource_memory(world.turn((FakeEvent(
+            "HARVEST_SUCCEEDED",
+            actor_id=world.world_workers[0].id,
+            position=harvested,
+            values={"amount": 1},
+        ),)))
+
+        self.assertNotIn(harvested, tactic._resource_memory)
+        self.assertIn(
+            harvested, tactic._resource_tombstones,
+            "the tombstone must survive the next map save",
+        )
+
+    def test_sticky_assignment_dies_when_the_mine_is_harvested_out(self) -> None:
+        world = RespawnWorld(core_pos=(-197, 1501), mines=set(), workers=0)
+        world.add_worker((-197, 1503))
+        wid = world.world_workers[0].id
+        mine = (-197, 1491)          # 10 cells north: a 22-step round trip
+        tactic._resource_memory.add(mine)
+        self.run_ticks(world, ticks=1, config=self.config())
+        self.assertEqual(tactic._resource_assignments.get(wid), mine)
+
+        # What HARVEST_SUCCEEDED does when another worker empties the cell.
+        tactic._forget_resource(mine)
+        self.run_ticks(world, ticks=1, config=self.config())
+        self.assertNotEqual(
+            tactic._resource_assignments.get(wid), mine,
+            "a harvested-out memory cell must not keep its worker walking",
+        )
+
+    def test_sticky_assignment_is_revalidated_against_the_round_trip(self) -> None:
+        # A mine inside the 200-cell radius when assigned can fall out of it as
+        # the Core migrates. Re-check "outbound + return" every Tick: 150 out
+        # from the Core plus 210 from the worker is 360 > 200, so the sticky
+        # entry dies and the nearer mine wins.
+        world = RespawnWorld(core_pos=(0, 0), mines=set(), workers=0)
+        world.add_worker((0, -60))
+        wid = world.world_workers[0].id
+        far_mine = (0, 150)
+        near_mine = (0, -70)
+        tactic._resource_memory.update({far_mine, near_mine})
+        tactic._resource_assignments[wid] = far_mine
+        self.run_ticks(world, ticks=1, config=self.config())
+        self.assertEqual(tactic._resource_assignments.get(wid), near_mine)
+
+    def test_loaded_worker_waits_instead_of_depositing_into_a_moving_core(
+            self) -> None:
+        world = RespawnWorld(core_pos=(-197, 1501), mines=set(), workers=0)
+        world.add_worker((-197, 1501))
+        worker = world.world_workers[0]
+        worker.cargo = 1
+        world.core.view = SimpleNamespace(state=CoreState.MOVING)
+        self._config = self.config(target_workers=1)
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                self.isolated_tick_env(Path(temp_dir)):
+            _core_action, details = tactic.choose_actions(world.turn(()))
+        self.assertIn("deposit-defer-core-moving", details[worker.id])
+        self.assertEqual(world.deposits, 0)
+        self.assertEqual(worker.cargo, 1, "the cargo must stay aboard")
+        self.assertEqual(worker.last, ("wait",))
+
+    def test_loaded_worker_deposits_once_the_core_lands(self) -> None:
+        world = RespawnWorld(core_pos=(-197, 1501), mines=set(), workers=0)
+        world.add_worker((-197, 1501))
+        worker = world.world_workers[0]
+        worker.cargo = 1
+        self._config = self.config(target_workers=1)
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                self.isolated_tick_env(Path(temp_dir)):
+            _core_action, details = tactic.choose_actions(world.turn(()))
+        self.assertIn("at_core", details[worker.id])
+        self.assertEqual(world.deposits, 1)
+        self.assertEqual(worker.cargo, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

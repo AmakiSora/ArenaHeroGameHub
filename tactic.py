@@ -3146,6 +3146,19 @@ def _rally_route_goal(
     )
 
 
+def _core_is_moving(core) -> bool:
+    """True while a Core migration step is in flight.
+
+    A MOVING Core rejects every DEPOSIT (CORE_MOVING), and when the step lands
+    the cell named in a DEPOSIT planned earlier is empty (CORE_NOT_PRESENT).
+    Those were the two failure reasons in ticks 654574-655274, all of them a
+    carrier standing on the Core cell at plan time. Ask this before issuing
+    DEPOSIT and WAIT instead. The retry itself is cheap (median 2 Ticks), so
+    this buys a clean log and one fewer rejected action, not extra income.
+    """
+    return getattr(getattr(core, "view", None), "state", None) == CoreState.MOVING
+
+
 def _plan_worker(
     worker,
     core,
@@ -3287,6 +3300,17 @@ def _plan_worker(
             )
 
     if pos == core.position and turn_context.resource_space > 0 and carrying:
+        if _core_is_moving(core):
+            # The Core is mid-step: DEPOSIT can only be rejected this Tick
+            # (CORE_MOVING) or land on the wrong cell once it moves
+            # (CORE_NOT_PRESENT). Hold the cargo on the chute and unload the
+            # moment the Core lands. This is a log-noise fix, not a throughput
+            # one: measured over all 232 live DEPOSIT_FAILED, the same worker's
+            # next DEPOSIT_SUCCEEDED came a median 2 Ticks later (p90 3, max
+            # 13) — the cargo is kept and the walk is not repeated.
+            worker.wait()
+            _set_worker_route(worker, tuple(core.position), [tuple(pos)], complete=True)
+            return ("WAIT", "deposit-defer-core-moving")
         worker.deposit()
         _set_worker_route(worker, tuple(core.position), [tuple(pos)], complete=True)
         return ("DEPOSIT", f"at_core cargo={worker.cargo}")
@@ -8231,6 +8255,33 @@ _resource_memory: set[tuple[int, int]] = set()
 # Resources confirmed absent but not yet flushed to map_memory.json. Tombstones
 # prevent sticky manual entries on disk from being merged back during a save.
 _resource_tombstones: set[tuple[int, int]] = set()
+# Resource nodes are one-shot. Vision-corrected test over the whole local log
+# span 628662-655498 (_review/_respawn_vision.py): 467 harvests, and every
+# harvested cell came back within vision (Chebyshev 3 for a worker, 5 for the
+# Core) within 400 Ticks — so the fleet had a clean look at all of them — and
+# exactly one was ever reported visible again, 339 Ticks after its harvest.
+# An earlier read of "empty at 655056, visible at 655200" mistook *not seen*
+# for *confirmed empty*: workers only see 3 cells, so absence from
+# ``turn.resource_cells`` says nothing. Forgetting a harvested node is
+# therefore permanent, and the economy is discovery-limited: the harvest rate
+# equals fresh cells swept per Tick x 0.484% node density (144 resources seen
+# over 29,782 cells swept in ticks 655183-655443). 243 harvests on 243 distinct
+# cells is the same conclusion from the other side.
+#
+# That makes the whole game the sweep rate near the Core, not the trip to a
+# remembered cell: the fleet swept 42.5 new cells/Tick against a ~180/Tick
+# ceiling (26 workers x ~7 new cells per orthogonal step). A fleet-wide trail
+# map (tried and measured: 80 vs 92 harvests over 700 Ticks) did not raise it,
+# so the fan-out is left as it is — the sweep is set by how far the fleet
+# roams, and the recall stays at 2 x the configured mine radius.
+#
+# Kept from the 2026-11-24 economy A/B (700 Ticks, 26 workers, one-shot nodes,
+# median of 5 PYTHONHASHSEED runs): the harvest tombstone plus the per-Tick
+# sticky revalidation raised deposits_ok 102 -> 106 and cut no_harvest_max
+# 367 -> 286 at sweep 36.1 -> 36.6 cells/Tick. Three additions were measured
+# and dropped: a 100-step memory trip budget (deposits_ok 97), a 120-cell idle
+# leash (96), and a round-trip-cost ranking (111 deposits but no_harvest_max
+# 426 — it starves the tail worker). No constant from those is kept.
 # Permanent obstacles: once seen, always blocked
 _obstacle_memory: set[tuple[int, int]] = set()
 # Enemy sightings: remember every position where enemies were seen
@@ -9968,7 +10019,17 @@ def _update_obstacle_memory(turn) -> frozenset[tuple[int, int]]:
 
 
 def _forget_resource(position: tuple[int, int]) -> None:
-    """Mark a resource as absent in memory and the next persisted map."""
+    """Mark a resource as absent in memory and the next persisted map.
+
+    The tombstone is permanent: over the full local log span (628662-655498,
+    467 harvests) every harvested cell was re-observed within vision and only
+    one was ever refilled (339 Ticks later), so a depleted node is not a mine
+    the fleet can plan on.
+    Forgetting it at harvest time is also what keeps the assignment stage from
+    aiming a second worker at it in the same window (65 of the 171 mine runs
+    in ticks 654574-655274 targeted a cell already harvested then, and 57 of
+    those walked there to find nothing).
+    """
     global _map_dirty
     pos = tuple(position)
     _resource_memory.discard(pos)
@@ -9977,14 +10038,15 @@ def _forget_resource(position: tuple[int, int]) -> None:
 
 
 def _update_resource_memory(turn) -> set[tuple[int, int]]:
-    """Remember visible resources permanently until depletion is confirmed.
+    """Remember visible resources until they are harvested or reported gone.
 
-    A node is forgotten only when the server actually reports it gone:
-    HARVEST_FAILED / RESOURCE_DEPLETED, or a worker arriving at a remembered
-    cell that no longer shows a resource. HARVEST_FAILED / CARGO_FULL is NOT a
-    depletion signal — it is the server refusing a harvest because the worker
-    already carries cargo (harvest fills the full capacity in one action), so
-    the node stays remembered for the next empty worker.
+    A node is forgotten when it is harvested (a successful harvest empties it;
+    see _forget_resource for the one-shot evidence) or when the server reports
+    it gone: HARVEST_FAILED / RESOURCE_DEPLETED, or a worker arriving at a
+    remembered cell that no longer shows a resource. HARVEST_FAILED /
+    CARGO_FULL is NOT a depletion signal — it is the server refusing a harvest
+    because the worker already carries cargo (harvest fills the full capacity
+    in one action), so the node stays remembered for the next empty worker.
 
     Returns the cells newly remembered this Tick so the battle log can diff
     discoveries without copying the whole (20k+) resource set every Tick.
@@ -10008,6 +10070,9 @@ def _update_resource_memory(turn) -> set[tuple[int, int]]:
         ):
             pos = tuple(event.position)
             _forget_resource(pos)
+        elif event.event_type == "HARVEST_SUCCEEDED" and event.position:
+            # A successful harvest empties the node; see _forget_resource.
+            _forget_resource(tuple(event.position))
 
     return added
 
@@ -11111,21 +11176,27 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         # home to deposit, so it is never assigned a fresh mine.
         idle_workers = [(str(w.id), tuple(w.position)) for w in turn.workers if w.cargo == 0]
         idle_ids = {wid for wid, _ in idle_workers}
-        all_resources = _merge_resource_cells(
-            turn.resource_cells,
-            _resource_memory,
-            depleted,
-        )
-
+        pos_by_id = dict(idle_workers)
         # Workers ignore mines farther than this Manhattan distance from the core —
         # a far deposit round-trip wastes more ticks than it earns, and a worker
         # stranded out deep is easy prey. 0 (default) disables the cap.
         mine_max_distance = _effective_mine_radius(config)
-        if mine_max_distance > 0:
-            all_resources = [
-                r for r in all_resources
-                if _manhattan(tuple(r), core_pos) <= mine_max_distance
-            ]
+        max_trip = mine_max_distance if mine_max_distance > 0 else 10 ** 6
+        # The live ~250-Tick harvest interval was the trip itself, not pathing:
+        # successful mines sat a median 78.5 cells from the Core and the walk
+        # took 81.5 steps against 78.5 straight-line. So the cap below is a
+        # round-trip test, not a straight-line radius.
+        # One pass over remembered cells: _update_resource_memory() has already
+        # merged this Tick's visible cells into the set and dropped harvested
+        # ones, so membership here is "believed to hold a resource".
+        scanned: list[tuple[int, tuple[int, int]]] = []
+        for cell in _resource_memory:
+            if cell in depleted:
+                continue
+            d_core = _manhattan(cell, core_pos)
+            if mine_max_distance > 0 and d_core > mine_max_distance:
+                continue
+            scanned.append((d_core, cell))
 
         # Dangerous mines: covered by enemy fire (real attack geometry, so a
         # diagonal Ranger at (2,2) bans the mine it can actually shoot), adjacent
@@ -11143,8 +11214,7 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         turn_context.mine_danger_cells = frozenset(danger_cells)
         enemy_cells = {tuple(e.position) for e in enemies}
         death_cells = turn_context.recent_death_cells
-        for res in all_resources:
-            rt = tuple(res)
+        for _d, rt in scanned:
             if (
                 rt in danger_cells
                 or any(_manhattan(rt, ec) <= 1 for ec in enemy_cells)
@@ -11157,10 +11227,11 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
             cell: until for cell, until in _mine_danger_ban.items()
             if until > _tick_now
         }
-        all_resources = [
-            r for r in all_resources
-            if _mine_danger_ban.get(tuple(r), 0) <= _tick_now
+        scanned = [
+            (d, cell) for d, cell in scanned
+            if _mine_danger_ban.get(cell, 0) <= _tick_now
         ]
+        all_resources = sorted(cell for _d, cell in scanned)
         # Home-defence sortie targets: visible combat units lurking by a recent
         # death or a banned mine, within the mining radius. Home defenders chase
         # these even far outside the core patrol ring (see _plan_home_combat),
@@ -11199,26 +11270,35 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         # A mine under the Core is not mineable: an empty worker must vacate the
         # chute before HARVEST, so assigning it produces a vacate/return A-B-A
         # loop and starves Core production with CELL_UNIT_LIMIT.
-        assignable_resources = [
-            r for r in all_resources if tuple(r) != tuple(core_pos)
-        ]
+        budgeted = [(d_core, cell) for d_core, cell in scanned if cell != tuple(core_pos)]
+        cell_d_core = {cell: d_core for d_core, cell in budgeted}
 
-        # Sticky validation must use the filtered set, otherwise a worker keeps
-        # its old assignment to a mine that just became contested/out of range.
-        resource_set = set(assignable_resources)
-
+        # Sticky validation: keep an assignment only while the whole round trip
+        # still fits and the cell is still a known resource. The Core moves
+        # during a trip, so a mine inside the radius when assigned can fall out
+        # of it — re-check "remaining outbound leg + return leg to the Core"
+        # every Tick instead of trusting memory membership. A cell harvested out
+        # from under the worker is gone from _resource_memory (the harvest event
+        # forgot it), so the sticky entry dies here instead of marching a second
+        # worker to a dead cell.
         sticky: dict[str, tuple[int, int]] = {}
         claimed_resources: set[tuple[int, int]] = set()
         for wid, res in list(_resource_assignments.items()):
             res_t = tuple(res)
-            if wid in idle_ids and res_t in resource_set and res_t not in claimed_resources:
-                sticky[wid] = res_t
-                claimed_resources.add(res_t)
+            if wid not in idle_ids or res_t in claimed_resources:
+                continue
+            d_core = cell_d_core.get(res_t)
+            if d_core is None:
+                continue
+            if d_core + _manhattan(res_t, pos_by_id[wid]) > max_trip:
+                continue
+            sticky[wid] = res_t
+            claimed_resources.add(res_t)
         _resource_assignments.clear()
         _resource_assignments.update(sticky)
 
         available = [w for w in idle_workers if w[0] not in sticky]
-        open_resources = [r for r in assignable_resources if r not in claimed_resources]
+        open_resources = [cell for _d, cell in budgeted if cell not in claimed_resources]
         for res in sorted(
             open_resources,
             key=lambda p: min(_manhattan(p, w[1]) for w in available) if available else 0,
