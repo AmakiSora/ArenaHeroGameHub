@@ -161,6 +161,34 @@ CONFIG_FIELDS = (
         20,
         1,
     ),
+    # Base-alert recall: when enough enemy combat units mass near the Core, the
+    # dispersed attack/kite/guerrilla squads march home to defend instead of
+    # leaving a handful of home defenders to be overrun (t663387: 9 home vs ~30
+    # enemy Rangers while the main army roamed 300-2600 cells away). The threat
+    # window lingers recall_release_ticks after the last sighting so vision
+    # flicker does not yo-yo the recall.
+    ConfigField("recall_enabled", "基地告急召回主力", "combat", "boolean", True),
+    ConfigField("recall_threat_radius", "告急判定半径(核心切比雪夫)", "combat", "integer", 16, 0, 50, 1),
+    ConfigField("recall_enemy_threshold", "告急敌战斗单位阈值", "combat", "integer", 6, 0, 50, 1),
+    ConfigField("recall_release_ticks", "告急解除迟滞 Tick", "combat", "integer", 30, 0, 200, 1),
+    # A recall from 296+ cells cannot arrive before a Core dies in 34 Ticks and
+    # pulls the unit off its front for hundreds of Ticks; only recall units
+    # within this Manhattan distance (1 cell/Tick). 0 disables the cap.
+    ConfigField("recall_max_distance", "召回最大距离(格)", "combat", "integer", 60, 0, 5000, 1),
+    # Campers kill workers before the mass becomes visible. A few recent ally
+    # deaths near the Core trigger the alert earlier than the visible count.
+    ConfigField("recall_death_heat_threshold", "近核阵亡热点阈值", "combat", "integer", 2, 0, 50, 1),
+    ConfigField("recall_death_heat_ticks", "阵亡热点回溯 Tick", "combat", "integer", 60, 0, 300, 1),
+    ConfigField("recall_on_core_damage", "核心受损即召回", "combat", "boolean", True),
+    # Home focus fire: all home Rangers concentrate on one shared target (lowest
+    # HP, then nearest the Core) instead of each shooting its own nearest foe,
+    # so the squad secures kills against kiting Rangers rather than spreading
+    # 1-damage shots across many targets (t663387: 5 shots in 59 Ticks).
+    ConfigField("home_focus_fire", "守家集火共享目标", "combat", "boolean", True),
+    # Infer off-vision threats from recent ally-death heat near the Core and feed
+    # them to the home sortie (defense_targets). Campers slip in and out of vision
+    # so the visible-only sortie fired 0 targets while workers died (t663387).
+    ConfigField("threat_inference_enabled", "阵亡热点推断出击", "combat", "boolean", True),
     ConfigField("attack_target_x", "进攻目标 X", "combat", "integer", 0, -10000, 10000, 1),
     ConfigField("attack_target_y", "进攻目标 Y", "combat", "integer", 0, -10000, 10000, 1),
     ConfigField(

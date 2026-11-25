@@ -477,7 +477,7 @@ class MiningEconomyTests(RespawnRecoveryBase):
             "HARVEST_SUCCEEDED",
             actor_id=world.world_workers[0].id,
             position=harvested,
-            values={"amount": 1},
+            values={"amount": 1, "source": "RESOURCE_NODE"},
         ),)))
 
         self.assertNotIn(harvested, tactic._resource_memory)
@@ -485,6 +485,26 @@ class MiningEconomyTests(RespawnRecoveryBase):
             harvested, tactic._resource_tombstones,
             "the tombstone must survive the next map save",
         )
+
+    def test_dropped_cargo_pickup_does_not_tombstone_the_cell(self) -> None:
+        # Live t656231: W23 picked up DROPPED_CARGO at (-127,982) and the same
+        # cell was still in resource_cells next Tick. Only a RESOURCE_NODE
+        # harvest depletes a node.
+        world = RespawnWorld(core_pos=(-197, 1501), mines=set(), workers=0)
+        world.add_worker((-197, 1503))
+        cell = (-197, 1491)
+        tactic._resource_memory.add(cell)
+        tactic._resource_tombstones.discard(cell)
+
+        tactic._update_resource_memory(world.turn((FakeEvent(
+            "HARVEST_SUCCEEDED",
+            actor_id=world.world_workers[0].id,
+            position=cell,
+            values={"amount": 1, "source": "DROPPED_CARGO"},
+        ),)))
+
+        self.assertIn(cell, tactic._resource_memory)
+        self.assertNotIn(cell, tactic._resource_tombstones)
 
     def test_sticky_assignment_dies_when_the_mine_is_harvested_out(self) -> None:
         world = RespawnWorld(core_pos=(-197, 1501), mines=set(), workers=0)

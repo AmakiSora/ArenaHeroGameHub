@@ -74,8 +74,15 @@ def _reset_danger_state():
     tactic._mine_danger_ban.clear()
     tactic._prev_unit_snapshot.clear()
     tactic._home_chute_wait.clear()
+    tactic._recall_ids.clear()
+    tactic._recall_threat_until = 0
+    tactic._recall_active_logged = False
     tactic.turn_context.dead_unit_names = {}
     tactic.turn_context.recent_death_cells = frozenset()
     tactic.turn_context.mine_danger_cells = frozenset()
     tactic.turn_context.defense_targets = ()
+    tactic.turn_context.home_focus_target = None
+    tactic.turn_context.recall_active = False
+    tactic.turn_context.recall_count = 0
+    tactic.turn_context.recall_deaths = 0
     yield

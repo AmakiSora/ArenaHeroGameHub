@@ -25,6 +25,7 @@ from functools import wraps
 from getpass import getpass
 from heapq import heappop, heappush, merge
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from arena_hero import (
@@ -5052,6 +5053,7 @@ def _attack_regroup_step(
     config: Mapping | None = None,
     enemies: tuple = (),
     unit_kind: str = "ranger",
+    label: str = "attack-regroup",
 ) -> tuple[str, str] | None:
     """One step of the attack-team home-recovery march toward the Core.
 
@@ -5081,7 +5083,7 @@ def _attack_regroup_step(
         # frozen). Stop at the ring; a wounded unit still claims the cell.
         unit.wait()
         _set_unit_route(unit, core_pos, [tuple(pos)], complete=True)
-        return ("WAIT", f"attack-regroup-ring {core_pos}")
+        return ("WAIT", f"{label}-ring {core_pos}")
     # A visible enemy next to the unit is not in obstacle_cells, so A* happily
     # routes through its cell and the server rejects every step with
     # MOVE_DESTINATION_OCCUPIED. Production R11 sat at (-1056,980) for 130
@@ -5102,7 +5104,7 @@ def _attack_regroup_step(
         pos,
         core_pos,
         obstacle_cells,
-        detail_prefix="attack-regroup",
+        detail_prefix=label,
         cell_counts=cell_counts,
         extra_obstacles=blocked_cells,
         max_steps=budget,
@@ -5114,7 +5116,7 @@ def _attack_regroup_step(
         pos,
         core_pos,
         obstacle_cells,
-        detail_prefix="attack-regroup",
+        detail_prefix=label,
         cell_counts=cell_counts,
         extra_obstacles=blocked_cells,
     )
@@ -5124,7 +5126,7 @@ def _attack_regroup_step(
         if unit_kind == "vanguard":
             sweep = _vanguard_adjacent_sweep(unit, pos, adjacent_enemies)
             if sweep is not None:
-                return ("SWEEP", f"attack-regroup-blocker {sweep[1]}")
+                return ("SWEEP", f"{label}-blocker {sweep[1]}")
         else:
             shot = _ranger_best_shot(
                 unit,
@@ -5137,8 +5139,204 @@ def _attack_regroup_step(
                 ),
             )
             if shot is not None:
-                return ("SHOOT", f"attack-regroup-blocker {shot[1]}")
+                return ("SHOOT", f"{label}-blocker {shot[1]}")
     return None
+
+
+# ── base-alert recall / home focus fire / off-vision threat inference ─────────
+# t663387 wipe: ~30 enemy Rangers massed on the Core while only 9 home defenders
+# stood against them and the main army roamed 300-2600 cells away; the home squad
+# fired 5 shots in 59 Ticks (each Ranger picked its own nearest foe) and the
+# visible-only sortie saw 0 targets because the killers flickered out of vision.
+# These three helpers address the兵力 mismatch, the spread fire, and the blind
+# sortie respectively. All run once per Tick in core_setup / resource_assign.
+
+
+def _update_recall(turn: Any, enemies: tuple, core_pos: tuple[int, int], config: dict) -> None:
+    """March the closest squads home while the Core is threatened.
+
+    Three triggers, any one is enough:
+    * ``recall_enemy_threshold`` visible combat enemies inside
+      ``recall_threat_radius`` (Chebyshev) of the Core;
+    * ``recall_death_heat_threshold`` recent ally-death cells inside the same
+      radius (campers kill a worker before the mass becomes visible);
+    * ``CORE_DAMAGED`` this Tick when ``recall_on_core_damage`` is on.
+
+    The alert lingers ``recall_release_ticks`` after the last trigger so vision
+    flicker does not yo-yo the recall. Only units whose Manhattan distance to
+    the Core is at most ``recall_max_distance`` join ``_recall_ids``: a unit
+    296 cells out cannot arrive before a Core dies in 34 Ticks, and pulling it
+    off the attack/kite front for hundreds of Ticks is worse than leaving it.
+    0 disables the cap (the old behaviour). Arrived units leave the set
+    individually; dead ids are pruned in _prune_dead_unit_bookkeeping.
+    """
+    global _recall_threat_until, _recall_active_logged
+    tick = int(getattr(turn_context, "tick", 0) or 0)
+    if not bool(config.get("recall_enabled", True)):
+        _recall_ids.clear()
+        _recall_threat_until = 0
+        _recall_active_logged = False
+        turn_context.recall_active = False
+        turn_context.recall_count = 0
+        turn_context.recall_deaths = 0
+        return
+    radius = max(int(config.get("recall_threat_radius", 16) or 0), 0)
+    threshold = max(int(config.get("recall_enemy_threshold", 6) or 0), 1)
+    release = max(int(config.get("recall_release_ticks", 30) or 0), 0)
+    death_threshold = max(int(config.get("recall_death_heat_threshold", 2) or 0), 0)
+    death_window = max(int(config.get("recall_death_heat_ticks", 60) or 0), 0)
+    max_distance = max(int(config.get("recall_max_distance", 60) or 0), 0)
+    near = [
+        e for e in _combat_threats(enemies)
+        if _chebyshev(tuple(e.position), tuple(core_pos)) <= radius
+    ]
+    near_deaths: list[tuple[int, int]] = []
+    if death_threshold > 0:
+        for cell in turn_context.recent_death_cells:
+            cell = tuple(cell)
+            died = _death_heat.get(cell, tick)
+            if death_window and tick - died > death_window:
+                continue
+            if _chebyshev(cell, tuple(core_pos)) <= radius:
+                near_deaths.append(cell)
+    core_hit = False
+    if bool(config.get("recall_on_core_damage", True)):
+        for event in getattr(turn, "events", ()) or ():
+            event_type = getattr(event, "event_type", None) or getattr(event, "type", None)
+            if event_type != "CORE_DAMAGED":
+                continue
+            event_pos = getattr(event, "position", None)
+            if event_pos is not None and tuple(event_pos) != tuple(core_pos):
+                continue
+            core_hit = True
+            break
+    reasons: list[str] = []
+    if len(near) >= threshold:
+        reasons.append(f"近核敌 {len(near)}≥{threshold}")
+    if death_threshold and len(near_deaths) >= death_threshold:
+        reasons.append(f"近核阵亡热点 {len(near_deaths)}≥{death_threshold}")
+    if core_hit:
+        reasons.append("核心受损")
+    if reasons:
+        _recall_threat_until = tick + release
+    active = tick < _recall_threat_until
+    turn_context.recall_active = active
+    turn_context.recall_count = len(near)
+    turn_context.recall_deaths = len(near_deaths)
+    if active:
+        home_names = _parse_team_names(config.get("home_team", ""))
+        ring = int(config.get("home_patrol_radius", 5)) + 1
+        recalled = 0
+        skipped_far = 0
+        distances: list[int] = []
+        for u in turn.units:
+            if u.unit_type not in (UnitType.VANGUARD, UnitType.RANGER):
+                continue
+            uid = str(u.id)
+            name = _object_name(u.id, _UNIT_NAME_PREFIX.get(u.unit_type, "U")).upper()
+            if name in home_names:
+                _recall_ids.discard(uid)
+                continue
+            distance = _manhattan(tuple(u.position), tuple(core_pos))
+            if distance <= ring:
+                _recall_ids.discard(uid)
+                continue
+            if max_distance and distance > max_distance:
+                _recall_ids.discard(uid)
+                skipped_far += 1
+                continue
+            _recall_ids.add(uid)
+            recalled += 1
+            distances.append(distance)
+        if not _recall_active_logged:
+            _recall_active_logged = True
+            reason_text = " / ".join(reasons) if reasons else "告急迟滞"
+            distance_text = f"，最近 {min(distances)} 格" if distances else ""
+            skip_text = (
+                f"，{skipped_far} 个超出 {max_distance} 格上限未召回"
+                if skipped_far else ""
+            )
+            try:
+                append_jsonl(BATTLE_LOG_PATH, [{
+                    "tick": tick, "ts": time.time(), "cat": "combat",
+                    "msg": (
+                        f"基地告急召回：{reason_text}；召回 {recalled} 个"
+                        f"{distance_text}{skip_text}，回防 {_fmt_cell(tuple(core_pos))}"
+                    ),
+                }])
+            except OSError:
+                pass
+    else:
+        if _recall_active_logged:
+            _recall_active_logged = False
+            try:
+                append_jsonl(BATTLE_LOG_PATH, [{
+                    "tick": tick, "ts": time.time(), "cat": "combat",
+                    "msg": "基地告急解除，召回释放",
+                }])
+            except OSError:
+                pass
+        _recall_ids.clear()
+
+
+def _pick_home_focus_target(enemies: tuple, core_pos: tuple[int, int], config: dict) -> str | None:
+    """Shared home-fire target: lowest HP, then nearest the Core, in engage range.
+
+    Concentrating the home Rangers on one foe secures kills against kiting
+    Rangers (2 HP) instead of spreading 1-damage shots across many targets that
+    slip out of range before dying. Returns the enemy id, or None.
+    """
+    if not bool(config.get("home_focus_fire", True)):
+        return None
+    engage = max(
+        int(config.get("home_engage_radius", 10) or 0),
+        int(config.get("home_patrol_radius", 5)) + 1,
+    )
+    cands = [
+        e for e in _combat_threats(enemies)
+        if _manhattan(tuple(core_pos), tuple(e.position)) <= engage
+    ]
+    if not cands:
+        return None
+    best = min(
+        cands,
+        key=lambda e: (
+            int(getattr(e, "hp", 0) or 0),
+            _manhattan(tuple(core_pos), tuple(e.position)),
+        ),
+    )
+    return str(best.id)
+
+
+def _inferred_threat_enemies(
+    core_pos: tuple[int, int], config: dict, enemies: tuple,
+) -> tuple:
+    """Lightweight stand-in threats at recent ally-death cells near the Core.
+
+    Campers kill workers then slip out of vision, so the visible-only sortie
+    (defense_targets) fired 0 targets during the t663387 wipe. Recent death heat
+    (150-Tick TTL) marks where the killers operate; surface those cells as fake
+    RANGER threats so home defenders intercept them. They drive MOVEMENT only —
+    shooting/sweeping still uses the real visible ``enemies`` tuple, so no Ranger
+    ever fires at an empty inferred cell.
+    """
+    if not bool(config.get("threat_inference_enabled", True)):
+        return ()
+    radius = max(int(config.get("recall_threat_radius", 16) or 0), 0)
+    visible = {tuple(e.position) for e in enemies}
+    out = []
+    for cell in _death_heat:
+        if cell in visible:
+            continue
+        if _chebyshev(cell, tuple(core_pos)) > radius:
+            continue
+        out.append(SimpleNamespace(
+            id=f"inferred-{cell[0]}-{cell[1]}",
+            position=cell,
+            hp=2,
+            unit_type=UnitType.RANGER,
+        ))
+    return tuple(out)
 
 
 # ── sweep miss fuse ──────────────────────────────────────────────────────────
@@ -5524,6 +5722,7 @@ def _ranger_best_shot(
     attack_range: int,
     *,
     lead_fire_enabled: bool = False,
+    focus_id: str | None = None,
 ) -> tuple[str, str] | None:
     """Pick the best enemy in legal 8-way range (rules v0.8/v0.13).
 
@@ -5532,10 +5731,16 @@ def _ranger_best_shot(
     and only intermediate crossed cells can block the line. Among legal targets
     a still one outranks a mover (current-cell hits on movers are ~3%), with
     distance breaking ties inside the same motion tier.
+
+    ``focus_id`` (home focus fire): when that enemy is a legal target for this
+    Ranger, shoot it instead of the motion-tier pick so the squad concentrates
+    fire on one shared foe. Falls back to the normal pick when the focus target
+    is out of range / line-blocked for this Ranger.
     """
     best_key = (1 << 30, 1 << 30)
     best_dist = 10_000
     best_target = None
+    focus_target = None
     for enemy in enemies:
         dx = int(enemy.position[0]) - pos[0]
         dy = int(enemy.position[1]) - pos[1]
@@ -5544,11 +5749,16 @@ def _ranger_best_shot(
             continue
         if _line_blocked(pos, tuple(enemy.position), obstacle_cells):
             continue
+        if focus_id is not None and str(enemy.id) == focus_id:
+            focus_target = enemy
         key = (_enemy_motion_tier(enemy), dist)
         if key < best_key:
             best_key = key
             best_dist = dist
             best_target = enemy
+    if focus_target is not None:
+        best_target = focus_target
+        best_dist = _chebyshev(pos, tuple(focus_target.position))
     if best_target is None:
         return None
     prediction = _shadow_shot_prediction(
@@ -5889,6 +6099,22 @@ def _plan_home_combat(
         _cw = None
     _chute_escape = _cw is not None and _cw[1] >= _HOME_CHUTE_WAIT_ESCAPE
 
+    # Base-alert recall: a non-home unit pulled back to defend marches home until
+    # it reaches the ring, then rejoins normal home defence. Reuses the attack
+    # regroup march (distance-scaled A* + greedy fallback) so a unit hundreds of
+    # cells out still paths home instead of stalling on the bounded home-return.
+    if _uid in _recall_ids:
+        if _manhattan(pos, core_pos) <= return_radius:
+            _recall_ids.discard(_uid)
+        else:
+            step = _attack_regroup_step(
+                unit, pos, core_pos, obstacle_cells,
+                cell_counts=cell_counts, config=config, enemies=enemies,
+                unit_kind=unit_kind, label="recall-march",
+            )
+            if step is not None:
+                return step
+
     if unit_kind == "vanguard":
         # Sweep first: an adjacent enemy is free damage this Tick. Approach
         # only when no cardinal target exists (see _plan_waypoint).
@@ -5914,6 +6140,7 @@ def _plan_home_combat(
             obstacle_cells,
             int(config["ranger_attack_range"]),
             lead_fire_enabled=bool(config.get("ranger_lead_fire_enabled", True)),
+            focus_id=getattr(turn_context, "home_focus_target", None),
         )
         if shot is not None:
             return shot
@@ -8410,6 +8637,13 @@ _worker_contest_repeat: dict[str, tuple[tuple[int, int], int]] = {}
 # after unit death (bounded by total units ever regrouped; new units carry
 # fresh UUIDs so stale ids can never mis-arm a respawn).
 _attack_regroup_ids: set[str] = set()
+# Base-alert recall: non-home combat units marching home while the Core is
+# threatened. Managed by _update_recall (linger window + hysteresis); a unit
+# leaves the set when it reaches the home ring or the alert releases. Reuses the
+# _attack_regroup_step march so far units path home with a distance-scaled budget.
+_recall_ids: set[str] = set()
+_recall_threat_until: int = 0
+_recall_active_logged: bool = False
 # Cached A* path for the manual core target (goal + full cell path). Reused
 # while the Core stays on it; recomputed when the target changes, the Core
 # leaves the path, or a newly learned wall blocks the next step.
@@ -10077,8 +10311,15 @@ def _update_resource_memory(turn) -> set[tuple[int, int]]:
             pos = tuple(event.position)
             _forget_resource(pos)
         elif event.event_type == "HARVEST_SUCCEEDED" and event.position:
-            # A successful harvest empties the node; see _forget_resource.
-            _forget_resource(tuple(event.position))
+            # A successful RESOURCE_NODE harvest empties the node; see
+            # _forget_resource. DROPPED_CARGO is a dead unit's cargo being
+            # picked up at a cell that may still hold a resource: live t656231
+            # W23 picked up dropped cargo at (-127,982) and the same cell was
+            # still in resource_cells on the next Tick. Tombstoning it would
+            # forget a live node until the worker happens to see it again.
+            _source = (getattr(event, "values", None) or {}).get("source")
+            if _source != "DROPPED_CARGO":
+                _forget_resource(tuple(event.position))
 
     return added
 
@@ -10455,6 +10696,10 @@ turn_context = type(
         "recent_death_cells": frozenset(),
         "mine_danger_cells": frozenset(),
         "defense_targets": (),
+        "home_focus_target": None,
+        "recall_active": False,
+        "recall_count": 0,
+        "recall_deaths": 0,
         "home_defense_leash": 12,
         "home_defense_decisions": {},
         "config_values": None,
@@ -10587,6 +10832,7 @@ def _prune_dead_unit_bookkeeping(alive_ids: set[str]) -> None:
     for (prefix, obj_id), name in list(_object_names.items()):
         if prefix in ("W", "V", "R") and str(obj_id) not in alive_ids:
             _object_names.pop((prefix, obj_id), None)
+    _recall_ids.intersection_update(alive_ids)
 
 
 # ── post-combat healing (rules v0.10) ─────────────────────────────────────────
@@ -11179,6 +11425,11 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
         turn_context.attack_retreat_from = None
         turn_context.attack_forbidden_targets = frozenset()
 
+    # Base-alert recall + home focus fire (computed once per Tick so every home
+    # defender acts on the same shared target and the same recall verdict).
+    _update_recall(turn, enemies, tuple(core_pos), config)
+    turn_context.home_focus_target = _pick_home_focus_target(enemies, tuple(core_pos), config)
+
     beacon_on_ground_here = beacon.status == "GROUND" and beacon.position == core_pos
     beacon_carried_by_core = beacon.status == "CARRIED" and beacon.carrier_id == core.id
 
@@ -11287,6 +11538,18 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 )
             )
         )
+        # Off-vision campers: recent death heat near the Core marks where killers
+        # operate even when they flicker out of sight (the visible-only sortie
+        # above saw 0 targets during the t663387 wipe). Add inferred stand-in
+        # threats within the mining radius so home defenders investigate the
+        # hotspot. They drive intercept movement only, never shots.
+        inferred = tuple(
+            e for e in _inferred_threat_enemies(tuple(core_pos), config, enemies)
+            if mine_max_distance <= 0
+            or _manhattan(tuple(e.position), core_pos) <= mine_max_distance
+        )
+        if inferred:
+            turn_context.defense_targets = turn_context.defense_targets + inferred
         # Periodic situation row so a later log review can quantify whether the
         # danger ban / death heat / home sortie are engaging the camp.
         global _last_defense_log_tick
@@ -12371,6 +12634,8 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                     )
         elif unit.unit_type == UnitType.VANGUARD:
             team = _combat_team_for(name, config)
+            if str(unit.id) in _recall_ids:
+                team = "home"
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
             _contest_cells = (
                 _attack_contest_cells(str(unit.id), turn.tick)
@@ -12410,6 +12675,8 @@ def _choose_actions(turn) -> tuple[str, dict[str, str]]:
                 _record_combat_planned_step(unit, detail)
         elif unit.unit_type == UnitType.RANGER:
             team = _combat_team_for(name, config)
+            if str(unit.id) in _recall_ids:
+                team = "home"
             _blocked_cell = _cell_limit_block_cell(str(unit.id), turn.tick)
             _contest_cells = (
                 _attack_contest_cells(str(unit.id), turn.tick)

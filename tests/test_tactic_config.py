@@ -44,6 +44,33 @@ class TacticConfigTests(unittest.TestCase):
         self.assertEqual(config["core_max_drift"], 200)
         self.assertEqual(config["combat_team_ratio"], "2:1:1:1")
 
+    def test_base_defense_field_defaults_and_validation(self) -> None:
+        config = default_config()
+        self.assertTrue(config["recall_enabled"])
+        self.assertEqual(config["recall_threat_radius"], 16)
+        self.assertEqual(config["recall_enemy_threshold"], 6)
+        self.assertEqual(config["recall_release_ticks"], 30)
+        self.assertEqual(config["recall_max_distance"], 60)
+        self.assertEqual(config["recall_death_heat_threshold"], 2)
+        self.assertEqual(config["recall_death_heat_ticks"], 60)
+        self.assertTrue(config["recall_on_core_damage"])
+        self.assertTrue(config["home_focus_fire"])
+        self.assertTrue(config["threat_inference_enabled"])
+
+        # Out-of-range integers are rejected; booleans coerce normally.
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"recall_threat_radius": 51})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"recall_enemy_threshold": -1})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"recall_max_distance": -1})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"recall_death_heat_threshold": 51})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"recall_death_heat_ticks": 301})
+        self.assertFalse(validate_config({"recall_enabled": False})["recall_enabled"])
+        self.assertFalse(validate_config({"recall_on_core_damage": False})["recall_on_core_damage"])
+
     def test_team_ratio_parse_and_validation(self) -> None:
         from tactic_config import parse_team_ratio
 
