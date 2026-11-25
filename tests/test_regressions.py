@@ -8519,8 +8519,13 @@ class ArenaConsoleRoutingTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"csrf_token": "csrf-x"})
         cookie = headers.get("Set-Cookie", "")
         # Domain/Secure must go (dashboard origin may be plain HTTP); the
-        # cookie must stay HttpOnly and bind to this origin's path.
-        self.assertEqual(cookie, "ah_session=abc123; Path=/; HttpOnly; SameSite=Lax")
+        # cookie must stay HttpOnly and bind to this origin's path. No upstream
+        # Max-Age means a browser-session cookie, so persist it locally instead
+        # of dropping it when the browser closes.
+        self.assertEqual(
+            cookie,
+            "ah_session=abc123; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000",
+        )
 
     def test_csrf_token_is_forwarded_upstream(self) -> None:
         captured = {}
@@ -8603,10 +8608,14 @@ class ArenaConsoleRoutingTests(unittest.TestCase):
             seen["cookie"] = request.get_header("Cookie")
             return FakeResponse()
 
-        with patch.object(urllib.request, "urlopen", fake_urlopen):
+        with tempfile.TemporaryDirectory() as tmp,                 patch.object(dashboard, "SESSION_DRAFT_FILE",
+                             str(Path(tmp) / "session_draft.json")),                 patch.object(urllib.request, "urlopen", fake_urlopen):
             status, headers, body = self._import_request(
                 '{"cookies": "arena_session=s3cr3t; csrf_hint=x1", "csrf": "csrf-abc"}')
+            persisted = json.loads((Path(tmp) / "session_draft.json").read_text(encoding="utf-8"))
         self.assertEqual(status, 200)
+        self.assertEqual(persisted["cookies"], "arena_session=s3cr3t; csrf_hint=x1")
+        self.assertEqual(persisted["csrf"], "csrf-abc")
         payload = json.loads(body)
         self.assertEqual(payload["user"]["username"], "operator")
         # The CSRF token is echoed back so the frontend can attach it to the
@@ -8615,11 +8624,47 @@ class ArenaConsoleRoutingTests(unittest.TestCase):
         self.assertEqual(seen["url"], "https://api.arenahero.io/api/v1/me")
         self.assertEqual(seen["cookie"], "arena_session=s3cr3t; csrf_hint=x1")
         set_cookies = [v for name, v in headers if name.lower() == "set-cookie"]
-        self.assertIn("arena_session=s3cr3t; Path=/; HttpOnly; SameSite=Lax", set_cookies)
-        self.assertIn("csrf_hint=x1; Path=/; HttpOnly; SameSite=Lax", set_cookies)
+        self.assertIn(
+            "arena_session=s3cr3t; Path=/; HttpOnly; SameSite=Lax; "
+            "Max-Age=2592000", set_cookies)
+        self.assertIn(
+            "csrf_hint=x1; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000",
+            set_cookies)
         # The CSRF token rides in its own carrier cookie so the proxy can
         # attach it as X-CSRF-Token on session POSTs.
-        self.assertIn("arena_csrf=csrf-abc; Path=/; HttpOnly; SameSite=Lax", set_cookies)
+        self.assertIn(
+            "arena_csrf=csrf-abc; Path=/; HttpOnly; SameSite=Lax; "
+            "Max-Age=2592000", set_cookies)
+
+    def test_session_draft_survives_a_dashboard_restart(self) -> None:
+        original = dashboard._SESSION_DRAFT
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "session_draft.json"
+                with patch.object(dashboard, "SESSION_DRAFT_FILE", str(path)):
+                    dashboard._save_session_draft({
+                        "cookies": "arena_session=s3cr3t", "csrf": "csrf-abc",
+                    })
+                    self.assertTrue(path.exists())
+                    # A fresh process has an empty memory draft and must load
+                    # the persisted copy instead of asking for a paste.
+                    dashboard._SESSION_DRAFT = None
+                    loaded = dashboard._load_session_draft()
+                self.assertEqual(loaded, {
+                    "cookies": "arena_session=s3cr3t", "csrf": "csrf-abc",
+                })
+        finally:
+            dashboard._SESSION_DRAFT = original
+
+    def test_upstream_login_cookie_keeps_its_own_max_age(self) -> None:
+        rewritten = dashboard.Handler._rewrite_set_cookie(
+            "ah_session=x1; Domain=api.arenahero.io; Path=/; Max-Age=3600; "
+            "Secure; HttpOnly; SameSite=None",
+        )
+        self.assertEqual(
+            rewritten,
+            "ah_session=x1; Path=/; HttpOnly; SameSite=Lax; Max-Age=3600",
+        )
 
     def test_session_import_rejects_malformed_cookies(self) -> None:
         status, _, body = self._import_request('{"cookies": "no-equals-sign"}')

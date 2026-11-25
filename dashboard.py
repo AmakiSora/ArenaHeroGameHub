@@ -121,11 +121,50 @@ _ARENA_POST_PATHS = {"/api/v1/game/commands", "/api/v1/auth/login", "/api/v1/aut
 _ARENA_CSRF_COOKIE = "arena_csrf"
 _ARENA_WS_PATH = "/api/v1/game/ws"
 _WS_ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-# Remembered session-import draft (raw upstream cookies + CSRF). Kept in the
-# dashboard process behind DASHBOARD_TOKEN instead of browser localStorage,
-# where any XSS could read it. In-memory only: a restart asks the operator to
-# paste once more, which is acceptable for a credential this sensitive.
-_SESSION_DRAFT: dict[str, str] | None = None
+# Remembered session-import draft (raw upstream cookies + CSRF). Kept behind
+# DASHBOARD_TOKEN instead of browser localStorage, where any XSS could read it.
+# Persisted to the runtime dir (0600) so a deploy/restart does not lose a
+# still-valid upstream session; the operator still re-imports once the upstream
+# session itself expires (the official API has no refresh endpoint).
+SESSION_DRAFT_FILE = _data_path("session_draft.json")
+# Imported cookies stay in the browser for 30 days. The upstream still decides
+# whether the session is valid; this only stops a browser restart from dropping
+# a cookie that would otherwise still work.
+_SESSION_COOKIE_MAX_AGE = 30 * 24 * 60 * 60
+
+
+def _load_session_draft() -> dict[str, str] | None:
+    try:
+        data = json.loads(Path(SESSION_DRAFT_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    cookies = str(data.get("cookies", "")).strip()
+    csrf = str(data.get("csrf", "")).strip()
+    if not cookies or not csrf or len(cookies) > 8192 or len(csrf) > 512:
+        return None
+    return {"cookies": cookies, "csrf": csrf}
+
+
+def _save_session_draft(draft: dict[str, str] | None) -> None:
+    global _SESSION_DRAFT
+    _SESSION_DRAFT = draft
+    path = Path(SESSION_DRAFT_FILE)
+    if draft is None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    atomic_write_text(path, json.dumps(draft, ensure_ascii=False))
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+_SESSION_DRAFT: dict[str, str] | None = _load_session_draft()
 
 
 # ---------- security / freshness knobs ------------------------------------
@@ -2063,7 +2102,15 @@ class Handler(BaseHTTPRequestHandler):
         Secure are dropped and the attributes are normalized.
         """
         name_value = value.split(";", 1)[0].strip()
-        return f"{name_value}; Path=/; HttpOnly; SameSite=Lax"
+        attrs = []
+        for part in value.split(";")[1:]:
+            attr = part.strip()
+            name, sep, _ = attr.partition("=")
+            if sep and name.strip().lower() in ("max-age", "expires"):
+                attrs.append(attr)
+        if not attrs:
+            attrs.append(f"Max-Age={_SESSION_COOKIE_MAX_AGE}")
+        return "; ".join([name_value, "Path=/", "HttpOnly", "SameSite=Lax", *attrs])
 
     _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
     _COOKIE_VALUE_RE = re.compile(r"^[\x21-\x7e]+$")
@@ -2125,20 +2172,26 @@ class Handler(BaseHTTPRequestHandler):
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             self._send_json(502, {"ok": False, "error": f"上游不可达: {exc}"})
             return
-        set_cookies = [("Set-Cookie", f"{n}={v}; Path=/; HttpOnly; SameSite=Lax") for n, v in pairs]
+        max_age = f"Max-Age={_SESSION_COOKIE_MAX_AGE}"
+        set_cookies = [
+            ("Set-Cookie", f"{n}={v}; Path=/; HttpOnly; SameSite=Lax; {max_age}")
+            for n, v in pairs
+        ]
         if csrf:
             # Bind the CSRF token to the session cookie itself: the proxy
             # attaches it as X-CSRF-Token on session POSTs, so a stale
             # browser-side token can never outlive the session it came from.
-            set_cookies.append(("Set-Cookie", f"{_ARENA_CSRF_COOKIE}={csrf}; Path=/; HttpOnly; SameSite=Lax"))
+            set_cookies.append((
+                "Set-Cookie",
+                f"{_ARENA_CSRF_COOKIE}={csrf}; Path=/; HttpOnly; SameSite=Lax; {max_age}",
+            ))
         try:
             user = json.loads(user_body.decode("utf-8"))
         except Exception:
             user = {}
         print(f"[arena-proxy] session import ok for {user.get('username', '?')} "
               f"({len(pairs)} cookie(s), csrf={'yes' if csrf else 'no'})", flush=True)
-        global _SESSION_DRAFT
-        _SESSION_DRAFT = {"cookies": cookie_header, "csrf": csrf}
+        _save_session_draft({"cookies": cookie_header, "csrf": csrf})
         self._send(200, json.dumps({"ok": True, "user": user, "csrf_token": csrf}, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8", extra_headers=set_cookies)
 
@@ -2605,7 +2658,6 @@ class Handler(BaseHTTPRequestHandler):
             # One-time migration of a legacy browser-stored draft, or an
             # explicit save. Format-check only: the upstream validation
             # happens on the actual import.
-            global _SESSION_DRAFT
             status, data = self._read_json_body(raw)
             if status != 200:
                 self._send_json(415, _JSON_ONLY_ERROR)
@@ -2615,11 +2667,11 @@ class Handler(BaseHTTPRequestHandler):
             if not cookies or not csrf or len(cookies) > 8192 or len(csrf) > 512:
                 self._send_json(400, {"ok": False, "error": "SESSION_IMPORT_INVALID"})
                 return
-            _SESSION_DRAFT = {"cookies": cookies, "csrf": csrf}
+            _save_session_draft({"cookies": cookies, "csrf": csrf})
             self._send_json(200, {"ok": True})
             return
         if path == "/api/session/draft/clear":
-            _SESSION_DRAFT = None
+            _save_session_draft(None)
             self._send_json(200, {"ok": True})
             return
         if path in _ARENA_POST_PATHS:
