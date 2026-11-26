@@ -5638,8 +5638,19 @@ class DemandSpawnTests(unittest.TestCase):
             tactic._plan_demand_spawn(
                 self._turn(workers=10, vanguards=2, rangers=2), self.Core(), 100, self.config))
 
-    def test_workers_still_first_while_below_target(self) -> None:
+    def test_early_guard_precedes_workers_when_no_combat(self) -> None:
+        # A base with workers but zero combat units spawns one cheap Vanguard
+        # first for defense (see test_early_recovery.py); the worker-first rule
+        # below resumes once any combat unit exists.
         turn = self._turn(workers=9, vanguards=0, rangers=0)
+
+        self.assertEqual(
+            tactic._plan_demand_spawn(turn, self.Core(), 100, self.config),
+            "SPAWN_VANGUARD",
+        )
+
+    def test_workers_still_first_while_below_target(self) -> None:
+        turn = self._turn(workers=9, vanguards=1, rangers=0)
 
         self.assertEqual(
             tactic._plan_demand_spawn(turn, self.Core(), 100, self.config),

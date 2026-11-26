@@ -8561,6 +8561,11 @@ _CORE_RECOVERY_HEADCOUNT = 4
 # target mode, and auto mode resumes seeking resources.
 _CORE_RECOVERY_MAX_TICKS = 300
 _CORE_RECOVERY_MINE_RADIUS = 32
+# Adaptive recovery ring: when the base 32-cell ring holds fewer than this many
+# remembered mines, widen to _RECOVERY_MINE_WIDE_RADIUS so a mine-poor respawn
+# site does not stall the rebuild (t663811: 4 mines within 32, 300-Tick timeout).
+_RECOVERY_MINE_MIN_COUNT = 6
+_RECOVERY_MINE_WIDE_RADIUS = 80
 _core_recovery: bool = False
 _core_recovery_tick: int = 0
 # A manual core target configured before the Core died points at the old base.
@@ -10743,9 +10748,22 @@ def _spawn_order(turn: Any, config: dict[str, Any]) -> tuple[UnitType, ...]:
     priority applies. Once workers are full, Vanguards and Rangers alternate —
     the type with fewer live units goes next, ties go to the Vanguard — so the
     two types grow evenly (V, R, V, R...) instead of Vanguards filling up first.
+
+    Early guard: a freshly respawned base with a couple of workers but no combat
+    unit is defenseless, so spawn one cheap Vanguard ahead of more workers until
+    any combat unit exists (then the normal order resumes).
     """
     worker_target = int(config.get(_TARGET_KEYS[UnitType.WORKER], _TARGET_DEFAULTS[UnitType.WORKER]))
-    if _unit_type_count(turn, UnitType.WORKER) < worker_target:
+    workers = _unit_type_count(turn, UnitType.WORKER)
+    if (
+        bool(config.get("early_guard_enabled", True))
+        and workers < worker_target
+        and workers >= int(config.get("early_guard_worker_min", 2) or 0)
+        and _unit_type_count(turn, UnitType.VANGUARD) == 0
+        and _unit_type_count(turn, UnitType.RANGER) == 0
+    ):
+        return (UnitType.VANGUARD, UnitType.WORKER, UnitType.RANGER)
+    if workers < worker_target:
         return _SPAWN_PRIORITY
     combat = sorted(
         (UnitType.VANGUARD, UnitType.RANGER),
@@ -11034,13 +11052,33 @@ def _effective_mine_radius(config: Mapping) -> int:
     workers probe fresh ground instead of walking to remembered nodes 100+
     cells away (the live pair spent 400 Ticks on that round trip). 0 still
     means "no cap" in normal play, but recovery needs a finite ring.
+
+    Adaptive: a mine-poor respawn site (t663811 had only 4 mines within 32)
+    stalls the rebuild against a fixed ring, so when the base ring holds fewer
+    than _RECOVERY_MINE_MIN_COUNT remembered mines the ring widens to
+    _RECOVERY_MINE_WIDE_RADIUS (still bounded by the operator's configured cap).
     """
     configured = int(config.get("worker_mine_max_distance", 0) or 0)
     if not _core_recovery:
         return configured
-    if configured <= 0:
-        return _CORE_RECOVERY_MINE_RADIUS
-    return min(configured, _CORE_RECOVERY_MINE_RADIUS)
+    radius = (
+        _CORE_RECOVERY_MINE_RADIUS if configured <= 0
+        else min(configured, _CORE_RECOVERY_MINE_RADIUS)
+    )
+    if bool(config.get("recovery_adaptive_radius", True)):
+        core_pos = getattr(turn_context, "core_pos", None)
+        if core_pos is not None:
+            core_pos = tuple(core_pos)
+            near = sum(
+                1 for cell in _resource_memory
+                if _manhattan(cell, core_pos) <= radius
+            )
+            if near < _RECOVERY_MINE_MIN_COUNT:
+                wide = _RECOVERY_MINE_WIDE_RADIUS
+                if configured > 0:
+                    wide = min(wide, configured)
+                radius = max(radius, wide)
+    return radius
 
 
 def _manual_core_target(

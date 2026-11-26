@@ -189,6 +189,17 @@ CONFIG_FIELDS = (
     # them to the home sortie (defense_targets). Campers slip in and out of vision
     # so the visible-only sortie fired 0 targets while workers died (t663387).
     ConfigField("threat_inference_enabled", "阵亡热点推断出击", "combat", "boolean", True),
+    # Early guard: a respawned Core with a couple of workers but zero combat
+    # units is defenseless (t663811: 3 workers, 0 military, an enemy Core 16
+    # cells away). Spawn one cheap Vanguard before filling the worker target so
+    # the base has a defender that can also clear a nearby lone Core. Once any
+    # combat unit exists the normal worker-first order resumes.
+    ConfigField("early_guard_enabled", "前期先产 1 个守卫先锋", "production", "boolean", True),
+    ConfigField("early_guard_worker_min", "产守卫所需最少工人", "production", "integer", 2, 0, 20, 1),
+    # Adaptive recovery mine radius: the fixed 32-cell recovery ring stalls when
+    # the respawn site is mine-poor (t663811: only 4 mines within 32, recovery
+    # timed out at 3 workers). Widen the ring when it holds too few mines.
+    ConfigField("recovery_adaptive_radius", "恢复期采矿半径自适应", "core", "boolean", True),
     ConfigField("attack_target_x", "进攻目标 X", "combat", "integer", 0, -10000, 10000, 1),
     ConfigField("attack_target_y", "进攻目标 Y", "combat", "integer", 0, -10000, 10000, 1),
     ConfigField(

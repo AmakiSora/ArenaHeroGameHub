@@ -71,6 +71,20 @@ class TacticConfigTests(unittest.TestCase):
         self.assertFalse(validate_config({"recall_enabled": False})["recall_enabled"])
         self.assertFalse(validate_config({"recall_on_core_damage": False})["recall_on_core_damage"])
 
+    def test_early_recovery_field_defaults_and_validation(self) -> None:
+        config = default_config()
+        self.assertTrue(config["early_guard_enabled"])
+        self.assertEqual(config["early_guard_worker_min"], 2)
+        self.assertTrue(config["recovery_adaptive_radius"])
+
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"early_guard_worker_min": 21})
+        with self.assertRaises(ConfigValidationError):
+            validate_config({"early_guard_worker_min": -1})
+        self.assertFalse(
+            validate_config({"early_guard_enabled": False})["early_guard_enabled"]
+        )
+
     def test_team_ratio_parse_and_validation(self) -> None:
         from tactic_config import parse_team_ratio
 
